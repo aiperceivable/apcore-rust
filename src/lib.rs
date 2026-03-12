@@ -1,6 +1,9 @@
 // APCore SDK for Rust — AI Partner Core protocol implementation
 // Main library module — re-exports all public API
 #![allow(unused)]
+// ModuleError is intentionally large (rich structured error for an SDK); boxing it
+// everywhere would change the public API, so we suppress this lint crate-wide.
+#![allow(clippy::result_large_err)]
 
 pub mod acl;
 pub mod approval;

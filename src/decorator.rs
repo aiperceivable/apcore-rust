@@ -12,24 +12,23 @@ use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations};
 
+/// Boxed async handler type for FunctionModule.
+type HandlerFn = Box<
+    dyn for<'a> Fn(
+            &'a Context<serde_json::Value>,
+            serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
 /// A module implemented as a wrapped async function.
 pub struct FunctionModule {
     pub annotations: ModuleAnnotations,
     pub input_schema: serde_json::Value,
     pub output_schema: serde_json::Value,
-    handler: Box<
-        dyn Fn(
-                &Context<serde_json::Value>,
-                serde_json::Value,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
-                        + Send
-                        + '_,
-                >,
-            > + Send
-            + Sync,
-    >,
+    handler: HandlerFn,
 }
 
 impl std::fmt::Debug for FunctionModule {
@@ -49,15 +48,11 @@ impl FunctionModule {
         handler: F,
     ) -> Self
     where
-        F: Fn(
-                &Context<serde_json::Value>,
+        F: for<'a> Fn(
+                &'a Context<serde_json::Value>,
                 serde_json::Value,
             ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
-                        + Send
-                        + '_,
-                >,
+                Box<dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>> + Send + 'a>,
             > + Send
             + Sync
             + 'static,

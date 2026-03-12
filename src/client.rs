@@ -17,6 +17,12 @@ pub struct APCore {
     event_emitter: Option<EventEmitter>,
 }
 
+impl Default for APCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl APCore {
     /// Create a new APCore client with default configuration.
     pub fn new() -> Self {
