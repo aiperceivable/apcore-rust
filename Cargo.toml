@@ -1,0 +1,25 @@
+[package]
+name = "apcore"
+version = "0.13.0"
+edition = "2021"
+description = "APCore SDK for Rust — AI Partner Core protocol implementation"
+license = "Apache-2.0"
+repository = "https://github.com/aipartnerup/apcore-rust"
+keywords = ["apcore", "ai", "sdk", "protocol"]
+categories = ["api-bindings"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+schemars = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+regex = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
