@@ -18,7 +18,11 @@ type HandlerFn = Box<
             &'a Context<serde_json::Value>,
             serde_json::Value,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
+                    + Send
+                    + 'a,
+            >,
         > + Send
         + Sync,
 >;
@@ -52,7 +56,11 @@ impl FunctionModule {
                 &'a Context<serde_json::Value>,
                 serde_json::Value,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>> + Send + 'a>,
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
+                        + Send
+                        + 'a,
+                >,
             > + Send
             + Sync
             + 'static,
