@@ -38,7 +38,7 @@ pub trait Module: Send + Sync {
 }
 
 /// Metadata annotations attached to a module.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModuleAnnotations {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]

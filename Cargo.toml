@@ -2,11 +2,24 @@
 name = "apcore"
 version = "0.13.0"
 edition = "2021"
-description = "APCore SDK for Rust — AI Partner Core protocol implementation"
+description = "Schema-driven module standard for AI-perceivable interfaces"
 license = "Apache-2.0"
+readme = "README.md"
+authors = ["aipartnerup <tercel.yi@gmail.com>"]
+homepage = "https://aipartnerup.com"
 repository = "https://github.com/aipartnerup/apcore-rust"
-keywords = ["apcore", "ai", "sdk", "protocol"]
-categories = ["api-bindings"]
+documentation = "https://apcore.aipartnerup.com/"
+keywords = ["ai", "llm", "middleware", "observability", "schema"]
+categories = [
+    "api-bindings",
+    "asynchronous",
+    "development-tools",
+    "web-programming",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

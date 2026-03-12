@@ -1,0 +1,171 @@
+//! SendEmail module — destructive action with sensitive fields and examples.
+
+use apcore::context::{Context, Identity};
+use apcore::errors::ModuleError;
+use apcore::module::{Module, ModuleAnnotations, ModuleExample};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+// ---------------------------------------------------------------------------
+// Typed schemas
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SendEmailInput {
+    to: String,
+    subject: String,
+    body: String,
+    /// Sensitive field — should be redacted in logs.
+    api_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SendEmailOutput {
+    status: String,
+    message_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Module implementation
+// ---------------------------------------------------------------------------
+
+struct SendEmailModule;
+
+#[async_trait]
+impl Module for SendEmailModule {
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "to":      { "type": "string", "description": "Recipient email address" },
+                "subject": { "type": "string" },
+                "body":    { "type": "string" },
+                "api_key": { "type": "string", "x-sensitive": true }
+            },
+            "required": ["to", "subject", "body", "api_key"]
+        })
+    }
+
+    fn output_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "status":     { "type": "string", "enum": ["sent", "failed"] },
+                "message_id": { "type": "string" }
+            },
+            "required": ["status", "message_id"]
+        })
+    }
+
+    fn description(&self) -> &str {
+        "Send an email message via external API (destructive)"
+    }
+
+    async fn execute(
+        &self,
+        ctx: &Context<Value>,
+        input: Value,
+    ) -> Result<Value, ModuleError> {
+        let req: SendEmailInput = serde_json::from_value(input).map_err(|e| {
+            ModuleError::new(apcore::errors::ErrorCode::GeneralInvalidInput, e.to_string())
+        })?;
+
+        // Simulate sending (real impl would call SMTP/API)
+        println!(
+            "[{}] Sending email to '{}' | subject: '{}'",
+            ctx.execution_id, req.to, req.subject
+        );
+
+        let message_id = format!("msg-{:05}", req.to.len() * 1000 % 100000);
+
+        let output = SendEmailOutput {
+            status: "sent".to_string(),
+            message_id,
+        };
+
+        Ok(serde_json::to_value(output).unwrap())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper — build annotations for this module
+// ---------------------------------------------------------------------------
+
+fn send_email_annotations() -> ModuleAnnotations {
+    ModuleAnnotations {
+        name: "email.send".to_string(),
+        description: Some("Send an email message".to_string()),
+        version: Some("1.2.0".to_string()),
+        tags: vec![
+            "email".to_string(),
+            "communication".to_string(),
+            "external".to_string(),
+        ],
+        metadata: {
+            let mut m = HashMap::new();
+            m.insert("provider".to_string(), json!("example-smtp"));
+            m.insert("max_retries".to_string(), json!(3));
+            m
+        },
+        examples: vec![ModuleExample {
+            name: "Send a welcome email".to_string(),
+            description: Some("Sends a welcome email to a new user".to_string()),
+            input: json!({
+                "to": "user@example.com",
+                "subject": "Welcome!",
+                "body": "Welcome to the platform.",
+                "api_key": "sk-xxx"
+            }),
+            expected_output: json!({
+                "status": "sent",
+                "message_id": "msg-12345"
+            }),
+        }],
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() {
+    let identity = Identity {
+        id: "admin-1".to_string(),
+        name: "Admin".to_string(),
+        roles: vec!["admin".to_string()],
+        attributes: HashMap::new(),
+    };
+    let ctx: Context<Value> = Context::new(identity);
+    let module = SendEmailModule;
+
+    let out = module
+        .execute(
+            &ctx,
+            json!({
+                "to":      "alice@example.com",
+                "subject": "Hello from apcore",
+                "body":    "This is a test email.",
+                "api_key": "sk-secret"
+            }),
+        )
+        .await
+        .unwrap();
+    println!("Result: {out}");
+
+    // Show annotations
+    let annotations = send_email_annotations();
+    println!(
+        "\nAnnotations:\n{}",
+        serde_json::to_string_pretty(&annotations).unwrap()
+    );
+
+    // Schema — note x-sensitive on api_key
+    println!(
+        "\nInput schema:\n{}",
+        serde_json::to_string_pretty(&module.input_schema()).unwrap()
+    );
+}

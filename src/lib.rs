@@ -1,5 +1,6 @@
 // APCore SDK for Rust — AI Partner Core protocol implementation
 // Main library module — re-exports all public API
+#![allow(unused)]
 
 pub mod acl;
 pub mod approval;
