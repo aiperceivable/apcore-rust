@@ -136,9 +136,9 @@ fn get_user_annotations() -> ModuleAnnotations {
 async fn main() {
     let identity = Identity {
         id: "service-account".to_string(),
-        name: "Data Service".to_string(),
+        identity_type: "Data Service".to_string(),
         roles: vec!["reader".to_string()],
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     };
     let ctx: Context<Value> = Context::new(identity);
     let module = GetUserModule;

@@ -7,6 +7,6 @@ pub mod resolver;
 pub mod validator;
 
 pub use exporter::{ExportProfile, SchemaExporter};
-pub use loader::SchemaLoader;
+pub use loader::{SchemaLoader, SchemaStrategy};
 pub use resolver::RefResolver;
 pub use validator::SchemaValidator;

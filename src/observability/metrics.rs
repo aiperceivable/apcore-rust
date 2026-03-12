@@ -2,7 +2,6 @@
 // Spec reference: Execution metrics and metrics middleware
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -10,44 +9,46 @@ use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
 
-/// A single metric data point.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricEntry {
-    pub name: String,
-    pub value: f64,
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    #[serde(default)]
-    pub tags: HashMap<String, String>,
-}
-
-/// Collects and stores metrics.
+/// Collects and stores metrics counters and observations.
 #[derive(Debug, Clone)]
 pub struct MetricsCollector {
-    entries: Arc<Mutex<Vec<MetricEntry>>>,
+    counters: Arc<Mutex<HashMap<String, f64>>>,
+    observations: Arc<Mutex<HashMap<String, Vec<f64>>>>,
 }
 
 impl MetricsCollector {
     /// Create a new metrics collector.
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(vec![])),
+            counters: Arc::new(Mutex::new(HashMap::new())),
+            observations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Record a metric.
-    pub fn record(&self, name: &str, value: f64, tags: HashMap<String, String>) {
+    /// Increment a counter metric by `amount`.
+    pub fn increment(&self, name: &str, labels: HashMap<String, String>, amount: f64) {
         // TODO: Implement
         todo!()
     }
 
-    /// Get all recorded metrics.
-    pub fn get_metrics(&self) -> Vec<MetricEntry> {
-        self.entries.lock().unwrap().clone()
+    /// Observe a value for a histogram/gauge metric.
+    pub fn observe(&self, name: &str, labels: HashMap<String, String>, value: f64) {
+        // TODO: Implement
+        todo!()
     }
 
-    /// Clear all metrics.
-    pub fn clear(&self) {
-        self.entries.lock().unwrap().clear();
+    /// Return a snapshot of all current metric values.
+    pub fn snapshot(&self) -> HashMap<String, f64> {
+        // TODO: Implement
+        todo!()
+    }
+
+    /// Reset all metrics.
+    pub fn reset(&self) {
+        let mut c = self.counters.lock().unwrap();
+        c.clear();
+        let mut o = self.observations.lock().unwrap();
+        o.clear();
     }
 }
 
@@ -90,6 +91,7 @@ impl Middleware for MetricsMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
         // TODO: Implement — record duration, success count
@@ -100,6 +102,7 @@ impl Middleware for MetricsMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         _error: &ModuleError,
     ) -> Result<(), ModuleError> {
         // TODO: Implement — record error count

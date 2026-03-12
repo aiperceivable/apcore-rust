@@ -102,9 +102,9 @@ async fn main() {
     // Build a caller identity
     let identity = Identity {
         id: "user-1".to_string(),
-        name: "Alice".to_string(),
+        identity_type: "Alice".to_string(),
         roles: vec!["user".to_string()],
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     };
 
     // Create an execution context

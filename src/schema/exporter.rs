@@ -1,37 +1,17 @@
 // APCore Protocol — Schema exporter
 // Spec reference: Exporting schemas in various formats
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::errors::ModuleError;
 
 /// Profile controlling how schemas are exported.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportProfile {
-    pub name: String,
-    pub format: String,
-    #[serde(default)]
-    pub include_descriptions: bool,
-    #[serde(default)]
-    pub include_examples: bool,
-    #[serde(default)]
-    pub dereference: bool,
-    #[serde(default)]
-    pub settings: HashMap<String, serde_json::Value>,
-}
-
-impl Default for ExportProfile {
-    fn default() -> Self {
-        Self {
-            name: "default".into(),
-            format: "json".into(),
-            include_descriptions: true,
-            include_examples: true,
-            dereference: false,
-            settings: HashMap::new(),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportProfile {
+    Mcp,
+    OpenAi,
+    Anthropic,
+    Generic,
 }
 
 /// Exports schemas to various formats.
@@ -48,7 +28,7 @@ impl SchemaExporter {
     pub fn export(
         &self,
         schema: &serde_json::Value,
-        profile: &ExportProfile,
+        profile: ExportProfile,
     ) -> Result<String, ModuleError> {
         // TODO: Implement
         todo!()
@@ -58,7 +38,7 @@ impl SchemaExporter {
     pub fn export_all(
         &self,
         loader: &super::loader::SchemaLoader,
-        profile: &ExportProfile,
+        profile: ExportProfile,
     ) -> Result<HashMap<String, String>, ModuleError> {
         // TODO: Implement
         todo!()

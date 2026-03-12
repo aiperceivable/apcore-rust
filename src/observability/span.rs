@@ -83,8 +83,8 @@ impl Span {
 /// Trait for exporting completed spans.
 #[async_trait]
 pub trait SpanExporter: Send + Sync + std::fmt::Debug {
-    /// Export a batch of completed spans.
-    async fn export(&self, spans: &[Span]) -> Result<(), ModuleError>;
+    /// Export a single completed span.
+    async fn export(&self, span: &Span) -> Result<(), ModuleError>;
 
     /// Shut down the exporter.
     async fn shutdown(&self) -> Result<(), ModuleError>;

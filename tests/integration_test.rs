@@ -62,9 +62,9 @@ fn test_cancel_token() {
 fn test_identity_creation() {
     let identity = Identity {
         id: "user-1".to_string(),
-        name: "Test User".to_string(),
+        identity_type: "Test User".to_string(),
         roles: vec!["admin".to_string()],
-        attributes: std::collections::HashMap::new(),
+        attrs: std::collections::HashMap::new(),
     };
     assert_eq!(identity.id, "user-1");
     assert_eq!(identity.roles.len(), 1);

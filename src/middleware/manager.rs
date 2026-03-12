@@ -47,6 +47,7 @@ impl MiddlewareManager {
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
+        inputs: serde_json::Value,
         mut output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
         // TODO: Implement
@@ -58,6 +59,7 @@ impl MiddlewareManager {
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
+        inputs: serde_json::Value,
         error: &ModuleError,
     ) -> Result<(), ModuleError> {
         // TODO: Implement

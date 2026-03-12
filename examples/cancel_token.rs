@@ -62,9 +62,9 @@ impl Module for SlowModule {
 async fn main() {
     let identity = Identity {
         id: "user-1".to_string(),
-        name: "Alice".to_string(),
+        identity_type: "Alice".to_string(),
         roles: vec![],
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     };
 
     // --- Run 1: complete all steps (no cancellation) ---

@@ -63,6 +63,7 @@ impl Middleware for RetryMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
         Ok(output)
@@ -72,6 +73,7 @@ impl Middleware for RetryMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         _error: &ModuleError,
     ) -> Result<(), ModuleError> {
         // TODO: Implement — check if retryable, apply backoff

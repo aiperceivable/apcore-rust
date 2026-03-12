@@ -10,15 +10,15 @@ use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
 
-/// Usage statistics for a single module.
+/// Usage summary for a single module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageStats {
     pub module_name: String,
     pub total_calls: u64,
     pub success_count: u64,
     pub error_count: u64,
-    pub total_duration_ms: u64,
-    pub avg_duration_ms: f64,
+    pub total_latency_ms: u64,
+    pub avg_latency_ms: f64,
 }
 
 /// Collects usage statistics across module executions.
@@ -35,25 +35,19 @@ impl UsageCollector {
         }
     }
 
-    /// Record a successful execution.
-    pub fn record_success(&self, module_name: &str, duration_ms: u64) {
+    /// Record a module execution.
+    pub fn record(&self, module_id: &str, caller_id: Option<&str>, latency_ms: u64, success: bool) {
         // TODO: Implement
         todo!()
     }
 
-    /// Record a failed execution.
-    pub fn record_error(&self, module_name: &str, duration_ms: u64) {
-        // TODO: Implement
-        todo!()
+    /// Get usage summary for a module.
+    pub fn get_module_summary(&self, module_id: &str) -> Option<UsageStats> {
+        self.stats.lock().unwrap().get(module_id).cloned()
     }
 
-    /// Get usage stats for a module.
-    pub fn get_stats(&self, module_name: &str) -> Option<UsageStats> {
-        self.stats.lock().unwrap().get(module_name).cloned()
-    }
-
-    /// Get all usage stats.
-    pub fn get_all_stats(&self) -> Vec<UsageStats> {
+    /// Get all usage summaries.
+    pub fn get_all_summaries(&self) -> Vec<UsageStats> {
         self.stats.lock().unwrap().values().cloned().collect()
     }
 
@@ -102,6 +96,7 @@ impl Middleware for UsageMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
         // TODO: Implement — record success
@@ -112,6 +107,7 @@ impl Middleware for UsageMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         _error: &ModuleError,
     ) -> Result<(), ModuleError> {
         // TODO: Implement — record error

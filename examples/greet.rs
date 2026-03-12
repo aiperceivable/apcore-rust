@@ -86,9 +86,9 @@ impl Module for GreetModule {
 async fn main() {
     let identity = Identity {
         id: "agent-1".to_string(),
-        name: "AI Agent".to_string(),
+        identity_type: "AI Agent".to_string(),
         roles: vec!["assistant".to_string()],
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     };
     let ctx: Context<Value> = Context::new(identity);
     let module = GreetModule;

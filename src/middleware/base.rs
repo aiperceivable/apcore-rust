@@ -21,18 +21,22 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
     ) -> Result<serde_json::Value, ModuleError>;
 
     /// Called after successful module execution. Can modify output.
+    /// `inputs` is the original (post-before) input for correlation.
     async fn after(
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
+        inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError>;
 
     /// Called when module execution fails.
+    /// `inputs` is the original (post-before) input for correlation.
     async fn on_error(
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
+        inputs: serde_json::Value,
         error: &ModuleError,
     ) -> Result<(), ModuleError>;
 }

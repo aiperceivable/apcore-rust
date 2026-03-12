@@ -5,12 +5,12 @@ use apcore::context::{Context, Identity};
 use serde_json::Value;
 use std::collections::HashMap;
 
-fn make_identity(id: &str, name: &str, roles: Vec<&str>) -> Identity {
+fn make_identity(id: &str, identity_type: &str, roles: Vec<&str>) -> Identity {
     Identity {
         id: id.to_string(),
-        name: name.to_string(),
+        identity_type: identity_type.to_string(),
         roles: roles.iter().map(|s| s.to_string()).collect(),
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     }
 }
 
@@ -22,7 +22,7 @@ fn make_identity(id: &str, name: &str, roles: Vec<&str>) -> Identity {
 fn test_identity_basic_fields() {
     let id = make_identity("user-1", "Alice", vec!["admin", "user"]);
     assert_eq!(id.id, "user-1");
-    assert_eq!(id.name, "Alice");
+    assert_eq!(id.identity_type, "Alice");
     assert_eq!(id.roles.len(), 2);
     assert!(id.roles.contains(&"admin".to_string()));
 }
@@ -34,11 +34,11 @@ fn test_identity_empty_roles() {
 }
 
 #[test]
-fn test_identity_with_attributes() {
+fn test_identity_with_attrs() {
     let mut id = make_identity("user-2", "Bob", vec![]);
-    id.attributes
+    id.attrs
         .insert("tier".to_string(), serde_json::json!("premium"));
-    assert_eq!(id.attributes["tier"], "premium");
+    assert_eq!(id.attrs["tier"], "premium");
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn test_identity_serialization() {
     let json = serde_json::to_string(&id).unwrap();
     let restored: Identity = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.id, id.id);
-    assert_eq!(restored.name, id.name);
+    assert_eq!(restored.identity_type, id.identity_type);
     assert_eq!(restored.roles, id.roles);
 }
 
@@ -56,11 +56,11 @@ fn test_identity_serialization() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_context_new_has_unique_execution_id() {
+fn test_context_new_has_unique_trace_id() {
     let id = make_identity("user-1", "Alice", vec![]);
     let ctx1: Context<Value> = Context::new(id.clone());
     let ctx2: Context<Value> = Context::new(id);
-    assert_ne!(ctx1.execution_id, ctx2.execution_id);
+    assert_ne!(ctx1.trace_id, ctx2.trace_id);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn test_context_initial_call_chain_is_empty() {
 fn test_context_no_parent_by_default() {
     let id = make_identity("user-1", "Alice", vec![]);
     let ctx: Context<Value> = Context::new(id);
-    assert!(ctx.parent_execution_id.is_none());
+    assert!(ctx.parent_trace_id.is_none());
 }
 
 #[test]
@@ -109,8 +109,8 @@ fn test_context_with_cancel_token() {
 }
 
 #[test]
-fn test_context_metadata_starts_empty() {
+fn test_context_data_starts_empty() {
     let id = make_identity("user-1", "Alice", vec![]);
     let ctx: Context<Value> = Context::new(id);
-    assert!(ctx.metadata.is_empty());
+    assert!(ctx.data.is_empty());
 }

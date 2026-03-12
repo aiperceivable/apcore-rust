@@ -20,14 +20,24 @@ pub mod module;
 pub mod observability;
 pub mod registry;
 pub mod schema;
+pub mod sys_modules;
 pub mod trace_context;
 pub mod utils;
 pub mod version;
 
 // Re-export primary types at crate root for convenience.
+pub use acl::{ACL, ACLRule};
+pub use approval::{AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler};
+pub use async_task::TaskStatus;
 pub use client::APCore;
 pub use config::Config;
 pub use context::{Context, ContextFactory, Identity};
 pub use errors::{ErrorCode, ModuleError};
+pub use events::emitter::{ApCoreEvent, EventEmitter};
 pub use executor::Executor;
 pub use module::Module;
+pub use observability::logging::ContextLogger;
+pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
+pub use registry::registry::Registry;
+pub use schema::{ExportProfile, SchemaStrategy};
+pub use sys_modules::register_sys_modules;

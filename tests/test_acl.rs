@@ -8,14 +8,14 @@ use apcore::acl::{ACLRule, ACL};
 
 #[test]
 fn test_acl_new_is_empty() {
-    let acl = ACL::new();
-    assert!(acl.audit_log().is_empty());
+    let acl = ACL::new(vec![], "deny");
+    assert!(acl.rules().is_empty());
 }
 
 #[test]
 fn test_acl_default_is_empty() {
     let acl = ACL::default();
-    assert!(acl.audit_log().is_empty());
+    assert!(acl.rules().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -25,96 +25,69 @@ fn test_acl_default_is_empty() {
 #[test]
 fn test_acl_rule_fields() {
     let rule = ACLRule {
-        id: "rule-1".to_string(),
-        module_pattern: "admin.*".to_string(),
-        allowed_roles: vec!["admin".to_string()],
-        denied_roles: vec![],
-        allowed_identities: vec![],
-        denied_identities: vec![],
-        priority: 10,
-        enabled: true,
+        callers: vec!["admin".to_string()],
+        targets: vec!["admin.*".to_string()],
+        effect: "allow".to_string(),
+        description: None,
+        conditions: None,
     };
-    assert_eq!(rule.id, "rule-1");
-    assert_eq!(rule.module_pattern, "admin.*");
-    assert_eq!(rule.allowed_roles, vec!["admin"]);
-    assert!(rule.enabled);
+    assert_eq!(rule.callers, vec!["admin"]);
+    assert_eq!(rule.targets, vec!["admin.*"]);
+    assert_eq!(rule.effect, "allow");
 }
 
 #[test]
-fn test_acl_rule_disabled() {
+fn test_acl_rule_deny() {
     let rule = ACLRule {
-        id: "rule-disabled".to_string(),
-        module_pattern: "*".to_string(),
-        allowed_roles: vec![],
-        denied_roles: vec![],
-        allowed_identities: vec![],
-        denied_identities: vec![],
-        priority: 0,
-        enabled: false,
+        callers: vec!["guest".to_string()],
+        targets: vec!["*".to_string()],
+        effect: "deny".to_string(),
+        description: Some("Deny all guests".to_string()),
+        conditions: None,
     };
-    assert!(!rule.enabled);
+    assert_eq!(rule.effect, "deny");
+    assert_eq!(rule.description.as_deref(), Some("Deny all guests"));
 }
 
 #[test]
-fn test_acl_rule_deny_pattern() {
+fn test_acl_rule_with_conditions() {
     let rule = ACLRule {
-        id: "deny-all".to_string(),
-        module_pattern: "*".to_string(),
-        allowed_roles: vec![],
-        denied_roles: vec!["guest".to_string()],
-        allowed_identities: vec![],
-        denied_identities: vec!["anon-*".to_string()],
-        priority: 100,
-        enabled: true,
+        callers: vec!["user".to_string()],
+        targets: vec!["data.*".to_string()],
+        effect: "allow".to_string(),
+        description: None,
+        conditions: Some(serde_json::json!({"ip_range": "10.0.0.0/8"})),
     };
-    assert_eq!(rule.denied_roles, vec!["guest"]);
-    assert_eq!(rule.denied_identities, vec!["anon-*"]);
+    assert!(rule.conditions.is_some());
 }
 
 #[test]
 fn test_acl_rule_serialization_round_trip() {
     let rule = ACLRule {
-        id: "rule-1".to_string(),
-        module_pattern: "user.*".to_string(),
-        allowed_roles: vec!["user".to_string(), "admin".to_string()],
-        denied_roles: vec![],
-        allowed_identities: vec![],
-        denied_identities: vec![],
-        priority: 5,
-        enabled: true,
+        callers: vec!["user".to_string(), "admin".to_string()],
+        targets: vec!["user.*".to_string()],
+        effect: "allow".to_string(),
+        description: None,
+        conditions: None,
     };
     let json = serde_json::to_string(&rule).unwrap();
     let restored: ACLRule = serde_json::from_str(&json).unwrap();
-    assert_eq!(restored.id, rule.id);
-    assert_eq!(restored.module_pattern, rule.module_pattern);
-    assert_eq!(restored.allowed_roles, rule.allowed_roles);
-    assert_eq!(restored.priority, rule.priority);
+    assert_eq!(restored.callers, rule.callers);
+    assert_eq!(restored.targets, rule.targets);
+    assert_eq!(restored.effect, rule.effect);
 }
 
 #[test]
-fn test_acl_rule_priority_ordering() {
-    let mut rules = vec![
+fn test_acl_new_with_rules() {
+    let rules = vec![
         ACLRule {
-            id: "low".to_string(),
-            module_pattern: "*".to_string(),
-            allowed_roles: vec![],
-            denied_roles: vec![],
-            allowed_identities: vec![],
-            denied_identities: vec![],
-            priority: 1,
-            enabled: true,
-        },
-        ACLRule {
-            id: "high".to_string(),
-            module_pattern: "*".to_string(),
-            allowed_roles: vec![],
-            denied_roles: vec![],
-            allowed_identities: vec![],
-            denied_identities: vec![],
-            priority: 100,
-            enabled: true,
+            callers: vec!["admin".to_string()],
+            targets: vec!["*".to_string()],
+            effect: "allow".to_string(),
+            description: None,
+            conditions: None,
         },
     ];
-    rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
-    assert_eq!(rules[0].id, "high");
+    let acl = ACL::new(rules, "deny");
+    assert_eq!(acl.rules().len(), 1);
 }

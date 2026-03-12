@@ -75,7 +75,7 @@ impl Module for SendEmailModule {
         // Simulate sending (real impl would call SMTP/API)
         println!(
             "[{}] Sending email to '{}' | subject: '{}'",
-            ctx.execution_id, req.to, req.subject
+            ctx.trace_id, req.to, req.subject
         );
 
         let message_id = format!("msg-{:05}", req.to.len() * 1000 % 100000);
@@ -135,9 +135,9 @@ fn send_email_annotations() -> ModuleAnnotations {
 async fn main() {
     let identity = Identity {
         id: "admin-1".to_string(),
-        name: "Admin".to_string(),
+        identity_type: "Admin".to_string(),
         roles: vec!["admin".to_string()],
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     };
     let ctx: Context<Value> = Context::new(identity);
     let module = SendEmailModule;

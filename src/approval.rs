@@ -2,50 +2,46 @@
 // Spec reference: Approval requests, results, and handler trait
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
-use crate::context::Context;
 use crate::errors::ModuleError;
 
 /// Approval request sent before a sensitive operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
-    pub id: Uuid,
-    pub module_name: String,
-    pub action: String,
-    pub description: String,
-    pub requested_by: String,
-    pub requested_at: DateTime<Utc>,
+    pub module_id: String,
+    pub arguments: serde_json::Value,
     #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
+    pub annotations: HashMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Outcome of an approval request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalResult {
-    pub request_id: Uuid,
-    pub approved: bool,
+    /// "approved", "rejected", "timeout", or "pending"
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub approved_by: Option<String>,
-    pub decided_at: DateTime<Utc>,
+    pub approval_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Trait for handling approval requests.
 #[async_trait]
-pub trait ApprovalHandler: Send + Sync {
+pub trait ApprovalHandler: Send + Sync + std::fmt::Debug {
     /// Request approval for an operation. Returns the result.
     async fn request_approval(
         &self,
         request: &ApprovalRequest,
-        ctx: &Context<serde_json::Value>,
     ) -> Result<ApprovalResult, ModuleError>;
+
+    /// Check the current status of a pending approval by ID.
+    async fn check_approval(&self, approval_id: &str) -> Result<ApprovalResult, ModuleError>;
 }
 
 /// An approval handler that automatically approves all requests.
@@ -56,9 +52,13 @@ pub struct AutoApproveHandler;
 impl ApprovalHandler for AutoApproveHandler {
     async fn request_approval(
         &self,
-        request: &ApprovalRequest,
-        _ctx: &Context<serde_json::Value>,
+        _request: &ApprovalRequest,
     ) -> Result<ApprovalResult, ModuleError> {
+        // TODO: Implement
+        todo!()
+    }
+
+    async fn check_approval(&self, _approval_id: &str) -> Result<ApprovalResult, ModuleError> {
         // TODO: Implement
         todo!()
     }
@@ -66,15 +66,19 @@ impl ApprovalHandler for AutoApproveHandler {
 
 /// An approval handler that automatically denies all requests.
 #[derive(Debug, Clone)]
-pub struct AutoDenyHandler;
+pub struct AlwaysDenyHandler;
 
 #[async_trait]
-impl ApprovalHandler for AutoDenyHandler {
+impl ApprovalHandler for AlwaysDenyHandler {
     async fn request_approval(
         &self,
-        request: &ApprovalRequest,
-        _ctx: &Context<serde_json::Value>,
+        _request: &ApprovalRequest,
     ) -> Result<ApprovalResult, ModuleError> {
+        // TODO: Implement
+        todo!()
+    }
+
+    async fn check_approval(&self, _approval_id: &str) -> Result<ApprovalResult, ModuleError> {
         // TODO: Implement
         todo!()
     }

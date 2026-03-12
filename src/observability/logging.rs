@@ -10,31 +10,44 @@ use crate::middleware::base::Middleware;
 /// Logger that injects execution context into log records.
 #[derive(Debug)]
 pub struct ContextLogger {
-    pub prefix: String,
+    pub name: String,
 }
 
 impl ContextLogger {
-    /// Create a new context logger.
-    pub fn new(prefix: impl Into<String>) -> Self {
+    /// Create a new context logger with the given name.
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
-            prefix: prefix.into(),
+            name: name.into(),
         }
     }
 
-    /// Log an info message with context.
-    pub fn info(&self, ctx: &Context<serde_json::Value>, message: &str) {
+    /// Create a logger with name derived from context.
+    pub fn from_context(ctx: &Context<serde_json::Value>, name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+        }
+    }
+
+    /// Log an info message.
+    pub fn info(&self, message: &str) {
         // TODO: Implement — use tracing crate
         todo!()
     }
 
-    /// Log a warning message with context.
-    pub fn warn(&self, ctx: &Context<serde_json::Value>, message: &str) {
+    /// Log a debug message.
+    pub fn debug(&self, message: &str) {
         // TODO: Implement
         todo!()
     }
 
-    /// Log an error message with context.
-    pub fn error(&self, ctx: &Context<serde_json::Value>, message: &str) {
+    /// Log a warning message.
+    pub fn warning(&self, message: &str) {
+        // TODO: Implement
+        todo!()
+    }
+
+    /// Log an error message.
+    pub fn error(&self, message: &str) {
         // TODO: Implement
         todo!()
     }
@@ -73,6 +86,7 @@ impl Middleware for ObsLoggingMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
         // TODO: Implement
@@ -83,6 +97,7 @@ impl Middleware for ObsLoggingMiddleware {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         _error: &ModuleError,
     ) -> Result<(), ModuleError> {
         // TODO: Implement

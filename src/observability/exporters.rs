@@ -13,8 +13,8 @@ pub struct StdoutExporter;
 
 #[async_trait]
 impl SpanExporter for StdoutExporter {
-    async fn export(&self, _spans: &[Span]) -> Result<(), ModuleError> {
-        // TODO: Implement — print spans as JSON to stdout
+    async fn export(&self, _span: &Span) -> Result<(), ModuleError> {
+        // TODO: Implement — print span as JSON to stdout
         todo!()
     }
 
@@ -56,7 +56,7 @@ impl Default for InMemoryExporter {
 
 #[async_trait]
 impl SpanExporter for InMemoryExporter {
-    async fn export(&self, spans: &[Span]) -> Result<(), ModuleError> {
+    async fn export(&self, span: &Span) -> Result<(), ModuleError> {
         // TODO: Implement
         todo!()
     }
@@ -83,7 +83,7 @@ impl OTLPExporter {
 
 #[async_trait]
 impl SpanExporter for OTLPExporter {
-    async fn export(&self, _spans: &[Span]) -> Result<(), ModuleError> {
+    async fn export(&self, _span: &Span) -> Result<(), ModuleError> {
         // TODO: Implement — HTTP POST to OTLP endpoint
         todo!()
     }

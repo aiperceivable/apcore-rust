@@ -61,9 +61,9 @@ impl Module for FailingModule {
 fn make_ctx() -> Context<Value> {
     Context::new(Identity {
         id: "test".to_string(),
-        name: "Test".to_string(),
+        identity_type: "Test".to_string(),
         roles: vec![],
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     })
 }
 

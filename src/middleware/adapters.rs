@@ -29,6 +29,7 @@ pub trait AfterMiddleware: Send + Sync + std::fmt::Debug {
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
+        inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError>;
 }
@@ -56,6 +57,7 @@ impl<T: BeforeMiddleware + 'static> Middleware for BeforeMiddlewareAdapter<T> {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
         Ok(output)
@@ -65,6 +67,7 @@ impl<T: BeforeMiddleware + 'static> Middleware for BeforeMiddlewareAdapter<T> {
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         _error: &ModuleError,
     ) -> Result<(), ModuleError> {
         Ok(())
@@ -94,15 +97,17 @@ impl<T: AfterMiddleware + 'static> Middleware for AfterMiddlewareAdapter<T> {
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
+        inputs: serde_json::Value,
         output: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
-        self.0.after(ctx, module_name, output).await
+        self.0.after(ctx, module_name, inputs, output).await
     }
 
     async fn on_error(
         &self,
         _ctx: &Context<serde_json::Value>,
         _module_name: &str,
+        _inputs: serde_json::Value,
         _error: &ModuleError,
     ) -> Result<(), ModuleError> {
         Ok(())
