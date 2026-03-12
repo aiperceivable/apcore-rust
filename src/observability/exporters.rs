@@ -4,8 +4,8 @@
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
-use crate::errors::ModuleError;
 use super::span::{Span, SpanExporter};
+use crate::errors::ModuleError;
 
 /// Exports spans to stdout.
 #[derive(Debug)]

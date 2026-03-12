@@ -26,8 +26,10 @@ pub mod utils;
 pub mod version;
 
 // Re-export primary types at crate root for convenience.
-pub use acl::{ACL, ACLRule};
-pub use approval::{AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler};
+pub use acl::{ACLRule, ACL};
+pub use approval::{
+    AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,
+};
 pub use async_task::TaskStatus;
 pub use client::APCore;
 pub use config::Config;

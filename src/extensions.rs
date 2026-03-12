@@ -30,10 +30,7 @@ pub trait Extension: Send + Sync + std::fmt::Debug {
     fn extension_point(&self) -> &str;
 
     /// Execute the extension logic.
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value, ModuleError>;
+    async fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value, ModuleError>;
 }
 
 impl ExtensionManager {
@@ -52,10 +49,7 @@ impl ExtensionManager {
     }
 
     /// Register an extension for a given extension point.
-    pub fn register_extension(
-        &mut self,
-        extension: Box<dyn Extension>,
-    ) -> Result<(), ModuleError> {
+    pub fn register_extension(&mut self, extension: Box<dyn Extension>) -> Result<(), ModuleError> {
         // TODO: Implement
         todo!()
     }

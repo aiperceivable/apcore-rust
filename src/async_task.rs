@@ -81,10 +81,7 @@ impl AsyncTaskManager {
     }
 
     /// Wait for a task to complete and return its result.
-    pub async fn await_task(
-        &self,
-        task_id: &Uuid,
-    ) -> Result<serde_json::Value, ModuleError> {
+    pub async fn await_task(&self, task_id: &Uuid) -> Result<serde_json::Value, ModuleError> {
         // TODO: Implement
         todo!()
     }

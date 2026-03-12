@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 
+use super::base::Middleware;
 use crate::context::Context;
 use crate::errors::ModuleError;
-use super::base::Middleware;
 
 /// Adapter for middleware that only needs a before hook.
 #[async_trait]

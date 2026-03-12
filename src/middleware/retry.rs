@@ -4,9 +4,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::base::Middleware;
 use crate::context::Context;
 use crate::errors::ModuleError;
-use super::base::Middleware;
 
 /// Configuration for retry behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,8 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::errors::ModuleError;
 use super::subscribers::EventSubscriber;
+use crate::errors::ModuleError;
 
 /// An event emitted by the APCore system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,8 @@ impl EventEmitter {
     /// Remove a subscriber by ID.
     pub fn unsubscribe(&mut self, subscriber_id: &str) -> bool {
         let len_before = self.subscribers.len();
-        self.subscribers.retain(|s| s.subscriber_id() != subscriber_id);
+        self.subscribers
+            .retain(|s| s.subscriber_id() != subscriber_id);
         self.subscribers.len() < len_before
     }
 

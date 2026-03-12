@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 
-use crate::errors::ModuleError;
 use super::emitter::ApCoreEvent;
+use crate::errors::ModuleError;
 
 /// Trait for receiving events from the EventEmitter.
 #[async_trait]
@@ -30,7 +30,11 @@ pub struct WebhookSubscriber {
 
 impl WebhookSubscriber {
     /// Create a new webhook subscriber.
-    pub fn new(id: impl Into<String>, url: impl Into<String>, event_pattern: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        url: impl Into<String>,
+        event_pattern: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             url: url.into(),

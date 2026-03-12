@@ -4,5 +4,5 @@
 pub mod registry;
 
 pub use registry::{
-    DependencyInfo, Discoverer, DiscoveredModule, ModuleDescriptor, ModuleValidator, Registry,
+    DependencyInfo, DiscoveredModule, Discoverer, ModuleDescriptor, ModuleValidator, Registry,
 };

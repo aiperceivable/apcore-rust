@@ -17,10 +17,7 @@ fn make_traceparent(trace_id: &str, parent_id: &str) -> TraceParent {
 
 #[test]
 fn test_traceparent_to_header() {
-    let tp = make_traceparent(
-        "4bf92f3577b34da6a3ce929d0e0e4736",
-        "00f067aa0ba902b7",
-    );
+    let tp = make_traceparent("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
     let header = tp.to_header();
     assert_eq!(
         header,

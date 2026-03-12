@@ -39,11 +39,7 @@ impl Module for AddModule {
         "Add two integers"
     }
 
-    async fn execute(
-        &self,
-        _ctx: &Context<Value>,
-        input: Value,
-    ) -> Result<Value, ModuleError> {
+    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
         let a = input["a"].as_i64().unwrap_or(0);
         let b = input["b"].as_i64().unwrap_or(0);
         Ok(json!({ "result": a + b }))
@@ -82,11 +78,7 @@ impl Module for GreetModule {
         "Greet a user"
     }
 
-    async fn execute(
-        &self,
-        _ctx: &Context<Value>,
-        input: Value,
-    ) -> Result<Value, ModuleError> {
+    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
         let name = input["name"].as_str().unwrap_or("World");
         let greeting = input["greeting"].as_str().unwrap_or("Hello");
         Ok(json!({ "message": format!("{}, {}!", greeting, name) }))

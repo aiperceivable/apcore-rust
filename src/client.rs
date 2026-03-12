@@ -52,10 +52,7 @@ impl APCore {
     }
 
     /// Register a module.
-    pub fn register(
-        &mut self,
-        module: Box<dyn crate::module::Module>,
-    ) -> Result<(), ModuleError> {
+    pub fn register(&mut self, module: Box<dyn crate::module::Module>) -> Result<(), ModuleError> {
         // TODO: Implement
         todo!()
     }
@@ -67,11 +64,7 @@ impl APCore {
     }
 
     /// List all registered modules, optionally filtered by tags and/or prefix.
-    pub fn list_modules(
-        &self,
-        tags: Option<&[String]>,
-        prefix: Option<&str>,
-    ) -> Vec<String> {
+    pub fn list_modules(&self, tags: Option<&[String]>, prefix: Option<&str>) -> Vec<String> {
         // TODO: Implement
         todo!()
     }
@@ -101,11 +94,7 @@ impl APCore {
     }
 
     /// Subscribe to an event type. Returns the subscriber ID.
-    pub fn on(
-        &mut self,
-        event_type: &str,
-        subscriber: Box<dyn EventSubscriber>,
-    ) -> String {
+    pub fn on(&mut self, event_type: &str, subscriber: Box<dyn EventSubscriber>) -> String {
         // TODO: Implement
         todo!()
     }

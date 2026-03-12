@@ -26,11 +26,7 @@ impl Module for SlowModule {
         "A slow module that checks for cancellation between steps"
     }
 
-    async fn execute(
-        &self,
-        ctx: &Context<Value>,
-        input: Value,
-    ) -> Result<Value, ModuleError> {
+    async fn execute(&self, ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
         let steps = input["steps"].as_i64().unwrap_or(5) as usize;
 
         for i in 0..steps {

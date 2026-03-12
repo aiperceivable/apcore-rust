@@ -64,7 +64,9 @@ impl ErrorHistory {
     pub fn clear(&self, module_id: Option<&str>) {
         let mut map = self.entries.lock().unwrap();
         match module_id {
-            Some(id) => { map.remove(id); }
+            Some(id) => {
+                map.remove(id);
+            }
             None => map.clear(),
         }
     }

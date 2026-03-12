@@ -1,9 +1,9 @@
 // APCore Protocol — Middleware manager
 // Spec reference: Middleware pipeline execution
 
+use super::base::Middleware;
 use crate::context::Context;
 use crate::errors::ModuleError;
-use super::base::Middleware;
 
 /// Manages an ordered pipeline of middleware.
 #[derive(Debug)]

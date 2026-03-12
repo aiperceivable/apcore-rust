@@ -48,7 +48,11 @@ impl SchemaLoader {
     }
 
     /// Load a schema from a JSON value.
-    pub fn load_from_value(&mut self, name: &str, schema: serde_json::Value) -> Result<(), ModuleError> {
+    pub fn load_from_value(
+        &mut self,
+        name: &str,
+        schema: serde_json::Value,
+    ) -> Result<(), ModuleError> {
         // TODO: Implement
         todo!()
     }

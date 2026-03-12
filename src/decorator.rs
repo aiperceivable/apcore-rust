@@ -21,15 +21,13 @@ pub struct FunctionModule {
         dyn Fn(
                 &Context<serde_json::Value>,
                 serde_json::Value,
-            )
-                -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Result<serde_json::Value, ModuleError>,
-                            > + Send
-                            + '_,
-                    >,
-                > + Send
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
+                        + Send
+                        + '_,
+                >,
+            > + Send
             + Sync,
     >,
 }
@@ -54,15 +52,13 @@ impl FunctionModule {
         F: Fn(
                 &Context<serde_json::Value>,
                 serde_json::Value,
-            )
-                -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Result<serde_json::Value, ModuleError>,
-                            > + Send
-                            + '_,
-                    >,
-                > + Send
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
+                        + Send
+                        + '_,
+                >,
+            > + Send
             + Sync
             + 'static,
     {
@@ -86,10 +82,7 @@ impl Module for FunctionModule {
     }
 
     fn description(&self) -> &str {
-        self.annotations
-            .description
-            .as_deref()
-            .unwrap_or("")
+        self.annotations.description.as_deref().unwrap_or("")
     }
 
     async fn execute(

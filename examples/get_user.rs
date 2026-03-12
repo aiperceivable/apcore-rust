@@ -81,13 +81,12 @@ impl Module for GetUserModule {
         "Look up a user by ID (readonly, idempotent)"
     }
 
-    async fn execute(
-        &self,
-        _ctx: &Context<Value>,
-        input: Value,
-    ) -> Result<Value, ModuleError> {
+    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
         let req: GetUserInput = serde_json::from_value(input).map_err(|e| {
-            ModuleError::new(apcore::errors::ErrorCode::GeneralInvalidInput, e.to_string())
+            ModuleError::new(
+                apcore::errors::ErrorCode::GeneralInvalidInput,
+                e.to_string(),
+            )
         })?;
 
         let users = Self::users();

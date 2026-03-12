@@ -3,10 +3,10 @@
 
 use async_trait::async_trait;
 
+use super::span::SpanExporter;
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
-use super::span::SpanExporter;
 
 /// Strategy for deciding which spans to sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

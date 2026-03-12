@@ -79,15 +79,13 @@ fn test_acl_rule_serialization_round_trip() {
 
 #[test]
 fn test_acl_new_with_rules() {
-    let rules = vec![
-        ACLRule {
-            callers: vec!["admin".to_string()],
-            targets: vec!["*".to_string()],
-            effect: "allow".to_string(),
-            description: None,
-            conditions: None,
-        },
-    ];
+    let rules = vec![ACLRule {
+        callers: vec!["admin".to_string()],
+        targets: vec!["*".to_string()],
+        effect: "allow".to_string(),
+        description: None,
+        conditions: None,
+    }];
     let acl = ACL::new(rules, "deny");
     assert_eq!(acl.rules().len(), 1);
 }

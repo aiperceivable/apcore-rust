@@ -24,11 +24,7 @@ impl Module for EchoModule {
     fn description(&self) -> &str {
         "Echo the input value back"
     }
-    async fn execute(
-        &self,
-        _ctx: &Context<Value>,
-        input: Value,
-    ) -> Result<Value, ModuleError> {
+    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
         Ok(input)
     }
 }
@@ -46,11 +42,7 @@ impl Module for FailingModule {
     fn description(&self) -> &str {
         "Always returns an error"
     }
-    async fn execute(
-        &self,
-        _ctx: &Context<Value>,
-        _input: Value,
-    ) -> Result<Value, ModuleError> {
+    async fn execute(&self, _ctx: &Context<Value>, _input: Value) -> Result<Value, ModuleError> {
         Err(ModuleError::new(
             ErrorCode::GeneralInternalError,
             "intentional failure",

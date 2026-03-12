@@ -16,16 +16,12 @@ pub struct ContextLogger {
 impl ContextLogger {
     /// Create a new context logger with the given name.
     pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-        }
+        Self { name: name.into() }
     }
 
     /// Create a logger with name derived from context.
     pub fn from_context(ctx: &Context<serde_json::Value>, name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-        }
+        Self { name: name.into() }
     }
 
     /// Log an info message.
