@@ -63,25 +63,41 @@ impl EventEmitter {
         }
     }
 
-    /// Add a subscriber. Returns the subscriber ID.
-    pub fn subscribe(&mut self, subscriber: Box<dyn EventSubscriber>) -> String {
-        let id = subscriber.subscriber_id().to_string();
+    /// Add a subscriber (matching Python's void return signature).
+    pub fn subscribe(&mut self, subscriber: Box<dyn EventSubscriber>) {
         self.subscribers.push(subscriber);
-        id
     }
 
-    /// Remove a subscriber by ID.
-    pub fn unsubscribe(&mut self, subscriber_id: &str) -> bool {
-        let len_before = self.subscribers.len();
-        self.subscribers
-            .retain(|s| s.subscriber_id() != subscriber_id);
-        self.subscribers.len() < len_before
+    /// Remove the first subscriber whose `subscriber_id()` matches the given
+    /// subscriber's ID, matching Python's identity-based removal semantics.
+    pub fn unsubscribe(&mut self, subscriber: &dyn EventSubscriber) -> bool {
+        let target_id = subscriber.subscriber_id();
+        let pos = self.subscribers.iter().position(|s| s.subscriber_id() == target_id);
+        if let Some(i) = pos {
+            self.subscribers.remove(i);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Emit an event to all matching subscribers.
+    /// Emit an event to all subscribers whose pattern matches the event type.
+    ///
+    /// Errors from individual subscribers are logged but not propagated
+    /// (error isolation), matching Python's behaviour.
     pub async fn emit(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        for subscriber in &self.subscribers {
+            if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+                if let Err(e) = subscriber.on_event(event).await {
+                    eprintln!(
+                        "Subscriber {} failed: {}",
+                        subscriber.subscriber_id(),
+                        e
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Emit an event to subscribers matching the given event type pattern.
@@ -90,14 +106,60 @@ impl EventEmitter {
         event: &ApCoreEvent,
         pattern: &str,
     ) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        for subscriber in &self.subscribers {
+            if Self::matches_pattern(pattern, &event.event_type) {
+                if let Err(e) = subscriber.on_event(event).await {
+                    eprintln!(
+                        "Subscriber {} failed: {}",
+                        subscriber.subscriber_id(),
+                        e
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Flush all pending events, waiting up to timeout_ms milliseconds.
-    pub async fn flush(&self, timeout_ms: u64) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+    pub async fn flush(&self, _timeout_ms: u64) -> Result<(), ModuleError> {
+        // Synchronous dispatch model — nothing to flush.
+        Ok(())
+    }
+
+    /// Simple glob-style pattern matching with `*` wildcard.
+    ///
+    /// - `"*"` matches everything.
+    /// - `"foo.*"` matches `"foo.bar"`, `"foo.baz"`, etc.
+    /// - An exact string matches only itself.
+    fn matches_pattern(pattern: &str, event_type: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+        // Split pattern by '*' and check that all parts appear in order.
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let mut remaining = event_type;
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                continue;
+            }
+            if i == 0 {
+                // First part must be a prefix.
+                if let Some(rest) = remaining.strip_prefix(part) {
+                    remaining = rest;
+                } else {
+                    return false;
+                }
+            } else if let Some(pos) = remaining.find(part) {
+                remaining = &remaining[pos + part.len()..];
+            } else {
+                return false;
+            }
+        }
+        // If pattern doesn't end with *, remaining must be empty.
+        if !pattern.ends_with('*') && !remaining.is_empty() {
+            return false;
+        }
+        true
     }
 }
 

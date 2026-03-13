@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
 use crate::cancel::CancelToken;
 use crate::errors::ModuleError;
 use crate::observability::logging::ContextLogger;
@@ -46,6 +48,9 @@ pub struct Context<T> {
     pub cancel_token: Option<CancelToken>,
     #[serde(skip)]
     pub trace_context: Option<TraceContext>,
+    /// Runtime reference to the executor for nested calls (not serialized).
+    #[serde(skip)]
+    pub executor: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl<T: Default> Context<T> {
@@ -63,12 +68,31 @@ impl<T: Default> Context<T> {
             redacted_inputs: None,
             cancel_token: None,
             trace_context: None,
+            executor: None,
         }
     }
 
     /// Create a child context for nested calls.
     pub fn child(&self, target_module_id: &str) -> Context<T> where T: Clone {
-        todo!("Context.child() — create child context for nested calls")
+        let caller_id = self.call_chain.last().cloned();
+        let mut call_chain = self.call_chain.clone();
+        call_chain.push(target_module_id.to_string());
+
+        Context {
+            trace_id: self.trace_id.clone(),
+            identity: self.identity.clone(),
+            services: self.services.clone(),
+            created_at: Utc::now(),
+            caller_id,
+            data: self.data.clone(),
+            parent_trace_id: self.parent_trace_id.clone(),
+            call_depth: self.call_depth + 1,
+            call_chain,
+            redacted_inputs: None,
+            cancel_token: self.cancel_token.clone(),
+            trace_context: self.trace_context.clone(),
+            executor: self.executor.clone(),
+        }
     }
 
     /// Serialize context to JSON.
@@ -106,6 +130,7 @@ impl<T: Default> Context<T> {
             redacted_inputs: None,
             cancel_token: None,
             trace_context: None,
+            executor: None,
         }
     }
 }

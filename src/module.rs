@@ -35,6 +35,20 @@ pub trait Module: Send + Sync {
             checks: vec![],
         }
     }
+
+    /// Called after the module is registered. Default: no-op.
+    fn on_load(&self) {}
+
+    /// Called before the module is unregistered. Default: no-op.
+    fn on_unload(&self) {}
+
+    /// Called before hot-reload to capture state. Returns state dict for on_resume().
+    /// Default: returns None (no state to preserve).
+    fn on_suspend(&self) -> Option<serde_json::Value> { None }
+
+    /// Called after hot-reload to restore state from on_suspend().
+    /// Default: no-op.
+    fn on_resume(&self, _state: serde_json::Value) {}
 }
 
 /// Metadata annotations attached to a module.

@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations, ValidationResult};
@@ -17,6 +17,8 @@ pub struct ModuleDescriptor {
     pub output_schema: serde_json::Value,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<DependencyInfo>,
 }
@@ -52,9 +54,25 @@ pub trait ModuleValidator: Send + Sync {
 }
 
 /// Central registry of modules.
+///
+/// TODO(L-012): Add VersionedStore support for multi-version module management.
+/// This requires a separate `versioned_store` module with version-aware storage,
+/// conflict resolution, and migration support. For now, modules are single-version.
 pub struct Registry {
     modules: HashMap<String, Box<dyn Module>>,
     descriptors: HashMap<String, ModuleDescriptor>,
+    /// Reference counts for safe hot-reload — prevents unloading while in use.
+    ref_counts: HashMap<String, usize>,
+    /// Modules marked for unload (draining active requests before removal).
+    draining: HashSet<String>,
+    /// Drain completion notification — signaled when a draining module reaches zero refs.
+    drain_events: HashMap<String, tokio::sync::Notify>,
+    /// Event callbacks keyed by event name (e.g. "register", "unregister").
+    callbacks: HashMap<String, Vec<Box<dyn Fn(&str, &dyn Module) + Send + Sync>>>,
+    /// Case-insensitive lookup: lowercase name -> canonical name.
+    lowercase_map: HashMap<String, String>,
+    /// Cached JSON schemas for registered modules.
+    schema_cache: HashMap<String, serde_json::Value>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -62,6 +80,12 @@ impl std::fmt::Debug for Registry {
         f.debug_struct("Registry")
             .field("modules", &self.modules.keys().collect::<Vec<_>>())
             .field("descriptors", &self.descriptors)
+            .field("ref_counts", &self.ref_counts)
+            .field("draining", &self.draining)
+            .field("drain_events_keys", &self.drain_events.keys().collect::<Vec<_>>())
+            .field("callbacks_keys", &self.callbacks.keys().collect::<Vec<_>>())
+            .field("lowercase_map", &self.lowercase_map)
+            .field("schema_cache_keys", &self.schema_cache.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -72,6 +96,12 @@ impl Registry {
         Self {
             modules: HashMap::new(),
             descriptors: HashMap::new(),
+            ref_counts: HashMap::new(),
+            draining: HashSet::new(),
+            drain_events: HashMap::new(),
+            callbacks: HashMap::new(),
+            lowercase_map: HashMap::new(),
+            schema_cache: HashMap::new(),
         }
     }
 
@@ -102,9 +132,36 @@ impl Registry {
         self.descriptors.get(name)
     }
 
-    /// List all registered module names.
-    pub fn list(&self) -> Vec<&str> {
-        self.modules.keys().map(|k| k.as_str()).collect()
+    /// List registered module names with optional filtering.
+    ///
+    /// - `tags`: if provided, only return modules whose descriptor annotations
+    ///   contain ALL of the specified tags.
+    /// - `prefix`: if provided, only return modules whose name starts with the prefix.
+    /// - When both are `None`, returns all registered module names.
+    pub fn list(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<&str> {
+        self.modules
+            .keys()
+            .filter(|name| {
+                if let Some(pfx) = prefix {
+                    if !name.starts_with(pfx) {
+                        return false;
+                    }
+                }
+                if let Some(required_tags) = tags {
+                    if let Some(desc) = self.descriptors.get(name.as_str()) {
+                        let module_tags = &desc.tags;
+                        if !required_tags.iter().all(|t| module_tags.contains(&t.to_string())) {
+                            return false;
+                        }
+                    } else {
+                        // No descriptor means no tags — exclude when tag filter is active
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|k| k.as_str())
+            .collect()
     }
 
     /// Check if a module is registered.
@@ -150,7 +207,7 @@ impl Registry {
 
     /// Check if a module is draining.
     pub fn is_draining(&self, name: &str) -> bool {
-        todo!("Registry.is_draining()")
+        self.draining.contains(name)
     }
 
     /// Event subscription.
@@ -180,12 +237,14 @@ impl Registry {
 
     /// Return count of registered modules.
     pub fn count(&self) -> usize {
-        todo!("Registry.count()")
+        self.modules.len()
     }
 
-    /// Return all module IDs.
+    /// Return all module IDs, sorted alphabetically.
     pub fn module_ids(&self) -> Vec<String> {
-        todo!("Registry.module_ids()")
+        let mut ids: Vec<String> = self.modules.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 }
 
