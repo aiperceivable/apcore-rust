@@ -60,9 +60,21 @@ impl Executor {
         module_id: &str,
         inputs: serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
+        version_hint: Option<&str>,
     ) -> Result<serde_json::Value, ModuleError> {
         // TODO: Implement
         todo!()
+    }
+
+    /// Alias for `call()` — provided for spec compatibility.
+    pub async fn call_async(
+        &self,
+        module_id: &str,
+        inputs: serde_json::Value,
+        ctx: Option<&Context<serde_json::Value>>,
+        version_hint: Option<&str>,
+    ) -> Result<serde_json::Value, ModuleError> {
+        self.call(module_id, inputs, ctx, version_hint).await
     }
 
     /// Validate module inputs without executing.
@@ -97,7 +109,7 @@ impl Executor {
     }
 
     /// Stream execution of a module.
-    pub async fn stream(&self, module_id: &str, inputs: Value, ctx: Option<&Context<Value>>) -> Result<Vec<Value>, ModuleError> {
+    pub async fn stream(&self, module_id: &str, inputs: Value, ctx: Option<&Context<Value>>, version_hint: Option<&str>) -> Result<Vec<Value>, ModuleError> {
         todo!("Executor.stream() — streaming execution")
     }
 

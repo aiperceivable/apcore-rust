@@ -201,8 +201,26 @@ impl Registry {
     }
 
     /// Ref-counted module access.
+    ///
+    /// Checks draining status before returning the module reference.
+    /// Note: Full RAII guard would need a `ModuleGuard` type; for now
+    /// this checks draining status and delegates to the module map.
     pub fn acquire(&self, name: &str) -> Result<&dyn Module, ModuleError> {
-        todo!("Registry.acquire() — ref-counted module access")
+        if self.draining.contains(name) {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::ModuleNotFound,
+                format!("Module '{}' is draining", name),
+            ));
+        }
+        self.modules
+            .get(name)
+            .map(|m| m.as_ref())
+            .ok_or_else(|| {
+                ModuleError::new(
+                    crate::errors::ErrorCode::ModuleNotFound,
+                    format!("Module '{}' not found", name),
+                )
+            })
     }
 
     /// Check if a module is draining.

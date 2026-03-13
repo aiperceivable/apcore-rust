@@ -40,7 +40,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 | `Registry` | Module storage — discover, register, get, list, watch |
 | `Executor` | Execution engine — call with middleware pipeline, ACL, approval |
 | `Context` | Request context — trace ID, identity, call chain, cancel token |
-| `Config` | Configuration — load from YAML, get/set values |
+| `Config` | Configuration — from_defaults with env overrides, load YAML/JSON, get/set dot-path, validate, reload |
 | `Identity` | Caller identity — id, type, roles, attributes |
 | `Module` | Core trait for implementing schema-aware modules |
 
@@ -86,7 +86,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 
 | Type | Description |
 |------|-------------|
-| `EventEmitter` | Event system — subscribe, emit, flush |
+| `EventEmitter` | Event system — subscribe, unsubscribe, emit, emit_filtered, flush |
 | `WebhookSubscriber` | Built-in event subscriber |
 | `ExtensionManager` | Unified extension point management |
 | `AsyncTaskManager` | Background module execution with status tracking |
@@ -129,6 +129,13 @@ struct AddModule;
 #[async_trait::async_trait]
 impl Module for AddModule {
     fn description(&self) -> &str { "Add two integers" }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}, "required": ["a", "b"]})
+    }
+    fn output_schema(&self) -> Value {
+        json!({"type": "object", "properties": {"result": {"type": "integer"}}})
+    }
 
     async fn execute(
         &self,
@@ -192,9 +199,9 @@ struct GetUserModule;
 #[async_trait::async_trait]
 impl Module for GetUserModule {
     fn description(&self) -> &str { "Get user details by ID" }
-    fn annotations(&self) -> ModuleAnnotations {
-        ModuleAnnotations { readonly: true, idempotent: true, ..Default::default() }
-    }
+
+    // Annotations (readonly, idempotent, etc.) are set on
+    // ModuleDescriptor when registering the module with the registry.
 
     async fn execute(
         &self,
@@ -418,18 +425,19 @@ use apcore::module::{Module, ModuleAnnotations, ModuleExample};
 
 fn get_user_annotations() -> ModuleAnnotations {
     ModuleAnnotations {
-        name: "user.get".to_string(),
-        description: Some("Look up a user by ID".to_string()),
-        version: Some("1.0.0".to_string()),
-        tags: vec!["user".to_string(), "readonly".to_string()],
-        examples: vec![ModuleExample {
-            name: "Look up Alice".to_string(),
-            description: Some("Returns Alice's profile".to_string()),
-            input: json!({"user_id": "user-1"}),
-            expected_output: json!({"id": "user-1", "name": "Alice", "email": "alice@example.com"}),
-        }],
+        readonly: true,
+        idempotent: true,
         ..Default::default()
     }
+}
+
+fn get_user_examples() -> Vec<ModuleExample> {
+    vec![ModuleExample {
+        title: "Look up Alice".to_string(),
+        description: Some("Returns Alice's profile".to_string()),
+        inputs: json!({"user_id": "user-1"}),
+        output: json!({"id": "user-1", "name": "Alice", "email": "alice@example.com"}),
+    }]
 }
 ```
 
@@ -463,23 +471,19 @@ fn input_schema(&self) -> Value {
 ```rust
 fn send_email_annotations() -> ModuleAnnotations {
     ModuleAnnotations {
-        name: "email.send".to_string(),
-        version: Some("1.2.0".to_string()),
-        tags: vec!["email".to_string(), "communication".to_string(), "external".to_string()],
-        metadata: {
-            let mut m = HashMap::new();
-            m.insert("provider".to_string(), json!("example-smtp"));
-            m.insert("max_retries".to_string(), json!(3));
-            m
-        },
-        examples: vec![ModuleExample {
-            name: "Send a welcome email".to_string(),
-            input: json!({ "to": "user@example.com", "subject": "Welcome!", "body": "...", "api_key": "sk-xxx" }),
-            expected_output: json!({ "status": "sent", "message_id": "msg-12345" }),
-            ..Default::default()
-        }],
+        destructive: true,
+        requires_approval: true,
         ..Default::default()
     }
+}
+
+fn send_email_examples() -> Vec<ModuleExample> {
+    vec![ModuleExample {
+        title: "Send a welcome email".to_string(),
+        inputs: json!({ "to": "user@example.com", "subject": "Welcome!", "body": "...", "api_key": "sk-xxx" }),
+        output: json!({ "status": "sent", "message_id": "msg-12345" }),
+        ..Default::default()
+    }]
 }
 ```
 

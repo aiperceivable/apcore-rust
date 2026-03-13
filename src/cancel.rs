@@ -27,6 +27,23 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Check if cancelled and return error if so.
+    pub fn check(&self) -> Result<(), crate::errors::ModuleError> {
+        if self.is_cancelled() {
+            Err(crate::errors::ModuleError::new(
+                crate::errors::ErrorCode::ExecutionCancelled,
+                "Execution was cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Reset the cancellation flag.
+    pub fn reset(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Default for CancelToken {
