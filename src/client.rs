@@ -1,11 +1,14 @@
 // APCore Protocol — Client
 // Spec reference: APCore client entry point
 
+use serde_json::Value;
+
 use crate::config::Config;
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::events::emitter::EventEmitter;
 use crate::events::subscribers::EventSubscriber;
+use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::registry::registry::Registry;
 
@@ -126,5 +129,25 @@ impl APCore {
     pub async fn shutdown(&mut self) -> Result<(), ModuleError> {
         // TODO: Implement
         todo!()
+    }
+
+    /// Stream execution of a module.
+    pub async fn stream(&self, module_id: &str, inputs: Value, ctx: Option<&Context<Value>>) -> Result<Vec<Value>, ModuleError> {
+        todo!("APCore.stream() — streaming execution")
+    }
+
+    /// Describe a module by ID.
+    pub fn describe(&self, module_id: &str) -> String {
+        todo!("APCore.describe() — describe module")
+    }
+
+    /// Add a before callback middleware.
+    pub fn use_before(&mut self, middleware: Box<dyn BeforeMiddleware>) {
+        todo!("APCore.use_before() — add before callback")
+    }
+
+    /// Add an after callback middleware.
+    pub fn use_after(&mut self, middleware: Box<dyn AfterMiddleware>) {
+        todo!("APCore.use_after() — add after callback")
     }
 }

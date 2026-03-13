@@ -2,7 +2,7 @@
 
 use apcore::context::{Context, Identity};
 use apcore::errors::ModuleError;
-use apcore::module::{Module, ModuleAnnotations, ModuleExample};
+use apcore::module::{Module, ModuleAnnotations};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -94,34 +94,9 @@ impl Module for SendEmailModule {
 
 fn send_email_annotations() -> ModuleAnnotations {
     ModuleAnnotations {
-        name: "email.send".to_string(),
-        description: Some("Send an email message".to_string()),
-        version: Some("1.2.0".to_string()),
-        tags: vec![
-            "email".to_string(),
-            "communication".to_string(),
-            "external".to_string(),
-        ],
-        metadata: {
-            let mut m = HashMap::new();
-            m.insert("provider".to_string(), json!("example-smtp"));
-            m.insert("max_retries".to_string(), json!(3));
-            m
-        },
-        examples: vec![ModuleExample {
-            name: "Send a welcome email".to_string(),
-            description: Some("Sends a welcome email to a new user".to_string()),
-            input: json!({
-                "to": "user@example.com",
-                "subject": "Welcome!",
-                "body": "Welcome to the platform.",
-                "api_key": "sk-xxx"
-            }),
-            expected_output: json!({
-                "status": "sent",
-                "message_id": "msg-12345"
-            }),
-        }],
+        destructive: true,
+        requires_approval: true,
+        open_world: true,
         ..Default::default()
     }
 }

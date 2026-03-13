@@ -38,43 +38,65 @@ pub trait Module: Send + Sync {
 }
 
 /// Metadata annotations attached to a module.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Describes behavioral characteristics of the module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleAnnotations {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub author: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
     #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    pub readonly: bool,
     #[serde(default)]
-    pub deprecated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deprecated_message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub since: Option<String>,
+    pub destructive: bool,
     #[serde(default)]
-    pub hidden: bool,
+    pub idempotent: bool,
     #[serde(default)]
-    pub examples: Vec<ModuleExample>,
+    pub requires_approval: bool,
+    #[serde(default = "default_true")]
+    pub open_world: bool,
     #[serde(default)]
-    pub dependencies: Vec<String>,
+    pub streaming: bool,
     #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
+    pub cacheable: bool,
+    #[serde(default)]
+    pub cache_ttl: u64,
+    #[serde(default)]
+    pub cache_key_fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub paginated: bool,
+    #[serde(default = "default_pagination_style")]
+    pub pagination_style: String, // "cursor" | "offset" | "page"
+    // Legacy fields moved to ModuleDescriptor:
+    // name, version, author, description, tags, category, deprecated,
+    // deprecated_message, since, hidden, examples, dependencies, metadata
+}
+
+fn default_true() -> bool { true }
+fn default_pagination_style() -> String { "cursor".to_string() }
+
+impl Default for ModuleAnnotations {
+    fn default() -> Self {
+        Self {
+            readonly: false,
+            destructive: false,
+            idempotent: false,
+            requires_approval: false,
+            open_world: true,
+            streaming: false,
+            cacheable: false,
+            cache_ttl: 0,
+            cache_key_fields: None,
+            paginated: false,
+            pagination_style: "cursor".to_string(),
+        }
+    }
 }
 
 /// An example input/output pair for documentation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleExample {
-    pub name: String,
+    pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub input: serde_json::Value,
-    pub expected_output: serde_json::Value,
+    pub inputs: serde_json::Value,
+    pub output: serde_json::Value,
 }
 
 /// Result of validating a single aspect.

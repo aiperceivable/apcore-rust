@@ -23,13 +23,13 @@ fn test_registry_get_unknown_module_returns_none() {
 #[test]
 fn test_registry_contains_unknown_module_returns_false() {
     let registry = Registry::new();
-    assert!(!registry.contains("nonexistent"));
+    assert!(!registry.has("nonexistent"));
 }
 
 #[test]
-fn test_registry_get_descriptor_unknown_returns_none() {
+fn test_registry_get_definition_unknown_returns_none() {
     let registry = Registry::new();
-    assert!(registry.get_descriptor("nonexistent").is_none());
+    assert!(registry.get_definition("nonexistent").is_none());
 }
 
 #[test]

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::cancel::CancelToken;
+use crate::errors::ModuleError;
+use crate::observability::logging::ContextLogger;
 use crate::trace_context::TraceContext;
 
 /// Frozen/immutable identity representing the caller.
@@ -62,6 +64,26 @@ impl<T: Default> Context<T> {
             cancel_token: None,
             trace_context: None,
         }
+    }
+
+    /// Create a child context for nested calls.
+    pub fn child(&self, target_module_id: &str) -> Context<T> where T: Clone {
+        todo!("Context.child() — create child context for nested calls")
+    }
+
+    /// Serialize context to JSON.
+    pub fn to_json(&self) -> serde_json::Value {
+        todo!("Context.to_json() — serialize context")
+    }
+
+    /// Deserialize context from JSON.
+    pub fn from_json(data: serde_json::Value) -> Result<Context<serde_json::Value>, crate::errors::ModuleError> {
+        todo!("Context.from_json() — deserialize context")
+    }
+
+    /// Get a context-scoped logger.
+    pub fn logger(&self) -> ContextLogger {
+        todo!("Context.logger() — context-scoped logger")
     }
 
     /// Create a context from explicit parameters.

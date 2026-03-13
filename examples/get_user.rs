@@ -2,7 +2,7 @@
 
 use apcore::context::{Context, Identity};
 use apcore::errors::ModuleError;
-use apcore::module::{Module, ModuleAnnotations, ModuleExample};
+use apcore::module::{Module, ModuleAnnotations};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -113,16 +113,10 @@ impl Module for GetUserModule {
 
 fn get_user_annotations() -> ModuleAnnotations {
     ModuleAnnotations {
-        name: "user.get".to_string(),
-        description: Some("Look up a user by ID".to_string()),
-        version: Some("1.0.0".to_string()),
-        tags: vec!["user".to_string(), "readonly".to_string()],
-        examples: vec![ModuleExample {
-            name: "Look up Alice".to_string(),
-            description: Some("Returns Alice's profile".to_string()),
-            input: json!({"user_id": "user-1"}),
-            expected_output: json!({"id": "user-1", "name": "Alice", "email": "alice@example.com"}),
-        }],
+        readonly: true,
+        idempotent: true,
+        cacheable: true,
+        cache_ttl: 60,
         ..Default::default()
     }
 }

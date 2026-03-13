@@ -50,7 +50,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 |------|-------------|
 | `ACL` | Access control — rule-based caller/target authorization |
 | `ApprovalHandler` | Pluggable approval gate trait |
-| `AlwaysDenyHandler` / `AutoApproveHandler` / `CallbackApprovalHandler` | Built-in approval handlers |
+| `AlwaysDenyHandler` / `AutoApproveHandler` | Built-in approval handlers |
 
 **Middleware**
 
@@ -58,7 +58,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 |------|-------------|
 | `Middleware` | Pipeline hooks — before/after/on_error interception |
 | `BeforeMiddleware` / `AfterMiddleware` | Single-phase middleware adapters |
-| `LoggingMiddleware` | Structured logging middleware |
+| `ObsLoggingMiddleware` | Structured logging middleware |
 | `RetryMiddleware` | Automatic retry with backoff |
 | `ErrorHistoryMiddleware` | Records errors into `ErrorHistory` |
 | `PlatformNotifyMiddleware` | Emits events on error rate/latency spikes |
@@ -87,7 +87,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 | Type | Description |
 |------|-------------|
 | `EventEmitter` | Event system — subscribe, emit, flush |
-| `WebhookSubscriber` / `A2ASubscriber` | Built-in event subscribers |
+| `WebhookSubscriber` | Built-in event subscriber |
 | `ExtensionManager` | Unified extension point management |
 | `AsyncTaskManager` | Background module execution with status tracking |
 | `CancelToken` | Cooperative cancellation token |
@@ -128,13 +128,12 @@ struct AddModule;
 
 #[async_trait::async_trait]
 impl Module for AddModule {
-    fn id(&self) -> &str { "math.add" }
     fn description(&self) -> &str { "Add two integers" }
 
     async fn execute(
         &self,
-        input: Value,
         _ctx: &Context<Value>,
+        input: Value,
     ) -> Result<Value, apcore::errors::ModuleError> {
         let a = input["a"].as_i64().unwrap_or(0);
         let b = input["b"].as_i64().unwrap_or(0);
@@ -145,10 +144,10 @@ impl Module for AddModule {
 #[tokio::main]
 async fn main() {
     let mut client = APCore::new();
-    client.register_module("math.add", Box::new(AddModule)).unwrap();
+    client.register(Box::new(AddModule)).unwrap();
 
     let result = client
-        .execute("math.add", json!({"a": 10, "b": 5}), Default::default())
+        .call("math.add", json!({"a": 10, "b": 5}), Default::default())
         .await
         .unwrap();
     println!("{}", result); // {"result": 15}
@@ -159,10 +158,11 @@ async fn main() {
 
 ```rust
 use apcore::{APCore, Config};
+use std::path::Path;
 
 #[tokio::main]
 async fn main() {
-    let config = Config::from_file("apcore.yaml").unwrap();
+    let config = Config::from_yaml_file(Path::new("apcore.yaml")).unwrap();
     let client = APCore::with_config(config);
 }
 ```
@@ -191,7 +191,6 @@ struct GetUserModule;
 
 #[async_trait::async_trait]
 impl Module for GetUserModule {
-    fn id(&self) -> &str { "user.get" }
     fn description(&self) -> &str { "Get user details by ID" }
     fn annotations(&self) -> ModuleAnnotations {
         ModuleAnnotations { readonly: true, idempotent: true, ..Default::default() }
@@ -199,8 +198,8 @@ impl Module for GetUserModule {
 
     async fn execute(
         &self,
-        input: Value,
         _ctx: &Context<Value>,
+        input: Value,
     ) -> Result<Value, apcore::errors::ModuleError> {
         let req: GetUserInput = serde_json::from_value(input)?;
         let user = match req.user_id.as_str() {
@@ -216,9 +215,9 @@ impl Module for GetUserModule {
 ### Add middleware
 
 ```rust
-use apcore::observability::{LoggingMiddleware, TracingMiddleware};
+use apcore::observability::{ObsLoggingMiddleware, TracingMiddleware};
 
-client.use_middleware(Box::new(LoggingMiddleware::new()));
+client.use_middleware(Box::new(ObsLoggingMiddleware::new()));
 client.use_middleware(Box::new(TracingMiddleware::new()));
 ```
 
@@ -322,9 +321,9 @@ impl Module for AddModule {
 async fn main() {
     let identity = Identity {
         id: "user-1".to_string(),
-        name: "Alice".to_string(),
+        identity_type: "user".to_string(),
         roles: vec!["user".to_string()],
-        attributes: HashMap::new(),
+        attrs: HashMap::new(),
     };
     let ctx: Context<Value> = Context::new(identity);
     let module = AddModule;
@@ -388,7 +387,7 @@ impl Module for GreetModule {
 
 #[tokio::main]
 async fn main() {
-    let identity = Identity { id: "agent-1".to_string(), name: "AI Agent".to_string(), roles: vec![], attributes: HashMap::new() };
+    let identity = Identity { id: "agent-1".to_string(), identity_type: "agent".to_string(), roles: vec![], attrs: HashMap::new() };
     let ctx: Context<Value> = Context::new(identity);
     let module = GreetModule;
 
@@ -535,19 +534,6 @@ Error (expected): Execution cancelled after 2 steps
 
 ## Tests
 
-The `tests/` directory contains integration and unit tests:
-
-| File | Coverage |
-|------|----------|
-| `integration_test.rs` | Smoke tests — all 37 `ErrorCode` variants, `CancelToken`, `Identity`, `ModuleError` |
-| `test_cancel.rs` | `CancelToken` — new, cancel, idempotent, clone sharing |
-| `test_context.rs` | `Identity` fields/serialization, `Context` creation, metadata, cancel token |
-| `test_errors.rs` | `ErrorCode` equality/serialization, `ModuleError` fields, display, `std::error::Error` |
-| `test_module.rs` | `Module` trait execution, preflight, `ModuleAnnotations` defaults/serialization, `ModuleExample` |
-| `test_acl.rs` | `ACL` construction, `ACLRule` fields, serialization, priority ordering |
-| `test_registry.rs` | `Registry` creation, empty state, unknown-key lookups |
-| `test_trace_context.rs` | `TraceParent` header formatting/serialization, `TraceContext` baggage/tracestate |
-
 Run all tests:
 
 ```bash
@@ -571,42 +557,6 @@ Run with output visible:
 
 ```bash
 cargo test -- --nocapture
-```
-
-## Project Structure
-
-```
-src/
-    lib.rs               # Public API & re-exports
-    client.rs            # APCore high-level client
-    async_task.rs        # Background task manager
-    cancel.rs            # Cooperative cancellation primitives
-    context.rs           # Execution context & identity
-    executor.rs          # Core execution engine
-    decorator.rs         # Module builder helpers
-    bindings.rs          # YAML binding loader
-    config.rs            # Configuration
-    acl.rs               # Access control
-    approval.rs          # Approval system
-    extensions.rs        # Extension point manager
-    errors.rs            # Error hierarchy
-    module.rs            # Module trait & annotations
-    trace_context.rs     # W3C trace context helpers
-    middleware/          # Middleware system
-    observability/       # Tracing, metrics, logging
-    registry/            # Module discovery & registration
-    schema/              # Schema loading, validation, export
-    events/              # Event emitter & subscribers
-    utils/               # Utilities
-examples/
-    simple_client.rs     # Minimal APCore client demo
-    global_client.rs     # Global client usage demo
-    greet.rs             # Typed schema module
-    get_user.rs          # Readonly + idempotent module
-    send_email.rs        # Approval gate demo
-    bindings_format_date.rs  # YAML bindings demo
-tests/
-    integration_test.rs  # Integration & conformance tests
 ```
 
 ## Development

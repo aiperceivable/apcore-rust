@@ -49,7 +49,7 @@ feature-aligned with `apcore-python` 0.13.0.
 #### Observability
 - **`TracingMiddleware`** — Distributed tracing with span lifecycle and pluggable `SpanExporter`
 - **`Span`** / **`SpanExporter`** trait — W3C-compatible span model
-- **`ConsoleSpanExporter`** / **`NoopSpanExporter`** — Built-in exporters
+- **`StdoutExporter`** / **`InMemoryExporter`** — Built-in exporters
 - **`MetricsCollector`** / **`MetricsMiddleware`** — Call count, latency, and error-rate metrics
 - **`ContextLogger`** — Context-aware structured log sink (`info`, `warn`, `error`)
 - **`ObsLoggingMiddleware`** — Middleware wrapper around `ContextLogger`
@@ -65,7 +65,7 @@ feature-aligned with `apcore-python` 0.13.0.
 #### Registry
 - **`Registry`** — Module storage with `register`, `unregister`, `get`, `list`, `watch`
 - **`ModuleDescriptor`** — Metadata envelope: id, version, tags, source path, `sunset_date`
-- **`DiscoveryPlugin`** trait — Pluggable module discovery backends
+- **`Discoverer`** trait — Pluggable module discovery backends
 
 #### Events & Extensions
 - **`EventEmitter`** — Async event bus with pattern-based subscribe / emit / flush

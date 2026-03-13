@@ -32,7 +32,7 @@ impl MiddlewareManager {
     }
 
     /// Run the before hooks for all middlewares in order.
-    pub async fn run_before(
+    pub async fn execute_before(
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
@@ -43,7 +43,7 @@ impl MiddlewareManager {
     }
 
     /// Run the after hooks for all middlewares in reverse order.
-    pub async fn run_after(
+    pub async fn execute_after(
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
@@ -55,7 +55,7 @@ impl MiddlewareManager {
     }
 
     /// Run the on_error hooks for all middlewares.
-    pub async fn run_on_error(
+    pub async fn execute_on_error(
         &self,
         ctx: &Context<serde_json::Value>,
         module_name: &str,
@@ -66,8 +66,8 @@ impl MiddlewareManager {
         todo!()
     }
 
-    /// List middleware names in pipeline order.
-    pub fn list(&self) -> Vec<&str> {
+    /// Snapshot of middleware names in pipeline order.
+    pub fn snapshot(&self) -> Vec<&str> {
         self.middlewares.iter().map(|m| m.name()).collect()
     }
 }

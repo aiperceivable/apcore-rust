@@ -1,11 +1,14 @@
 // APCore Protocol — Executor
 // Spec reference: Module execution engine
 
+use serde_json::Value;
+
 use crate::acl::ACL;
 use crate::approval::ApprovalHandler;
 use crate::config::Config;
 use crate::context::Context;
 use crate::errors::ModuleError;
+use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::manager::MiddlewareManager;
 use crate::registry::registry::Registry;
 
@@ -86,5 +89,25 @@ impl Executor {
     ) -> Result<(), ModuleError> {
         // TODO: Implement
         todo!()
+    }
+
+    /// Create an executor from a registry and config.
+    pub fn from_registry(registry: Registry, config: Config) -> Self {
+        Self::new(registry, config)
+    }
+
+    /// Stream execution of a module.
+    pub async fn stream(&self, module_id: &str, inputs: Value, ctx: Option<&Context<Value>>) -> Result<Vec<Value>, ModuleError> {
+        todo!("Executor.stream() — streaming execution")
+    }
+
+    /// Add a before middleware.
+    pub fn use_before(&mut self, middleware: Box<dyn BeforeMiddleware>) {
+        todo!("Executor.use_before()")
+    }
+
+    /// Add an after middleware.
+    pub fn use_after(&mut self, middleware: Box<dyn AfterMiddleware>) {
+        todo!("Executor.use_after()")
     }
 }

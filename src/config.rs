@@ -58,4 +58,29 @@ impl Config {
         // TODO: Implement
         todo!()
     }
+
+    /// Create a config from defaults.
+    pub fn from_defaults() -> Self {
+        Self::default()
+    }
+
+    /// Get a setting by key.
+    pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.settings.get(key)
+    }
+
+    /// Set a setting by key.
+    pub fn set(&mut self, key: &str, value: serde_json::Value) {
+        self.settings.insert(key.to_string(), value);
+    }
+
+    /// Re-read config from file.
+    pub fn reload(&mut self) -> Result<(), ModuleError> {
+        todo!("Config.reload() — re-read config from file")
+    }
+
+    /// Auto-detect format by extension and load.
+    pub fn load(path: &std::path::Path) -> Result<Self, ModuleError> {
+        todo!("Config.load() — auto-detect format by extension")
+    }
 }

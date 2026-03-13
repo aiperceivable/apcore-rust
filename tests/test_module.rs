@@ -109,42 +109,49 @@ fn test_module_schemas_are_valid_json() {
 #[test]
 fn test_annotations_default() {
     let ann = ModuleAnnotations {
-        name: "test.module".to_string(),
         ..Default::default()
     };
-    assert_eq!(ann.name, "test.module");
-    assert!(ann.version.is_none());
-    assert!(ann.tags.is_empty());
-    assert!(!ann.deprecated);
-    assert!(!ann.hidden);
-    assert!(ann.examples.is_empty());
+    assert!(!ann.readonly);
+    assert!(!ann.destructive);
+    assert!(!ann.idempotent);
+    assert!(!ann.requires_approval);
+    assert!(ann.open_world);
+    assert!(!ann.streaming);
+    assert!(!ann.cacheable);
+    assert_eq!(ann.cache_ttl, 0);
+    assert!(ann.cache_key_fields.is_none());
+    assert!(!ann.paginated);
+    assert_eq!(ann.pagination_style, "cursor");
 }
 
 #[test]
 fn test_annotations_with_tags_and_version() {
     let ann = ModuleAnnotations {
-        name: "user.get".to_string(),
-        version: Some("1.0.0".to_string()),
-        tags: vec!["user".to_string(), "readonly".to_string()],
+        readonly: true,
+        idempotent: true,
+        cacheable: true,
+        cache_ttl: 300,
         ..Default::default()
     };
-    assert_eq!(ann.version.as_deref(), Some("1.0.0"));
-    assert_eq!(ann.tags.len(), 2);
+    assert!(ann.readonly);
+    assert!(ann.idempotent);
+    assert!(ann.cacheable);
+    assert_eq!(ann.cache_ttl, 300);
 }
 
 #[test]
 fn test_annotations_serialization_round_trip() {
     let ann = ModuleAnnotations {
-        name: "email.send".to_string(),
-        description: Some("Send email".to_string()),
-        tags: vec!["email".to_string()],
-        deprecated: false,
+        destructive: true,
+        requires_approval: true,
+        open_world: false,
         ..Default::default()
     };
     let json = serde_json::to_string(&ann).unwrap();
     let restored: ModuleAnnotations = serde_json::from_str(&json).unwrap();
-    assert_eq!(restored.name, ann.name);
-    assert_eq!(restored.tags, ann.tags);
+    assert_eq!(restored.destructive, ann.destructive);
+    assert_eq!(restored.requires_approval, ann.requires_approval);
+    assert_eq!(restored.open_world, ann.open_world);
 }
 
 // ---------------------------------------------------------------------------
@@ -154,26 +161,26 @@ fn test_annotations_serialization_round_trip() {
 #[test]
 fn test_module_example_fields() {
     let ex = ModuleExample {
-        name: "Add two numbers".to_string(),
+        title: "Add two numbers".to_string(),
         description: Some("Returns the sum".to_string()),
-        input: json!({"a": 1, "b": 2}),
-        expected_output: json!({"result": 3}),
+        inputs: json!({"a": 1, "b": 2}),
+        output: json!({"result": 3}),
     };
-    assert_eq!(ex.name, "Add two numbers");
-    assert_eq!(ex.input["a"], 1);
-    assert_eq!(ex.expected_output["result"], 3);
+    assert_eq!(ex.title, "Add two numbers");
+    assert_eq!(ex.inputs["a"], 1);
+    assert_eq!(ex.output["result"], 3);
 }
 
 #[test]
 fn test_module_example_serialization() {
     let ex = ModuleExample {
-        name: "Greet Alice".to_string(),
+        title: "Greet Alice".to_string(),
         description: None,
-        input: json!({"name": "Alice"}),
-        expected_output: json!({"message": "Hello, Alice!"}),
+        inputs: json!({"name": "Alice"}),
+        output: json!({"message": "Hello, Alice!"}),
     };
     let json = serde_json::to_string(&ex).unwrap();
     let restored: ModuleExample = serde_json::from_str(&json).unwrap();
-    assert_eq!(restored.name, ex.name);
-    assert_eq!(restored.input, ex.input);
+    assert_eq!(restored.title, ex.title);
+    assert_eq!(restored.inputs, ex.inputs);
 }

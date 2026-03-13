@@ -85,7 +85,8 @@ impl Module for FunctionModule {
     }
 
     fn description(&self) -> &str {
-        self.annotations.description.as_deref().unwrap_or("")
+        // TODO: description moved to ModuleDescriptor; return empty for now
+        ""
     }
 
     async fn execute(
