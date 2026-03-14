@@ -58,9 +58,7 @@ impl ErrorHistory {
         let error_code = format!("{:?}", error.code);
         let now = Utc::now();
 
-        let module_entries = map
-            .entry(module_id.to_string())
-            .or_default();
+        let module_entries = map.entry(module_id.to_string()).or_default();
 
         // Check for existing entry with same code and message (deduplication)
         let existing = module_entries

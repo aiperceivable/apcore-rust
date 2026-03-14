@@ -100,7 +100,6 @@ impl ACL {
 
     /// Add a rule to the ACL (inserted at position 0, highest priority).
     pub fn add_rule(&mut self, rule: ACLRule) -> Result<(), ModuleError> {
-
         self.rules.insert(0, rule);
         Ok(())
     }
@@ -108,7 +107,6 @@ impl ACL {
     /// Remove the first rule matching the given callers and targets.
     /// Returns true if a rule was removed.
     pub fn remove_rule(&mut self, callers: &[String], targets: &[String]) -> bool {
-
         if let Some(pos) = self
             .rules
             .iter()
@@ -129,8 +127,6 @@ impl ACL {
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> Result<bool, ModuleError> {
-
-
         let caller = caller_id.unwrap_or("@external");
 
         if self.rules.is_empty() {
@@ -317,9 +313,7 @@ impl ACL {
         if let Some(identity_types) = obj.get("identity_types") {
             if let Some(arr) = identity_types.as_array() {
                 let id_type = &ctx.identity.identity_type;
-                let matched = arr
-                    .iter()
-                    .any(|v| v.as_str().is_some_and(|s| s == id_type));
+                let matched = arr.iter().any(|v| v.as_str().is_some_and(|s| s == id_type));
                 if !matched {
                     return false;
                 }
