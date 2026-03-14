@@ -16,9 +16,9 @@ pub struct Span {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<String>,
     pub name: String,
-    pub start_time: DateTime<Utc>,
+    pub start_time: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_time: Option<DateTime<Utc>>,
+    pub end_time: Option<f64>,
     #[serde(default)]
     pub attributes: HashMap<String, serde_json::Value>,
     #[serde(default)]
@@ -45,14 +45,19 @@ pub enum SpanStatus {
 }
 
 impl Span {
-    /// Create a new span.
+    /// Create a new span with a random hex span_id.
     pub fn new(name: impl Into<String>, trace_id: impl Into<String>) -> Self {
+        let span_id = format!(
+            "{:016x}",
+            uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFFFFFFFFFF
+        );
+        let now = Utc::now().timestamp_millis() as f64 / 1000.0;
         Self {
             trace_id: trace_id.into(),
-            span_id: uuid::Uuid::new_v4().to_string(),
+            span_id,
             parent_span_id: None,
             name: name.into(),
-            start_time: Utc::now(),
+            start_time: now,
             end_time: None,
             attributes: HashMap::new(),
             events: vec![],
@@ -60,9 +65,9 @@ impl Span {
         }
     }
 
-    /// End the span.
+    /// End the span, recording the end time as epoch seconds.
     pub fn end(&mut self) {
-        self.end_time = Some(Utc::now());
+        self.end_time = Some(Utc::now().timestamp_millis() as f64 / 1000.0);
     }
 
     /// Add an attribute to the span.
@@ -76,6 +81,19 @@ impl Span {
             name: name.into(),
             timestamp: Utc::now(),
             attributes: HashMap::new(),
+        });
+    }
+
+    /// Add an event with attributes to the span.
+    pub fn add_event_with_attributes(
+        &mut self,
+        name: impl Into<String>,
+        attributes: HashMap<String, serde_json::Value>,
+    ) {
+        self.events.push(SpanEvent {
+            name: name.into(),
+            timestamp: Utc::now(),
+            attributes,
         });
     }
 }

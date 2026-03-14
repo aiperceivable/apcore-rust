@@ -72,7 +72,15 @@ impl EventEmitter {
     /// subscriber's ID, matching Python's identity-based removal semantics.
     pub fn unsubscribe(&mut self, subscriber: &dyn EventSubscriber) -> bool {
         let target_id = subscriber.subscriber_id();
-        let pos = self.subscribers.iter().position(|s| s.subscriber_id() == target_id);
+        self.unsubscribe_by_id(target_id)
+    }
+
+    /// Remove the first subscriber whose `subscriber_id()` matches the given ID string.
+    pub fn unsubscribe_by_id(&mut self, subscriber_id: &str) -> bool {
+        let pos = self
+            .subscribers
+            .iter()
+            .position(|s| s.subscriber_id() == subscriber_id);
         if let Some(i) = pos {
             self.subscribers.remove(i);
             true
@@ -89,31 +97,26 @@ impl EventEmitter {
         for subscriber in &self.subscribers {
             if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 if let Err(e) = subscriber.on_event(event).await {
-                    eprintln!(
-                        "Subscriber {} failed: {}",
-                        subscriber.subscriber_id(),
-                        e
-                    );
+                    eprintln!("Subscriber {} failed: {}", subscriber.subscriber_id(), e);
                 }
             }
         }
         Ok(())
     }
 
-    /// Emit an event to subscribers matching the given event type pattern.
+    /// Emit an event to subscribers matching both the caller's filter pattern
+    /// AND the subscriber's own event_pattern.
     pub async fn emit_filtered(
         &self,
         event: &ApCoreEvent,
         pattern: &str,
     ) -> Result<(), ModuleError> {
         for subscriber in &self.subscribers {
-            if Self::matches_pattern(pattern, &event.event_type) {
+            if Self::matches_pattern(pattern, &event.event_type)
+                && Self::matches_pattern(subscriber.event_pattern(), &event.event_type)
+            {
                 if let Err(e) = subscriber.on_event(event).await {
-                    eprintln!(
-                        "Subscriber {} failed: {}",
-                        subscriber.subscriber_id(),
-                        e
-                    );
+                    eprintln!("Subscriber {} failed: {}", subscriber.subscriber_id(), e);
                 }
             }
         }

@@ -26,7 +26,7 @@ impl Module for SlowModule {
         "A slow module that checks for cancellation between steps"
     }
 
-    async fn execute(&self, ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let steps = input["steps"].as_i64().unwrap_or(5) as usize;
 
         for i in 0..steps {
@@ -70,7 +70,7 @@ async fn main() {
     ctx.cancel_token = Some(token);
 
     let module = SlowModule;
-    let result = module.execute(&ctx, json!({"steps": 3})).await.unwrap();
+    let result = module.execute(json!({"steps": 3}), &ctx).await.unwrap();
     println!("Result: {result}\n");
 
     // --- Run 2: cancel mid-flight ---
@@ -87,7 +87,7 @@ async fn main() {
         token2_clone.cancel();
     });
 
-    match module.execute(&ctx2, json!({"steps": 10})).await {
+    match module.execute(json!({"steps": 10}), &ctx2).await {
         Ok(r) => println!("Result: {r}"),
         Err(e) => println!("Error (expected): {e}"),
     }

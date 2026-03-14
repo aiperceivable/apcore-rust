@@ -9,12 +9,13 @@ authors = ["aipartnerup <tercel.yi@gmail.com>"]
 homepage = "https://aipartnerup.com"
 repository = "https://github.com/aipartnerup/apcore-rust"
 documentation = "https://apcore.aipartnerup.com/"
-keywords = ["ai", "llm", "middleware", "observability", "schema"]
+keywords = ["ai", "llm", "module", "middleware", "schema"]
 categories = [
     "api-bindings",
     "asynchronous",
     "development-tools",
     "web-programming",
+    "config",
 ]
 
 [package.metadata.docs.rs]

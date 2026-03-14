@@ -6,7 +6,6 @@
 // support types for function-based modules.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use crate::context::Context;
 use crate::errors::ModuleError;
@@ -15,8 +14,8 @@ use crate::module::{Module, ModuleAnnotations};
 /// Boxed async handler type for FunctionModule.
 type HandlerFn = Box<
     dyn for<'a> Fn(
-            &'a Context<serde_json::Value>,
             serde_json::Value,
+            &'a Context<serde_json::Value>,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
@@ -53,8 +52,8 @@ impl FunctionModule {
     ) -> Self
     where
         F: for<'a> Fn(
-                &'a Context<serde_json::Value>,
                 serde_json::Value,
+                &'a Context<serde_json::Value>,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
@@ -91,9 +90,9 @@ impl Module for FunctionModule {
 
     async fn execute(
         &self,
+        inputs: serde_json::Value,
         ctx: &Context<serde_json::Value>,
-        input: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError> {
-        (self.handler)(ctx, input).await
+        (self.handler)(inputs, ctx).await
     }
 }

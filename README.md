@@ -139,8 +139,8 @@ impl Module for AddModule {
 
     async fn execute(
         &self,
-        _ctx: &Context<Value>,
         input: Value,
+        _ctx: &Context<Value>,
     ) -> Result<Value, apcore::errors::ModuleError> {
         let a = input["a"].as_i64().unwrap_or(0);
         let b = input["b"].as_i64().unwrap_or(0);
@@ -151,10 +151,10 @@ impl Module for AddModule {
 #[tokio::main]
 async fn main() {
     let mut client = APCore::new();
-    client.register(Box::new(AddModule)).unwrap();
+    client.register("math.add", Box::new(AddModule)).unwrap();
 
     let result = client
-        .call("math.add", json!({"a": 10, "b": 5}), Default::default())
+        .call("math.add", json!({"a": 10, "b": 5}), None, None)
         .await
         .unwrap();
     println!("{}", result); // {"result": 15}
@@ -198,6 +198,27 @@ struct GetUserModule;
 
 #[async_trait::async_trait]
 impl Module for GetUserModule {
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "user_id": { "type": "string" }
+            },
+            "required": ["user_id"]
+        })
+    }
+
+    fn output_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" },
+                "email": { "type": "string" }
+            }
+        })
+    }
+
     fn description(&self) -> &str { "Get user details by ID" }
 
     // Annotations (readonly, idempotent, etc.) are set on
@@ -205,8 +226,8 @@ impl Module for GetUserModule {
 
     async fn execute(
         &self,
-        _ctx: &Context<Value>,
         input: Value,
+        _ctx: &Context<Value>,
     ) -> Result<Value, apcore::errors::ModuleError> {
         let req: GetUserInput = serde_json::from_value(input)?;
         let user = match req.user_id.as_str() {
@@ -222,10 +243,10 @@ impl Module for GetUserModule {
 ### Add middleware
 
 ```rust
-use apcore::observability::{ObsLoggingMiddleware, TracingMiddleware};
+use apcore::observability::{ContextLogger, ObsLoggingMiddleware};
 
-client.use_middleware(Box::new(ObsLoggingMiddleware::new()));
-client.use_middleware(Box::new(TracingMiddleware::new()));
+client.use_middleware(Box::new(ObsLoggingMiddleware::new(ContextLogger::new("app"))));
+// TracingMiddleware requires a SpanExporter — see observability docs
 ```
 
 ### Access control
@@ -234,9 +255,9 @@ client.use_middleware(Box::new(TracingMiddleware::new()));
 use apcore::acl::{ACL, ACLRule};
 
 let acl = ACL::new(vec![
-    ACLRule::new(vec!["admin.*"], vec!["*"],       "allow", "Admins can call anything"),
-    ACLRule::new(vec!["*"],       vec!["admin.*"], "deny",  "Others cannot call admin modules"),
-]);
+    ACLRule { callers: vec!["admin.*".into()], targets: vec!["*".into()], effect: "allow".into(), description: Some("Admins can call anything".into()), conditions: None },
+    ACLRule { callers: vec!["*".into()], targets: vec!["admin.*".into()], effect: "deny".into(), description: Some("Others cannot call admin modules".into()), conditions: None },
+], "deny");
 ```
 
 ### YAML bindings
@@ -269,7 +290,7 @@ Load it at runtime:
 use apcore::bindings::BindingLoader;
 
 let loader = BindingLoader::new();
-loader.load_file("binding.yaml", &mut client).unwrap();
+loader.load_from_file(std::path::Path::new("binding.yaml")).unwrap();
 ```
 
 ## Examples
@@ -317,7 +338,7 @@ impl Module for AddModule {
     }
     fn description(&self) -> &str { "Add two integers" }
 
-    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let a = input["a"].as_i64().unwrap_or(0);
         let b = input["b"].as_i64().unwrap_or(0);
         Ok(json!({ "result": a + b }))
@@ -335,7 +356,7 @@ async fn main() {
     let ctx: Context<Value> = Context::new(identity);
     let module = AddModule;
 
-    let result = module.execute(&ctx, json!({"a": 10, "b": 5})).await.unwrap();
+    let result = module.execute(json!({"a": 10, "b": 5}), &ctx).await.unwrap();
     println!("{result}"); // {"result":15}
 }
 ```
@@ -385,7 +406,7 @@ impl Module for GreetModule {
     }
     fn description(&self) -> &str { "Greet a user by name" }
 
-    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let req: GreetInput = serde_json::from_value(input)
             .map_err(|e| ModuleError::new(apcore::errors::ErrorCode::GeneralInvalidInput, e.to_string()))?;
         Ok(serde_json::to_value(GreetOutput { message: format!("{}, {}!", req.greeting, req.name) }).unwrap())
@@ -398,17 +419,17 @@ async fn main() {
     let ctx: Context<Value> = Context::new(identity);
     let module = GreetModule;
 
-    let out = module.execute(&ctx, json!({"name": "Alice", "greeting": "Good morning"})).await.unwrap();
+    let out = module.execute(json!({"name": "Alice", "greeting": "Good morning"}), &ctx).await.unwrap();
     println!("{out}"); // {"message":"Good morning, Alice!"}
 
-    let out = module.execute(&ctx, json!({"name": "Bob"})).await.unwrap();
+    let out = module.execute(json!({"name": "Bob"}), &ctx).await.unwrap();
     println!("{out}"); // {"message":"Hello, Bob!"}  ← default greeting applied
 
     // Schema introspection
     println!("{}", serde_json::to_string_pretty(&module.input_schema()).unwrap());
 
     // Missing required field → validation error
-    let err = module.execute(&ctx, json!({"greeting": "Hi"})).await.unwrap_err();
+    let err = module.execute(json!({"greeting": "Hi"}), &ctx).await.unwrap_err();
     println!("Error: {err}");
 }
 ```
@@ -508,7 +529,7 @@ tokio::spawn(async move {
 });
 
 // Module checks the token between steps
-async fn execute(&self, ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+async fn execute(&self, input: Value, ctx: &Context<Value>) -> Result<Value, ModuleError> {
     for i in 0..steps {
         if let Some(t) = &ctx.cancel_token {
             if t.is_cancelled() {

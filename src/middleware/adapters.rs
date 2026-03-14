@@ -14,10 +14,10 @@ pub trait BeforeMiddleware: Send + Sync + std::fmt::Debug {
 
     async fn before(
         &self,
+        module_id: &str,
+        inputs: serde_json::Value,
         ctx: &Context<serde_json::Value>,
-        module_name: &str,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value, ModuleError>;
+    ) -> Result<Option<serde_json::Value>, ModuleError>;
 }
 
 /// Adapter for middleware that only needs an after hook.
@@ -27,11 +27,11 @@ pub trait AfterMiddleware: Send + Sync + std::fmt::Debug {
 
     async fn after(
         &self,
-        ctx: &Context<serde_json::Value>,
-        module_name: &str,
+        module_id: &str,
         inputs: serde_json::Value,
         output: serde_json::Value,
-    ) -> Result<serde_json::Value, ModuleError>;
+        ctx: &Context<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ModuleError>;
 }
 
 /// Wraps a BeforeMiddleware into a full Middleware.
@@ -46,31 +46,31 @@ impl<T: BeforeMiddleware + 'static> Middleware for BeforeMiddlewareAdapter<T> {
 
     async fn before(
         &self,
+        module_id: &str,
+        inputs: serde_json::Value,
         ctx: &Context<serde_json::Value>,
-        module_name: &str,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value, ModuleError> {
-        self.0.before(ctx, module_name, input).await
+    ) -> Result<Option<serde_json::Value>, ModuleError> {
+        self.0.before(module_id, inputs, ctx).await
     }
 
     async fn after(
         &self,
-        _ctx: &Context<serde_json::Value>,
-        _module_name: &str,
+        _module_id: &str,
         _inputs: serde_json::Value,
-        output: serde_json::Value,
-    ) -> Result<serde_json::Value, ModuleError> {
-        Ok(output)
+        _output: serde_json::Value,
+        _ctx: &Context<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ModuleError> {
+        Ok(None)
     }
 
     async fn on_error(
         &self,
-        _ctx: &Context<serde_json::Value>,
-        _module_name: &str,
+        _module_id: &str,
         _inputs: serde_json::Value,
         _error: &ModuleError,
-    ) -> Result<(), ModuleError> {
-        Ok(())
+        _ctx: &Context<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ModuleError> {
+        Ok(None)
     }
 }
 
@@ -86,30 +86,30 @@ impl<T: AfterMiddleware + 'static> Middleware for AfterMiddlewareAdapter<T> {
 
     async fn before(
         &self,
+        _module_id: &str,
+        _inputs: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
-        _module_name: &str,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value, ModuleError> {
-        Ok(input)
+    ) -> Result<Option<serde_json::Value>, ModuleError> {
+        Ok(None)
     }
 
     async fn after(
         &self,
-        ctx: &Context<serde_json::Value>,
-        module_name: &str,
+        module_id: &str,
         inputs: serde_json::Value,
         output: serde_json::Value,
-    ) -> Result<serde_json::Value, ModuleError> {
-        self.0.after(ctx, module_name, inputs, output).await
+        ctx: &Context<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ModuleError> {
+        self.0.after(module_id, inputs, output, ctx).await
     }
 
     async fn on_error(
         &self,
-        _ctx: &Context<serde_json::Value>,
-        _module_name: &str,
+        _module_id: &str,
         _inputs: serde_json::Value,
         _error: &ModuleError,
-    ) -> Result<(), ModuleError> {
-        Ok(())
+        _ctx: &Context<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ModuleError> {
+        Ok(None)
     }
 }

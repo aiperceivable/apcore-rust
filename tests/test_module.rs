@@ -24,7 +24,7 @@ impl Module for EchoModule {
     fn description(&self) -> &str {
         "Echo the input value back"
     }
-    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         Ok(input)
     }
 }
@@ -42,7 +42,7 @@ impl Module for FailingModule {
     fn description(&self) -> &str {
         "Always returns an error"
     }
-    async fn execute(&self, _ctx: &Context<Value>, _input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, _input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         Err(ModuleError::new(
             ErrorCode::GeneralInternalError,
             "intentional failure",
@@ -68,7 +68,7 @@ async fn test_echo_module_returns_input() {
     let ctx = make_ctx();
     let module = EchoModule;
     let input = json!({"value": "hello"});
-    let result = module.execute(&ctx, input.clone()).await.unwrap();
+    let result = module.execute(input.clone(), &ctx).await.unwrap();
     assert_eq!(result, input);
 }
 
@@ -76,7 +76,7 @@ async fn test_echo_module_returns_input() {
 async fn test_failing_module_returns_error() {
     let ctx = make_ctx();
     let module = FailingModule;
-    let err = module.execute(&ctx, json!({})).await.unwrap_err();
+    let err = module.execute(json!({}), &ctx).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::GeneralInternalError);
 }
 

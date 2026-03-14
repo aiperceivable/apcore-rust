@@ -84,13 +84,13 @@ fn test_module_error_basic_fields() {
 #[test]
 fn test_module_error_not_retryable_by_default() {
     let err = ModuleError::new(ErrorCode::GeneralInternalError, "oops");
-    assert!(!err.retryable);
+    assert_eq!(err.retryable, None);
 }
 
 #[test]
 fn test_module_error_not_user_fixable_by_default() {
     let err = ModuleError::new(ErrorCode::GeneralInternalError, "oops");
-    assert!(!err.user_fixable);
+    assert_eq!(err.user_fixable, None);
 }
 
 #[test]

@@ -14,5 +14,5 @@ pub use exporters::{InMemoryExporter, OTLPExporter, StdoutExporter};
 pub use logging::{ContextLogger, ObsLoggingMiddleware};
 pub use metrics::{MetricsCollector, MetricsMiddleware};
 pub use span::{Span, SpanExporter};
-pub use tracing_middleware::TracingMiddleware;
-pub use usage::{UsageCollector, UsageMiddleware};
+pub use tracing_middleware::{SamplingStrategy, TracingMiddleware};
+pub use usage::{UsageCollector, UsageMiddleware, UsageStats};

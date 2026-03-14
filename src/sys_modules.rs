@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 
 use crate::config::Config;
-use crate::errors::ModuleError;
 use crate::executor::Executor;
 use crate::observability::metrics::MetricsCollector;
 use crate::registry::registry::Registry;
@@ -13,11 +12,13 @@ use crate::registry::registry::Registry;
 /// Returns a map of module_id → module descriptor info.
 /// `metrics_collector` is optional; if provided, metrics modules are wired up.
 pub fn register_sys_modules(
-    registry: &mut Registry,
-    executor: &mut Executor,
-    config: &Config,
-    metrics_collector: Option<MetricsCollector>,
+    _registry: &mut Registry,
+    _executor: &mut Executor,
+    _config: &Config,
+    _metrics_collector: Option<MetricsCollector>,
 ) -> HashMap<String, serde_json::Value> {
-    // TODO: Implement — register __health, __list_modules, __describe, etc.
-    todo!()
+    // System modules (__health, __list_modules, __describe, etc.) require full
+    // Module trait implementations. Returning empty for now — these will be
+    // implemented when concrete system module structs are defined.
+    HashMap::new()
 }

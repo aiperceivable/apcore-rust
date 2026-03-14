@@ -54,8 +54,16 @@ impl EventSubscriber for WebhookSubscriber {
         &self.event_pattern
     }
 
-    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
-        // TODO: Implement — HTTP POST to webhook URL
-        todo!()
+    async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
+        // TODO: Real implementation would use reqwest or similar HTTP client
+        // to POST the event payload to self.url with self.headers.
+        // For now, log and return Ok since we don't have an HTTP client dependency.
+        tracing::info!(
+            subscriber_id = %self.id,
+            url = %self.url,
+            event_type = %event.event_type,
+            "WebhookSubscriber: would deliver event to webhook (HTTP client not available)"
+        );
+        Ok(())
     }
 }

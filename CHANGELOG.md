@@ -23,9 +23,9 @@ feature-aligned with `apcore-python` 0.13.0.
 - **`Module` trait** — Async `execute` with `input_schema` / `output_schema`, `description`, `annotations`, `preflight`
 - **`ModuleAnnotations`** — Behavioral metadata: `readonly`, `destructive`, `idempotent`, `cacheable`, `cache_ttl`, `cache_key_fields`, `paginated`, `pagination_style`, `sunset_date`, `tags`, `examples`, `metadata`
 - **`ModuleExample`** — Named input/output pair for AI-perceivable documentation
-- **`APCore`** client — `register_module`, `unregister_module`, `execute`, `stream`, `use_middleware`
+- **`APCore`** client — `register`, `unregister`, `call`, `stream`, `use_middleware`
 - **`Config`** — Load from YAML / JSON file, `get` / `set` values
-- **`Context<T>`** — Request context with `execution_id`, `trace_id`, `identity`, `call_chain`, `cancel_token`, `metadata`
+- **`Context<T>`** — Request context with `trace_id`, `identity`, `call_chain`, `cancel_token`, `metadata`
 - **`ContextFactory`** — Builder for execution contexts
 - **`Identity`** — Caller identity with `id`, `name`, `roles`, `attributes`
 - **`Executor`** — Execution engine with middleware pipeline, ACL enforcement, approval gate, call-depth guard, timeout
@@ -34,14 +34,14 @@ feature-aligned with `apcore-python` 0.13.0.
 - **`ACL`** — Pattern-based, first-match-wins rules with wildcard support
 - **`ACLRule`** — Rule entry with caller patterns, target patterns, effect (`allow`/`deny`), and priority
 - **`ApprovalHandler`** trait — Pluggable async approval gate
-- **`AutoApproveHandler`** / **`AlwaysDenyHandler`** / **`CallbackApprovalHandler`** — Built-in handlers
-- **`ApprovalRequest`** / **`ApprovalDecision`** — Request/response types for the approval pipeline
+- **`AutoApproveHandler`** / **`AlwaysDenyHandler`** / **`CallbackApprovalHandler`** (planned) — Built-in handlers
+- **`ApprovalRequest`** / **`ApprovalResult`** — Request/response types for the approval pipeline
 
 #### Middleware
 - **`Middleware`** trait — `before` / `after` / `on_error` pipeline hooks
 - **`BeforeMiddleware`** / **`AfterMiddleware`** — Single-phase adapter types
 - **`MiddlewareManager`** — Ordered middleware chain execution
-- **`LoggingMiddleware`** — Structured context-aware logging
+- **`ObsLoggingMiddleware`** — Structured context-aware logging
 - **`RetryMiddleware`** — Automatic retry with configurable backoff
 - **`ErrorHistoryMiddleware`** — Records errors into `ErrorHistory` ring buffer
 - **`PlatformNotifyMiddleware`** — Emits events on error-rate / latency threshold breaches
@@ -70,7 +70,7 @@ feature-aligned with `apcore-python` 0.13.0.
 #### Events & Extensions
 - **`EventEmitter`** — Async event bus with pattern-based subscribe / emit / flush
 - **`ApCoreEvent`** — Typed event (module lifecycle, errors, config changes)
-- **`WebhookSubscriber`** / **`A2ASubscriber`** — Built-in event delivery subscribers
+- **`WebhookSubscriber`** / **`A2ASubscriber`** (planned) — Built-in event delivery subscribers
 - **`ExtensionManager`** — Unified extension point registry for discoverers, middleware, ACL, approval, exporters, and validators
 
 #### Async Tasks & Cancellation

@@ -63,7 +63,7 @@ impl Module for SendEmailModule {
         "Send an email message via external API (destructive)"
     }
 
-    async fn execute(&self, ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let req: SendEmailInput = serde_json::from_value(input).map_err(|e| {
             ModuleError::new(
                 apcore::errors::ErrorCode::GeneralInvalidInput,
@@ -118,13 +118,13 @@ async fn main() {
 
     let out = module
         .execute(
-            &ctx,
             json!({
                 "to":      "alice@example.com",
                 "subject": "Hello from apcore",
                 "body":    "This is a test email.",
                 "api_key": "sk-secret"
             }),
+            &ctx,
         )
         .await
         .unwrap();

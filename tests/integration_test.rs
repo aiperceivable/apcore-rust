@@ -75,6 +75,6 @@ fn test_module_error_creation() {
     let error =
         apcore::errors::ModuleError::new(ErrorCode::GeneralInternalError, "something went wrong");
     assert_eq!(error.code, ErrorCode::GeneralInternalError);
-    assert!(!error.retryable);
-    assert!(!error.user_fixable);
+    assert_eq!(error.retryable, None);
+    assert_eq!(error.user_fixable, None);
 }

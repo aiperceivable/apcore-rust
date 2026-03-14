@@ -61,7 +61,7 @@ impl Module for GreetModule {
         "Greet a user by name"
     }
 
-    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let req: GreetInput = serde_json::from_value(input).map_err(|e| {
             ModuleError::new(
                 apcore::errors::ErrorCode::GeneralInvalidInput,
@@ -94,13 +94,13 @@ async fn main() {
 
     // With custom greeting
     let out = module
-        .execute(&ctx, json!({"name": "Alice", "greeting": "Good morning"}))
+        .execute(json!({"name": "Alice", "greeting": "Good morning"}), &ctx)
         .await
         .unwrap();
     println!("{out}"); // {"message":"Good morning, Alice!"}
 
     // With default greeting
-    let out = module.execute(&ctx, json!({"name": "Bob"})).await.unwrap();
+    let out = module.execute(json!({"name": "Bob"}), &ctx).await.unwrap();
     println!("{out}"); // {"message":"Hello, Bob!"}
 
     // Schema introspection
@@ -111,7 +111,7 @@ async fn main() {
 
     // Validation error: missing required field
     let err = module
-        .execute(&ctx, json!({"greeting": "Hi"}))
+        .execute(json!({"greeting": "Hi"}), &ctx)
         .await
         .unwrap_err();
     println!("\nExpected error: {err}");

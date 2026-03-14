@@ -81,7 +81,7 @@ impl Module for GetUserModule {
         "Look up a user by ID (readonly, idempotent)"
     }
 
-    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let req: GetUserInput = serde_json::from_value(input).map_err(|e| {
             ModuleError::new(
                 apcore::errors::ErrorCode::GeneralInvalidInput,
@@ -138,7 +138,7 @@ async fn main() {
 
     for user_id in ["user-1", "user-2", "user-999"] {
         let out = module
-            .execute(&ctx, json!({"user_id": user_id}))
+            .execute(json!({"user_id": user_id}), &ctx)
             .await
             .unwrap();
         println!("{user_id}: {out}");

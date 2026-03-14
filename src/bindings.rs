@@ -41,20 +41,66 @@ impl BindingLoader {
 
     /// Load bindings from a JSON file.
     pub fn load_from_file(&mut self, path: &Path) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            ModuleError::new(
+                crate::errors::ErrorCode::BindingFileInvalid,
+                format!("Failed to read binding file '{}': {}", path.display(), e),
+            )
+        })?;
+
+        let definitions: Vec<BindingDefinition> = serde_json::from_str(&content).map_err(|e| {
+            ModuleError::new(
+                crate::errors::ErrorCode::BindingFileInvalid,
+                format!("Failed to parse binding file '{}': {}", path.display(), e),
+            )
+        })?;
+
+        for def in definitions {
+            self.bindings.insert(def.name.clone(), def);
+        }
+
+        Ok(())
     }
 
     /// Load bindings from a YAML file.
     pub fn load_from_yaml(&mut self, path: &Path) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            ModuleError::new(
+                crate::errors::ErrorCode::BindingFileInvalid,
+                format!(
+                    "Failed to read binding YAML file '{}': {}",
+                    path.display(),
+                    e
+                ),
+            )
+        })?;
+
+        let definitions: Vec<BindingDefinition> = serde_yaml::from_str(&content).map_err(|e| {
+            ModuleError::new(
+                crate::errors::ErrorCode::BindingFileInvalid,
+                format!(
+                    "Failed to parse binding YAML file '{}': {}",
+                    path.display(),
+                    e
+                ),
+            )
+        })?;
+
+        for def in definitions {
+            self.bindings.insert(def.name.clone(), def);
+        }
+
+        Ok(())
     }
 
     /// Resolve a binding by name.
     pub fn resolve(&self, name: &str) -> Result<&BindingDefinition, ModuleError> {
-        // TODO: Implement
-        todo!()
+        self.bindings.get(name).ok_or_else(|| {
+            ModuleError::new(
+                crate::errors::ErrorCode::BindingModuleNotFound,
+                format!("Binding '{}' not found", name),
+            )
+        })
     }
 
     /// List all loaded binding names.

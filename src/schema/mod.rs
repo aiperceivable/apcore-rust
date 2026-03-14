@@ -10,3 +10,27 @@ pub use exporter::{ExportProfile, SchemaExporter};
 pub use loader::{SchemaLoader, SchemaStrategy};
 pub use resolver::RefResolver;
 pub use validator::SchemaValidator;
+
+use serde::{Deserialize, Serialize};
+
+/// A structured schema definition for a module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaDefinition {
+    /// The module this schema belongs to.
+    pub module_id: String,
+    /// Human-readable description of the schema.
+    pub description: String,
+    /// JSON Schema for the module's input.
+    pub input_schema: serde_json::Value,
+    /// JSON Schema for the module's output.
+    pub output_schema: serde_json::Value,
+    /// Optional JSON Schema for the module's error output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_schema: Option<serde_json::Value>,
+    /// Optional reusable schema definitions (e.g. $defs / definitions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definitions: Option<serde_json::Value>,
+    /// Optional schema version string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}

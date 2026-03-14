@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cancel::CancelToken;
-use crate::errors::ModuleError;
 use crate::observability::logging::ContextLogger;
 use crate::trace_context::TraceContext;
 
@@ -73,7 +72,10 @@ impl<T: Default> Context<T> {
     }
 
     /// Create a child context for nested calls.
-    pub fn child(&self, target_module_id: &str) -> Context<T> where T: Clone {
+    pub fn child(&self, target_module_id: &str) -> Context<T>
+    where
+        T: Clone,
+    {
         let caller_id = self.call_chain.last().cloned();
         let mut call_chain = self.call_chain.clone();
         call_chain.push(target_module_id.to_string());
@@ -96,18 +98,49 @@ impl<T: Default> Context<T> {
     }
 
     /// Serialize context to JSON.
-    pub fn to_json(&self) -> serde_json::Value {
-        todo!("Context.to_json() — serialize context")
+    pub fn to_json(&self) -> serde_json::Value
+    where
+        T: Serialize,
+    {
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        // Filter out internal keys (keys starting with "_") from data
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(data_val) = obj.get_mut("data") {
+                if let Some(data_obj) = data_val.as_object_mut() {
+                    let internal_keys: Vec<String> = data_obj
+                        .keys()
+                        .filter(|k| k.starts_with('_'))
+                        .cloned()
+                        .collect();
+                    for key in internal_keys {
+                        data_obj.remove(&key);
+                    }
+                }
+            }
+        }
+        value
     }
 
     /// Deserialize context from JSON.
-    pub fn from_json(data: serde_json::Value) -> Result<Context<serde_json::Value>, crate::errors::ModuleError> {
-        todo!("Context.from_json() — deserialize context")
+    pub fn from_json(
+        data: serde_json::Value,
+    ) -> Result<Context<serde_json::Value>, crate::errors::ModuleError> {
+        let ctx: Context<serde_json::Value> = serde_json::from_value(data)?;
+        Ok(ctx)
     }
 
     /// Get a context-scoped logger.
     pub fn logger(&self) -> ContextLogger {
-        todo!("Context.logger() — context-scoped logger")
+        let module_id = self.call_chain.last().cloned();
+        let caller_id = self.caller_id.clone();
+        ContextLogger {
+            name: "apcore".to_string(),
+            level: "info".to_string(),
+            format: crate::observability::logging::LogFormat::Json,
+            trace_id: Some(self.trace_id.clone()),
+            module_id,
+            caller_id,
+        }
     }
 
     /// Create a context from explicit parameters.

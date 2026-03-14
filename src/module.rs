@@ -3,7 +3,6 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
@@ -20,11 +19,11 @@ pub trait Module: Send + Sync {
     /// Returns a human-readable description of this module.
     fn description(&self) -> &str;
 
-    /// Execute the module with the given context and input.
+    /// Execute the module with the given inputs and context.
     async fn execute(
         &self,
+        inputs: serde_json::Value,
         ctx: &Context<serde_json::Value>,
-        input: serde_json::Value,
     ) -> Result<serde_json::Value, ModuleError>;
 
     /// Run preflight checks before execution.
@@ -44,7 +43,9 @@ pub trait Module: Send + Sync {
 
     /// Called before hot-reload to capture state. Returns state dict for on_resume().
     /// Default: returns None (no state to preserve).
-    fn on_suspend(&self) -> Option<serde_json::Value> { None }
+    fn on_suspend(&self) -> Option<serde_json::Value> {
+        None
+    }
 
     /// Called after hot-reload to restore state from on_suspend().
     /// Default: no-op.
@@ -77,13 +78,17 @@ pub struct ModuleAnnotations {
     pub paginated: bool,
     #[serde(default = "default_pagination_style")]
     pub pagination_style: String, // "cursor" | "offset" | "page"
-    // Legacy fields moved to ModuleDescriptor:
-    // name, version, author, description, tags, category, deprecated,
-    // deprecated_message, since, hidden, examples, dependencies, metadata
+                                  // Legacy fields moved to ModuleDescriptor:
+                                  // name, version, author, description, tags, category, deprecated,
+                                  // deprecated_message, since, hidden, examples, dependencies, metadata
 }
 
-fn default_true() -> bool { true }
-fn default_pagination_style() -> String { "cursor".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_pagination_style() -> String {
+    "cursor".to_string()
+}
 
 impl Default for ModuleAnnotations {
     fn default() -> Self {

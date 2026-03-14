@@ -26,6 +26,10 @@ pub struct ApprovalResult {
     /// "approved", "rejected", "timeout", or "pending"
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
@@ -54,13 +58,23 @@ impl ApprovalHandler for AutoApproveHandler {
         &self,
         _request: &ApprovalRequest,
     ) -> Result<ApprovalResult, ModuleError> {
-        // TODO: Implement
-        todo!()
+        Ok(ApprovalResult {
+            status: "approved".to_string(),
+            approved_by: Some("auto".to_string()),
+            reason: None,
+            approval_id: None,
+            metadata: None,
+        })
     }
 
     async fn check_approval(&self, _approval_id: &str) -> Result<ApprovalResult, ModuleError> {
-        // TODO: Implement
-        todo!()
+        Ok(ApprovalResult {
+            status: "approved".to_string(),
+            approved_by: Some("auto".to_string()),
+            reason: None,
+            approval_id: None,
+            metadata: None,
+        })
     }
 }
 
@@ -74,12 +88,22 @@ impl ApprovalHandler for AlwaysDenyHandler {
         &self,
         _request: &ApprovalRequest,
     ) -> Result<ApprovalResult, ModuleError> {
-        // TODO: Implement
-        todo!()
+        Ok(ApprovalResult {
+            status: "rejected".to_string(),
+            approved_by: None,
+            reason: Some("Always denied".to_string()),
+            approval_id: None,
+            metadata: None,
+        })
     }
 
     async fn check_approval(&self, _approval_id: &str) -> Result<ApprovalResult, ModuleError> {
-        // TODO: Implement
-        todo!()
+        Ok(ApprovalResult {
+            status: "rejected".to_string(),
+            approved_by: None,
+            reason: Some("Always denied".to_string()),
+            approval_id: None,
+            metadata: None,
+        })
     }
 }

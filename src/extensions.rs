@@ -44,14 +44,18 @@ impl ExtensionManager {
 
     /// Register an extension point.
     pub fn register_point(&mut self, point: ExtensionPoint) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        self.extension_points.insert(point.name.clone(), point);
+        Ok(())
     }
 
     /// Register an extension for a given extension point.
     pub fn register_extension(&mut self, extension: Box<dyn Extension>) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        let point_name = extension.extension_point().to_string();
+        self.extensions
+            .entry(point_name)
+            .or_default()
+            .push(extension);
+        Ok(())
     }
 
     /// Invoke all extensions registered at the given extension point.
@@ -60,8 +64,16 @@ impl ExtensionManager {
         point_name: &str,
         input: serde_json::Value,
     ) -> Result<Vec<serde_json::Value>, ModuleError> {
-        // TODO: Implement
-        todo!()
+        let mut results = Vec::new();
+
+        if let Some(exts) = self.extensions.get(point_name) {
+            for ext in exts {
+                let result = ext.execute(input.clone()).await?;
+                results.push(result);
+            }
+        }
+
+        Ok(results)
     }
 
     /// List all registered extension point names.

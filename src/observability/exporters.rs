@@ -2,20 +2,27 @@
 // Spec reference: Built-in span export destinations
 
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use super::span::{Span, SpanExporter};
 use crate::errors::ModuleError;
 
-/// Exports spans to stdout.
+/// Exports spans to stdout as JSON.
 #[derive(Debug)]
 pub struct StdoutExporter;
 
 #[async_trait]
 impl SpanExporter for StdoutExporter {
-    async fn export(&self, _span: &Span) -> Result<(), ModuleError> {
-        // TODO: Implement — print span as JSON to stdout
-        todo!()
+    async fn export(&self, span: &Span) -> Result<(), ModuleError> {
+        let json = serde_json::to_string(span).map_err(|e| {
+            ModuleError::new(
+                crate::errors::ErrorCode::GeneralInternalError,
+                format!("Failed to serialize span: {}", e),
+            )
+        })?;
+        println!("{}", json);
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), ModuleError> {
@@ -23,23 +30,36 @@ impl SpanExporter for StdoutExporter {
     }
 }
 
+/// Default maximum spans for InMemoryExporter.
+const DEFAULT_MAX_SPANS: usize = 1000;
+
 /// Exports spans to an in-memory buffer for testing.
 #[derive(Debug, Clone)]
 pub struct InMemoryExporter {
-    spans: Arc<Mutex<Vec<Span>>>,
+    spans: Arc<Mutex<VecDeque<Span>>>,
+    max_spans: usize,
 }
 
 impl InMemoryExporter {
-    /// Create a new in-memory exporter.
+    /// Create a new in-memory exporter with default capacity.
     pub fn new() -> Self {
         Self {
-            spans: Arc::new(Mutex::new(vec![])),
+            spans: Arc::new(Mutex::new(VecDeque::new())),
+            max_spans: DEFAULT_MAX_SPANS,
+        }
+    }
+
+    /// Create with explicit max spans capacity.
+    pub fn with_max_spans(max_spans: usize) -> Self {
+        Self {
+            spans: Arc::new(Mutex::new(VecDeque::new())),
+            max_spans,
         }
     }
 
     /// Get all exported spans.
     pub fn get_spans(&self) -> Vec<Span> {
-        self.spans.lock().unwrap().clone()
+        self.spans.lock().unwrap().iter().cloned().collect()
     }
 
     /// Clear all exported spans.
@@ -57,8 +77,12 @@ impl Default for InMemoryExporter {
 #[async_trait]
 impl SpanExporter for InMemoryExporter {
     async fn export(&self, span: &Span) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        let mut spans = self.spans.lock().unwrap();
+        spans.push_back(span.clone());
+        while spans.len() > self.max_spans {
+            spans.pop_front();
+        }
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), ModuleError> {
@@ -67,6 +91,8 @@ impl SpanExporter for InMemoryExporter {
 }
 
 /// Exports spans to an OTLP-compatible endpoint.
+/// Note: Full HTTP transport requires an HTTP client dependency.
+/// This is a placeholder that logs the intent.
 #[derive(Debug)]
 pub struct OTLPExporter {
     pub endpoint: String,
@@ -83,9 +109,14 @@ impl OTLPExporter {
 
 #[async_trait]
 impl SpanExporter for OTLPExporter {
-    async fn export(&self, _span: &Span) -> Result<(), ModuleError> {
-        // TODO: Implement — HTTP POST to OTLP endpoint
-        todo!()
+    async fn export(&self, span: &Span) -> Result<(), ModuleError> {
+        // Placeholder: OTLP export requires an HTTP client (e.g., reqwest).
+        // Log the span that would be exported.
+        eprintln!(
+            "OTLPExporter: would export span {} to {}",
+            span.span_id, self.endpoint
+        );
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), ModuleError> {

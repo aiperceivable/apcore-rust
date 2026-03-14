@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::errors::ModuleError;
+use crate::errors::{ErrorCode, ModuleError};
 
 /// Strategy for loading schemas when both YAML and native definitions exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +43,33 @@ impl SchemaLoader {
 
     /// Load a schema from a JSON/YAML file.
     pub fn load_from_file(&mut self, name: &str, path: &Path) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            ModuleError::new(
+                ErrorCode::SchemaNotFound,
+                format!("Failed to read schema file '{}': {}", path.display(), e),
+            )
+        })?;
+
+        // Determine format from extension; default to YAML (which also handles JSON).
+        let value: serde_json::Value = if path.extension().is_some_and(|ext| ext == "json") {
+            serde_json::from_str(&contents).map_err(|e| {
+                ModuleError::new(
+                    ErrorCode::SchemaParseError,
+                    format!("Failed to parse JSON schema '{}': {}", path.display(), e),
+                )
+            })?
+        } else {
+            // YAML parser handles both .yaml/.yml (and is a superset of JSON)
+            serde_yaml::from_str(&contents).map_err(|e| {
+                ModuleError::new(
+                    ErrorCode::SchemaParseError,
+                    format!("Failed to parse YAML schema '{}': {}", path.display(), e),
+                )
+            })?
+        };
+
+        self.schemas.insert(name.to_string(), value);
+        Ok(())
     }
 
     /// Load a schema from a JSON value.
@@ -53,8 +78,8 @@ impl SchemaLoader {
         name: &str,
         schema: serde_json::Value,
     ) -> Result<(), ModuleError> {
-        // TODO: Implement
-        todo!()
+        self.schemas.insert(name.to_string(), schema);
+        Ok(())
     }
 
     /// Get a loaded schema by name.

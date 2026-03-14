@@ -39,7 +39,7 @@ impl Module for AddModule {
         "Add two integers"
     }
 
-    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let a = input["a"].as_i64().unwrap_or(0);
         let b = input["b"].as_i64().unwrap_or(0);
         Ok(json!({ "result": a + b }))
@@ -78,7 +78,7 @@ impl Module for GreetModule {
         "Greet a user"
     }
 
-    async fn execute(&self, _ctx: &Context<Value>, input: Value) -> Result<Value, ModuleError> {
+    async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         let name = input["name"].as_str().unwrap_or("World");
         let greeting = input["greeting"].as_str().unwrap_or("Hello");
         Ok(json!({ "message": format!("{}, {}!", greeting, name) }))
@@ -108,21 +108,21 @@ async fn main() {
 
     // Execute math.add
     let result = add_module
-        .execute(&ctx, json!({"a": 10, "b": 5}))
+        .execute(json!({"a": 10, "b": 5}), &ctx)
         .await
         .unwrap();
     println!("math.add result:  {result}"); // {"result":15}
 
     // Execute greet
     let result = greet_module
-        .execute(&ctx, json!({"name": "Alice", "greeting": "Hi"}))
+        .execute(json!({"name": "Alice", "greeting": "Hi"}), &ctx)
         .await
         .unwrap();
     println!("greet result:     {result}"); // {"message":"Hi, Alice!"}
 
     // Default greeting
     let result = greet_module
-        .execute(&ctx, json!({"name": "Bob"}))
+        .execute(json!({"name": "Bob"}), &ctx)
         .await
         .unwrap();
     println!("greet (default):  {result}"); // {"message":"Hello, Bob!"}
