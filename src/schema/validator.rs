@@ -60,6 +60,7 @@ impl SchemaValidator {
     }
 
     /// Recursively validate a value against a schema node, collecting errors.
+    #[allow(clippy::only_used_in_recursion)]
     fn validate_inner(
         &self,
         value: &serde_json::Value,

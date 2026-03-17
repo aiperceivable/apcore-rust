@@ -8,7 +8,7 @@ use apcore::errors::ErrorCode;
 #[test]
 fn test_error_code_variants_exist() {
     // Verify all critical ErrorCode variants are defined.
-    let codes = vec![
+    let codes = [
         ErrorCode::ConfigNotFound,
         ErrorCode::ConfigInvalid,
         ErrorCode::AclRuleError,

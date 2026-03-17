@@ -28,7 +28,7 @@ fn test_error_code_deserialization() {
 #[test]
 fn test_all_error_codes_defined() {
     // Verify the full set matches the protocol spec (37 codes).
-    let codes = vec![
+    let codes = [
         ErrorCode::ConfigNotFound,
         ErrorCode::ConfigInvalid,
         ErrorCode::AclRuleError,
