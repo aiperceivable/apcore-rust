@@ -6,11 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 > **Note on versioning:** This crate starts at `0.13.0` rather than `0.1.0` to stay in sync
-> with the [apcore-python](https://github.com/aipartnerup/apcore-python) and
-> [apcore-typescript](https://github.com/aipartnerup/apcore-typescript) packages.
+> with the [apcore-python](https://github.com/aiperceivable/apcore-python) and
+> [apcore-typescript](https://github.com/aiperceivable/apcore-typescript) packages.
 > All three SDKs implement the same protocol specification and share a unified version line.
 
 ---
+
+## [0.13.1] - 2026-03-22
+
+### Changed
+- Rebrand: aipartnerup → aiperceivable
 
 ## [0.13.0] - 2026-03-12
 

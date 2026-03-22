@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aipartnerup/apcore/main/apcore-logo.svg" alt="apcore logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aiperceivable/apcore/main/apcore-logo.svg" alt="apcore logo" width="200"/>
 </div>
 
 # apcore
@@ -96,7 +96,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 ## Documentation
 
 For full documentation, including Quick Start guides for Python and Rust, visit:
-**[https://aipartnerup.github.io/apcore/getting-started.html](https://aipartnerup.github.io/apcore/getting-started.html)**
+**[https://aiperceivable.github.io/apcore/getting-started.html](https://aiperceivable.github.io/apcore/getting-started.html)**
 
 ## Requirements
 
@@ -597,7 +597,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### Clone and build
 
 ```bash
-git clone https://github.com/aipartnerup/apcore-rust.git
+git clone https://github.com/aiperceivable/apcore-rust.git
 cd apcore-rust
 cargo build
 ```
@@ -645,9 +645,9 @@ Apache-2.0
 
 ## Links
 
-- **Documentation**: [https://aipartnerup.github.io/apcore/](https://aipartnerup.github.io/apcore/)
-- **Website**: [aipartnerup.com](https://aipartnerup.com)
-- **GitHub**: [aipartnerup/apcore-rust](https://github.com/aipartnerup/apcore-rust)
+- **Documentation**: [https://aiperceivable.github.io/apcore/](https://aiperceivable.github.io/apcore/)
+- **Website**: [aiperceivable.com](https://aiperceivable.com)
+- **GitHub**: [aiperceivable/apcore-rust](https://github.com/aiperceivable/apcore-rust)
 - **crates.io**: [apcore](https://crates.io/crates/apcore)
-- **Issues**: [GitHub Issues](https://github.com/aipartnerup/apcore-rust/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/aipartnerup/apcore-rust/discussions)
+- **Issues**: [GitHub Issues](https://github.com/aiperceivable/apcore-rust/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/aiperceivable/apcore-rust/discussions)

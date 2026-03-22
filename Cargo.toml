@@ -1,14 +1,14 @@
 [package]
 name = "apcore"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 description = "Schema-driven module standard for AI-perceivable interfaces"
 license = "Apache-2.0"
 readme = "README.md"
-authors = ["aipartnerup <tercel.yi@gmail.com>"]
-homepage = "https://aipartnerup.com"
-repository = "https://github.com/aipartnerup/apcore-rust"
-documentation = "https://apcore.aipartnerup.com/"
+authors = ["aiperceivable <tercel.yi@gmail.com>"]
+homepage = "https://aiperceivable.com"
+repository = "https://github.com/aiperceivable/apcore-rust"
+documentation = "https://apcore.aiperceivable.com/"
 keywords = ["ai", "llm", "module", "middleware", "schema"]
 categories = [
     "api-bindings",
