@@ -11,15 +11,20 @@ use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
 
 /// Strategy for deciding which spans to sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SamplingStrategy {
-    /// Sample all spans (Python: "full").
+    /// Sample all spans (serializes as "full").
+    #[serde(rename = "full")]
     Always,
-    /// Sample spans at the configured rate (Python: "proportional").
+    /// Sample spans at the configured rate (serializes as "proportional").
+    #[serde(rename = "proportional")]
     Probabilistic,
-    /// Sample errors always, success at rate (Python: "error_first").
+    /// Sample errors always, success at rate (serializes as "error_first").
+    #[serde(rename = "error_first")]
     ErrorFirst,
-    /// Never sample spans (Python: "off").
+    /// Never sample spans (serializes as "off").
+    #[serde(rename = "off")]
     Never,
 }
 

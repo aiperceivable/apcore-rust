@@ -26,9 +26,21 @@ impl MiddlewareManager {
     }
 
     /// Add a middleware to the pipeline.
+    ///
+    /// Middlewares are maintained in sorted order by priority (higher first).
+    /// Among middlewares with the same priority, registration order is preserved.
     pub fn add(&mut self, middleware: Box<dyn Middleware>) {
         let mut mws = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
-        mws.push(Arc::from(middleware));
+        let priority = middleware.priority();
+        let arc: Arc<dyn Middleware> = Arc::from(middleware);
+        // Find the first position where existing priority is strictly less than
+        // the new priority. Insert before that position to maintain stable
+        // ordering (later registrations go after earlier ones at same priority).
+        let pos = mws
+            .iter()
+            .position(|m| m.priority() < priority)
+            .unwrap_or(mws.len());
+        mws.insert(pos, arc);
     }
 
     /// Remove the first middleware matching the given name.
@@ -178,5 +190,118 @@ impl MiddlewareManager {
 impl Default for MiddlewareManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Context;
+    use crate::errors::ModuleError;
+    use async_trait::async_trait;
+
+    /// Simple test middleware with configurable name and priority.
+    #[derive(Debug)]
+    struct TestMiddleware {
+        mw_name: String,
+        mw_priority: u16,
+    }
+
+    impl TestMiddleware {
+        fn new(name: &str, priority: u16) -> Self {
+            Self {
+                mw_name: name.to_string(),
+                mw_priority: priority,
+            }
+        }
+
+        fn boxed(name: &str, priority: u16) -> Box<Self> {
+            Box::new(Self::new(name, priority))
+        }
+    }
+
+    #[async_trait]
+    impl Middleware for TestMiddleware {
+        fn name(&self) -> &str {
+            &self.mw_name
+        }
+
+        fn priority(&self) -> u16 {
+            self.mw_priority
+        }
+
+        async fn before(
+            &self,
+            _module_id: &str,
+            _inputs: serde_json::Value,
+            _ctx: &Context<serde_json::Value>,
+        ) -> Result<Option<serde_json::Value>, ModuleError> {
+            Ok(None)
+        }
+
+        async fn after(
+            &self,
+            _module_id: &str,
+            _inputs: serde_json::Value,
+            _output: serde_json::Value,
+            _ctx: &Context<serde_json::Value>,
+        ) -> Result<Option<serde_json::Value>, ModuleError> {
+            Ok(None)
+        }
+
+        async fn on_error(
+            &self,
+            _module_id: &str,
+            _inputs: serde_json::Value,
+            _error: &ModuleError,
+            _ctx: &Context<serde_json::Value>,
+        ) -> Result<Option<serde_json::Value>, ModuleError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_higher_priority_executes_first_in_before() {
+        let mut mgr = MiddlewareManager::new();
+        mgr.add(TestMiddleware::boxed("low", 1));
+        mgr.add(TestMiddleware::boxed("high", 10));
+        mgr.add(TestMiddleware::boxed("mid", 5));
+
+        let names = mgr.snapshot();
+        assert_eq!(names, vec!["high", "mid", "low"]);
+    }
+
+    #[test]
+    fn test_equal_priority_preserves_registration_order() {
+        let mut mgr = MiddlewareManager::new();
+        mgr.add(TestMiddleware::boxed("first", 5));
+        mgr.add(TestMiddleware::boxed("second", 5));
+        mgr.add(TestMiddleware::boxed("third", 5));
+
+        let names = mgr.snapshot();
+        assert_eq!(names, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn test_default_priority_orders_after_explicit_priority() {
+        let mut mgr = MiddlewareManager::new();
+        mgr.add(TestMiddleware::boxed("default_a", 0));
+        mgr.add(TestMiddleware::boxed("explicit", 1));
+        mgr.add(TestMiddleware::boxed("default_b", 0));
+
+        let names = mgr.snapshot();
+        assert_eq!(names, vec!["explicit", "default_a", "default_b"]);
+    }
+
+    #[test]
+    fn test_snapshot_reflects_priority_sorted_order() {
+        let mut mgr = MiddlewareManager::new();
+        mgr.add(TestMiddleware::boxed("d", 0));
+        mgr.add(TestMiddleware::boxed("a", 100));
+        mgr.add(TestMiddleware::boxed("c", 5));
+        mgr.add(TestMiddleware::boxed("b", 50));
+
+        let names = mgr.snapshot();
+        assert_eq!(names, vec!["a", "b", "c", "d"]);
     }
 }

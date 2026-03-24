@@ -16,6 +16,13 @@ use crate::middleware::manager::MiddlewareManager;
 use crate::registry::registry::Registry;
 use crate::utils::guard_call_chain;
 
+/// Result of a validate() call. Preflight warnings are advisory and never block.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationResult {
+    /// Warnings collected from preflight checks (advisory, never blocking).
+    pub warnings: Vec<String>,
+}
+
 /// Responsible for executing modules with middleware, ACL, and context management.
 #[derive(Debug)]
 pub struct Executor {
@@ -127,10 +134,10 @@ impl Executor {
             self.config.max_module_repeat as usize,
         )?;
 
-        // Step 3: Create child context (adds module_id to call_chain)
+        // Create child context (adds module_id to call_chain)
         let child_ctx = parent_ctx.child(module_id);
 
-        // Step 4: Module Lookup
+        // Step 3: Module Lookup
         let module = self.registry.get(module_id).ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ModuleNotFound,
@@ -283,12 +290,15 @@ impl Executor {
         self.call(module_id, inputs, ctx, version_hint).await
     }
 
-    /// Validate module inputs without executing (steps 1-6 only).
+    /// Validate module inputs without executing (steps 1-7).
+    ///
+    /// Returns a `ValidationResult` containing any preflight warnings.
+    /// Preflight failures are advisory and never block validation.
     pub async fn validate(
         &self,
         module_id: &str,
         inputs: &serde_json::Value,
-    ) -> Result<(), ModuleError> {
+    ) -> Result<ValidationResult, ModuleError> {
         // Step 1: Context
         let default_ctx = Context::<serde_json::Value>::new(Identity {
             id: "@external".to_string(),
@@ -305,11 +315,11 @@ impl Executor {
             self.config.max_module_repeat as usize,
         )?;
 
-        // Step 3: Create child context
+        // Create child context
         let child_ctx = default_ctx.child(module_id);
 
-        // Step 4: Module Lookup
-        let _module = self.registry.get(module_id).ok_or_else(|| {
+        // Step 3: Module Lookup
+        let module = self.registry.get(module_id).ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ModuleNotFound,
                 format!("Module '{}' not found in registry", module_id),
@@ -361,7 +371,31 @@ impl Executor {
 
         // Step 6: Input Validation — pass through for now
 
-        Ok(())
+        // Step 7: Module Preflight (optional, advisory) — collect warnings, never block
+        let mut result = ValidationResult::default();
+        let preflight_result = module.preflight();
+        if !preflight_result.passed {
+            let failed_checks: Vec<String> = preflight_result
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| {
+                    c.message
+                        .clone()
+                        .unwrap_or_else(|| format!("Check '{}' failed", c.name))
+                })
+                .collect();
+            for warning in failed_checks {
+                tracing::warn!(
+                    module_id = module_id,
+                    warning = %warning,
+                    "Preflight check warning (advisory)"
+                );
+                result.warnings.push(warning);
+            }
+        }
+
+        Ok(result)
     }
 
     /// Check call depth limits before execution.

@@ -38,7 +38,7 @@ pub use config::Config;
 pub use context::{Context, ContextFactory, Identity};
 pub use errors::{ErrorCode, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
-pub use executor::Executor;
+pub use executor::{Executor, ValidationResult};
 pub use module::Module;
 pub use observability::logging::ContextLogger;
 pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};

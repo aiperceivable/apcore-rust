@@ -192,21 +192,21 @@ impl MetricsCollector {
         let mut labels = HashMap::new();
         labels.insert("module".to_string(), module_name.to_string());
         labels.insert("status".to_string(), status.to_string());
-        self.increment("apcore_calls_total", labels, 1.0);
+        self.increment("apcore_module_calls_total", labels, 1.0);
     }
 
     /// Convenience: increment error counter.
     pub fn increment_errors(&self, module_name: &str) {
         let mut labels = HashMap::new();
         labels.insert("module".to_string(), module_name.to_string());
-        self.increment("apcore_errors_total", labels, 1.0);
+        self.increment("apcore_module_errors_total", labels, 1.0);
     }
 
     /// Convenience: observe call duration.
     pub fn observe_duration(&self, module_name: &str, duration_secs: f64) {
         let mut labels = HashMap::new();
         labels.insert("module".to_string(), module_name.to_string());
-        self.observe("apcore_duration_seconds", labels, duration_secs);
+        self.observe("apcore_module_duration_seconds", labels, duration_secs);
     }
 }
 

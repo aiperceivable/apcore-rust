@@ -88,10 +88,16 @@ impl PlatformNotifyMiddleware {
             None => return 0.0,
         };
 
-        // Look for counters matching apcore_calls_total with module label.
+        // Look for counters matching apcore_module_calls_total with module label.
         // Keys are formatted as "name|key=value,key=value".
-        let total_key = format!("apcore_calls_total|module={},status=success", module_id);
-        let error_key = format!("apcore_calls_total|module={},status=error", module_id);
+        let total_key = format!(
+            "apcore_module_calls_total|module={},status=success",
+            module_id
+        );
+        let error_key = format!(
+            "apcore_module_calls_total|module={},status=error",
+            module_id
+        );
 
         let success = counters
             .get(&total_key)

@@ -20,6 +20,12 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
     /// Name of this middleware for logging/debugging.
     fn name(&self) -> &str;
 
+    /// Priority of this middleware (higher runs first). Default is 0.
+    /// When two middlewares have the same priority, registration order is preserved.
+    fn priority(&self) -> u16 {
+        0
+    }
+
     /// Called before module execution. Can modify input.
     /// Return `Ok(None)` to pass through unchanged, `Ok(Some(v))` to modify.
     async fn before(
