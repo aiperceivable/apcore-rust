@@ -3,11 +3,13 @@
 
 pub mod adapters;
 pub mod base;
+pub mod logging;
 pub mod manager;
 pub mod retry;
 
 pub use adapters::{AfterMiddleware, BeforeMiddleware};
 pub use base::Middleware;
+pub use logging::LoggingMiddleware;
 pub use manager::MiddlewareManager;
 pub use retry::{RetryConfig, RetryMiddleware};
 

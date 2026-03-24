@@ -134,7 +134,12 @@ impl ContextLogger {
                 }
                 if let Some(extra_map) = extra {
                     for (k, v) in extra_map {
-                        record.insert(k.clone(), v.clone());
+                        if k.starts_with("_secret_") {
+                            record
+                                .insert(k.clone(), serde_json::Value::String(REDACTED.to_string()));
+                        } else {
+                            record.insert(k.clone(), v.clone());
+                        }
                     }
                 }
                 let json_str =

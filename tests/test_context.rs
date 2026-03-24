@@ -64,10 +64,10 @@ fn test_context_new_has_unique_trace_id() {
 }
 
 #[test]
-fn test_context_initial_call_depth_is_zero() {
+fn test_context_initial_call_chain_length_is_zero() {
     let id = make_identity("user-1", "Alice", vec![]);
     let ctx: Context<Value> = Context::new(id);
-    assert_eq!(ctx.call_depth, 0);
+    assert_eq!(ctx.call_chain.len(), 0);
 }
 
 #[test]
@@ -88,8 +88,9 @@ fn test_context_no_parent_by_default() {
 fn test_context_identity_is_preserved() {
     let id = make_identity("svc-42", "MyService", vec!["reader"]);
     let ctx: Context<Value> = Context::new(id);
-    assert_eq!(ctx.identity.id, "svc-42");
-    assert_eq!(ctx.identity.roles, vec!["reader"]);
+    let identity = ctx.identity.as_ref().expect("identity should be Some");
+    assert_eq!(identity.id, "svc-42");
+    assert_eq!(identity.roles, vec!["reader"]);
 }
 
 #[test]
@@ -112,5 +113,56 @@ fn test_context_with_cancel_token() {
 fn test_context_data_starts_empty() {
     let id = make_identity("user-1", "Alice", vec![]);
     let ctx: Context<Value> = Context::new(id);
-    assert!(ctx.data.is_empty());
+    assert!(ctx.data.read().unwrap().is_empty());
+}
+
+#[test]
+fn test_anonymous_context_has_none_identity() {
+    let ctx: Context<Value> = Context::anonymous();
+    assert!(ctx.identity.is_none());
+    assert!(ctx.call_chain.is_empty());
+}
+
+#[test]
+fn test_shared_data_between_parent_and_child() {
+    let id = make_identity("user-1", "Alice", vec![]);
+    let parent: Context<Value> = Context::new(id);
+    let child = parent.child("child_mod");
+
+    // Write to parent's data
+    parent
+        .data
+        .write()
+        .unwrap()
+        .insert("key".to_string(), serde_json::json!("from_parent"));
+
+    // Read from child's data — should see parent's write since they share Arc
+    let child_data = child.data.read().unwrap();
+    assert_eq!(
+        child_data.get("key").unwrap(),
+        &serde_json::json!("from_parent")
+    );
+}
+
+#[test]
+fn test_context_serde_roundtrip() {
+    let id = make_identity("user-1", "Alice", vec!["admin"]);
+    let ctx: Context<Value> = Context::new(id);
+    ctx.data
+        .write()
+        .unwrap()
+        .insert("foo".to_string(), serde_json::json!(42));
+
+    let json = serde_json::to_value(&ctx).unwrap();
+    let restored: Context<Value> = serde_json::from_value(json).unwrap();
+
+    assert_eq!(restored.trace_id, ctx.trace_id);
+    assert_eq!(
+        restored.identity.as_ref().unwrap().id,
+        ctx.identity.as_ref().unwrap().id
+    );
+    assert_eq!(
+        restored.data.read().unwrap().get("foo"),
+        Some(&serde_json::json!(42))
+    );
 }

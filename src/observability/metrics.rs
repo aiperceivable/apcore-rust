@@ -188,24 +188,25 @@ impl MetricsCollector {
     }
 
     /// Convenience: increment call counter.
-    pub fn increment_calls(&self, module_name: &str, status: &str) {
+    pub fn increment_calls(&self, module_id: &str, status: &str) {
         let mut labels = HashMap::new();
-        labels.insert("module".to_string(), module_name.to_string());
+        labels.insert("module_id".to_string(), module_id.to_string());
         labels.insert("status".to_string(), status.to_string());
         self.increment("apcore_module_calls_total", labels, 1.0);
     }
 
     /// Convenience: increment error counter.
-    pub fn increment_errors(&self, module_name: &str) {
+    pub fn increment_errors(&self, module_id: &str, error_code: &str) {
         let mut labels = HashMap::new();
-        labels.insert("module".to_string(), module_name.to_string());
+        labels.insert("module_id".to_string(), module_id.to_string());
+        labels.insert("error_code".to_string(), error_code.to_string());
         self.increment("apcore_module_errors_total", labels, 1.0);
     }
 
     /// Convenience: observe call duration.
-    pub fn observe_duration(&self, module_name: &str, duration_secs: f64) {
+    pub fn observe_duration(&self, module_id: &str, duration_secs: f64) {
         let mut labels = HashMap::new();
-        labels.insert("module".to_string(), module_name.to_string());
+        labels.insert("module_id".to_string(), module_id.to_string());
         self.observe("apcore_module_duration_seconds", labels, duration_secs);
     }
 }
@@ -306,8 +307,9 @@ impl Middleware for MetricsMiddleware {
                 .unwrap_or(0.0)
         };
 
+        let error_code = format!("{:?}", _error.code);
         self.collector.increment_calls(module_id, "error");
-        self.collector.increment_errors(module_id);
+        self.collector.increment_errors(module_id, &error_code);
         self.collector.observe_duration(module_id, duration_secs);
 
         Ok(None)

@@ -20,10 +20,11 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
     /// Name of this middleware for logging/debugging.
     fn name(&self) -> &str;
 
-    /// Priority of this middleware (higher runs first). Default is 0.
+    /// Priority of this middleware (higher runs first). Default is 100.
+    /// Valid range: 0-1000 (enforced by MiddlewareManager::add).
     /// When two middlewares have the same priority, registration order is preserved.
     fn priority(&self) -> u16 {
-        0
+        100
     }
 
     /// Called before module execution. Can modify input.

@@ -1,6 +1,6 @@
 [package]
 name = "apcore"
-version = "0.13.2"
+version = "0.14.0"
 edition = "2021"
 description = "Schema-driven module standard for AI-perceivable interfaces"
 license = "Apache-2.0"
@@ -34,6 +34,7 @@ thiserror = "2"
 async-trait = "0.1"
 tracing = "0.1"
 regex = "1"
+jsonschema = "0.28"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -161,8 +161,13 @@ impl APCore {
     }
 
     /// Add a middleware to the execution pipeline.
-    pub fn use_middleware(&mut self, middleware: Box<dyn Middleware>) {
-        self.executor.use_middleware(middleware);
+    ///
+    /// Returns an error if the middleware's priority exceeds the allowed range.
+    pub fn use_middleware(
+        &mut self,
+        middleware: Box<dyn Middleware>,
+    ) -> Result<(), crate::errors::ModuleError> {
+        self.executor.use_middleware(middleware)
     }
 
     /// Remove a middleware by name.
@@ -255,12 +260,18 @@ impl APCore {
     }
 
     /// Add a before callback middleware.
-    pub fn use_before(&mut self, middleware: Box<dyn BeforeMiddleware>) {
-        self.executor.use_before(middleware);
+    pub fn use_before(
+        &mut self,
+        middleware: Box<dyn BeforeMiddleware>,
+    ) -> Result<(), crate::errors::ModuleError> {
+        self.executor.use_before(middleware)
     }
 
     /// Add an after callback middleware.
-    pub fn use_after(&mut self, middleware: Box<dyn AfterMiddleware>) {
-        self.executor.use_after(middleware);
+    pub fn use_after(
+        &mut self,
+        middleware: Box<dyn AfterMiddleware>,
+    ) -> Result<(), crate::errors::ModuleError> {
+        self.executor.use_after(middleware)
     }
 }

@@ -310,10 +310,15 @@ impl ACL {
         };
 
         // identity_types: list of allowed identity types (OR match).
+        // If identity is None (anonymous), no identity type can match.
         if let Some(identity_types) = obj.get("identity_types") {
             if let Some(arr) = identity_types.as_array() {
-                let id_type = &ctx.identity.identity_type;
-                let matched = arr.iter().any(|v| v.as_str().is_some_and(|s| s == id_type));
+                let matched = match &ctx.identity {
+                    Some(id) => arr
+                        .iter()
+                        .any(|v| v.as_str().is_some_and(|s| s == id.identity_type)),
+                    None => false, // anonymous caller has no identity type
+                };
                 if !matched {
                     return false;
                 }
@@ -321,23 +326,26 @@ impl ACL {
         }
 
         // roles: list of required roles (any match).
+        // If identity is None (anonymous), no roles can match.
         if let Some(roles) = obj.get("roles") {
             if let Some(arr) = roles.as_array() {
-                let ctx_roles = &ctx.identity.roles;
-                let matched = arr.iter().any(|v| {
-                    v.as_str()
-                        .is_some_and(|s| ctx_roles.contains(&s.to_string()))
-                });
+                let matched = match &ctx.identity {
+                    Some(id) => arr.iter().any(|v| {
+                        v.as_str()
+                            .is_some_and(|s| id.roles.contains(&s.to_string()))
+                    }),
+                    None => false, // anonymous caller has no roles
+                };
                 if !matched {
                     return false;
                 }
             }
         }
 
-        // max_call_depth: context call_depth must not exceed this.
+        // max_call_depth: call_chain length must not exceed this.
         if let Some(max_depth) = obj.get("max_call_depth") {
             if let Some(max) = max_depth.as_u64() {
-                if (ctx.call_depth as u64) > max {
+                if (ctx.call_chain.len() as u64) > max {
                     return false;
                 }
             }
@@ -366,9 +374,11 @@ impl ACL {
             reason: reason.to_string(),
             matched_rule: matched_rule_desc.map(|s| s.to_string()),
             matched_rule_index,
-            identity_type: ctx.map(|c| c.identity.identity_type.clone()),
-            roles: ctx.map(|c| c.identity.roles.clone()).unwrap_or_default(),
-            call_depth: ctx.map(|c| c.call_depth as usize),
+            identity_type: ctx.and_then(|c| c.identity.as_ref().map(|id| id.identity_type.clone())),
+            roles: ctx
+                .and_then(|c| c.identity.as_ref().map(|id| id.roles.clone()))
+                .unwrap_or_default(),
+            call_depth: ctx.map(|c| c.call_chain.len()),
             trace_id: ctx.map(|c| c.trace_id.clone()),
         }
     }

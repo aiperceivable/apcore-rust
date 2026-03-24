@@ -29,9 +29,28 @@ impl MiddlewareManager {
     ///
     /// Middlewares are maintained in sorted order by priority (higher first).
     /// Among middlewares with the same priority, registration order is preserved.
-    pub fn add(&mut self, middleware: Box<dyn Middleware>) {
-        let mut mws = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
+    ///
+    /// Returns an error if the middleware's priority exceeds 1000 (the spec-defined
+    /// maximum from section 11.2).
+    pub fn add(&mut self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
         let priority = middleware.priority();
+        if priority > 1000 {
+            tracing::warn!(
+                middleware = middleware.name(),
+                priority = priority,
+                "Middleware rejected: priority {} exceeds maximum 1000",
+                priority,
+            );
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Middleware '{}' has priority {} which exceeds the maximum allowed value of 1000",
+                    middleware.name(),
+                    priority,
+                ),
+            ));
+        }
+        let mut mws = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
         let arc: Arc<dyn Middleware> = Arc::from(middleware);
         // Find the first position where existing priority is strictly less than
         // the new priority. Insert before that position to maintain stable
@@ -41,6 +60,7 @@ impl MiddlewareManager {
             .position(|m| m.priority() < priority)
             .unwrap_or(mws.len());
         mws.insert(pos, arc);
+        Ok(())
     }
 
     /// Remove the first middleware matching the given name.
@@ -263,9 +283,9 @@ mod tests {
     #[test]
     fn test_higher_priority_executes_first_in_before() {
         let mut mgr = MiddlewareManager::new();
-        mgr.add(TestMiddleware::boxed("low", 1));
-        mgr.add(TestMiddleware::boxed("high", 10));
-        mgr.add(TestMiddleware::boxed("mid", 5));
+        mgr.add(TestMiddleware::boxed("low", 1)).unwrap();
+        mgr.add(TestMiddleware::boxed("high", 10)).unwrap();
+        mgr.add(TestMiddleware::boxed("mid", 5)).unwrap();
 
         let names = mgr.snapshot();
         assert_eq!(names, vec!["high", "mid", "low"]);
@@ -274,9 +294,9 @@ mod tests {
     #[test]
     fn test_equal_priority_preserves_registration_order() {
         let mut mgr = MiddlewareManager::new();
-        mgr.add(TestMiddleware::boxed("first", 5));
-        mgr.add(TestMiddleware::boxed("second", 5));
-        mgr.add(TestMiddleware::boxed("third", 5));
+        mgr.add(TestMiddleware::boxed("first", 5)).unwrap();
+        mgr.add(TestMiddleware::boxed("second", 5)).unwrap();
+        mgr.add(TestMiddleware::boxed("third", 5)).unwrap();
 
         let names = mgr.snapshot();
         assert_eq!(names, vec!["first", "second", "third"]);
@@ -285,9 +305,9 @@ mod tests {
     #[test]
     fn test_default_priority_orders_after_explicit_priority() {
         let mut mgr = MiddlewareManager::new();
-        mgr.add(TestMiddleware::boxed("default_a", 0));
-        mgr.add(TestMiddleware::boxed("explicit", 1));
-        mgr.add(TestMiddleware::boxed("default_b", 0));
+        mgr.add(TestMiddleware::boxed("default_a", 0)).unwrap();
+        mgr.add(TestMiddleware::boxed("explicit", 1)).unwrap();
+        mgr.add(TestMiddleware::boxed("default_b", 0)).unwrap();
 
         let names = mgr.snapshot();
         assert_eq!(names, vec!["explicit", "default_a", "default_b"]);
@@ -296,12 +316,34 @@ mod tests {
     #[test]
     fn test_snapshot_reflects_priority_sorted_order() {
         let mut mgr = MiddlewareManager::new();
-        mgr.add(TestMiddleware::boxed("d", 0));
-        mgr.add(TestMiddleware::boxed("a", 100));
-        mgr.add(TestMiddleware::boxed("c", 5));
-        mgr.add(TestMiddleware::boxed("b", 50));
+        mgr.add(TestMiddleware::boxed("d", 0)).unwrap();
+        mgr.add(TestMiddleware::boxed("a", 100)).unwrap();
+        mgr.add(TestMiddleware::boxed("c", 5)).unwrap();
+        mgr.add(TestMiddleware::boxed("b", 50)).unwrap();
 
         let names = mgr.snapshot();
         assert_eq!(names, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_add_rejects_priority_above_1000() {
+        let mut mgr = MiddlewareManager::new();
+        let result = mgr.add(TestMiddleware::boxed("over_limit", 1001));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("exceeds the maximum"),
+            "Expected error about priority limit, got: {}",
+            err.message,
+        );
+        // Pipeline should be empty — the middleware was not added.
+        assert!(mgr.snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_add_accepts_priority_at_1000() {
+        let mut mgr = MiddlewareManager::new();
+        mgr.add(TestMiddleware::boxed("at_limit", 1000)).unwrap();
+        assert_eq!(mgr.snapshot(), vec!["at_limit"]);
     }
 }

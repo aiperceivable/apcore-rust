@@ -221,8 +221,9 @@ async fn test_middleware_manager_pipeline_order() {
 
     let mut mgr = MiddlewareManager::new();
     // add() takes Box, so we verify snapshot order
-    mgr.add(Box::new(TrackingMiddleware::new("first")));
-    mgr.add(Box::new(TrackingMiddleware::new("second")));
+    mgr.add(Box::new(TrackingMiddleware::new("first"))).unwrap();
+    mgr.add(Box::new(TrackingMiddleware::new("second")))
+        .unwrap();
 
     let names = mgr.snapshot();
     assert_eq!(names, vec!["first", "second"]);
@@ -233,8 +234,8 @@ fn test_middleware_manager_remove() {
     use apcore::middleware::MiddlewareManager;
 
     let mut mgr = MiddlewareManager::new();
-    mgr.add(Box::new(TrackingMiddleware::new("alpha")));
-    mgr.add(Box::new(TrackingMiddleware::new("beta")));
+    mgr.add(Box::new(TrackingMiddleware::new("alpha"))).unwrap();
+    mgr.add(Box::new(TrackingMiddleware::new("beta"))).unwrap();
 
     assert!(mgr.remove("alpha"));
     assert!(!mgr.remove("alpha")); // already removed

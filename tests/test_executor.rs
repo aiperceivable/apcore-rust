@@ -108,7 +108,7 @@ async fn test_apcore_call_missing_module() {
 async fn test_apcore_middleware_before_and_after() {
     let mut client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
-    client.use_middleware(Box::new(PrefixMiddleware));
+    client.use_middleware(Box::new(PrefixMiddleware)).unwrap();
 
     let result = client
         .call("math.add", json!({"a": 1, "b": 2}), None, None)
@@ -125,7 +125,7 @@ async fn test_apcore_middleware_before_and_after() {
 async fn test_apcore_remove_middleware() {
     let mut client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
-    client.use_middleware(Box::new(PrefixMiddleware));
+    client.use_middleware(Box::new(PrefixMiddleware)).unwrap();
 
     // Remove the middleware
     let removed = client.remove("prefix");
