@@ -13,6 +13,7 @@ pub mod client;
 pub mod config;
 pub mod context;
 pub mod decorator;
+pub mod error_formatter;
 pub mod errors;
 pub mod events;
 pub mod executor;
@@ -34,7 +35,7 @@ pub use approval::{
 };
 pub use async_task::TaskStatus;
 pub use client::APCore;
-pub use config::Config;
+pub use config::{Config, ConfigMode, MountSource, NamespaceInfo, NamespaceRegistration};
 pub use context::{Context, ContextFactory, Identity};
 pub use errors::{ErrorCode, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
@@ -44,4 +45,6 @@ pub use observability::logging::ContextLogger;
 pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use registry::registry::Registry;
 pub use schema::{ExportProfile, SchemaDefinition, SchemaStrategy};
-pub use sys_modules::register_sys_modules;
+pub use sys_modules::{
+    check_module_disabled, is_module_disabled, register_sys_modules, SysModulesContext, ToggleState,
+};

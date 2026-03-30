@@ -1,11 +1,59 @@
 // APCore Protocol — Configuration
 // Spec reference: Configuration loading, validation, and environment variable overrides (Algorithm A12)
 
+use regex::Regex;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 
 use crate::errors::{ErrorCode, ModuleError};
+
+/// Configuration mode detected from YAML content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ConfigMode {
+    #[default]
+    Legacy,
+    Namespace,
+}
+
+/// Source for a `config.mount()` operation.
+pub enum MountSource {
+    Dict(serde_json::Value),
+    File(PathBuf),
+}
+
+/// Registration info for a Config Bus namespace.
+#[derive(Debug, Clone)]
+pub struct NamespaceRegistration {
+    pub name: String,
+    pub env_prefix: Option<String>,
+    pub defaults: Option<serde_json::Value>,
+    pub schema: Option<serde_json::Value>,
+}
+
+/// Summary of a registered namespace (returned by `registered_namespaces()`).
+#[derive(Debug, Clone)]
+pub struct NamespaceInfo {
+    pub name: String,
+    pub env_prefix: Option<String>,
+    pub has_schema: bool,
+}
+
+static GLOBAL_NS_REGISTRY: OnceLock<RwLock<HashMap<String, NamespaceRegistration>>> =
+    OnceLock::new();
+
+fn global_ns_registry() -> &'static RwLock<HashMap<String, NamespaceRegistration>> {
+    GLOBAL_NS_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
+
+fn reserved_env_prefix_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^APCORE_[A-Z0-9]").unwrap())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -27,6 +75,8 @@ pub struct Config {
     pub settings: HashMap<String, serde_json::Value>,
     #[serde(skip)]
     pub yaml_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub mode: ConfigMode,
 }
 
 impl Default for Config {
@@ -41,6 +91,7 @@ impl Default for Config {
             enable_metrics: false,
             settings: HashMap::new(),
             yaml_path: None,
+            mode: ConfigMode::default(),
         }
     }
 }
@@ -62,6 +113,8 @@ impl Config {
             )
         })?;
         config.apply_env_overrides();
+        config.detect_mode();
+        init_builtin_namespaces();
         config.validate()?;
         Ok(config)
     }
@@ -83,6 +136,8 @@ impl Config {
         })?;
         config.yaml_path = Some(path.to_path_buf());
         config.apply_env_overrides();
+        config.detect_mode();
+        init_builtin_namespaces();
         config.validate()?;
         Ok(config)
     }
@@ -133,7 +188,19 @@ impl Config {
     pub fn from_defaults() -> Self {
         let mut config = Self::default();
         config.apply_env_overrides();
+        config.detect_mode();
+        init_builtin_namespaces();
         config
+    }
+
+    /// Discover and load config using the §9.14 search order.
+    ///
+    /// If no file is found, returns `Config::from_defaults()`.
+    pub fn discover() -> Result<Self, ModuleError> {
+        match discover_config_file() {
+            Some(path) => Self::load(&path),
+            None => Ok(Self::from_defaults()),
+        }
     }
 
     /// Get a config value by dot-path key.
@@ -278,7 +345,110 @@ impl Config {
         serde_json::Value::Object(root)
     }
 
+    // --- Namespace registration (class methods) ---
+
+    pub fn register_namespace(reg: NamespaceRegistration) -> Result<(), ModuleError> {
+        if RESERVED_NAMESPACES.contains(&reg.name.as_str()) {
+            return Err(ModuleError::config_namespace_reserved(&reg.name));
+        }
+        if let Some(ref prefix) = reg.env_prefix {
+            if reserved_env_prefix_pattern().is_match(prefix) {
+                return Err(ModuleError::config_env_prefix_conflict(prefix));
+            }
+        }
+        let mut map = global_ns_registry()
+            .write()
+            .map_err(|_| ModuleError::config_mount_error(&reg.name, "registry lock poisoned"))?;
+        if map.contains_key(&reg.name) {
+            return Err(ModuleError::config_namespace_duplicate(&reg.name));
+        }
+        map.insert(reg.name.clone(), reg);
+        Ok(())
+    }
+
+    pub fn registered_namespaces() -> Vec<NamespaceInfo> {
+        global_ns_registry()
+            .read()
+            .map(|m| {
+                m.values()
+                    .map(|r| NamespaceInfo {
+                        name: r.name.clone(),
+                        env_prefix: r.env_prefix.clone(),
+                        has_schema: r.schema.is_some(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // --- Namespace instance methods ---
+
+    pub fn namespace(&self, name: &str) -> Option<serde_json::Value> {
+        self.settings.get(name).cloned()
+    }
+
+    pub fn mount(&mut self, namespace: &str, source: MountSource) -> Result<(), ModuleError> {
+        // W-2: Reject reserved namespace per §9.7 spec.
+        if namespace == "_config" {
+            return Err(ModuleError::config_mount_error(
+                namespace,
+                "cannot mount to reserved namespace '_config'",
+            ));
+        }
+        let data = match source {
+            MountSource::Dict(v) => v,
+            MountSource::File(path) => {
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| ModuleError::config_mount_error(namespace, &e.to_string()))?;
+                serde_yaml::from_str(&content)
+                    .map_err(|e| ModuleError::config_mount_error(namespace, &e.to_string()))?
+            }
+        };
+        if !data.is_object() {
+            return Err(ModuleError::config_mount_error(
+                namespace,
+                "mount source must be a JSON object",
+            ));
+        }
+        let entry = self
+            .settings
+            .entry(namespace.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let (Some(target), Some(source_map)) = (entry.as_object_mut(), data.as_object()) {
+            for (k, v) in source_map {
+                target.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn bind<T: DeserializeOwned>(&self, namespace: &str) -> Result<T, ModuleError> {
+        let value = self
+            .settings
+            .get(namespace)
+            .ok_or_else(|| ModuleError::config_bind_error(namespace, "namespace not found"))?;
+        serde_json::from_value(value.clone())
+            .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
+    }
+
+    pub fn get_typed<T: DeserializeOwned>(&self, key: &str) -> Result<T, ModuleError> {
+        let value = self
+            .get(key)
+            .ok_or_else(|| ModuleError::config_bind_error(key, "key not found"))?;
+        serde_json::from_value(value)
+            .map_err(|e| ModuleError::config_bind_error(key, &e.to_string()))
+    }
+
     // --- Private helpers ---
+
+    fn detect_mode(&mut self) {
+        // W-3: Only activate namespace mode when "apcore" key is a mapping.
+        // A null or scalar value is not a valid namespace indicator.
+        self.mode = match self.settings.get("apcore") {
+            Some(serde_json::Value::Object(_)) => ConfigMode::Namespace,
+            _ => ConfigMode::Legacy,
+        };
+    }
 
     /// Apply APCORE_* environment variable overrides to both typed fields and settings.
     fn apply_env_overrides(&mut self) {
@@ -424,4 +594,92 @@ impl Config {
         }
         serde_json::Value::String(value.to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in namespace initialization (§9.15)
+// ---------------------------------------------------------------------------
+
+fn init_builtin_namespaces() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let namespaces = vec![
+            NamespaceRegistration {
+                name: "observability".to_string(),
+                env_prefix: Some("APCORE__OBSERVABILITY".to_string()),
+                defaults: Some(serde_json::json!({
+                    "tracing": { "enabled": false, "sampling_rate": 1.0 },
+                    "metrics": { "enabled": false }
+                })),
+                schema: None,
+            },
+            NamespaceRegistration {
+                name: "sys_modules".to_string(),
+                env_prefix: Some("APCORE__SYS".to_string()),
+                defaults: Some(serde_json::json!({
+                    "enabled": false,
+                    "events": {
+                        "enabled": false,
+                        "subscribers": [],
+                        "thresholds": { "error_rate": 0.1, "latency_p99_ms": 5000.0 }
+                    },
+                    "error_history": {
+                        "max_entries_per_module": 50,
+                        "max_total_entries": 1000
+                    }
+                })),
+                schema: None,
+            },
+        ];
+        for ns in namespaces {
+            // Ignore duplicate errors on re-init
+            let _ = Config::register_namespace(ns);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Config discovery (§9.14)
+// ---------------------------------------------------------------------------
+
+fn discover_config_file() -> Option<std::path::PathBuf> {
+    if let Ok(env_path) = std::env::var("APCORE_CONFIG_FILE") {
+        if !env_path.is_empty() {
+            return Some(std::path::PathBuf::from(env_path));
+        }
+    }
+
+    let cwd_candidates = ["project.yaml", "project.yml", "apcore.yaml", "apcore.yml"];
+    for name in &cwd_candidates {
+        let p = std::path::Path::new(name);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+    }
+
+    if let Some(home) = dirs_home() {
+        #[cfg(target_os = "macos")]
+        let xdg = home
+            .join("Library")
+            .join("Application Support")
+            .join("apcore")
+            .join("config.yaml");
+        #[cfg(not(target_os = "macos"))]
+        let xdg = home.join(".config").join("apcore").join("config.yaml");
+
+        if xdg.exists() {
+            return Some(xdg);
+        }
+
+        let legacy = home.join(".apcore").join("config.yaml");
+        if legacy.exists() {
+            return Some(legacy);
+        }
+    }
+
+    None
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(std::path::PathBuf::from)
 }
