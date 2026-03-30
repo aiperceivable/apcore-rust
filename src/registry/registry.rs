@@ -533,6 +533,49 @@ impl Registry {
         ids.sort();
         ids
     }
+
+    /// Export the combined input/output schema for a module.
+    ///
+    /// Returns the cached schema JSON, or `None` if the module is not registered.
+    pub fn export_schema(&self, name: &str) -> Option<&serde_json::Value> {
+        self.schema_cache.get(name)
+    }
+
+    /// Mark a module as disabled in its descriptor.
+    ///
+    /// Disabled modules remain registered but callers should check `is_enabled()`
+    /// before dispatching. Returns an error if the module is not found.
+    pub fn disable(&mut self, name: &str) -> Result<(), ModuleError> {
+        let descriptor = self.descriptors.get_mut(name).ok_or_else(|| {
+            ModuleError::new(
+                crate::errors::ErrorCode::ModuleNotFound,
+                format!("Module '{}' not found", name),
+            )
+        })?;
+        descriptor.enabled = false;
+        Ok(())
+    }
+
+    /// Mark a module as enabled in its descriptor.
+    ///
+    /// Returns an error if the module is not found.
+    pub fn enable(&mut self, name: &str) -> Result<(), ModuleError> {
+        let descriptor = self.descriptors.get_mut(name).ok_or_else(|| {
+            ModuleError::new(
+                crate::errors::ErrorCode::ModuleNotFound,
+                format!("Module '{}' not found", name),
+            )
+        })?;
+        descriptor.enabled = true;
+        Ok(())
+    }
+
+    /// Return whether a module is enabled (per its descriptor).
+    ///
+    /// Returns `None` if the module is not registered.
+    pub fn is_enabled(&self, name: &str) -> Option<bool> {
+        self.descriptors.get(name).map(|d| d.enabled)
+    }
 }
 
 impl Default for Registry {

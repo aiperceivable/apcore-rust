@@ -4,7 +4,7 @@
 use crate::errors::{ErrorCode, ModuleError, VersionIncompatibleError};
 
 /// The current protocol version supported by this SDK.
-pub const PROTOCOL_VERSION: &str = "0.13.0";
+pub const PROTOCOL_VERSION: &str = "0.15.0";
 
 /// Parse a semver string into (major, minor, patch).
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
