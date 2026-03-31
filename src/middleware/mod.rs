@@ -37,7 +37,6 @@ pub struct PlatformNotifyMiddleware {
     emitter: EventEmitter,
     metrics_collector: Option<MetricsCollector>,
     error_rate_threshold: f64,
-    #[allow(dead_code)]
     latency_p99_threshold_ms: f64,
     /// Tracks which alert types are active per module to implement hysteresis.
     /// Key: module_id, Value: set of alert type strings ("error_rate", "latency").
@@ -131,7 +130,7 @@ impl PlatformNotifyMiddleware {
                     "threshold": self.error_rate_threshold,
                 }),
                 module_id,
-                "warning",
+                "error",
             );
             module_alerts.insert("error_rate".to_string());
             Some(event)
@@ -141,11 +140,51 @@ impl PlatformNotifyMiddleware {
     }
 
     /// Check latency threshold; returns an event to emit if p99 exceeds limit.
-    fn check_latency_threshold(&self, _module_id: &str) -> Option<ApCoreEvent> {
-        // Latency estimation requires histogram bucket data from MetricsCollector.
-        // The current Rust MetricsCollector does not expose histogram buckets,
-        // so this is a no-op placeholder that will activate when the metrics
-        // system supports histograms.
+    fn check_latency_threshold(&self, module_id: &str) -> Option<ApCoreEvent> {
+        let collector = self.metrics_collector.as_ref()?;
+        let snap = collector.snapshot();
+
+        let histograms = snap.get("histograms")?.as_object()?;
+        let hist_key = format!("apcore_module_duration_seconds|module_id={module_id}");
+        let data = histograms.get(&hist_key)?;
+
+        let count = data.get("count")?.as_u64().unwrap_or(0);
+        if count == 0 {
+            return None;
+        }
+
+        // Estimate p99 from cumulative histogram buckets.
+        let buckets = data.get("buckets")?.as_array()?;
+        let target = (count as f64 * 0.99).ceil() as u64;
+        let mut p99_sec = 0.0_f64;
+        for bucket in buckets {
+            let le = bucket
+                .get("le")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::INFINITY);
+            let cnt = bucket.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            if cnt >= target {
+                p99_sec = le;
+                break;
+            }
+        }
+        let p99_ms = p99_sec * 1000.0;
+
+        let mut alerted = self.alerted.lock().unwrap();
+        let module_alerts = alerted.entry(module_id.to_string()).or_default();
+        if p99_ms >= self.latency_p99_threshold_ms && !module_alerts.contains("latency") {
+            let event = ApCoreEvent::with_module(
+                "latency_threshold_exceeded",
+                serde_json::json!({
+                    "p99_latency_ms": p99_ms,
+                    "threshold": self.latency_p99_threshold_ms,
+                }),
+                module_id,
+                "warn",
+            );
+            module_alerts.insert("latency".to_string());
+            return Some(event);
+        }
         None
     }
 
@@ -164,7 +203,7 @@ impl PlatformNotifyMiddleware {
 
         if error_rate < self.error_rate_threshold * 0.5 {
             let event = ApCoreEvent::with_module(
-                "module_health_changed",
+                "apcore.health.recovered",
                 serde_json::json!({
                     "status": "recovered",
                     "error_rate": error_rate,
