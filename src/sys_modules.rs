@@ -90,11 +90,13 @@ const SENSITIVE_SEGMENTS: &[&str] = &["token", "secret", "key", "password", "aut
 
 fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_lowercase();
-    // W-6: Use substring containment so compound segments like "api_key" or
-    // "auth_token" are also masked, not just exact-match segments.
-    lower
-        .split('.')
-        .any(|seg| SENSITIVE_SEGMENTS.iter().any(|s| seg.contains(s)))
+    // W-6: Match exact segments ("key") or underscore-compound segments ("api_key",
+    // "auth_token") without false-positives on "keyboard" or "authentication".
+    lower.split('.').any(|seg| {
+        SENSITIVE_SEGMENTS.iter().any(|&s| {
+            seg == s || seg.ends_with(&format!("_{s}")) || seg.starts_with(&format!("{s}_"))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -534,9 +536,14 @@ pub struct SysModulesContext {
 ///
 /// `registry` must be an `Arc<Mutex<Registry>>` so the async reload/toggle
 /// modules can hold a live reference to the same registry the caller uses.
-/// (C-1: Previously this function created a disconnected empty registry.)
 ///
-/// Returns `None` if `sys_modules.enabled` is `false` in config. (C-2)
+/// Returns `None` if `sys_modules.enabled` is `false` in config.
+///
+/// # Panics
+///
+/// Panics if called from within a tokio async runtime. This function uses
+/// `blocking_lock()` internally and must be called from a synchronous context
+/// (e.g. application startup, before entering the async runtime).
 pub fn register_sys_modules(
     registry: Arc<Mutex<Registry>>,
     _executor: &mut Executor,

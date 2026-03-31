@@ -617,7 +617,7 @@ fn init_builtin_namespaces() {
                 name: "sys_modules".to_string(),
                 env_prefix: Some("APCORE__SYS".to_string()),
                 defaults: Some(serde_json::json!({
-                    "enabled": false,
+                    "enabled": true,
                     "events": {
                         "enabled": false,
                         "subscribers": [],
