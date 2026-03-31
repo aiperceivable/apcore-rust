@@ -35,6 +35,11 @@ async-trait = "0.1"
 tracing = "0.1"
 regex = "1"
 jsonschema = "0.28"
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+[features]
+default = []
+events = ["reqwest"]
 
 [dev-dependencies]
 tokio-test = "0.4"

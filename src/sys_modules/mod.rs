@@ -1,6 +1,10 @@
 // APCore Protocol — System modules registration
 // Spec reference: Built-in system modules (F10, F11, F19)
 
+pub mod health;
+pub mod manifest;
+pub mod usage;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -14,7 +18,9 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
 use crate::executor::Executor;
 use crate::module::Module;
+use crate::observability::error_history::{ErrorHistory, ErrorHistoryMiddleware};
 use crate::observability::metrics::MetricsCollector;
+use crate::observability::usage::{UsageCollector, UsageMiddleware};
 use crate::registry::registry::{ModuleDescriptor, Registry};
 
 // ---------------------------------------------------------------------------
@@ -518,7 +524,7 @@ async fn emit_event(
 }
 
 // ---------------------------------------------------------------------------
-// SysModulesContext — typed return value for register_sys_modules (W-8)
+// SysModulesContext — typed return value for register_sys_modules
 // ---------------------------------------------------------------------------
 
 /// Holds references to components created during sys-module registration.
@@ -526,18 +532,22 @@ pub struct SysModulesContext {
     pub registered_modules: HashMap<String, serde_json::Value>,
     pub emitter: Arc<Mutex<EventEmitter>>,
     pub toggle_state: Arc<ToggleState>,
+    pub error_history: ErrorHistory,
+    pub usage_collector: UsageCollector,
 }
 
 // ---------------------------------------------------------------------------
 // register_sys_modules
 // ---------------------------------------------------------------------------
 
-/// Register built-in system control modules into the registry.
+/// Register built-in system modules into the registry.
 ///
-/// `registry` must be an `Arc<Mutex<Registry>>` so the async reload/toggle
-/// modules can hold a live reference to the same registry the caller uses.
-///
-/// Returns `None` if `sys_modules.enabled` is `false` in config.
+/// Workflow (per spec §9.15):
+/// 1. Check `sys_modules.enabled` — return `None` if false.
+/// 2. Create `ErrorHistory` + `ErrorHistoryMiddleware`, register on executor.
+/// 3. Create `UsageCollector` + `UsageMiddleware`, register on executor.
+/// 4. Register health, manifest, and usage modules (always).
+/// 5. If `sys_modules.events.enabled`: register control modules + EventEmitter.
 ///
 /// # Panics
 ///
@@ -546,11 +556,10 @@ pub struct SysModulesContext {
 /// (e.g. application startup, before entering the async runtime).
 pub fn register_sys_modules(
     registry: Arc<Mutex<Registry>>,
-    _executor: &mut Executor,
+    executor: &mut Executor,
     config: &Config,
-    _metrics_collector: Option<MetricsCollector>,
+    metrics_collector: Option<MetricsCollector>,
 ) -> Option<SysModulesContext> {
-    // C-2: Guard on sys_modules.enabled (default: true per spec §9.15).
     let enabled = config
         .get("sys_modules.enabled")
         .and_then(|v| v.as_bool())
@@ -559,60 +568,134 @@ pub fn register_sys_modules(
         return None;
     }
 
-    // §9.15: Control modules require sys_modules.events.enabled.
-    let events_enabled = config
-        .get("sys_modules.events.enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // --- Step 2: ErrorHistory + middleware ---
+    let max_per_module = config
+        .get("sys_modules.error_history.max_entries_per_module")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+    let max_total = config
+        .get("sys_modules.error_history.max_total_entries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000) as usize;
+    let error_history = ErrorHistory::with_limits(max_per_module, max_total);
+    let eh_middleware = ErrorHistoryMiddleware::new(error_history.clone());
+    let _ = executor.use_middleware(Box::new(eh_middleware));
 
-    if !events_enabled {
-        return Some(SysModulesContext {
-            registered_modules: HashMap::new(),
-            emitter: Arc::new(Mutex::new(EventEmitter::new())),
-            toggle_state: Arc::new(ToggleState::new()),
-        });
-    }
+    // --- Step 3: UsageCollector + middleware ---
+    let usage_collector = UsageCollector::new();
+    let usage_middleware = UsageMiddleware::new(usage_collector.clone());
+    let _ = executor.use_middleware(Box::new(usage_middleware));
 
     let config_arc = Arc::new(Mutex::new(config.clone()));
     let emitter_arc = Arc::new(Mutex::new(EventEmitter::new()));
     let toggle_state = Arc::new(ToggleState::new());
 
-    let update_config: Box<dyn Module> = Box::new(UpdateConfigModule::new(
-        Arc::clone(&config_arc),
-        Arc::clone(&emitter_arc),
-    ));
-    let reload_module: Box<dyn Module> = Box::new(ReloadModuleModule::new(
-        Arc::clone(&registry),
-        Arc::clone(&emitter_arc),
-    ));
-    let toggle_feature: Box<dyn Module> = Box::new(ToggleFeatureModule::new(
-        Arc::clone(&registry),
-        Arc::clone(&emitter_arc),
-        Arc::clone(&toggle_state),
-    ));
-
-    let modules: Vec<(&str, Box<dyn Module>)> = vec![
-        ("system.control.update_config", update_config),
-        ("system.control.reload_module", reload_module),
-        ("system.control.toggle_feature", toggle_feature),
+    // --- Step 4: Build module list (health + manifest + usage always) ---
+    let mut modules: Vec<(&str, Box<dyn Module>, Vec<String>)> = vec![
+        (
+            "system.health.summary",
+            Box::new(health::HealthSummaryModule::new(
+                Arc::clone(&registry),
+                metrics_collector.clone(),
+                error_history.clone(),
+                Arc::clone(&config_arc),
+            )),
+            vec!["system".into(), "health".into()],
+        ),
+        (
+            "system.health.module",
+            Box::new(health::HealthModuleModule::new(
+                Arc::clone(&registry),
+                metrics_collector.clone(),
+                error_history.clone(),
+            )),
+            vec!["system".into(), "health".into()],
+        ),
+        (
+            "system.manifest.module",
+            Box::new(manifest::ManifestModuleModule::new(
+                Arc::clone(&registry),
+                Arc::clone(&config_arc),
+            )),
+            vec!["system".into(), "manifest".into()],
+        ),
+        (
+            "system.manifest.full",
+            Box::new(manifest::ManifestFullModule::new(
+                Arc::clone(&registry),
+                Arc::clone(&config_arc),
+            )),
+            vec!["system".into(), "manifest".into()],
+        ),
+        (
+            "system.usage.summary",
+            Box::new(usage::UsageSummaryModule::new(usage_collector.clone())),
+            vec!["system".into(), "usage".into()],
+        ),
+        (
+            "system.usage.module",
+            Box::new(usage::UsageModuleModule::new(
+                Arc::clone(&registry),
+                usage_collector.clone(),
+            )),
+            vec!["system".into(), "usage".into()],
+        ),
     ];
 
+    // --- Step 5: Control modules only if events.enabled ---
+    let events_enabled = config
+        .get("sys_modules.events.enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if events_enabled {
+        modules.push((
+            "system.control.update_config",
+            Box::new(UpdateConfigModule::new(
+                Arc::clone(&config_arc),
+                Arc::clone(&emitter_arc),
+            )),
+            vec!["system".into(), "control".into()],
+        ));
+        modules.push((
+            "system.control.reload_module",
+            Box::new(ReloadModuleModule::new(
+                Arc::clone(&registry),
+                Arc::clone(&emitter_arc),
+            )),
+            vec!["system".into(), "control".into()],
+        ));
+        modules.push((
+            "system.control.toggle_feature",
+            Box::new(ToggleFeatureModule::new(
+                Arc::clone(&registry),
+                Arc::clone(&emitter_arc),
+                Arc::clone(&toggle_state),
+            )),
+            vec!["system".into(), "control".into()],
+        ));
+    }
+
+    // --- Register all modules ---
     let mut registered: HashMap<String, serde_json::Value> = HashMap::new();
     // INVARIANT: This function is called from a synchronous context; no
     // concurrent holder of this lock exists before registration completes.
     let mut reg = registry.blocking_lock();
 
-    for (id, module) in modules {
+    for (id, module, tags) in modules {
+        let is_control = tags.contains(&"control".to_string());
         let descriptor = ModuleDescriptor {
             name: id.to_string(),
             annotations: crate::module::ModuleAnnotations {
-                requires_approval: true,
+                requires_approval: is_control,
+                readonly: !is_control,
+                idempotent: !is_control,
                 ..Default::default()
             },
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
             enabled: true,
-            tags: vec!["system".to_string(), "control".to_string()],
+            tags,
             dependencies: vec![],
         };
         let info = json!({
@@ -633,5 +716,7 @@ pub fn register_sys_modules(
         registered_modules: registered,
         emitter: emitter_arc,
         toggle_state,
+        error_history,
+        usage_collector,
     })
 }

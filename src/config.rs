@@ -451,18 +451,64 @@ impl Config {
     }
 
     /// Apply APCORE_* environment variable overrides to both typed fields and settings.
+    ///
+    /// In legacy mode, all `APCORE_*` vars are mapped via `env_key_to_dot_path`.
+    /// In namespace mode, registered `env_prefix` values are dispatched via
+    /// longest-prefix-match (§9.10).
     fn apply_env_overrides(&mut self) {
+        if self.mode == ConfigMode::Namespace {
+            self.apply_namespace_env_overrides();
+            return;
+        }
+        // Legacy mode: flat APCORE_ prefix stripping.
         for (key, value) in std::env::vars() {
             if let Some(suffix) = key.strip_prefix("APCORE_") {
                 let dot_path = Self::env_key_to_dot_path(suffix);
                 let parsed = Self::coerce_env_value(&value);
-                tracing::debug!(
-                    "Applying env override: {} = {:?} (from {})",
-                    dot_path,
-                    parsed,
-                    key
-                );
+                tracing::debug!(env = %key, path = %dot_path, "Applying legacy env override");
                 self.set(&dot_path, parsed);
+            }
+        }
+    }
+
+    /// §9.10: Namespace-aware env routing via longest-prefix-match.
+    fn apply_namespace_env_overrides(&mut self) {
+        let registry = global_ns_registry()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        // Collect registered prefixes, sorted by length descending (longest first).
+        let mut prefixed: Vec<(&str, &str)> = registry
+            .values()
+            .filter_map(|r| r.env_prefix.as_deref().map(|pfx| (pfx, r.name.as_str())))
+            .collect();
+        prefixed.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        for (env_key, env_value) in std::env::vars() {
+            let parsed = Self::coerce_env_value(&env_value);
+            // Try namespace-aware routing first.
+            let mut matched = false;
+            for &(prefix, ns_name) in &prefixed {
+                if let Some(suffix) = env_key.strip_prefix(prefix) {
+                    // Strip the leading separator (usually '_').
+                    let suffix = suffix.strip_prefix('_').unwrap_or(suffix);
+                    if suffix.is_empty() {
+                        continue;
+                    }
+                    let dot_path = Self::env_key_to_dot_path(suffix);
+                    let full_path = format!("{ns_name}.{dot_path}");
+                    tracing::debug!(env = %env_key, path = %full_path, "Applying namespace env override");
+                    self.set(&full_path, parsed.clone());
+                    matched = true;
+                    break;
+                }
+            }
+            // Fallback: legacy APCORE_ prefix for the apcore sub-namespace.
+            if !matched {
+                if let Some(suffix) = env_key.strip_prefix("APCORE_") {
+                    let dot_path = Self::env_key_to_dot_path(suffix);
+                    tracing::debug!(env = %env_key, path = %dot_path, "Applying legacy env override in namespace mode");
+                    self.set(&dot_path, parsed);
+                }
             }
         }
     }

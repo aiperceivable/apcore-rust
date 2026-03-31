@@ -300,7 +300,7 @@ fn test_register_sys_modules_returns_none_when_disabled() {
 }
 
 #[test]
-fn test_register_sys_modules_returns_empty_modules_when_events_disabled() {
+fn test_register_sys_modules_registers_health_but_not_control_when_events_disabled() {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let mut config = Config::default();
     config.set("sys_modules.enabled", serde_json::json!(true));
@@ -313,13 +313,8 @@ fn test_register_sys_modules_returns_empty_modules_when_events_disabled() {
         ctx.is_some(),
         "should return Some when sys_modules enabled but events disabled"
     );
-    let ctx = ctx.unwrap();
-    assert!(
-        ctx.registered_modules.is_empty(),
-        "no control modules should be registered when events.enabled=false"
-    );
 
-    // Verify the caller's registry has no control modules
+    // Verify health/manifest/usage modules ARE registered, but control modules are NOT
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -327,12 +322,24 @@ fn test_register_sys_modules_returns_empty_modules_when_events_disabled() {
     rt.block_on(async {
         let reg = registry.lock().await;
         assert!(
+            reg.has("system.health.summary"),
+            "health.summary should be registered even without events"
+        );
+        assert!(
+            reg.has("system.manifest.full"),
+            "manifest.full should be registered even without events"
+        );
+        assert!(
+            reg.has("system.usage.summary"),
+            "usage.summary should be registered even without events"
+        );
+        assert!(
             !reg.has("system.control.update_config"),
-            "update_config should NOT be registered"
+            "control modules should NOT be registered when events.enabled=false"
         );
         assert!(
             !reg.has("system.control.toggle_feature"),
-            "toggle_feature should NOT be registered"
+            "toggle_feature should NOT be registered when events.enabled=false"
         );
     });
 }
