@@ -33,11 +33,23 @@ fn test_register_namespace_reserved_config_name_returns_error() {
 }
 
 #[test]
-fn test_register_namespace_env_prefix_conflict_with_core_pattern() {
-    // APCORE_X… matches the reserved ^APCORE_[A-Z0-9] pattern
+fn test_register_namespace_env_prefix_duplicate_raises() {
+    // Duplicate env_prefix should raise ConfigEnvPrefixConflict.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = format!("DUP_PREFIX_{ts}");
+    Config::register_namespace(NamespaceRegistration {
+        name: format!("dup_pfx_a_{ts}"),
+        env_prefix: Some(prefix.clone()),
+        defaults: None,
+        schema: None,
+    })
+    .unwrap();
     let result = Config::register_namespace(NamespaceRegistration {
-        name: "myns_core_conflict_test".to_string(),
-        env_prefix: Some("APCORE_MYAPP".to_string()),
+        name: format!("dup_pfx_b_{ts}"),
+        env_prefix: Some(prefix),
         defaults: None,
         schema: None,
     });

@@ -1,7 +1,7 @@
 // APCore Protocol — Configuration
 // Spec reference: Configuration loading, validation, and environment variable overrides (Algorithm A12)
 
-use regex::Regex;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,11 +49,6 @@ fn global_ns_registry() -> &'static RwLock<HashMap<String, NamespaceRegistration
 }
 
 const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
-
-fn reserved_env_prefix_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^APCORE_[A-Z0-9]").unwrap())
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -351,16 +346,19 @@ impl Config {
         if RESERVED_NAMESPACES.contains(&reg.name.as_str()) {
             return Err(ModuleError::config_namespace_reserved(&reg.name));
         }
-        if let Some(ref prefix) = reg.env_prefix {
-            if reserved_env_prefix_pattern().is_match(prefix) {
-                return Err(ModuleError::config_env_prefix_conflict(prefix));
-            }
-        }
         let mut map = global_ns_registry()
             .write()
             .map_err(|_| ModuleError::config_mount_error(&reg.name, "registry lock poisoned"))?;
         if map.contains_key(&reg.name) {
             return Err(ModuleError::config_namespace_duplicate(&reg.name));
+        }
+        // Check for duplicate env_prefix
+        if let Some(ref prefix) = reg.env_prefix {
+            for existing in map.values() {
+                if existing.env_prefix.as_deref() == Some(prefix.as_str()) {
+                    return Err(ModuleError::config_env_prefix_conflict(prefix));
+                }
+            }
         }
         map.insert(reg.name.clone(), reg);
         Ok(())
@@ -653,7 +651,7 @@ fn init_builtin_namespaces() {
         let namespaces = vec![
             NamespaceRegistration {
                 name: "observability".to_string(),
-                env_prefix: Some("APCORE__OBSERVABILITY".to_string()),
+                env_prefix: Some("APCORE_OBSERVABILITY".to_string()),
                 defaults: Some(serde_json::json!({
                     "tracing": { "enabled": false, "sampling_rate": 1.0 },
                     "metrics": { "enabled": false }
@@ -662,7 +660,7 @@ fn init_builtin_namespaces() {
             },
             NamespaceRegistration {
                 name: "sys_modules".to_string(),
-                env_prefix: Some("APCORE__SYS".to_string()),
+                env_prefix: Some("APCORE_SYS".to_string()),
                 defaults: Some(serde_json::json!({
                     "enabled": true,
                     "health": { "enabled": true },
