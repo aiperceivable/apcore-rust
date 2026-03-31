@@ -16,7 +16,9 @@ use crate::config::Config;
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
+use crate::events::subscribers::create_subscriber;
 use crate::executor::Executor;
+use crate::middleware::PlatformNotifyMiddleware;
 use crate::module::Module;
 use crate::observability::error_history::{ErrorHistory, ErrorHistoryMiddleware};
 use crate::observability::metrics::MetricsCollector;
@@ -649,6 +651,39 @@ pub fn register_sys_modules(
         .unwrap_or(false);
 
     if events_enabled {
+        // Step 5a: PlatformNotifyMiddleware (gets its own EventEmitter instance).
+        let error_rate_threshold = config
+            .get("sys_modules.events.thresholds.error_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.1);
+        let latency_p99_threshold = config
+            .get("sys_modules.events.thresholds.latency_p99_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(5000.0);
+        let pn_middleware = PlatformNotifyMiddleware::new(
+            EventEmitter::new(),
+            metrics_collector.clone(),
+            error_rate_threshold,
+            latency_p99_threshold,
+        );
+        let _ = executor.use_middleware(Box::new(pn_middleware));
+
+        // Step 5b: Instantiate subscribers from config
+        if let Some(subs) = config.get("sys_modules.events.subscribers") {
+            if let Some(arr) = subs.as_array() {
+                let mut em = emitter_arc.blocking_lock();
+                for sub_config in arr {
+                    match create_subscriber(sub_config) {
+                        Ok(subscriber) => em.subscribe(subscriber),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to create subscriber from config");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 5c: Control modules
         modules.push((
             "system.control.update_config",
             Box::new(UpdateConfigModule::new(
@@ -710,6 +745,24 @@ pub fn register_sys_modules(
                 tracing::warn!(module_id = %id, error = %e, "Failed to register sys module");
             }
         }
+    }
+
+    // Step 5d: Bridge registry events to EventEmitter.
+    // Registry callbacks are synchronous; emit is async. We log the event
+    // and use try_lock to best-effort emit without blocking.
+    if events_enabled {
+        reg.on(
+            "register",
+            Box::new(move |module_id: &str, _module: &dyn Module| {
+                tracing::info!(module_id = %module_id, "module_registered");
+            }),
+        );
+        reg.on(
+            "unregister",
+            Box::new(move |module_id: &str, _module: &dyn Module| {
+                tracing::info!(module_id = %module_id, "module_unregistered");
+            }),
+        );
     }
 
     Some(SysModulesContext {

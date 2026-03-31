@@ -82,9 +82,14 @@ impl Module for ManifestModuleModule {
             .map(|m| m.description().to_string())
             .unwrap_or_default();
 
+        // Module trait doesn't expose documentation or metadata, so use defaults.
+        let documentation = serde_json::Value::Null;
+        let metadata = json!({});
+
         Ok(json!({
             "module_id": module_id,
             "description": description,
+            "documentation": documentation,
             "source_path": source_path,
             "input_schema": descriptor.input_schema,
             "output_schema": descriptor.output_schema,
@@ -96,6 +101,7 @@ impl Module for ManifestModuleModule {
             },
             "tags": descriptor.tags,
             "dependencies": descriptor.dependencies,
+            "metadata": metadata,
         }))
     }
 }
@@ -153,11 +159,17 @@ impl Module for ManifestFullModule {
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect());
 
-        let project_name = {
+        let (project_name, source_root) = {
             let cfg = self.config.lock().await;
-            cfg.get("project.name")
+            let name = cfg
+                .get("project.name")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "apcore".to_string())
+                .unwrap_or_else(|| "apcore".to_string());
+            let root = cfg
+                .get("project.source_root")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            (name, root)
         };
 
         let reg = self.registry.lock().await;
@@ -208,7 +220,12 @@ impl Module for ManifestFullModule {
                 entry["output_schema"] = descriptor.output_schema.clone();
             }
             if include_source_paths {
-                entry["source_path"] = json!(mid.replace('.', "/") + ".rs");
+                let sp = if source_root.is_empty() {
+                    mid.replace('.', "/") + ".rs"
+                } else {
+                    format!("{}/{}.rs", source_root, mid.replace('.', "/"))
+                };
+                entry["source_path"] = json!(sp);
             }
 
             modules.push(entry);

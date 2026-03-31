@@ -502,12 +502,13 @@ impl Config {
                     break;
                 }
             }
-            // Fallback: legacy APCORE_ prefix for the apcore sub-namespace.
+            // Fallback: legacy APCORE_ prefix → route into the "apcore" sub-namespace.
             if !matched {
                 if let Some(suffix) = env_key.strip_prefix("APCORE_") {
                     let dot_path = Self::env_key_to_dot_path(suffix);
-                    tracing::debug!(env = %env_key, path = %dot_path, "Applying legacy env override in namespace mode");
-                    self.set(&dot_path, parsed);
+                    let full_path = format!("apcore.{dot_path}");
+                    tracing::debug!(env = %env_key, path = %full_path, "Applying legacy env override in namespace mode");
+                    self.set(&full_path, parsed);
                 }
             }
         }

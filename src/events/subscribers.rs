@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 use async_trait::async_trait;
+#[cfg(feature = "events")]
 use serde_json::json;
 
 use super::emitter::ApCoreEvent;

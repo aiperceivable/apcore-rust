@@ -250,12 +250,19 @@ impl Module for HealthModuleModule {
             })
             .collect();
 
+        let (avg_latency_ms, p99_latency_ms) = snapshot
+            .as_ref()
+            .map(|s| extract_latency_stats(s, module_id))
+            .unwrap_or((0.0, 0.0));
+
         Ok(json!({
             "module_id": module_id,
             "status": status,
             "total_calls": total_calls,
             "error_count": errors,
             "error_rate": error_rate,
+            "avg_latency_ms": avg_latency_ms,
+            "p99_latency_ms": p99_latency_ms,
             "recent_errors": recent_errors,
         }))
     }
@@ -279,4 +286,49 @@ fn extract_call_counts(snapshot: &serde_json::Value, module_id: &str) -> (u64, u
         errors = v;
     }
     (total, errors)
+}
+
+/// Extract latency statistics (avg_ms, p99_ms) from a MetricsCollector snapshot.
+///
+/// Reads the histogram key `apcore_module_duration_seconds|module_id=<id>`.
+/// Returns (avg_latency_ms, p99_latency_ms).
+fn extract_latency_stats(snapshot: &serde_json::Value, module_id: &str) -> (f64, f64) {
+    let histograms = match snapshot.get("histograms").and_then(|h| h.as_object()) {
+        Some(h) => h,
+        None => return (0.0, 0.0),
+    };
+    let hist_key = format!("apcore_module_duration_seconds|module_id={module_id}");
+    let data = match histograms.get(&hist_key) {
+        Some(d) => d,
+        None => return (0.0, 0.0),
+    };
+    let sum = data.get("sum").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let avg_ms = if count > 0 {
+        (sum / count as f64) * 1000.0
+    } else {
+        0.0
+    };
+
+    // Estimate p99 from histogram buckets.
+    let p99_ms = if let Some(buckets) = data.get("buckets").and_then(|b| b.as_array()) {
+        let target = (count as f64 * 0.99).ceil() as u64;
+        let mut p99 = 0.0_f64;
+        for bucket in buckets {
+            let le = bucket
+                .get("le")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::INFINITY);
+            let cnt = bucket.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            if cnt >= target {
+                p99 = le * 1000.0; // seconds → ms
+                break;
+            }
+        }
+        p99
+    } else {
+        0.0
+    };
+
+    (avg_ms, p99_ms)
 }

@@ -156,10 +156,105 @@ impl UsageCollector {
             .collect()
     }
 
+    /// Get per-caller breakdown for a module.
+    pub fn get_caller_breakdown(&self, module_id: &str) -> Vec<CallerStats> {
+        let data = self.data.lock().unwrap();
+        let module_data = match data.get(module_id) {
+            Some(md) => md,
+            None => return Vec::new(),
+        };
+        let mut callers: HashMap<String, (u64, u64, f64)> = HashMap::new(); // (calls, errors, total_lat)
+        for records in module_data.records.values() {
+            for rec in records {
+                let cid = rec.caller_id.as_deref().unwrap_or("unknown").to_string();
+                let entry = callers.entry(cid).or_insert((0, 0, 0.0));
+                entry.0 += 1;
+                if !rec.success {
+                    entry.1 += 1;
+                }
+                entry.2 += rec.latency_ms;
+            }
+        }
+        callers
+            .into_iter()
+            .map(|(cid, (calls, errs, total_lat))| CallerStats {
+                caller_id: cid,
+                call_count: calls,
+                error_count: errs,
+                avg_latency_ms: if calls > 0 {
+                    total_lat / calls as f64
+                } else {
+                    0.0
+                },
+            })
+            .collect()
+    }
+
+    /// Get hourly distribution for a module (sorted by hour ascending).
+    pub fn get_hourly_distribution(&self, module_id: &str) -> Vec<HourlyBucket> {
+        let data = self.data.lock().unwrap();
+        let module_data = match data.get(module_id) {
+            Some(md) => md,
+            None => return Vec::new(),
+        };
+        let mut buckets: Vec<HourlyBucket> = module_data
+            .records
+            .iter()
+            .map(|(hour, records)| {
+                let call_count = records.len() as u64;
+                let error_count = records.iter().filter(|r| !r.success).count() as u64;
+                HourlyBucket {
+                    hour: format!("{hour}:00:00Z"),
+                    call_count,
+                    error_count,
+                }
+            })
+            .collect();
+        buckets.sort_by(|a, b| a.hour.cmp(&b.hour));
+        buckets
+    }
+
+    /// Compute p99 latency (ms) for a module from stored records.
+    pub fn get_p99_latency_ms(&self, module_id: &str) -> f64 {
+        let data = self.data.lock().unwrap();
+        let module_data = match data.get(module_id) {
+            Some(md) => md,
+            None => return 0.0,
+        };
+        let mut latencies: Vec<f64> = module_data
+            .records
+            .values()
+            .flat_map(|recs| recs.iter().map(|r| r.latency_ms))
+            .collect();
+        if latencies.is_empty() {
+            return 0.0;
+        }
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((latencies.len() as f64) * 0.99).ceil() as usize;
+        latencies[idx.min(latencies.len()) - 1]
+    }
+
     /// Reset all stats.
     pub fn reset(&self) {
         self.data.lock().unwrap().clear();
     }
+}
+
+/// Per-caller usage statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallerStats {
+    pub caller_id: String,
+    pub call_count: u64,
+    pub error_count: u64,
+    pub avg_latency_ms: f64,
+}
+
+/// Hourly usage bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyBucket {
+    pub hour: String,
+    pub call_count: u64,
+    pub error_count: u64,
 }
 
 impl Default for UsageCollector {

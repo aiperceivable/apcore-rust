@@ -145,6 +145,32 @@ impl Module for UsageModuleModule {
         }
 
         let stats = self.collector.get_module_summary(module_id);
+        let p99 = self.collector.get_p99_latency_ms(module_id);
+        let callers: Vec<serde_json::Value> = self
+            .collector
+            .get_caller_breakdown(module_id)
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "caller_id": c.caller_id,
+                    "call_count": c.call_count,
+                    "error_count": c.error_count,
+                    "avg_latency_ms": c.avg_latency_ms,
+                })
+            })
+            .collect();
+        let hourly: Vec<serde_json::Value> = self
+            .collector
+            .get_hourly_distribution(module_id)
+            .into_iter()
+            .map(|h| {
+                json!({
+                    "hour": h.hour,
+                    "call_count": h.call_count,
+                    "error_count": h.error_count,
+                })
+            })
+            .collect();
 
         match stats {
             Some(s) => Ok(json!({
@@ -153,8 +179,10 @@ impl Module for UsageModuleModule {
                 "call_count": s.call_count,
                 "error_count": s.error_count,
                 "avg_latency_ms": s.avg_latency_ms,
-                "unique_callers": s.unique_callers,
+                "p99_latency_ms": p99,
                 "trend": s.trend,
+                "callers": callers,
+                "hourly_distribution": hourly,
             })),
             None => Ok(json!({
                 "module_id": module_id,
@@ -162,8 +190,10 @@ impl Module for UsageModuleModule {
                 "call_count": 0,
                 "error_count": 0,
                 "avg_latency_ms": 0.0,
-                "unique_callers": 0,
+                "p99_latency_ms": 0.0,
                 "trend": "inactive",
+                "callers": [],
+                "hourly_distribution": [],
             })),
         }
     }
