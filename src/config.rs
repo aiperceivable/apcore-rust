@@ -1,7 +1,6 @@
 // APCore Protocol — Configuration
 // Spec reference: Configuration loading, validation, and environment variable overrides (Algorithm A12)
 
-
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
