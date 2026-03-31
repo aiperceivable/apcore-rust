@@ -300,6 +300,44 @@ fn test_register_sys_modules_returns_none_when_disabled() {
 }
 
 #[test]
+fn test_register_sys_modules_returns_empty_modules_when_events_disabled() {
+    let registry = Arc::new(Mutex::new(Registry::new()));
+    let mut config = Config::default();
+    config.set("sys_modules.enabled", serde_json::json!(true));
+    // events.enabled defaults to false, but set explicitly for clarity
+    config.set("sys_modules.events.enabled", serde_json::json!(false));
+    let mut executor = Executor::new(Registry::new(), Config::default());
+
+    let ctx = register_sys_modules(Arc::clone(&registry), &mut executor, &config, None);
+    assert!(
+        ctx.is_some(),
+        "should return Some when sys_modules enabled but events disabled"
+    );
+    let ctx = ctx.unwrap();
+    assert!(
+        ctx.registered_modules.is_empty(),
+        "no control modules should be registered when events.enabled=false"
+    );
+
+    // Verify the caller's registry has no control modules
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime should build");
+    rt.block_on(async {
+        let reg = registry.lock().await;
+        assert!(
+            !reg.has("system.control.update_config"),
+            "update_config should NOT be registered"
+        );
+        assert!(
+            !reg.has("system.control.toggle_feature"),
+            "toggle_feature should NOT be registered"
+        );
+    });
+}
+
+#[test]
 fn test_register_sys_modules_registers_control_modules_into_caller_registry() {
     // register_sys_modules is synchronous and uses blocking_lock internally;
     // call it outside any tokio runtime, then use block_on only for async assertions.
