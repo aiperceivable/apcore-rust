@@ -618,6 +618,10 @@ fn init_builtin_namespaces() {
                 env_prefix: Some("APCORE__SYS".to_string()),
                 defaults: Some(serde_json::json!({
                     "enabled": true,
+                    "health": { "enabled": true },
+                    "manifest": { "enabled": true },
+                    "usage": { "enabled": true, "retention_hours": 168, "bucketing_strategy": "hourly" },
+                    "control": { "enabled": true },
                     "events": {
                         "enabled": false,
                         "subscribers": [],
