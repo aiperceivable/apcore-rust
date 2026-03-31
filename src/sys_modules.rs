@@ -559,6 +559,20 @@ pub fn register_sys_modules(
         return None;
     }
 
+    // §9.15: Control modules require sys_modules.events.enabled.
+    let events_enabled = config
+        .get("sys_modules.events.enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !events_enabled {
+        return Some(SysModulesContext {
+            registered_modules: HashMap::new(),
+            emitter: Arc::new(Mutex::new(EventEmitter::new())),
+            toggle_state: Arc::new(ToggleState::new()),
+        });
+    }
+
     let config_arc = Arc::new(Mutex::new(config.clone()));
     let emitter_arc = Arc::new(Mutex::new(EventEmitter::new()));
     let toggle_state = Arc::new(ToggleState::new());
@@ -567,8 +581,6 @@ pub fn register_sys_modules(
         Arc::clone(&config_arc),
         Arc::clone(&emitter_arc),
     ));
-    // C-1: Pass the caller's registry Arc so reload/toggle can operate on the
-    //      live registry, not a disconnected empty one.
     let reload_module: Box<dyn Module> = Box::new(ReloadModuleModule::new(
         Arc::clone(&registry),
         Arc::clone(&emitter_arc),

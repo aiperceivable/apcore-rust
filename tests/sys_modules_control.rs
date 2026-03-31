@@ -306,6 +306,7 @@ fn test_register_sys_modules_registers_control_modules_into_caller_registry() {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let mut config = Config::default();
     config.set("sys_modules.enabled", serde_json::json!(true));
+    config.set("sys_modules.events.enabled", serde_json::json!(true));
     let mut executor = Executor::new(Registry::new(), Config::default());
 
     let ctx = register_sys_modules(Arc::clone(&registry), &mut executor, &config, None);
