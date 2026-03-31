@@ -6,6 +6,7 @@
 
 ![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)
 ![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12294/badge)](https://www.bestpractices.dev/projects/12294)
 
 > **Build once, invoke by Code or AI.**
 

@@ -68,6 +68,12 @@ pub enum ErrorCode {
     VersionIncompatible,
     ErrorCodeCollision,
     DependencyNotFound,
+    ConfigNamespaceDuplicate,
+    ConfigNamespaceReserved,
+    ConfigEnvPrefixConflict,
+    ConfigMountError,
+    ConfigBindError,
+    ErrorFormatterDuplicate,
 }
 
 /// Structured error returned by module execution.
@@ -143,6 +149,69 @@ impl ModuleError {
     /// Convert to a sparse JSON dictionary (omitting None fields).
     pub fn to_dict(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    pub fn config_namespace_duplicate(name: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("name".to_string(), serde_json::json!(name));
+        Self::new(
+            ErrorCode::ConfigNamespaceDuplicate,
+            format!("Namespace '{}' is already registered", name),
+        )
+        .with_details(details)
+    }
+
+    pub fn config_namespace_reserved(name: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("name".to_string(), serde_json::json!(name));
+        Self::new(
+            ErrorCode::ConfigNamespaceReserved,
+            format!("Namespace '{}' is reserved", name),
+        )
+        .with_details(details)
+    }
+
+    pub fn config_env_prefix_conflict(prefix: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("env_prefix".to_string(), serde_json::json!(prefix));
+        Self::new(
+            ErrorCode::ConfigEnvPrefixConflict,
+            format!("env_prefix '{}' conflicts with reserved pattern", prefix),
+        )
+        .with_details(details)
+    }
+
+    pub fn config_mount_error(namespace: &str, reason: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("namespace".to_string(), serde_json::json!(namespace));
+        Self::new(
+            ErrorCode::ConfigMountError,
+            format!("Mount failed for '{}': {}", namespace, reason),
+        )
+        .with_details(details)
+    }
+
+    pub fn config_bind_error(namespace: &str, reason: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("namespace".to_string(), serde_json::json!(namespace));
+        Self::new(
+            ErrorCode::ConfigBindError,
+            format!("Bind failed for '{}': {}", namespace, reason),
+        )
+        .with_details(details)
+    }
+
+    pub fn error_formatter_duplicate(adapter_name: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("adapter_name".to_string(), serde_json::json!(adapter_name));
+        Self::new(
+            ErrorCode::ErrorFormatterDuplicate,
+            format!(
+                "ErrorFormatter for adapter '{}' is already registered",
+                adapter_name
+            ),
+        )
+        .with_details(details)
     }
 }
 
