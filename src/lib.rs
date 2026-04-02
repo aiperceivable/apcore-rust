@@ -35,7 +35,7 @@ pub use approval::{
 };
 pub use async_task::TaskStatus;
 pub use client::APCore;
-pub use config::{Config, ConfigMode, MountSource, NamespaceInfo, NamespaceRegistration};
+pub use config::{Config, ConfigMode, EnvStyle, MountSource, NamespaceInfo, NamespaceRegistration};
 pub use context::{Context, ContextFactory, Identity};
 pub use errors::{ErrorCode, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};

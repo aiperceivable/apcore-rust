@@ -73,6 +73,7 @@ pub enum ErrorCode {
     ConfigEnvPrefixConflict,
     ConfigMountError,
     ConfigBindError,
+    ConfigEnvMapConflict,
     ErrorFormatterDuplicate,
 }
 
@@ -177,6 +178,20 @@ impl ModuleError {
         Self::new(
             ErrorCode::ConfigEnvPrefixConflict,
             format!("env_prefix '{}' conflicts with reserved pattern", prefix),
+        )
+        .with_details(details)
+    }
+
+    pub fn config_env_map_conflict(env_var: &str, owner: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("env_var".to_string(), serde_json::json!(env_var));
+        details.insert("owner".to_string(), serde_json::json!(owner));
+        Self::new(
+            ErrorCode::ConfigEnvMapConflict,
+            format!(
+                "Environment variable '{}' is already mapped by '{}'",
+                env_var, owner
+            ),
         )
         .with_details(details)
     }

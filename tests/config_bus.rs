@@ -1,6 +1,10 @@
 // Integration tests for Config Bus (§9.4–§9.15, v0.15.0)
 
-use apcore::config::{Config, ConfigMode, MountSource, NamespaceRegistration};
+use std::collections::HashMap;
+
+use apcore::config::{
+    Config, ConfigMode, EnvStyle, MountSource, NamespaceRegistration, DEFAULT_MAX_DEPTH,
+};
 use apcore::errors::ErrorCode;
 use serde::Deserialize;
 
@@ -15,6 +19,9 @@ fn test_register_namespace_reserved_name_returns_error() {
         env_prefix: None,
         defaults: None,
         schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
     });
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::ConfigNamespaceReserved);
@@ -27,6 +34,9 @@ fn test_register_namespace_reserved_config_name_returns_error() {
         env_prefix: None,
         defaults: None,
         schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
     });
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::ConfigNamespaceReserved);
@@ -45,6 +55,9 @@ fn test_register_namespace_env_prefix_duplicate_raises() {
         env_prefix: Some(prefix.clone()),
         defaults: None,
         schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
     })
     .unwrap();
     let result = Config::register_namespace(NamespaceRegistration {
@@ -52,6 +65,9 @@ fn test_register_namespace_env_prefix_duplicate_raises() {
         env_prefix: Some(prefix),
         defaults: None,
         schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
     });
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::ConfigEnvPrefixConflict);
@@ -72,6 +88,9 @@ fn test_register_namespace_success_and_list() {
         env_prefix: None,
         defaults: Some(serde_json::json!({"key": "value"})),
         schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
     })
     .unwrap();
 
@@ -95,6 +114,9 @@ fn test_register_namespace_duplicate_returns_error() {
         env_prefix: None,
         defaults: None,
         schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
     })
     .unwrap();
 
@@ -103,6 +125,9 @@ fn test_register_namespace_duplicate_returns_error() {
         env_prefix: None,
         defaults: None,
         schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
     });
     assert!(result.is_err());
     assert_eq!(
@@ -262,4 +287,236 @@ fn test_builtin_namespaces_sys_modules_registered() {
     let ns = Config::registered_namespaces();
     let has_sys = ns.iter().any(|n| n.name == "sys_modules");
     assert!(has_sys, "sys_modules namespace must be built-in");
+}
+
+// ---------------------------------------------------------------------------
+// env_style flat
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_env_style_flat_preserves_underscores() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ns_name = format!("flatns-{ts}");
+    let prefix = format!("FLAT_{ts}");
+
+    Config::register_namespace(NamespaceRegistration {
+        name: ns_name.clone(),
+        env_prefix: Some(prefix.clone()),
+        defaults: None,
+        schema: None,
+        env_style: EnvStyle::Flat,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
+    })
+    .unwrap();
+
+    // Set env vars with underscores in the key name.
+    let key1 = format!("{prefix}_DEVTO_API_KEY");
+    let key2 = format!("{prefix}_LLM_MODEL");
+    std::env::set_var(&key1, "abc123");
+    std::env::set_var(&key2, "gemini-pro");
+
+    // Load from a namespace-mode YAML file so env overrides are applied.
+    let tmp_dir = std::env::temp_dir().join(format!("apcore-flat-test-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let yaml_path = tmp_dir.join("cfg.yaml");
+    std::fs::write(
+        &yaml_path,
+        "max_call_depth: 32\nmax_module_repeat: 3\ndefault_timeout_ms: 30000\nglobal_timeout_ms: 60000\napcore:\n  version: '1.0.0'\n",
+    )
+    .unwrap();
+    let config = Config::load(&yaml_path).unwrap();
+
+    // Flat style: underscores preserved, no nesting.
+    assert_eq!(
+        config.get(&format!("{ns_name}.devto_api_key")),
+        Some(serde_json::json!("abc123"))
+    );
+    assert_eq!(
+        config.get(&format!("{ns_name}.llm_model")),
+        Some(serde_json::json!("gemini-pro"))
+    );
+
+    // Cleanup.
+    std::env::remove_var(&key1);
+    std::env::remove_var(&key2);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+const NS_YAML: &str = "max_call_depth: 32\nmax_module_repeat: 3\ndefault_timeout_ms: 30000\nglobal_timeout_ms: 60000\napcore:\n  version: '1.0.0'\n";
+
+#[test]
+fn test_env_style_auto_resolves_mixed_flat_and_nested() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ns_name = format!("autons-{ts}");
+    let prefix = format!("AUTO_{ts}");
+
+    Config::register_namespace(NamespaceRegistration {
+        name: ns_name.clone(),
+        env_prefix: Some(prefix.clone()),
+        defaults: Some(serde_json::json!({
+            "devto_api_key": "",
+            "publish": { "delay": 5, "retry": 3 }
+        })),
+        schema: None,
+        env_style: EnvStyle::Auto,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
+    })
+    .unwrap();
+
+    let k1 = format!("{prefix}_DEVTO_API_KEY");
+    let k2 = format!("{prefix}_PUBLISH_DELAY");
+    let k3 = format!("{prefix}_PUBLISH_RETRY");
+    std::env::set_var(&k1, "abc123");
+    std::env::set_var(&k2, "10");
+    std::env::set_var(&k3, "7");
+
+    let tmp_dir = std::env::temp_dir().join(format!("apcore-auto-test-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let yaml_path = tmp_dir.join("cfg.yaml");
+    std::fs::write(&yaml_path, NS_YAML).unwrap();
+    let config = Config::load(&yaml_path).unwrap();
+
+    // Flat key matched.
+    assert_eq!(
+        config.get(&format!("{ns_name}.devto_api_key")),
+        Some(serde_json::json!("abc123"))
+    );
+    // Nested keys matched.
+    assert_eq!(
+        config.get(&format!("{ns_name}.publish.delay")),
+        Some(serde_json::json!(10))
+    );
+    assert_eq!(
+        config.get(&format!("{ns_name}.publish.retry")),
+        Some(serde_json::json!(7))
+    );
+
+    std::env::remove_var(&k1);
+    std::env::remove_var(&k2);
+    std::env::remove_var(&k3);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_max_depth_limits_nesting() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ns_name = format!("depthns-{ts}");
+    let prefix = format!("DEPTH_{ts}");
+
+    Config::register_namespace(NamespaceRegistration {
+        name: ns_name.clone(),
+        env_prefix: Some(prefix.clone()),
+        defaults: None,
+        schema: None,
+        env_style: EnvStyle::Nested,
+        max_depth: 3,
+        env_map: None,
+    })
+    .unwrap();
+
+    let k1 = format!("{prefix}_A_B_C_D_E");
+    std::env::set_var(&k1, "val");
+
+    let tmp_dir = std::env::temp_dir().join(format!("apcore-depth-test-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let yaml_path = tmp_dir.join("cfg.yaml");
+    std::fs::write(&yaml_path, NS_YAML).unwrap();
+    let config = Config::load(&yaml_path).unwrap();
+
+    // max_depth=3: at most 3 segments (2 dots), rest literal.
+    assert_eq!(
+        config.get(&format!("{ns_name}.a.b.c_d_e")),
+        Some(serde_json::json!("val"))
+    );
+
+    std::env::remove_var(&k1);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_env_prefix_auto_derived_from_name() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ns_name = format!("autoderiv-{ts}");
+    // No env_prefix → auto-derived as "AUTODERIV_{ts}" (uppercase, - → _)
+    Config::register_namespace(NamespaceRegistration {
+        name: ns_name.clone(),
+        env_prefix: None, // auto-derive
+        defaults: None,
+        schema: None,
+        env_style: EnvStyle::Auto,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: None,
+    })
+    .unwrap();
+
+    let derived_prefix = ns_name.to_uppercase().replace('-', "_");
+    let k1 = format!("{derived_prefix}_FOO");
+    std::env::set_var(&k1, "bar");
+
+    let tmp_dir = std::env::temp_dir().join(format!("apcore-autoderiv-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let yaml_path = tmp_dir.join("cfg.yaml");
+    std::fs::write(&yaml_path, NS_YAML).unwrap();
+    let config = Config::load(&yaml_path).unwrap();
+
+    assert_eq!(
+        config.get(&format!("{ns_name}.foo")),
+        Some(serde_json::json!("bar"))
+    );
+
+    std::env::remove_var(&k1);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_namespace_env_map() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ns_name = format!("envmapns-{ts}");
+    let redis_key = format!("REDIS_URL_{ts}");
+    Config::register_namespace(NamespaceRegistration {
+        name: ns_name.clone(),
+        env_prefix: None,
+        defaults: None,
+        schema: None,
+        env_style: EnvStyle::Auto,
+        max_depth: DEFAULT_MAX_DEPTH,
+        env_map: Some(HashMap::from([(
+            redis_key.clone(),
+            "cache_url".to_string(),
+        )])),
+    })
+    .unwrap();
+
+    std::env::set_var(&redis_key, "redis://localhost");
+
+    let tmp_dir = std::env::temp_dir().join(format!("apcore-envmap-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let yaml_path = tmp_dir.join("cfg.yaml");
+    std::fs::write(&yaml_path, NS_YAML).unwrap();
+    let config = Config::load(&yaml_path).unwrap();
+
+    assert_eq!(
+        config.get(&format!("{ns_name}.cache_url")),
+        Some(serde_json::json!("redis://localhost"))
+    );
+
+    std::env::remove_var(&redis_key);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

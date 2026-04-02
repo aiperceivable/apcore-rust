@@ -23,13 +23,33 @@ pub enum MountSource {
     File(PathBuf),
 }
 
+/// Default maximum nesting depth for env var key conversion.
+pub const DEFAULT_MAX_DEPTH: usize = 5;
+
+/// Environment variable key conversion strategy for a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnvStyle {
+    /// Single `_` → `.` (section separator), double `__` → literal `_`.
+    Nested,
+    /// Suffix is lowercased as-is; no separator conversion.
+    Flat,
+    /// Match against defaults tree structure; fall back to Nested.
+    #[default]
+    Auto,
+}
+
 /// Registration info for a Config Bus namespace.
 #[derive(Debug, Clone)]
 pub struct NamespaceRegistration {
     pub name: String,
+    /// Env var prefix. `None` = auto-derive from name (uppercase, `-` → `_`).
     pub env_prefix: Option<String>,
     pub defaults: Option<serde_json::Value>,
     pub schema: Option<serde_json::Value>,
+    pub env_style: EnvStyle,
+    pub max_depth: usize,
+    /// Explicit bare env var → config key mapping (e.g. `"REDIS_URL" → "cache_url"`).
+    pub env_map: Option<HashMap<String, String>>,
 }
 
 /// Summary of a registered namespace (returned by `registered_namespaces()`).
@@ -42,9 +62,21 @@ pub struct NamespaceInfo {
 
 static GLOBAL_NS_REGISTRY: OnceLock<RwLock<HashMap<String, NamespaceRegistration>>> =
     OnceLock::new();
+/// Global bare env var → top-level config key mapping.
+static GLOBAL_ENV_MAP: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+/// Tracks all claimed env var names (for conflict detection).
+static ENV_MAP_CLAIMED: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
 
 fn global_ns_registry() -> &'static RwLock<HashMap<String, NamespaceRegistration>> {
     GLOBAL_NS_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn global_env_map() -> &'static RwLock<HashMap<String, String>> {
+    GLOBAL_ENV_MAP.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn env_map_claimed() -> &'static RwLock<HashMap<String, String>> {
+    ENV_MAP_CLAIMED.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
@@ -65,7 +97,7 @@ pub struct Config {
     pub enable_tracing: bool,
     #[serde(default)]
     pub enable_metrics: bool,
-    #[serde(default)]
+    #[serde(flatten)]
     pub settings: HashMap<String, serde_json::Value>,
     #[serde(skip)]
     pub yaml_path: Option<PathBuf>,
@@ -106,9 +138,9 @@ impl Config {
                 format!("Failed to parse JSON config: {}: {}", path.display(), e),
             )
         })?;
-        config.apply_env_overrides();
         config.detect_mode();
         init_builtin_namespaces();
+        config.apply_env_overrides();
         config.validate()?;
         Ok(config)
     }
@@ -129,9 +161,9 @@ impl Config {
             )
         })?;
         config.yaml_path = Some(path.to_path_buf());
-        config.apply_env_overrides();
         config.detect_mode();
         init_builtin_namespaces();
+        config.apply_env_overrides();
         config.validate()?;
         Ok(config)
     }
@@ -181,9 +213,9 @@ impl Config {
     /// Build config from defaults, applying env var overrides.
     pub fn from_defaults() -> Self {
         let mut config = Self::default();
-        config.apply_env_overrides();
         config.detect_mode();
         init_builtin_namespaces();
+        config.apply_env_overrides();
         config
     }
 
@@ -341,9 +373,13 @@ impl Config {
 
     // --- Namespace registration (class methods) ---
 
-    pub fn register_namespace(reg: NamespaceRegistration) -> Result<(), ModuleError> {
+    pub fn register_namespace(mut reg: NamespaceRegistration) -> Result<(), ModuleError> {
         if RESERVED_NAMESPACES.contains(&reg.name.as_str()) {
             return Err(ModuleError::config_namespace_reserved(&reg.name));
+        }
+        // Auto-derive env_prefix from name if not provided.
+        if reg.env_prefix.is_none() {
+            reg.env_prefix = Some(reg.name.to_uppercase().replace('-', "_"));
         }
         let mut map = global_ns_registry()
             .write()
@@ -351,15 +387,47 @@ impl Config {
         if map.contains_key(&reg.name) {
             return Err(ModuleError::config_namespace_duplicate(&reg.name));
         }
-        // Check for duplicate env_prefix
-        if let Some(ref prefix) = reg.env_prefix {
-            for existing in map.values() {
-                if existing.env_prefix.as_deref() == Some(prefix.as_str()) {
-                    return Err(ModuleError::config_env_prefix_conflict(prefix));
+        // Check for duplicate env_prefix.
+        let prefix = reg.env_prefix.as_deref().unwrap_or("");
+        for existing in map.values() {
+            if existing.env_prefix.as_deref() == Some(prefix) {
+                return Err(ModuleError::config_env_prefix_conflict(prefix));
+            }
+        }
+        // Validate env_map: no env var can be claimed twice.
+        if let Some(ref em) = reg.env_map {
+            let claimed = env_map_claimed().read().unwrap_or_else(|e| e.into_inner());
+            for env_var in em.keys() {
+                if let Some(owner) = claimed.get(env_var) {
+                    return Err(ModuleError::config_env_map_conflict(env_var, owner));
                 }
+            }
+            drop(claimed);
+            let mut claimed = env_map_claimed().write().unwrap_or_else(|e| e.into_inner());
+            for env_var in em.keys() {
+                claimed.insert(env_var.clone(), reg.name.clone());
             }
         }
         map.insert(reg.name.clone(), reg);
+        Ok(())
+    }
+
+    /// Register global bare env var → top-level config key mappings.
+    pub fn env_map(mapping: HashMap<String, String>) -> Result<(), ModuleError> {
+        let claimed_lock = env_map_claimed();
+        let claimed = claimed_lock.read().unwrap_or_else(|e| e.into_inner());
+        for env_var in mapping.keys() {
+            if let Some(owner) = claimed.get(env_var) {
+                return Err(ModuleError::config_env_map_conflict(env_var, owner));
+            }
+        }
+        drop(claimed);
+        let mut claimed = claimed_lock.write().unwrap_or_else(|e| e.into_inner());
+        let mut gmap = global_env_map().write().unwrap_or_else(|e| e.into_inner());
+        for (env_var, config_key) in mapping {
+            claimed.insert(env_var.clone(), "__global__".to_string());
+            gmap.insert(env_var, config_key);
+        }
         Ok(())
     }
 
@@ -473,26 +541,57 @@ impl Config {
         let registry = global_ns_registry()
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        // Collect registered prefixes, sorted by length descending (longest first).
-        let mut prefixed: Vec<(&str, &str)> = registry
+        let gmap = global_env_map().read().unwrap_or_else(|e| e.into_inner());
+
+        // Build namespace env_map lookup.
+        let mut ns_env_maps: HashMap<&str, (&str, &str)> = HashMap::new();
+        for reg in registry.values() {
+            if let Some(ref em) = reg.env_map {
+                for (env_var, config_key) in em {
+                    ns_env_maps.insert(env_var.as_str(), (reg.name.as_str(), config_key.as_str()));
+                }
+            }
+        }
+
+        // Prefix table: sorted by length descending for longest-prefix-match.
+        let mut prefixed: Vec<&NamespaceRegistration> = registry
             .values()
-            .filter_map(|r| r.env_prefix.as_deref().map(|pfx| (pfx, r.name.as_str())))
+            .filter(|r| r.env_prefix.is_some())
             .collect();
-        prefixed.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        prefixed.sort_by(|a, b| {
+            b.env_prefix
+                .as_ref()
+                .map_or(0, |p| p.len())
+                .cmp(&a.env_prefix.as_ref().map_or(0, |p| p.len()))
+        });
 
         for (env_key, env_value) in std::env::vars() {
             let parsed = Self::coerce_env_value(&env_value);
-            // Try namespace-aware routing first.
+
+            // 1. Global env_map (bare env var → top-level key).
+            if let Some(config_key) = gmap.get(&env_key) {
+                self.set(config_key, parsed);
+                continue;
+            }
+
+            // 2. Namespace env_map (bare env var → namespace key).
+            if let Some(&(ns_name, config_key)) = ns_env_maps.get(env_key.as_str()) {
+                let full_path = format!("{ns_name}.{config_key}");
+                self.set(&full_path, parsed);
+                continue;
+            }
+
+            // 3. Prefix-based dispatch.
             let mut matched = false;
-            for &(prefix, ns_name) in &prefixed {
+            for reg in &prefixed {
+                let prefix = reg.env_prefix.as_deref().unwrap_or("");
                 if let Some(suffix) = env_key.strip_prefix(prefix) {
-                    // Strip the leading separator (usually '_').
                     let suffix = suffix.strip_prefix('_').unwrap_or(suffix);
                     if suffix.is_empty() {
                         continue;
                     }
-                    let dot_path = Self::env_key_to_dot_path(suffix);
-                    let full_path = format!("{ns_name}.{dot_path}");
+                    let key = Self::resolve_env_suffix(suffix, reg);
+                    let full_path = format!("{}.{key}", reg.name);
                     tracing::debug!(env = %env_key, path = %full_path, "Applying namespace env override");
                     self.set(&full_path, parsed.clone());
                     matched = true;
@@ -600,17 +699,27 @@ impl Config {
     ///
     /// So to set `max_call_depth` via env, use `APCORE_EXECUTOR_MAX__CALL__DEPTH`.
     fn env_key_to_dot_path(raw: &str) -> String {
+        Self::env_key_to_dot_path_with_depth(raw, usize::MAX)
+    }
+
+    /// Convert env var suffix to dot-path, stopping at `max_depth` segments.
+    fn env_key_to_dot_path_with_depth(raw: &str, max_depth: usize) -> String {
         let lower = raw.to_lowercase();
         let chars: Vec<char> = lower.chars().collect();
         let mut result = String::with_capacity(chars.len());
+        let mut dot_count: usize = 0;
         let mut i = 0;
         while i < chars.len() {
             if chars[i] == '_' {
                 if i + 1 < chars.len() && chars[i + 1] == '_' {
-                    result.push('_');
+                    result.push('_'); // double __ → literal _
                     i += 2;
-                } else {
+                } else if dot_count < max_depth.saturating_sub(1) {
                     result.push('.');
+                    dot_count += 1;
+                    i += 1;
+                } else {
+                    result.push('_'); // depth limit reached
                     i += 1;
                 }
             } else {
@@ -619,6 +728,59 @@ impl Config {
             }
         }
         result
+    }
+
+    /// Try to match suffix against keys in a JSON object tree (recursive).
+    fn match_suffix_to_tree(
+        suffix: &str,
+        tree: &serde_json::Map<String, serde_json::Value>,
+        depth: usize,
+        max_depth: usize,
+    ) -> Option<String> {
+        // 1. Try full suffix as a flat key.
+        if tree.contains_key(suffix) {
+            return Some(suffix.to_string());
+        }
+        // 2. Depth limit.
+        if depth >= max_depth.saturating_sub(1) {
+            return None;
+        }
+        // 3. Try splitting at each underscore.
+        for (i, ch) in suffix.char_indices() {
+            if ch != '_' || i == 0 || i == suffix.len() - 1 {
+                continue;
+            }
+            let prefix_part = &suffix[..i];
+            let remainder = &suffix[i + 1..];
+            if let Some(serde_json::Value::Object(subtree)) = tree.get(prefix_part) {
+                if let Some(sub) =
+                    Self::match_suffix_to_tree(remainder, subtree, depth + 1, max_depth)
+                {
+                    return Some(format!("{prefix_part}.{sub}"));
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve an env var suffix based on the registration's env_style.
+    fn resolve_env_suffix(suffix: &str, reg: &NamespaceRegistration) -> String {
+        match reg.env_style {
+            EnvStyle::Flat => suffix.to_lowercase(),
+            EnvStyle::Auto => {
+                let lower = suffix.to_lowercase();
+                if let Some(serde_json::Value::Object(tree)) = reg.defaults.as_ref() {
+                    if let Some(resolved) =
+                        Self::match_suffix_to_tree(&lower, tree, 0, reg.max_depth)
+                    {
+                        return resolved;
+                    }
+                }
+                // Fall back to nested with depth.
+                Self::env_key_to_dot_path_with_depth(suffix, reg.max_depth)
+            }
+            EnvStyle::Nested => Self::env_key_to_dot_path_with_depth(suffix, reg.max_depth),
+        }
     }
 
     fn coerce_env_value(value: &str) -> serde_json::Value {
@@ -656,6 +818,9 @@ fn init_builtin_namespaces() {
                     "metrics": { "enabled": false }
                 })),
                 schema: None,
+                env_style: EnvStyle::Nested,
+                max_depth: DEFAULT_MAX_DEPTH,
+                env_map: None,
             },
             NamespaceRegistration {
                 name: "sys_modules".to_string(),
@@ -677,6 +842,9 @@ fn init_builtin_namespaces() {
                     }
                 })),
                 schema: None,
+                env_style: EnvStyle::Nested,
+                max_depth: DEFAULT_MAX_DEPTH,
+                env_map: None,
             },
         ];
         for ns in namespaces {
