@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
@@ -78,9 +79,13 @@ pub struct ModuleAnnotations {
     pub paginated: bool,
     #[serde(default = "default_pagination_style")]
     pub pagination_style: String, // "cursor" | "offset" | "page"
-                                  // Legacy fields moved to ModuleDescriptor:
-                                  // name, version, author, description, tags, category, deprecated,
-                                  // deprecated_message, since, hidden, examples, dependencies, metadata
+    /// Extension map for ecosystem package metadata.
+    /// Unknown JSON keys are captured here via serde(flatten).
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+    // Legacy fields moved to ModuleDescriptor:
+    // name, version, author, description, tags, category, deprecated,
+    // deprecated_message, since, hidden, examples, dependencies, metadata
 }
 
 fn default_true() -> bool {
@@ -104,6 +109,7 @@ impl Default for ModuleAnnotations {
             cache_key_fields: None,
             paginated: false,
             pagination_style: "cursor".to_string(),
+            extra: HashMap::new(),
         }
     }
 }

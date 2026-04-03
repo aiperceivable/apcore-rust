@@ -181,12 +181,12 @@ mod tests {
     use crate::context::{Context, Identity};
 
     fn test_ctx() -> Context<Value> {
-        let identity = Identity {
-            id: "test-user".to_string(),
-            identity_type: "user".to_string(),
-            roles: vec![],
-            attrs: std::collections::HashMap::new(),
-        };
+        let identity = Identity::new(
+            "test-user".to_string(),
+            "user".to_string(),
+            vec![],
+            std::collections::HashMap::new(),
+        );
         Context::new(identity)
     }
 

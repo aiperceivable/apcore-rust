@@ -60,14 +60,14 @@ fn test_cancel_token() {
 
 #[test]
 fn test_identity_creation() {
-    let identity = Identity {
-        id: "user-1".to_string(),
-        identity_type: "Test User".to_string(),
-        roles: vec!["admin".to_string()],
-        attrs: std::collections::HashMap::new(),
-    };
-    assert_eq!(identity.id, "user-1");
-    assert_eq!(identity.roles.len(), 1);
+    let identity = Identity::new(
+        "user-1".to_string(),
+        "Test User".to_string(),
+        vec!["admin".to_string()],
+        std::collections::HashMap::new(),
+    );
+    assert_eq!(identity.id(), "user-1");
+    assert_eq!(identity.roles().len(), 1);
 }
 
 #[test]

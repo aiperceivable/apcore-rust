@@ -51,12 +51,12 @@ impl Module for FailingModule {
 }
 
 fn make_ctx() -> Context<Value> {
-    Context::new(Identity {
-        id: "test".to_string(),
-        identity_type: "Test".to_string(),
-        roles: vec![],
-        attrs: HashMap::new(),
-    })
+    Context::new(Identity::new(
+        "test".to_string(),
+        "Test".to_string(),
+        vec![],
+        HashMap::new(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -183,4 +183,81 @@ fn test_module_example_serialization() {
     let restored: ModuleExample = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.title, ex.title);
     assert_eq!(restored.inputs, ex.inputs);
+}
+
+// ---------------------------------------------------------------------------
+// ModuleAnnotations -- extra field (annotations-redesign)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_annotations_default_extra_is_empty() {
+    let ann = ModuleAnnotations::default();
+    assert!(ann.extra.is_empty());
+}
+
+#[test]
+fn test_annotations_extra_with_values() {
+    let mut extra = HashMap::new();
+    extra.insert(
+        "mcp.category".to_string(),
+        serde_json::Value::String("tools".to_string()),
+    );
+    let ann = ModuleAnnotations {
+        extra,
+        ..Default::default()
+    };
+    assert_eq!(
+        ann.extra.get("mcp.category").unwrap(),
+        &serde_json::Value::String("tools".to_string())
+    );
+}
+
+#[test]
+fn test_annotations_serde_flatten_captures_unknown_keys() {
+    // AC-028: Unknown JSON keys captured into extra via serde(flatten)
+    let data = r#"{
+        "readonly": true,
+        "future_field": 42,
+        "another_unknown": "hello"
+    }"#;
+    let ann: ModuleAnnotations = serde_json::from_str(data).unwrap();
+    assert!(ann.readonly);
+    assert_eq!(ann.extra.get("future_field").unwrap(), &json!(42));
+    assert_eq!(ann.extra.get("another_unknown").unwrap(), &json!("hello"));
+}
+
+#[test]
+fn test_annotations_pagination_style_accepts_custom_string() {
+    let ann = ModuleAnnotations {
+        pagination_style: "custom".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(ann.pagination_style, "custom");
+}
+
+#[test]
+fn test_annotations_extra_round_trip() {
+    let mut extra = HashMap::new();
+    extra.insert("cli.approval_message".to_string(), json!("Are you sure?"));
+    let ann = ModuleAnnotations {
+        destructive: true,
+        extra,
+        ..Default::default()
+    };
+    let serialized = serde_json::to_string(&ann).unwrap();
+    let restored: ModuleAnnotations = serde_json::from_str(&serialized).unwrap();
+    assert!(restored.destructive);
+    assert_eq!(
+        restored.extra.get("cli.approval_message").unwrap(),
+        &json!("Are you sure?")
+    );
+}
+
+#[test]
+fn test_annotations_deserialization_missing_fields_use_defaults() {
+    let ann: ModuleAnnotations = serde_json::from_str("{}").unwrap();
+    assert!(!ann.readonly);
+    assert!(ann.open_world);
+    assert_eq!(ann.pagination_style, "cursor");
+    assert!(ann.extra.is_empty());
 }

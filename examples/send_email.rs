@@ -107,12 +107,12 @@ fn send_email_annotations() -> ModuleAnnotations {
 
 #[tokio::main]
 async fn main() {
-    let identity = Identity {
-        id: "admin-1".to_string(),
-        identity_type: "Admin".to_string(),
-        roles: vec!["admin".to_string()],
-        attrs: HashMap::new(),
-    };
+    let identity = Identity::new(
+        "admin-1".to_string(),
+        "Admin".to_string(),
+        vec!["admin".to_string()],
+        HashMap::new(),
+    );
     let ctx: Context<Value> = Context::new(identity);
     let module = SendEmailModule;
 

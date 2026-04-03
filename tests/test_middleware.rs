@@ -124,12 +124,12 @@ fn test_retry_config_defaults() {
 #[tokio::test]
 async fn test_retry_middleware_skips_non_retryable() {
     let mw = RetryMiddleware::new(RetryConfig::default());
-    let ctx = Context::<Value>::new(Identity {
-        id: "test".into(),
-        identity_type: "test".into(),
-        roles: vec![],
-        attrs: Default::default(),
-    });
+    let ctx = Context::<Value>::new(Identity::new(
+        "test".into(),
+        "test".into(),
+        vec![],
+        Default::default(),
+    ));
     let error = ModuleError::new(ErrorCode::ModuleExecuteError, "fail");
     // error.retryable is None (not explicitly retryable)
     let result = mw
@@ -148,12 +148,12 @@ async fn test_retry_middleware_retries_retryable_error() {
         max_delay_ms: 1,
         jitter: false,
     });
-    let ctx = Context::<Value>::new(Identity {
-        id: "test".into(),
-        identity_type: "test".into(),
-        roles: vec![],
-        attrs: Default::default(),
-    });
+    let ctx = Context::<Value>::new(Identity::new(
+        "test".into(),
+        "test".into(),
+        vec![],
+        Default::default(),
+    ));
     let error = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
 
     // First retry should succeed (count 0 < max 2)
@@ -187,12 +187,12 @@ async fn test_retry_middleware_resets_on_success() {
         max_delay_ms: 1,
         jitter: false,
     });
-    let ctx = Context::<Value>::new(Identity {
-        id: "test".into(),
-        identity_type: "test".into(),
-        roles: vec![],
-        attrs: Default::default(),
-    });
+    let ctx = Context::<Value>::new(Identity::new(
+        "test".into(),
+        "test".into(),
+        vec![],
+        Default::default(),
+    ));
     let error = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
 
     // First retry

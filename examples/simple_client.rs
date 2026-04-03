@@ -92,12 +92,12 @@ impl Module for GreetModule {
 #[tokio::main]
 async fn main() {
     // Build a caller identity
-    let identity = Identity {
-        id: "user-1".to_string(),
-        identity_type: "Alice".to_string(),
-        roles: vec!["user".to_string()],
-        attrs: HashMap::new(),
-    };
+    let identity = Identity::new(
+        "user-1".to_string(),
+        "Alice".to_string(),
+        vec!["user".to_string()],
+        HashMap::new(),
+    );
 
     // Create an execution context
     let ctx: Context<Value> = Context::new(identity);

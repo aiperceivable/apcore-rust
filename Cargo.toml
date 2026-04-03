@@ -44,3 +44,4 @@ events = ["reqwest"]
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+trybuild = "1"

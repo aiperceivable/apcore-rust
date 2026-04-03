@@ -283,12 +283,12 @@ mod tests {
 
     fn make_ctx(trace_id: &str) -> Context<serde_json::Value> {
         Context::create(
-            Identity {
-                id: "test-user".to_string(),
-                identity_type: "user".to_string(),
-                roles: vec![],
-                attrs: HashMap::new(),
-            },
+            Identity::new(
+                "test-user".to_string(),
+                "user".to_string(),
+                vec![],
+                HashMap::new(),
+            ),
             serde_json::Value::Null,
             None,
             None,

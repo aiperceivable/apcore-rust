@@ -42,12 +42,12 @@ fn make_descriptor(name: &str) -> ModuleDescriptor {
 }
 
 fn dummy_identity() -> Identity {
-    Identity {
-        id: "@test".to_string(),
-        identity_type: "test".to_string(),
-        roles: vec![],
-        attrs: Default::default(),
-    }
+    Identity::new(
+        "@test".to_string(),
+        "test".to_string(),
+        vec![],
+        Default::default(),
+    )
 }
 
 // ---------------------------------------------------------------------------

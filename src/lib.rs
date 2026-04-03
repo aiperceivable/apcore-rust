@@ -5,6 +5,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod acl;
+pub mod acl_handlers;
 pub mod approval;
 pub mod async_task;
 pub mod bindings;
@@ -12,6 +13,8 @@ pub mod cancel;
 pub mod client;
 pub mod config;
 pub mod context;
+pub mod context_key;
+pub mod context_keys;
 pub mod decorator;
 pub mod error_formatter;
 pub mod errors;
@@ -30,6 +33,7 @@ pub mod version;
 
 // Re-export primary types at crate root for convenience.
 pub use acl::{ACLRule, ACL};
+pub use acl_handlers::ACLConditionHandler;
 pub use approval::{
     AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,
 };
@@ -37,6 +41,7 @@ pub use async_task::TaskStatus;
 pub use client::APCore;
 pub use config::{Config, ConfigMode, EnvStyle, MountSource, NamespaceInfo, NamespaceRegistration};
 pub use context::{Context, ContextFactory, Identity};
+pub use context_key::ContextKey;
 pub use errors::{ErrorCode, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
 pub use executor::{redact_sensitive, Executor, ValidationResult, REDACTED_VALUE};

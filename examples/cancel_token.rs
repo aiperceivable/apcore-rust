@@ -56,12 +56,12 @@ impl Module for SlowModule {
 
 #[tokio::main]
 async fn main() {
-    let identity = Identity {
-        id: "user-1".to_string(),
-        identity_type: "Alice".to_string(),
-        roles: vec![],
-        attrs: HashMap::new(),
-    };
+    let identity = Identity::new(
+        "user-1".to_string(),
+        "Alice".to_string(),
+        vec![],
+        HashMap::new(),
+    );
 
     // --- Run 1: complete all steps (no cancellation) ---
     println!("=== Run 1: normal execution ===");

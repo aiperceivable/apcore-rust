@@ -2,27 +2,84 @@
 // Spec reference: Execution context and identity model
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use std::sync::{Arc, RwLock};
-use tokio::time::Instant;
 
 use crate::cancel::CancelToken;
 use crate::observability::logging::ContextLogger;
-use crate::trace_context::TraceContext;
+
+/// Raw intermediate struct for deserializing Identity with private fields.
+#[derive(Deserialize)]
+struct IdentityRaw {
+    id: String,
+    #[serde(rename = "type")]
+    identity_type: String,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    attrs: HashMap<String, serde_json::Value>,
+}
+
+impl From<IdentityRaw> for Identity {
+    fn from(raw: IdentityRaw) -> Self {
+        Identity {
+            id: raw.id,
+            identity_type: raw.identity_type,
+            roles: raw.roles,
+            attrs: raw.attrs,
+        }
+    }
+}
 
 /// Frozen/immutable identity representing the caller.
+/// Fields are private to enforce immutability after construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "IdentityRaw")]
 pub struct Identity {
-    pub id: String,
+    id: String,
     #[serde(rename = "type")]
-    pub identity_type: String,
-    #[serde(default)]
-    pub roles: Vec<String>,
-    #[serde(default)]
-    pub attrs: HashMap<String, serde_json::Value>,
+    identity_type: String,
+    roles: Vec<String>,
+    attrs: HashMap<String, serde_json::Value>,
+}
+
+impl Identity {
+    /// Create a new identity with the given fields.
+    pub fn new(
+        id: String,
+        identity_type: String,
+        roles: Vec<String>,
+        attrs: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            id,
+            identity_type,
+            roles,
+            attrs,
+        }
+    }
+
+    /// The unique identifier of the caller.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The type of the identity (e.g. "user", "service", "agent").
+    pub fn identity_type(&self) -> &str {
+        &self.identity_type
+    }
+
+    /// The roles assigned to this identity.
+    pub fn roles(&self) -> &[String] {
+        &self.roles
+    }
+
+    /// Additional attributes associated with this identity.
+    pub fn attrs(&self) -> &HashMap<String, serde_json::Value> {
+        &self.attrs
+    }
 }
 
 /// Shared mutable data map that is readable/writable along the call chain.
@@ -42,7 +99,6 @@ pub struct Context<T> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
     pub services: T,
-    pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_id: Option<String>,
     /// Shared data map — parent and child contexts share the same instance.
@@ -53,20 +109,16 @@ pub struct Context<T> {
         default = "default_shared_data"
     )]
     pub data: SharedData,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_trace_id: Option<String>,
     #[serde(default)]
     pub call_chain: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_inputs: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip)]
     pub cancel_token: Option<CancelToken>,
-    #[serde(skip)]
-    pub trace_context: Option<TraceContext>,
     /// Global deadline for dual-timeout enforcement (not serialized).
-    /// Set on root call; propagated to child contexts.
+    /// Stored as absolute epoch seconds (f64) for cross-language alignment.
     #[serde(skip)]
-    pub global_deadline: Option<Instant>,
+    pub global_deadline: Option<f64>,
     /// Runtime reference to the executor for nested calls (not serialized).
     #[serde(skip)]
     pub executor: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -98,14 +150,11 @@ impl<T: Default> Context<T> {
             trace_id: uuid::Uuid::new_v4().to_string(),
             identity: Some(identity),
             services: T::default(),
-            created_at: Utc::now(),
             caller_id: None,
             data: default_shared_data(),
-            parent_trace_id: None,
             call_chain: vec![],
             redacted_inputs: None,
             cancel_token: None,
-            trace_context: None,
             global_deadline: None,
             executor: None,
         }
@@ -117,14 +166,11 @@ impl<T: Default> Context<T> {
             trace_id: uuid::Uuid::new_v4().to_string(),
             identity: None,
             services: T::default(),
-            created_at: Utc::now(),
             caller_id: None,
             data: default_shared_data(),
-            parent_trace_id: None,
             call_chain: vec![],
             redacted_inputs: None,
             cancel_token: None,
-            trace_context: None,
             global_deadline: None,
             executor: None,
         }
@@ -146,15 +192,12 @@ impl<T: Default> Context<T> {
             trace_id: self.trace_id.clone(),
             identity: self.identity.clone(),
             services: self.services.clone(),
-            created_at: Utc::now(),
             caller_id,
             // Share the same underlying data map (Arc clone, not HashMap clone).
             data: Arc::clone(&self.data),
-            parent_trace_id: self.parent_trace_id.clone(),
             call_chain,
             redacted_inputs: None,
             cancel_token: self.cancel_token.clone(),
-            trace_context: self.trace_context.clone(),
             global_deadline: self.global_deadline,
             executor: self.executor.clone(),
         }
@@ -192,6 +235,125 @@ impl<T: Default> Context<T> {
         Ok(ctx)
     }
 
+    /// Serialize context to a cross-language JSON representation.
+    ///
+    /// Includes `_context_version: 1` at top level.
+    /// Excludes: executor, services, cancel_token, global_deadline.
+    /// Filters `_`-prefixed keys from data.
+    pub fn serialize(&self) -> serde_json::Value {
+        let mut result = serde_json::json!({
+            "_context_version": 1,
+            "trace_id": self.trace_id,
+            "caller_id": self.caller_id,
+            "call_chain": self.call_chain,
+        });
+
+        if let Some(ref identity) = self.identity {
+            result["identity"] = serde_json::json!({
+                "id": identity.id(),
+                "type": identity.identity_type(),
+                "roles": identity.roles(),
+                "attrs": identity.attrs(),
+            });
+        } else {
+            result["identity"] = serde_json::Value::Null;
+        }
+
+        if let Some(ref redacted) = self.redacted_inputs {
+            result["redacted_inputs"] =
+                serde_json::to_value(redacted).unwrap_or_default();
+        }
+
+        // Filter _-prefixed keys from data
+        let filtered: HashMap<String, serde_json::Value> = self
+            .data
+            .read()
+            .map(|map| {
+                map.iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        result["data"] = serde_json::to_value(filtered).unwrap_or_default();
+        result
+    }
+
+    /// Deserialize a cross-language JSON representation into a Context.
+    ///
+    /// Non-serializable fields (executor, services, cancel_token,
+    /// global_deadline) are set to `None`/default after deserialization.
+    /// If `_context_version` is greater than 1, a warning is logged
+    /// but deserialization proceeds (forward compatibility).
+    pub fn deserialize(
+        value: serde_json::Value,
+    ) -> Result<Self, serde_json::Error>
+    where
+        T: Default,
+    {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("expected JSON object"))?;
+
+        let version = obj
+            .get("_context_version")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+
+        if version > 1 {
+            tracing::warn!(
+                version = version,
+                "Unknown _context_version (expected 1). \
+                 Proceeding with best-effort deserialization."
+            );
+        }
+
+        let identity: Option<Identity> = obj
+            .get("identity")
+            .and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    serde_json::from_value(v.clone()).ok()
+                }
+            });
+
+        let data_map: HashMap<String, serde_json::Value> = obj
+            .get("data")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let call_chain: Vec<String> = obj
+            .get("call_chain")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let redacted_inputs: Option<HashMap<String, serde_json::Value>> = obj
+            .get("redacted_inputs")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        Ok(Context {
+            trace_id: obj
+                .get("trace_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            caller_id: obj
+                .get("caller_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            call_chain,
+            identity,
+            redacted_inputs,
+            data: Arc::new(RwLock::new(data_map)),
+            services: T::default(),
+            cancel_token: None,
+            global_deadline: None,
+            executor: None,
+        })
+    }
+
     /// Get a context-scoped logger.
     pub fn logger(&self) -> ContextLogger {
         let module_id = self.call_chain.last().cloned();
@@ -217,14 +379,11 @@ impl<T: Default> Context<T> {
             trace_id: uuid::Uuid::new_v4().to_string(),
             identity: Some(identity),
             services,
-            created_at: Utc::now(),
             caller_id,
             data: Arc::new(RwLock::new(data.unwrap_or_default())),
-            parent_trace_id: None,
             call_chain: vec![],
             redacted_inputs: None,
             cancel_token: None,
-            trace_context: None,
             global_deadline: None,
             executor: None,
         }

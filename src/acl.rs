@@ -3,8 +3,11 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
+use crate::acl_handlers::{register_builtin_handlers, CONDITION_HANDLERS};
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::utils::match_pattern;
@@ -83,19 +86,100 @@ impl Clone for ACL {
 }
 
 impl ACL {
-    /// Create a new ACL with the given rules and default effect.
-    pub fn new(rules: Vec<ACLRule>, default_effect: impl Into<String>) -> Self {
+    /// Create a new ACL with the given rules, default effect, and optional audit logger.
+    pub fn new(
+        rules: Vec<ACLRule>,
+        default_effect: impl Into<String>,
+        audit_logger: Option<Arc<AuditLoggerFn>>,
+    ) -> Self {
         Self {
             rules,
             default_effect: default_effect.into(),
             yaml_path: None,
-            audit_logger: None,
+            audit_logger,
         }
     }
 
     /// Set the audit logger callback.
     pub fn set_audit_logger(&mut self, logger: impl Fn(&AuditEntry) + Send + Sync + 'static) {
         self.audit_logger = Some(Arc::new(logger));
+    }
+
+    /// Evaluate all conditions with AND logic using the handler registry. Fail-closed on unknown.
+    /// This is a sync function that uses a lightweight executor to drive async handlers.
+    pub fn evaluate_conditions(
+        conditions: &HashMap<String, serde_json::Value>,
+        ctx: &Context<serde_json::Value>,
+    ) -> bool {
+        let handlers = match CONDITION_HANDLERS.read() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Condition handler registry lock poisoned: {}", e);
+                return false;
+            }
+        };
+        for (key, value) in conditions {
+            let handler = match handlers.get(key.as_str()) {
+                Some(h) => h,
+                None => {
+                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                    return false;
+                }
+            };
+            // Built-in handlers are trivially async (return immediately).
+            // We poll the future once — if it's not ready, treat as unsatisfied.
+            let fut = handler.evaluate(value, ctx);
+            let fut = std::pin::pin!(fut);
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            let result = match fut.poll(&mut cx) {
+                std::task::Poll::Ready(val) => val,
+                std::task::Poll::Pending => {
+                    tracing::warn!(
+                        "Async condition '{}' not immediately ready in sync context — treated as unsatisfied",
+                        key,
+                    );
+                    return false;
+                }
+            };
+            if !result {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Async evaluate all conditions with AND logic using the handler registry.
+    ///
+    /// The RwLock read guard is held across `.await` because handlers are stored
+    /// as `Box<dyn ACLConditionHandler>` (not `Arc`) and must be borrowed from
+    /// the map.  All built-in handlers resolve immediately (no real suspension),
+    /// and the registry is only mutated at startup, so contention is negligible.
+    #[allow(clippy::await_holding_lock)] // see doc comment above
+    pub async fn evaluate_conditions_async(
+        conditions: &HashMap<String, serde_json::Value>,
+        ctx: &Context<serde_json::Value>,
+    ) -> bool {
+        let handlers = match CONDITION_HANDLERS.read() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Condition handler registry lock poisoned: {}", e);
+                return false;
+            }
+        };
+        for (key, value) in conditions {
+            let handler = match handlers.get(key.as_str()) {
+                Some(h) => h,
+                None => {
+                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                    return false;
+                }
+            };
+            if !handler.evaluate(value, ctx).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Add a rule to the ACL (inserted at position 0, highest priority).
@@ -211,7 +295,7 @@ impl ACL {
             .unwrap_or("deny")
             .to_string();
 
-        let mut acl = Self::new(rules, default_effect);
+        let mut acl = Self::new(rules, default_effect, None);
         acl.yaml_path = Some(path.to_string());
         Ok(acl)
     }
@@ -250,25 +334,21 @@ impl ACL {
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
         // Caller OR-match: any pattern in callers list must match.
-        let caller_match = if rule.callers.is_empty() {
-            true
-        } else {
-            rule.callers
-                .iter()
-                .any(|p| Self::match_acl_pattern(p, caller))
-        };
+        // Empty callers matches nothing (aligned with Python/TS).
+        let caller_match = rule
+            .callers
+            .iter()
+            .any(|p| Self::match_acl_pattern(p, caller));
         if !caller_match {
             return false;
         }
 
         // Target OR-match: any pattern in targets list must match.
-        let target_match = if rule.targets.is_empty() {
-            true
-        } else {
-            rule.targets
-                .iter()
-                .any(|p| Self::match_acl_pattern(p, target))
-        };
+        // Empty targets matches nothing (aligned with Python/TS).
+        let target_match = rule
+            .targets
+            .iter()
+            .any(|p| Self::match_acl_pattern(p, target));
         if !target_match {
             return false;
         }
@@ -293,7 +373,7 @@ impl ACL {
         match_pattern(pattern, value)
     }
 
-    /// Evaluate conditions block against the context.
+    /// Evaluate conditions block against the context using registered handlers.
     fn check_conditions(
         &self,
         conditions: &serde_json::Value,
@@ -309,49 +389,12 @@ impl ACL {
             None => return false,
         };
 
-        // identity_types: list of allowed identity types (OR match).
-        // If identity is None (anonymous), no identity type can match.
-        if let Some(identity_types) = obj.get("identity_types") {
-            if let Some(arr) = identity_types.as_array() {
-                let matched = match &ctx.identity {
-                    Some(id) => arr
-                        .iter()
-                        .any(|v| v.as_str().is_some_and(|s| s == id.identity_type)),
-                    None => false, // anonymous caller has no identity type
-                };
-                if !matched {
-                    return false;
-                }
-            }
-        }
+        let map: HashMap<String, serde_json::Value> = obj
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
-        // roles: list of required roles (any match).
-        // If identity is None (anonymous), no roles can match.
-        if let Some(roles) = obj.get("roles") {
-            if let Some(arr) = roles.as_array() {
-                let matched = match &ctx.identity {
-                    Some(id) => arr.iter().any(|v| {
-                        v.as_str()
-                            .is_some_and(|s| id.roles.contains(&s.to_string()))
-                    }),
-                    None => false, // anonymous caller has no roles
-                };
-                if !matched {
-                    return false;
-                }
-            }
-        }
-
-        // max_call_depth: call_chain length must not exceed this.
-        if let Some(max_depth) = obj.get("max_call_depth") {
-            if let Some(max) = max_depth.as_u64() {
-                if (ctx.call_chain.len() as u64) > max {
-                    return false;
-                }
-            }
-        }
-
-        true
+        Self::evaluate_conditions(&map, ctx)
     }
 
     /// Build an audit entry from the check parameters and context.
@@ -374,13 +417,113 @@ impl ACL {
             reason: reason.to_string(),
             matched_rule: matched_rule_desc.map(|s| s.to_string()),
             matched_rule_index,
-            identity_type: ctx.and_then(|c| c.identity.as_ref().map(|id| id.identity_type.clone())),
+            identity_type: ctx
+                .and_then(|c| c.identity.as_ref().map(|id| id.identity_type().to_string())),
             roles: ctx
-                .and_then(|c| c.identity.as_ref().map(|id| id.roles.clone()))
+                .and_then(|c| c.identity.as_ref().map(|id| id.roles().to_vec()))
                 .unwrap_or_default(),
             call_depth: ctx.map(|c| c.call_chain.len()),
             trace_id: ctx.map(|c| c.trace_id.clone()),
         }
+    }
+
+    /// Async check whether the given caller is allowed to access the target.
+    /// Uses first-match-wins evaluation with async condition handler support.
+    pub async fn async_check(
+        &self,
+        caller_id: Option<&str>,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> Result<bool, ModuleError> {
+        let caller = caller_id.unwrap_or("@external");
+
+        if self.rules.is_empty() {
+            let entry = self.build_audit_entry(
+                caller,
+                target_id,
+                &self.default_effect,
+                "no_rules",
+                None,
+                None,
+                ctx,
+            );
+            self.emit_audit(&entry);
+            return Ok(self.default_effect == "allow");
+        }
+
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if self.matches_rule_async(rule, caller, target_id, ctx).await {
+                let decision = &rule.effect;
+                let entry = self.build_audit_entry(
+                    caller,
+                    target_id,
+                    decision,
+                    "rule_match",
+                    rule.description.as_deref(),
+                    Some(idx),
+                    ctx,
+                );
+                self.emit_audit(&entry);
+                return Ok(decision == "allow");
+            }
+        }
+
+        let entry = self.build_audit_entry(
+            caller,
+            target_id,
+            &self.default_effect,
+            "default_effect",
+            None,
+            None,
+            ctx,
+        );
+        self.emit_audit(&entry);
+        Ok(self.default_effect == "allow")
+    }
+
+    /// Async version of matches_rule that awaits async condition handlers.
+    async fn matches_rule_async(
+        &self,
+        rule: &ACLRule,
+        caller: &str,
+        target: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        let caller_match = rule
+            .callers
+            .iter()
+            .any(|p| Self::match_acl_pattern(p, caller));
+        if !caller_match {
+            return false;
+        }
+
+        let target_match = rule
+            .targets
+            .iter()
+            .any(|p| Self::match_acl_pattern(p, target));
+        if !target_match {
+            return false;
+        }
+
+        if let Some(ref conditions) = rule.conditions {
+            let ctx = match ctx {
+                Some(c) => c,
+                None => return false,
+            };
+            let obj = match conditions.as_object() {
+                Some(o) => o,
+                None => return false,
+            };
+            let map: HashMap<String, serde_json::Value> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !Self::evaluate_conditions_async(&map, ctx).await {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Emit an audit entry to the registered audit logger, if any.
@@ -389,10 +532,15 @@ impl ACL {
             logger(entry);
         }
     }
+
+    /// Initialize built-in handlers. Call once during application startup.
+    pub fn init_builtin_handlers() {
+        register_builtin_handlers(Self::evaluate_conditions);
+    }
 }
 
 impl Default for ACL {
     fn default() -> Self {
-        Self::new(vec![], "deny")
+        Self::new(vec![], "deny", None)
     }
 }

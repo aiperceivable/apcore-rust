@@ -32,12 +32,12 @@ fn make_registry() -> Arc<Mutex<Registry>> {
 }
 
 fn dummy_ctx() -> Context<serde_json::Value> {
-    Context::<serde_json::Value>::new(Identity {
-        id: "@test".to_string(),
-        identity_type: "test".to_string(),
-        roles: vec![],
-        attrs: Default::default(),
-    })
+    Context::<serde_json::Value>::new(Identity::new(
+        "@test".to_string(),
+        "test".to_string(),
+        vec![],
+        Default::default(),
+    ))
 }
 
 async fn register_dummy(registry: &Arc<Mutex<Registry>>, id: &str) {

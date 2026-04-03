@@ -127,12 +127,12 @@ fn get_user_annotations() -> ModuleAnnotations {
 
 #[tokio::main]
 async fn main() {
-    let identity = Identity {
-        id: "service-account".to_string(),
-        identity_type: "Data Service".to_string(),
-        roles: vec!["reader".to_string()],
-        attrs: HashMap::new(),
-    };
+    let identity = Identity::new(
+        "service-account".to_string(),
+        "Data Service".to_string(),
+        vec!["reader".to_string()],
+        HashMap::new(),
+    );
     let ctx: Context<Value> = Context::new(identity);
     let module = GetUserModule;
 

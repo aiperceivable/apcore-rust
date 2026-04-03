@@ -2,10 +2,9 @@
 // Spec reference: Module execution engine
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::time::Instant;
 
 use crate::acl::ACL;
 use crate::approval::{ApprovalHandler, ApprovalRequest};
@@ -279,12 +278,12 @@ impl Executor {
         let parent_ctx = match ctx {
             Some(parent) => parent,
             None => {
-                default_ctx = Context::<serde_json::Value>::new(Identity {
-                    id: "@external".to_string(),
-                    identity_type: "external".to_string(),
-                    roles: vec![],
-                    attrs: Default::default(),
-                });
+                default_ctx = Context::<serde_json::Value>::new(Identity::new(
+                    "@external".to_string(),
+                    "external".to_string(),
+                    vec![],
+                    Default::default(),
+                ));
                 &default_ctx
             }
         };
@@ -302,8 +301,12 @@ impl Executor {
 
         // Set global deadline on root call (when no parent context was provided)
         if ctx.is_none() && self.config.global_timeout_ms > 0 {
+            let now_epoch: f64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
             child_ctx.global_deadline =
-                Some(Instant::now() + Duration::from_millis(self.config.global_timeout_ms));
+                Some(now_epoch + (self.config.global_timeout_ms as f64 / 1000.0));
         }
 
         // Step 3: Module Lookup
@@ -579,12 +582,12 @@ impl Executor {
         inputs: &serde_json::Value,
     ) -> Result<ValidationResult, ModuleError> {
         // Step 1: Context
-        let default_ctx = Context::<serde_json::Value>::new(Identity {
-            id: "@external".to_string(),
-            identity_type: "external".to_string(),
-            roles: vec![],
-            attrs: Default::default(),
-        });
+        let default_ctx = Context::<serde_json::Value>::new(Identity::new(
+            "@external".to_string(),
+            "external".to_string(),
+            vec![],
+            Default::default(),
+        ));
 
         // Step 2: Safety Checks — guard on parent BEFORE creating child
         crate::utils::guard_call_chain_with_repeat(
@@ -774,19 +777,22 @@ impl Executor {
 
 /// Compute the effective timeout for module execution, enforcing dual-timeout model.
 ///
-/// Takes the per-module timeout and global deadline into account.
+/// Takes the per-module timeout and global deadline (epoch seconds, f64) into account.
 /// Returns the effective timeout in milliseconds.
 fn compute_effective_timeout(
     per_module_timeout_ms: u64,
-    global_deadline: Option<Instant>,
+    global_deadline: Option<f64>,
     module_id: &str,
     global_timeout_ms: u64,
 ) -> Result<u64, ModuleError> {
     let mut effective = per_module_timeout_ms;
 
-    if let Some(deadline) = global_deadline {
-        let now = Instant::now();
-        if now >= deadline {
+    if let Some(deadline_epoch) = global_deadline {
+        let now_epoch: f64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        if now_epoch >= deadline_epoch {
             // Global deadline already expired
             return Err(ModuleError::new(
                 ErrorCode::ModuleTimeout,
@@ -796,7 +802,7 @@ fn compute_effective_timeout(
                 ),
             ));
         }
-        let remaining_ms = (deadline - now).as_millis() as u64;
+        let remaining_ms = ((deadline_epoch - now_epoch) * 1000.0) as u64;
         if effective == 0 || remaining_ms < effective {
             effective = remaining_ms;
         }
@@ -1160,6 +1166,14 @@ mod tests {
     // compute_effective_timeout
     // ═══════════════════════════════════════════════════════════════════
 
+    /// Helper: returns the current epoch seconds as f64.
+    fn now_epoch() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    }
+
     #[test]
     fn test_compute_effective_timeout_per_module_only() {
         let result = compute_effective_timeout(5000, None, "mod", 0).unwrap();
@@ -1168,16 +1182,16 @@ mod tests {
 
     #[test]
     fn test_compute_effective_timeout_global_only() {
-        let deadline = Instant::now() + Duration::from_millis(3000);
+        let deadline: f64 = now_epoch() + 3.0; // 3 seconds from now
         let result = compute_effective_timeout(0, Some(deadline), "mod", 10000).unwrap();
-        // With per_module=0, the global remaining (~3000) should be used
+        // With per_module=0, the global remaining (~3000ms) should be used
         assert!(result > 0 && result <= 3000);
     }
 
     #[test]
     fn test_compute_effective_timeout_both_min_wins() {
         // Global remaining is ~3000ms, per-module is 5000ms -> global wins
-        let deadline = Instant::now() + Duration::from_millis(3000);
+        let deadline: f64 = now_epoch() + 3.0;
         let result = compute_effective_timeout(5000, Some(deadline), "mod", 10000).unwrap();
         assert!(result <= 3000);
     }
@@ -1185,7 +1199,7 @@ mod tests {
     #[test]
     fn test_compute_effective_timeout_per_module_wins_when_smaller() {
         // Global remaining is ~10000ms, per-module is 2000ms -> per-module wins
-        let deadline = Instant::now() + Duration::from_millis(10000);
+        let deadline: f64 = now_epoch() + 10.0;
         let result = compute_effective_timeout(2000, Some(deadline), "mod", 20000).unwrap();
         assert_eq!(result, 2000);
     }
@@ -1193,7 +1207,7 @@ mod tests {
     #[test]
     fn test_compute_effective_timeout_expired_deadline_returns_error() {
         // Deadline in the past
-        let deadline = Instant::now() - Duration::from_millis(100);
+        let deadline: f64 = now_epoch() - 0.1;
         let err = compute_effective_timeout(5000, Some(deadline), "mod", 10000).unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleTimeout);
         assert!(err.message.contains("Global timeout expired"));

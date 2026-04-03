@@ -10,7 +10,7 @@ use serde_json::Value;
 
 #[test]
 fn test_acl_new_is_empty() {
-    let acl = ACL::new(vec![], "deny");
+    let acl = ACL::new(vec![], "deny", None);
     assert!(acl.rules().is_empty());
 }
 
@@ -88,7 +88,7 @@ fn test_acl_new_with_rules() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     assert_eq!(acl.rules().len(), 1);
 }
 
@@ -97,12 +97,12 @@ fn test_acl_new_with_rules() {
 // ---------------------------------------------------------------------------
 
 fn make_ctx(id: &str, id_type: &str, roles: Vec<String>) -> Context<Value> {
-    Context::<Value>::new(Identity {
-        id: id.to_string(),
-        identity_type: id_type.to_string(),
+    Context::<Value>::new(Identity::new(
+        id.to_string(),
+        id_type.to_string(),
         roles,
-        attrs: Default::default(),
-    })
+        Default::default(),
+    ))
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn test_check_allow_rule_matches() {
         description: Some("Admin can access secrets".to_string()),
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     let ctx = make_ctx("admin", "user", vec![]);
     let result = acl
         .check(Some("admin"), "secrets.read", Some(&ctx))
@@ -131,7 +131,7 @@ fn test_check_allow_without_context() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     // check() with ctx=None should still match when there are no conditions
     let result = acl.check(Some("bot"), "public.info", None).unwrap();
     assert!(result);
@@ -150,7 +150,7 @@ fn test_check_deny_rule_matches() {
         description: Some("Guests cannot access admin".to_string()),
         conditions: None,
     }];
-    let acl = ACL::new(rules, "allow");
+    let acl = ACL::new(rules, "allow", None);
     let ctx = make_ctx("guest", "user", vec![]);
     let result = acl.check(Some("guest"), "admin.panel", Some(&ctx)).unwrap();
     assert!(!result, "Guest should be denied access to admin.*");
@@ -169,7 +169,7 @@ fn test_check_default_deny_when_no_rules_match() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     // "user1" does not match the "admin" caller pattern
     let result = acl.check(Some("user1"), "admin.panel", None).unwrap();
     assert!(!result, "Should fall through to default deny");
@@ -184,7 +184,7 @@ fn test_check_default_allow_when_no_rules_match() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "allow");
+    let acl = ACL::new(rules, "allow", None);
     // "friendly" does not match "blocked"
     let result = acl.check(Some("friendly"), "anything", None).unwrap();
     assert!(result, "Should fall through to default allow");
@@ -192,10 +192,10 @@ fn test_check_default_allow_when_no_rules_match() {
 
 #[test]
 fn test_check_default_effect_with_empty_rules() {
-    let acl_deny = ACL::new(vec![], "deny");
+    let acl_deny = ACL::new(vec![], "deny", None);
     assert!(!acl_deny.check(Some("anyone"), "anything", None).unwrap());
 
-    let acl_allow = ACL::new(vec![], "allow");
+    let acl_allow = ACL::new(vec![], "allow", None);
     assert!(acl_allow.check(Some("anyone"), "anything", None).unwrap());
 }
 
@@ -212,7 +212,7 @@ fn test_check_wildcard_target_matches_all() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     assert!(acl
         .check(Some("superadmin"), "any.module.here", None)
         .unwrap());
@@ -228,7 +228,7 @@ fn test_check_wildcard_caller_matches_all() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     assert!(acl.check(Some("anyone"), "public.health", None).unwrap());
     assert!(acl
         .check(Some("someone_else"), "public.health", None)
@@ -244,7 +244,7 @@ fn test_check_glob_pattern_in_target() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     assert!(acl.check(Some("svc"), "data.read", None).unwrap());
     assert!(acl.check(Some("svc"), "data.write", None).unwrap());
     assert!(
@@ -262,7 +262,7 @@ fn test_check_none_caller_maps_to_external() {
         description: None,
         conditions: None,
     }];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     // None caller should be treated as @external
     assert!(acl.check(None, "public.api", None).unwrap());
     // Explicit non-@external caller should not match
@@ -291,7 +291,7 @@ fn test_check_first_match_wins_allow_before_deny() {
             conditions: None,
         },
     ];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     let result = acl.check(Some("user"), "resource", None).unwrap();
     assert!(result, "First matching rule (allow) should win");
 }
@@ -314,7 +314,7 @@ fn test_check_first_match_wins_deny_before_allow() {
             conditions: None,
         },
     ];
-    let acl = ACL::new(rules, "allow");
+    let acl = ACL::new(rules, "allow", None);
     let result = acl.check(Some("user"), "resource", None).unwrap();
     assert!(!result, "First matching rule (deny) should win");
 }
@@ -337,7 +337,7 @@ fn test_check_first_match_skips_non_matching_rules() {
             conditions: None,
         },
     ];
-    let acl = ACL::new(rules, "deny");
+    let acl = ACL::new(rules, "deny", None);
     let result = acl.check(Some("user"), "resource", None).unwrap();
     assert!(
         result,
@@ -356,6 +356,7 @@ fn test_check_add_rule_inserts_at_front() {
             conditions: None,
         }],
         "deny",
+        None,
     );
 
     // add_rule inserts at position 0 — this deny rule should now be first
