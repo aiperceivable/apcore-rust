@@ -2,6 +2,7 @@
 // Spec reference: Module execution engine
 
 use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -14,6 +15,7 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::middleware::manager::MiddlewareManager;
+use crate::pipeline::{ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo};
 use crate::registry::registry::Registry;
 use crate::utils::guard_call_chain;
 
@@ -179,6 +181,42 @@ pub struct ValidationResult {
     pub warnings: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Global strategy registry (introspection)
+// ---------------------------------------------------------------------------
+
+/// Global registry of named execution strategies for introspection.
+static STRATEGY_REGISTRY: LazyLock<RwLock<Vec<StrategyInfo>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Register a strategy's info in the global registry for introspection.
+///
+/// Replaces any existing entry with the same name.
+pub fn register_strategy(info: StrategyInfo) {
+    let mut registry = STRATEGY_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    // Replace existing entry with same name, or append.
+    if let Some(existing) = registry.iter_mut().find(|s| s.name == info.name) {
+        *existing = info;
+    } else {
+        registry.push(info);
+    }
+}
+
+/// List all registered strategy summaries.
+pub fn list_strategies() -> Vec<StrategyInfo> {
+    STRATEGY_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Describe a pipeline by returning step names and descriptions from a strategy.
+pub fn describe_pipeline(strategy: &ExecutionStrategy) -> StrategyInfo {
+    strategy.info()
+}
+
 /// Responsible for executing modules with middleware, ACL, and context management.
 #[derive(Debug)]
 pub struct Executor {
@@ -187,6 +225,8 @@ pub struct Executor {
     pub acl: Option<ACL>,
     pub approval_handler: Option<Box<dyn ApprovalHandler>>,
     pub middleware_manager: MiddlewareManager,
+    /// Optional default execution strategy for pipeline-based execution.
+    strategy: Option<ExecutionStrategy>,
 }
 
 impl Executor {
@@ -198,6 +238,19 @@ impl Executor {
             acl: None,
             approval_handler: None,
             middleware_manager: MiddlewareManager::new(),
+            strategy: None,
+        }
+    }
+
+    /// Create a new executor with a default execution strategy.
+    pub fn with_strategy(registry: Registry, config: Config, strategy: ExecutionStrategy) -> Self {
+        Self {
+            registry,
+            config,
+            acl: None,
+            approval_handler: None,
+            middleware_manager: MiddlewareManager::new(),
+            strategy: Some(strategy),
         }
     }
 
@@ -225,6 +278,7 @@ impl Executor {
             acl,
             approval_handler,
             middleware_manager,
+            strategy: None,
         }
     }
 
@@ -747,7 +801,7 @@ impl Executor {
 
     /// Create an executor from a registry and config.
     pub fn from_registry(registry: Registry, config: Config) -> Self {
-        Self::with_options(registry, config, None, None, None)
+        Self::new(registry, config)
     }
 
     /// Stream execution of a module.
@@ -760,6 +814,68 @@ impl Executor {
     ) -> Result<Vec<Value>, ModuleError> {
         let result = self.call(module_id, inputs, ctx, version_hint).await?;
         Ok(vec![result])
+    }
+
+    /// Get a reference to the executor's default strategy, if set.
+    pub fn strategy(&self) -> Option<&ExecutionStrategy> {
+        self.strategy.as_ref()
+    }
+
+    /// Return a human-readable description of the configured pipeline.
+    pub fn describe_pipeline(&self) -> String {
+        match &self.strategy {
+            Some(s) => format!(
+                "{}-step pipeline: {}",
+                s.steps().len(),
+                s.step_names().join(" \u{2192} ")
+            ),
+            None => "11-step legacy pipeline (no strategy configured)".to_string(),
+        }
+    }
+
+    /// Execute a module through the pipeline engine, returning both the output
+    /// and a full execution trace.
+    ///
+    /// Uses the provided `strategy` override, or falls back to the executor's
+    /// default strategy. Returns an error if no strategy is available.
+    pub async fn call_with_trace(
+        &self,
+        module_id: &str,
+        inputs: Value,
+        ctx: Option<&Context<Value>>,
+        strategy: Option<&ExecutionStrategy>,
+    ) -> Result<(Value, PipelineTrace), ModuleError> {
+        let effective_strategy = strategy
+            .or(self.strategy.as_ref())
+            .ok_or_else(|| {
+                ModuleError::new(
+                    ErrorCode::GeneralInvalidInput,
+                    "No execution strategy provided and no default strategy set on executor"
+                        .to_string(),
+                )
+            })?;
+
+        let context = match ctx {
+            Some(c) => c.clone(),
+            None => Context::<Value>::new(Identity::new(
+                "@external".to_string(),
+                "external".to_string(),
+                vec![],
+                Default::default(),
+            )),
+        };
+
+        let mut pipeline_ctx = PipelineContext::new(
+            module_id,
+            inputs,
+            context,
+            effective_strategy.name(),
+        );
+
+        let (output, trace) =
+            PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await?;
+
+        Ok((output.unwrap_or(Value::Null), trace))
     }
 
     /// Add a before middleware.

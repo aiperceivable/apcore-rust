@@ -1,0 +1,218 @@
+// Integration tests for pipeline tasks:
+// executor-refactor, preset-strategies, call-with-trace, introspection
+
+use apcore::config::Config;
+use apcore::context::Context;
+use apcore::errors::ModuleError;
+use apcore::pipeline::{
+    ExecutionStrategy, PipelineContext, Step, StepResult,
+};
+use apcore::registry::registry::Registry;
+use apcore::{
+    build_internal_strategy, build_performance_strategy, build_standard_strategy,
+    build_testing_strategy, describe_pipeline, list_strategies, register_strategy, Executor,
+};
+use async_trait::async_trait;
+use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// Test helper: step that sets ctx.output
+// ---------------------------------------------------------------------------
+
+struct OutputStep {
+    output: Value,
+}
+
+impl OutputStep {
+    fn new(output: Value) -> Self {
+        Self { output }
+    }
+}
+
+#[async_trait]
+impl Step for OutputStep {
+    fn name(&self) -> &str {
+        "output_step"
+    }
+    fn description(&self) -> &str {
+        "Sets output on the pipeline context"
+    }
+    fn removable(&self) -> bool {
+        true
+    }
+    fn replaceable(&self) -> bool {
+        true
+    }
+    async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        ctx.output = Some(self.output.clone());
+        Ok(StepResult::continue_step())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 1: executor-refactor — with_strategy stores strategy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_executor_with_strategy_stores_strategy() {
+    let registry = Registry::new();
+    let config = Config::default();
+    let strategy = build_testing_strategy();
+
+    let executor = Executor::with_strategy(registry, config, strategy);
+
+    let stored = executor.strategy().expect("strategy should be Some");
+    assert_eq!(stored.name(), "testing");
+}
+
+#[test]
+fn test_executor_new_has_no_strategy() {
+    let registry = Registry::new();
+    let config = Config::default();
+    let executor = Executor::new(registry, config);
+    assert!(executor.strategy().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: preset-strategies
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_preset_internal_strategy() {
+    let strategy = build_internal_strategy();
+    assert_eq!(strategy.name(), "internal");
+    assert_eq!(strategy.steps().len(), 9);
+    // Internal skips ACL and approval
+    let names = strategy.step_names();
+    assert!(names.contains(&"context_creation".to_string()));
+    assert!(names.contains(&"execute".to_string()));
+    assert!(!names.contains(&"acl_check".to_string()));
+    assert!(!names.contains(&"approval_gate".to_string()));
+}
+
+#[test]
+fn test_preset_testing_strategy() {
+    let strategy = build_testing_strategy();
+    assert_eq!(strategy.name(), "testing");
+    assert_eq!(strategy.steps().len(), 8);
+    let names = strategy.step_names();
+    assert!(names.contains(&"context_creation".to_string()));
+    assert!(names.contains(&"execute".to_string()));
+    assert!(!names.contains(&"safety_check".to_string()));
+    assert!(!names.contains(&"acl_check".to_string()));
+    assert!(!names.contains(&"approval_gate".to_string()));
+}
+
+#[test]
+fn test_preset_performance_strategy() {
+    let strategy = build_performance_strategy();
+    assert_eq!(strategy.name(), "performance");
+    assert_eq!(strategy.steps().len(), 9);
+    let names = strategy.step_names();
+    assert!(names.contains(&"context_creation".to_string()));
+    assert!(names.contains(&"execute".to_string()));
+    assert!(!names.contains(&"middleware_before".to_string()));
+    assert!(!names.contains(&"middleware_after".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: call_with_trace
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_call_with_trace_returns_output_and_trace() {
+    let registry = Registry::new();
+    let config = Config::default();
+
+    let strategy = ExecutionStrategy::new(
+        "simple",
+        vec![Box::new(OutputStep::new(serde_json::json!({"result": 42})))],
+    )
+    .unwrap();
+
+    let executor = Executor::with_strategy(registry, config, strategy);
+    let (output, trace) = executor
+        .call_with_trace("test_mod", serde_json::json!({}), None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(output, serde_json::json!({"result": 42}));
+    assert!(trace.success);
+    assert_eq!(trace.steps.len(), 1);
+    assert_eq!(trace.steps[0].name, "output_step");
+    assert_eq!(trace.strategy_name, "simple");
+}
+
+#[tokio::test]
+async fn test_call_with_trace_strategy_override() {
+    let registry = Registry::new();
+    let config = Config::default();
+
+    let default_strategy = ExecutionStrategy::new(
+        "default",
+        vec![Box::new(OutputStep::new(serde_json::json!({"from": "default"})))],
+    )
+    .unwrap();
+
+    let override_strategy = ExecutionStrategy::new(
+        "override",
+        vec![Box::new(OutputStep::new(serde_json::json!({"from": "override"})))],
+    )
+    .unwrap();
+
+    let executor = Executor::with_strategy(registry, config, default_strategy);
+
+    // Override should take precedence
+    let (output, trace) = executor
+        .call_with_trace("mod", serde_json::json!({}), None, Some(&override_strategy))
+        .await
+        .unwrap();
+
+    assert_eq!(output, serde_json::json!({"from": "override"}));
+    assert_eq!(trace.strategy_name, "override");
+}
+
+#[tokio::test]
+async fn test_call_with_trace_no_strategy_errors() {
+    let registry = Registry::new();
+    let config = Config::default();
+    let executor = Executor::new(registry, config);
+
+    let result = executor
+        .call_with_trace("mod", serde_json::json!({}), None, None)
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.message.contains("No execution strategy"));
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: introspection — register_strategy, list_strategies, describe_pipeline
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_register_and_list_strategies() {
+    let strategy = build_internal_strategy();
+    let info = describe_pipeline(&strategy);
+    assert_eq!(info.name, "internal");
+    assert_eq!(info.step_count, 9);
+
+    register_strategy(info);
+
+    let all = list_strategies();
+    assert!(
+        all.iter().any(|s| s.name == "internal"),
+        "internal strategy should be in the registry"
+    );
+}
+
+#[test]
+fn test_describe_pipeline() {
+    let strategy = build_standard_strategy();
+    let info = describe_pipeline(&strategy);
+    assert_eq!(info.name, "standard");
+    assert_eq!(info.step_count, 11);
+    assert!(info.description.contains("context_creation"));
+    assert!(info.description.contains("execute"));
+}

@@ -9,6 +9,7 @@ pub mod acl_handlers;
 pub mod approval;
 pub mod async_task;
 pub mod bindings;
+pub mod builtin_steps;
 pub mod cancel;
 pub mod client;
 pub mod config;
@@ -24,6 +25,7 @@ pub mod extensions;
 pub mod middleware;
 pub mod module;
 pub mod observability;
+pub mod pipeline;
 pub mod registry;
 pub mod schema;
 pub mod sys_modules;
@@ -38,14 +40,27 @@ pub use approval::{
     AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,
 };
 pub use async_task::TaskStatus;
+pub use builtin_steps::{
+    build_internal_strategy, build_performance_strategy, build_standard_strategy,
+    build_testing_strategy, BuiltinACLCheck, BuiltinApprovalGate, BuiltinContextCreation,
+    BuiltinExecute, BuiltinInputValidation, BuiltinMiddlewareAfter, BuiltinMiddlewareBefore,
+    BuiltinModuleLookup, BuiltinOutputValidation, BuiltinReturnResult, BuiltinSafetyCheck,
+};
 pub use client::APCore;
 pub use config::{Config, ConfigMode, EnvStyle, MountSource, NamespaceInfo, NamespaceRegistration};
 pub use context::{Context, ContextFactory, Identity};
 pub use context_key::ContextKey;
 pub use errors::{ErrorCode, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
-pub use executor::{redact_sensitive, Executor, ValidationResult, REDACTED_VALUE};
+pub use executor::{
+    describe_pipeline, list_strategies, redact_sensitive, register_strategy, Executor,
+    ValidationResult, REDACTED_VALUE,
+};
 pub use module::Module;
+pub use pipeline::{
+    ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, Step, StepResult, StepTrace,
+    StrategyInfo,
+};
 pub use observability::logging::ContextLogger;
 pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use registry::registry::Registry;
