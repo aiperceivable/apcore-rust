@@ -23,10 +23,7 @@ fn test_metrics_starts_name() {
 
 #[test]
 fn test_logging_start_name() {
-    assert_eq!(
-        LOGGING_START.name.as_ref(),
-        "_apcore.mw.logging.start_time"
-    );
+    assert_eq!(LOGGING_START.name.as_ref(), "_apcore.mw.logging.start_time");
 }
 
 #[test]

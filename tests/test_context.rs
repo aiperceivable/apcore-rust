@@ -37,12 +37,7 @@ fn test_identity_empty_roles() {
 fn test_identity_with_attrs() {
     let mut attrs = HashMap::new();
     attrs.insert("tier".to_string(), serde_json::json!("premium"));
-    let id = Identity::new(
-        "user-2".to_string(),
-        "Bob".to_string(),
-        vec![],
-        attrs,
-    );
+    let id = Identity::new("user-2".to_string(), "Bob".to_string(), vec![], attrs);
     assert_eq!(id.attrs()["tier"], "premium");
 }
 

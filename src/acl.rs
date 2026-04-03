@@ -389,10 +389,8 @@ impl ACL {
             None => return false,
         };
 
-        let map: HashMap<String, serde_json::Value> = obj
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let map: HashMap<String, serde_json::Value> =
+            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         Self::evaluate_conditions(&map, ctx)
     }
@@ -514,10 +512,8 @@ impl ACL {
                 Some(o) => o,
                 None => return false,
             };
-            let map: HashMap<String, serde_json::Value> = obj
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let map: HashMap<String, serde_json::Value> =
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             if !Self::evaluate_conditions_async(&map, ctx).await {
                 return false;
             }

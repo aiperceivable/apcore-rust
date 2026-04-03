@@ -111,10 +111,8 @@ impl ACLConditionHandler for OrHandler {
         };
         for sub in arr {
             if let Some(obj) = sub.as_object() {
-                let map: HashMap<String, Value> = obj
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let map: HashMap<String, Value> =
+                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 if (self.evaluate_fn)(&map, ctx) {
                     return true;
                 }
@@ -140,10 +138,8 @@ impl ACLConditionHandler for NotHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
         match value.as_object() {
             Some(obj) => {
-                let map: HashMap<String, Value> = obj
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let map: HashMap<String, Value> =
+                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 !(self.evaluate_fn)(&map, ctx)
             }
             None => false,

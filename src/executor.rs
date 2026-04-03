@@ -15,7 +15,9 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::middleware::manager::MiddlewareManager;
-use crate::pipeline::{ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo};
+use crate::pipeline::{
+    ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
+};
 use crate::registry::registry::Registry;
 use crate::utils::guard_call_chain;
 
@@ -193,9 +195,7 @@ static STRATEGY_REGISTRY: LazyLock<RwLock<Vec<StrategyInfo>>> =
 ///
 /// Replaces any existing entry with the same name.
 pub fn register_strategy(info: StrategyInfo) {
-    let mut registry = STRATEGY_REGISTRY
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut registry = STRATEGY_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
     // Replace existing entry with same name, or append.
     if let Some(existing) = registry.iter_mut().find(|s| s.name == info.name) {
         *existing = info;
@@ -845,15 +845,13 @@ impl Executor {
         ctx: Option<&Context<Value>>,
         strategy: Option<&ExecutionStrategy>,
     ) -> Result<(Value, PipelineTrace), ModuleError> {
-        let effective_strategy = strategy
-            .or(self.strategy.as_ref())
-            .ok_or_else(|| {
-                ModuleError::new(
-                    ErrorCode::GeneralInvalidInput,
-                    "No execution strategy provided and no default strategy set on executor"
-                        .to_string(),
-                )
-            })?;
+        let effective_strategy = strategy.or(self.strategy.as_ref()).ok_or_else(|| {
+            ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                "No execution strategy provided and no default strategy set on executor"
+                    .to_string(),
+            )
+        })?;
 
         let context = match ctx {
             Some(c) => c.clone(),
@@ -865,15 +863,10 @@ impl Executor {
             )),
         };
 
-        let mut pipeline_ctx = PipelineContext::new(
-            module_id,
-            inputs,
-            context,
-            effective_strategy.name(),
-        );
+        let mut pipeline_ctx =
+            PipelineContext::new(module_id, inputs, context, effective_strategy.name());
 
-        let (output, trace) =
-            PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await?;
+        let (output, trace) = PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await?;
 
         Ok((output.unwrap_or(Value::Null), trace))
     }

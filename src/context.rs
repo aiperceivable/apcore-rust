@@ -260,8 +260,7 @@ impl<T: Default> Context<T> {
         }
 
         if let Some(ref redacted) = self.redacted_inputs {
-            result["redacted_inputs"] =
-                serde_json::to_value(redacted).unwrap_or_default();
+            result["redacted_inputs"] = serde_json::to_value(redacted).unwrap_or_default();
         }
 
         // Filter _-prefixed keys from data
@@ -286,9 +285,7 @@ impl<T: Default> Context<T> {
     /// global_deadline) are set to `None`/default after deserialization.
     /// If `_context_version` is greater than 1, a warning is logged
     /// but deserialization proceeds (forward compatibility).
-    pub fn deserialize(
-        value: serde_json::Value,
-    ) -> Result<Self, serde_json::Error>
+    pub fn deserialize(value: serde_json::Value) -> Result<Self, serde_json::Error>
     where
         T: Default,
     {
@@ -309,15 +306,13 @@ impl<T: Default> Context<T> {
             );
         }
 
-        let identity: Option<Identity> = obj
-            .get("identity")
-            .and_then(|v| {
-                if v.is_null() {
-                    None
-                } else {
-                    serde_json::from_value(v.clone()).ok()
-                }
-            });
+        let identity: Option<Identity> = obj.get("identity").and_then(|v| {
+            if v.is_null() {
+                None
+            } else {
+                serde_json::from_value(v.clone()).ok()
+            }
+        });
 
         let data_map: HashMap<String, serde_json::Value> = obj
             .get("data")

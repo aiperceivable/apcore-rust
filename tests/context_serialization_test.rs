@@ -105,10 +105,7 @@ fn test_serialize_filters_underscore_data_keys() {
     let ctx = make_ctx();
     {
         let mut data = ctx.data.write().unwrap();
-        data.insert(
-            "_apcore.internal".to_string(),
-            serde_json::json!("hidden"),
-        );
+        data.insert("_apcore.internal".to_string(), serde_json::json!("hidden"));
         data.insert("_secret_key".to_string(), serde_json::json!("hidden"));
         data.insert("public.counter".to_string(), serde_json::json!(42));
         data.insert("app.name".to_string(), serde_json::json!("test"));
@@ -207,8 +204,5 @@ fn test_deserialize_unknown_top_level_fields() {
     let restored: Context<()> = Context::deserialize(data).unwrap();
     assert_eq!(restored.trace_id, "abc-123");
     let data_map = restored.data.read().unwrap();
-    assert_eq!(
-        data_map.get("custom"),
-        Some(&serde_json::json!("value"))
-    );
+    assert_eq!(data_map.get("custom"), Some(&serde_json::json!("value")));
 }

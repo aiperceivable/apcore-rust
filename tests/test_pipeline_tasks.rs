@@ -4,9 +4,7 @@
 use apcore::config::Config;
 use apcore::context::Context;
 use apcore::errors::ModuleError;
-use apcore::pipeline::{
-    ExecutionStrategy, PipelineContext, Step, StepResult,
-};
+use apcore::pipeline::{ExecutionStrategy, PipelineContext, Step, StepResult};
 use apcore::registry::registry::Registry;
 use apcore::{
     build_internal_strategy, build_performance_strategy, build_standard_strategy,
@@ -150,13 +148,17 @@ async fn test_call_with_trace_strategy_override() {
 
     let default_strategy = ExecutionStrategy::new(
         "default",
-        vec![Box::new(OutputStep::new(serde_json::json!({"from": "default"})))],
+        vec![Box::new(OutputStep::new(
+            serde_json::json!({"from": "default"}),
+        ))],
     )
     .unwrap();
 
     let override_strategy = ExecutionStrategy::new(
         "override",
-        vec![Box::new(OutputStep::new(serde_json::json!({"from": "override"})))],
+        vec![Box::new(OutputStep::new(
+            serde_json::json!({"from": "override"}),
+        ))],
     )
     .unwrap();
 

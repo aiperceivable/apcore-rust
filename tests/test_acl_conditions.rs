@@ -15,7 +15,11 @@ use std::sync::Arc;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_context(identity_type: &str, roles: Vec<String>, call_chain: Vec<String>) -> Context<Value> {
+fn make_context(
+    identity_type: &str,
+    roles: Vec<String>,
+    call_chain: Vec<String>,
+) -> Context<Value> {
     let identity = Identity::new(
         "test-user".to_string(),
         identity_type.to_string(),
@@ -70,7 +74,11 @@ fn test_builtin_handlers_registered() {
     init_handlers();
     let handlers = CONDITION_HANDLERS.read().unwrap();
     for key in &["identity_types", "roles", "max_call_depth", "$or", "$not"] {
-        assert!(handlers.contains_key(*key), "Missing built-in handler: {}", key);
+        assert!(
+            handlers.contains_key(*key),
+            "Missing built-in handler: {}",
+            key
+        );
     }
 }
 
@@ -102,7 +110,11 @@ async fn test_identity_types_no_identity() {
 #[tokio::test]
 async fn test_roles_match() {
     let handler = RolesHandler;
-    let ctx = make_context("user", vec!["admin".to_string(), "viewer".to_string()], vec![]);
+    let ctx = make_context(
+        "user",
+        vec!["admin".to_string(), "viewer".to_string()],
+        vec![],
+    );
     assert!(handler.evaluate(&json!(["admin"]), &ctx).await);
 }
 
@@ -123,7 +135,16 @@ async fn test_max_call_depth_within_limit() {
 #[tokio::test]
 async fn test_max_call_depth_exceeds_limit() {
     let handler = MaxCallDepthHandler;
-    let ctx = make_context("user", vec![], vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]);
+    let ctx = make_context(
+        "user",
+        vec![],
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ],
+    );
     assert!(!handler.evaluate(&json!(3), &ctx).await);
 }
 
@@ -134,10 +155,13 @@ async fn test_max_call_depth_exceeds_limit() {
 #[tokio::test]
 async fn test_or_passes_when_any_match() {
     init_handlers();
-    let acl = make_acl_with_condition("$or", json!([
-        {"roles": ["admin"]},
-        {"identity_types": ["service"]},
-    ]));
+    let acl = make_acl_with_condition(
+        "$or",
+        json!([
+            {"roles": ["admin"]},
+            {"identity_types": ["service"]},
+        ]),
+    );
     let ctx = make_context("user", vec!["admin".to_string()], vec![]);
     let result = acl.check(Some("caller"), "target", Some(&ctx)).unwrap();
     assert!(result);
@@ -146,10 +170,13 @@ async fn test_or_passes_when_any_match() {
 #[tokio::test]
 async fn test_or_fails_when_none_match() {
     init_handlers();
-    let acl = make_acl_with_condition("$or", json!([
-        {"roles": ["admin"]},
-        {"identity_types": ["service"]},
-    ]));
+    let acl = make_acl_with_condition(
+        "$or",
+        json!([
+            {"roles": ["admin"]},
+            {"identity_types": ["service"]},
+        ]),
+    );
     let ctx = make_context("user", vec!["viewer".to_string()], vec![]);
     let result = acl.check(Some("caller"), "target", Some(&ctx)).unwrap();
     assert!(!result);
@@ -170,8 +197,12 @@ async fn test_not_negates_conditions() {
     let acl = make_acl_with_condition("$not", json!({"identity_types": ["service"]}));
     let ctx_user = make_context("user", vec![], vec![]);
     let ctx_service = make_context("service", vec![], vec![]);
-    assert!(acl.check(Some("caller"), "target", Some(&ctx_user)).unwrap());
-    assert!(!acl.check(Some("caller"), "target", Some(&ctx_service)).unwrap());
+    assert!(acl
+        .check(Some("caller"), "target", Some(&ctx_user))
+        .unwrap());
+    assert!(!acl
+        .check(Some("caller"), "target", Some(&ctx_service))
+        .unwrap());
 }
 
 #[tokio::test]
@@ -261,20 +292,29 @@ async fn test_async_check_basic() {
     init_handlers();
     let acl = make_acl_with_condition("roles", json!(["admin"]));
     let ctx = make_context("user", vec!["admin".to_string()], vec![]);
-    let result = acl.async_check(Some("caller"), "target", Some(&ctx)).await.unwrap();
+    let result = acl
+        .async_check(Some("caller"), "target", Some(&ctx))
+        .await
+        .unwrap();
     assert!(result);
 }
 
 #[tokio::test]
 async fn test_async_check_default_deny() {
     let acl = ACL::new(vec![], "deny", None);
-    let result = acl.async_check(Some("caller"), "target", None).await.unwrap();
+    let result = acl
+        .async_check(Some("caller"), "target", None)
+        .await
+        .unwrap();
     assert!(!result);
 }
 
 #[tokio::test]
 async fn test_async_check_default_allow() {
     let acl = ACL::new(vec![], "allow", None);
-    let result = acl.async_check(Some("caller"), "target", None).await.unwrap();
+    let result = acl
+        .async_check(Some("caller"), "target", None)
+        .await
+        .unwrap();
     assert!(result);
 }

@@ -25,10 +25,7 @@ macro_rules! builtin_step {
             fn replaceable(&self) -> bool {
                 $rp
             }
-            async fn execute(
-                &self,
-                _ctx: &mut PipelineContext,
-            ) -> Result<StepResult, ModuleError> {
+            async fn execute(&self, _ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
                 Ok(StepResult::continue_step())
             }
         }

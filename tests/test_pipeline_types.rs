@@ -169,7 +169,9 @@ fn test_strategy_lifecycle() {
         .expect("insert_before");
 
     // remove removable step
-    strategy.remove("safety_check").expect("remove safety_check");
+    strategy
+        .remove("safety_check")
+        .expect("remove safety_check");
     assert!(!strategy.step_names().contains(&"safety_check".to_string()));
 
     // remove non-removable step fails
@@ -182,7 +184,10 @@ fn test_strategy_lifecycle() {
         .expect("replace execute");
 
     // replace non-replaceable step fails
-    let err = strategy.replace("context_creation", TestStep::boxed("context_creation", false, false));
+    let err = strategy.replace(
+        "context_creation",
+        TestStep::boxed("context_creation", false, false),
+    );
     assert!(err.is_err());
 
     // info
@@ -193,18 +198,24 @@ fn test_strategy_lifecycle() {
 
 #[test]
 fn test_strategy_duplicate_insert_rejected() {
-    let mut s =
-        ExecutionStrategy::new("s", vec![TestStep::boxed("a", true, true)]).unwrap();
-    assert!(s.insert_after("a", TestStep::boxed("a", true, true)).is_err());
-    assert!(s.insert_before("a", TestStep::boxed("a", true, true)).is_err());
+    let mut s = ExecutionStrategy::new("s", vec![TestStep::boxed("a", true, true)]).unwrap();
+    assert!(s
+        .insert_after("a", TestStep::boxed("a", true, true))
+        .is_err());
+    assert!(s
+        .insert_before("a", TestStep::boxed("a", true, true))
+        .is_err());
 }
 
 #[test]
 fn test_strategy_unknown_anchor_rejected() {
-    let mut s =
-        ExecutionStrategy::new("s", vec![TestStep::boxed("a", true, true)]).unwrap();
-    assert!(s.insert_after("z", TestStep::boxed("b", true, true)).is_err());
-    assert!(s.insert_before("z", TestStep::boxed("b", true, true)).is_err());
+    let mut s = ExecutionStrategy::new("s", vec![TestStep::boxed("a", true, true)]).unwrap();
+    assert!(s
+        .insert_after("z", TestStep::boxed("b", true, true))
+        .is_err());
+    assert!(s
+        .insert_before("z", TestStep::boxed("b", true, true))
+        .is_err());
     assert!(s.remove("z").is_err());
     assert!(s.replace("z", TestStep::boxed("z", true, true)).is_err());
 }
@@ -215,16 +226,10 @@ fn test_strategy_unknown_anchor_rejected() {
 
 #[tokio::test]
 async fn test_step_execute_returns_result() {
-    let step = TestStep::new("test", true, true)
-        .with_result(StepResult::abort("not allowed"));
+    let step = TestStep::new("test", true, true).with_result(StepResult::abort("not allowed"));
 
     let ctx_inner = Context::<serde_json::Value>::anonymous();
-    let mut pctx = PipelineContext::new(
-        "my_module",
-        serde_json::json!({}),
-        ctx_inner,
-        "default",
-    );
+    let mut pctx = PipelineContext::new("my_module", serde_json::json!({}), ctx_inner, "default");
 
     let result = step.execute(&mut pctx).await.expect("execute");
     assert_eq!(result.action, "abort");
@@ -234,12 +239,7 @@ async fn test_step_execute_returns_result() {
 #[tokio::test]
 async fn test_pipeline_context_fields_initially_none() {
     let ctx_inner = Context::<serde_json::Value>::anonymous();
-    let pctx = PipelineContext::new(
-        "m",
-        serde_json::json!({"x": 1}),
-        ctx_inner,
-        "default",
-    );
+    let pctx = PipelineContext::new("m", serde_json::json!({"x": 1}), ctx_inner, "default");
     assert!(pctx.module.is_none());
     assert!(pctx.validated_inputs.is_none());
     assert!(pctx.output.is_none());
@@ -290,9 +290,7 @@ async fn test_pipeline_engine_abort_stops_early() {
         "s",
         vec![
             Box::new(TestStep::new("a", true, true)),
-            Box::new(
-                TestStep::new("b", true, true).with_result(StepResult::abort("denied")),
-            ),
+            Box::new(TestStep::new("b", true, true).with_result(StepResult::abort("denied"))),
             Box::new(TestStep::new("c", true, true)),
         ],
     )
@@ -313,9 +311,7 @@ async fn test_pipeline_engine_skip_to() {
     let strategy = ExecutionStrategy::new(
         "s",
         vec![
-            Box::new(
-                TestStep::new("a", true, true).with_result(StepResult::skip_to("d")),
-            ),
+            Box::new(TestStep::new("a", true, true).with_result(StepResult::skip_to("d"))),
             Box::new(TestStep::new("b", true, true)),
             Box::new(TestStep::new("c", true, true)),
             Box::new(TestStep::new("d", true, true)),

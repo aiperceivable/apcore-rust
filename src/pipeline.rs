@@ -253,10 +253,7 @@ impl ExecutionStrategy {
     /// Create a new strategy with the given name and initial steps.
     ///
     /// Returns an error if any two steps share the same name.
-    pub fn new(
-        name: impl Into<String>,
-        steps: Vec<Box<dyn Step>>,
-    ) -> Result<Self, ModuleError> {
+    pub fn new(name: impl Into<String>, steps: Vec<Box<dyn Step>>) -> Result<Self, ModuleError> {
         let name = name.into();
         // Check for duplicate step names.
         let mut seen = std::collections::HashSet::new();
@@ -296,11 +293,7 @@ impl ExecutionStrategy {
     }
 
     /// Insert a step immediately after the named anchor.
-    pub fn insert_after(
-        &mut self,
-        anchor: &str,
-        step: Box<dyn Step>,
-    ) -> Result<(), ModuleError> {
+    pub fn insert_after(&mut self, anchor: &str, step: Box<dyn Step>) -> Result<(), ModuleError> {
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx + 1, step);
@@ -308,11 +301,7 @@ impl ExecutionStrategy {
     }
 
     /// Insert a step immediately before the named anchor.
-    pub fn insert_before(
-        &mut self,
-        anchor: &str,
-        step: Box<dyn Step>,
-    ) -> Result<(), ModuleError> {
+    pub fn insert_before(&mut self, anchor: &str, step: Box<dyn Step>) -> Result<(), ModuleError> {
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx, step);
@@ -333,11 +322,7 @@ impl ExecutionStrategy {
     }
 
     /// Replace a step's implementation. Fails if the step is not replaceable.
-    pub fn replace(
-        &mut self,
-        step_name: &str,
-        new_step: Box<dyn Step>,
-    ) -> Result<(), ModuleError> {
+    pub fn replace(&mut self, step_name: &str, new_step: Box<dyn Step>) -> Result<(), ModuleError> {
         let idx = self.find_step_index(step_name)?;
         if !self.steps[idx].replaceable() {
             return Err(ModuleError::new(
@@ -436,8 +421,7 @@ impl PipelineEngine {
                     idx += 1;
                 }
                 "abort" => {
-                    ctx.trace.total_duration_ms =
-                        pipeline_start.elapsed().as_secs_f64() * 1000.0;
+                    ctx.trace.total_duration_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
                     ctx.trace.success = false;
                     return Ok((ctx.output.clone(), ctx.trace.clone()));
                 }
@@ -451,9 +435,9 @@ impl PipelineEngine {
                     match found {
                         Some(target_idx) => {
                             // Mark skipped steps in trace.
-                            for skip_idx in (idx + 1)..target_idx {
+                            for step in steps.iter().take(target_idx).skip(idx + 1) {
                                 ctx.trace.steps.push(StepTrace {
-                                    name: steps[skip_idx].name().to_string(),
+                                    name: step.name().to_string(),
                                     duration_ms: 0.0,
                                     result: StepResult::continue_step(),
                                     skipped: true,
@@ -639,11 +623,8 @@ mod tests {
 
     #[test]
     fn test_strategy_insert_rejects_duplicate() {
-        let mut strategy = ExecutionStrategy::new(
-            "s",
-            vec![FakeStep::boxed("a", true, true)],
-        )
-        .unwrap();
+        let mut strategy =
+            ExecutionStrategy::new("s", vec![FakeStep::boxed("a", true, true)]).unwrap();
 
         let result = strategy.insert_after("a", FakeStep::boxed("a", true, true));
         assert!(result.is_err());
@@ -651,11 +632,8 @@ mod tests {
 
     #[test]
     fn test_strategy_insert_rejects_unknown_anchor() {
-        let mut strategy = ExecutionStrategy::new(
-            "s",
-            vec![FakeStep::boxed("a", true, true)],
-        )
-        .unwrap();
+        let mut strategy =
+            ExecutionStrategy::new("s", vec![FakeStep::boxed("a", true, true)]).unwrap();
 
         let result = strategy.insert_after("missing", FakeStep::boxed("b", true, true));
         assert!(result.is_err());
@@ -678,11 +656,8 @@ mod tests {
 
     #[test]
     fn test_strategy_remove_non_removable() {
-        let mut strategy = ExecutionStrategy::new(
-            "s",
-            vec![FakeStep::boxed("core", false, false)],
-        )
-        .unwrap();
+        let mut strategy =
+            ExecutionStrategy::new("s", vec![FakeStep::boxed("core", false, false)]).unwrap();
 
         let result = strategy.remove("core");
         assert!(result.is_err());
@@ -690,11 +665,8 @@ mod tests {
 
     #[test]
     fn test_strategy_replace() {
-        let mut strategy = ExecutionStrategy::new(
-            "s",
-            vec![FakeStep::boxed("a", true, true)],
-        )
-        .unwrap();
+        let mut strategy =
+            ExecutionStrategy::new("s", vec![FakeStep::boxed("a", true, true)]).unwrap();
 
         strategy
             .replace("a", FakeStep::boxed("a", true, true))
@@ -705,11 +677,8 @@ mod tests {
 
     #[test]
     fn test_strategy_replace_non_replaceable() {
-        let mut strategy = ExecutionStrategy::new(
-            "s",
-            vec![FakeStep::boxed("a", true, false)],
-        )
-        .unwrap();
+        let mut strategy =
+            ExecutionStrategy::new("s", vec![FakeStep::boxed("a", true, false)]).unwrap();
 
         let result = strategy.replace("a", FakeStep::boxed("a", true, true));
         assert!(result.is_err());

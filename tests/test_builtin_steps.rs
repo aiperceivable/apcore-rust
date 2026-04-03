@@ -53,8 +53,7 @@ fn test_standard_strategy_step_flags() {
         ("return_result", false, false),
     ];
 
-    for (step, (name, removable, replaceable)) in
-        strategy.steps().iter().zip(expected_flags.iter())
+    for (step, (name, removable, replaceable)) in strategy.steps().iter().zip(expected_flags.iter())
     {
         assert_eq!(step.name(), *name, "name mismatch");
         assert_eq!(

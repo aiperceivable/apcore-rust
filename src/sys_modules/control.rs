@@ -14,7 +14,9 @@ use crate::events::emitter::EventEmitter;
 use crate::module::Module;
 use crate::registry::registry::Registry;
 
-use super::{emit_event, is_sensitive_key, missing_field_error, require_string, ToggleState, RESTRICTED_KEYS};
+use super::{
+    emit_event, is_sensitive_key, missing_field_error, require_string, ToggleState, RESTRICTED_KEYS,
+};
 
 // ---------------------------------------------------------------------------
 // UpdateConfigModule (F11)

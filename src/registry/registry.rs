@@ -59,7 +59,9 @@ type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
 /// Reserved words that cannot be used as the first segment of a module ID.
 ///
 /// Aligned with the Python and TypeScript SDKs to ensure cross-language consistency.
-pub const RESERVED_WORDS: &[&str] = &["system", "internal", "core", "apcore", "plugin", "schema", "acl"];
+pub const RESERVED_WORDS: &[&str] = &[
+    "system", "internal", "core", "apcore", "plugin", "schema", "acl",
+];
 
 /// Central registry of modules.
 ///

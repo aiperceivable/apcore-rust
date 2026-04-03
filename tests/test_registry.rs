@@ -262,7 +262,8 @@ fn test_register_rejects_all_reserved_words() {
         assert!(
             result.is_err(),
             "registering '{}' should fail — '{}' is reserved",
-            module_id, word
+            module_id,
+            word
         );
     }
 }

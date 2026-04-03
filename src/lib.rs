@@ -57,12 +57,12 @@ pub use executor::{
     ValidationResult, REDACTED_VALUE,
 };
 pub use module::Module;
+pub use observability::logging::ContextLogger;
+pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, Step, StepResult, StepTrace,
     StrategyInfo,
 };
-pub use observability::logging::ContextLogger;
-pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use registry::registry::Registry;
 pub use schema::{ExportProfile, SchemaDefinition, SchemaStrategy};
 pub use sys_modules::{

@@ -24,7 +24,7 @@ use crate::observability::metrics::MetricsCollector;
 use crate::observability::usage::{UsageCollector, UsageMiddleware};
 use crate::registry::registry::{ModuleDescriptor, Registry};
 
-pub use control::{UpdateConfigModule, ReloadModuleModule, ToggleFeatureModule};
+pub use control::{ReloadModuleModule, ToggleFeatureModule, UpdateConfigModule};
 
 // ---------------------------------------------------------------------------
 // ToggleState — thread-safe enable/disable tracking
@@ -95,7 +95,8 @@ pub fn check_module_disabled(module_id: &str) -> Result<(), ModuleError> {
 // Sensitive key detection
 // ---------------------------------------------------------------------------
 
-pub(crate) const SENSITIVE_SEGMENTS: &[&str] = &["token", "secret", "key", "password", "auth", "credential"];
+pub(crate) const SENSITIVE_SEGMENTS: &[&str] =
+    &["token", "secret", "key", "password", "auth", "credential"];
 
 pub(crate) fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_lowercase();
@@ -121,7 +122,10 @@ pub(crate) const RESTRICTED_KEYS: &[&str] = &["sys_modules.enabled"];
 // Shared helpers (used by control.rs)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn require_string(inputs: &serde_json::Value, field: &str) -> Result<String, ModuleError> {
+pub(crate) fn require_string(
+    inputs: &serde_json::Value,
+    field: &str,
+) -> Result<String, ModuleError> {
     inputs
         .get(field)
         .and_then(|v| v.as_str())
