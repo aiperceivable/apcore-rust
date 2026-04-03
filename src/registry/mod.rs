@@ -6,4 +6,5 @@ pub mod registry;
 
 pub use registry::{
     DependencyInfo, DiscoveredModule, Discoverer, ModuleDescriptor, ModuleValidator, Registry,
+    RESERVED_WORDS,
 };

@@ -201,6 +201,82 @@ fn test_module_enabled_by_default_after_registration() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Reserved word validation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_register_rejects_reserved_first_segment() {
+    let mut registry = Registry::new();
+    let result = registry.register(
+        "system.health",
+        Box::new(StubModule),
+        make_descriptor("system.health"),
+    );
+    assert!(result.is_err(), "registering 'system.health' should fail");
+    let err = result.unwrap_err();
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("reserved word"),
+        "error should mention reserved word, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_register_allows_reserved_word_in_non_first_segment() {
+    let mut registry = Registry::new();
+    let result = registry.register(
+        "email.system",
+        Box::new(StubModule),
+        make_descriptor("email.system"),
+    );
+    assert!(
+        result.is_ok(),
+        "registering 'email.system' should succeed — 'system' is not the first segment"
+    );
+}
+
+#[test]
+fn test_register_allows_normal_module_id() {
+    let mut registry = Registry::new();
+    let result = registry.register(
+        "email.send",
+        Box::new(StubModule),
+        make_descriptor("email.send"),
+    );
+    assert!(result.is_ok(), "registering 'email.send' should succeed");
+}
+
+#[test]
+fn test_register_rejects_all_reserved_words() {
+    use apcore::registry::RESERVED_WORDS;
+    for word in RESERVED_WORDS {
+        let mut registry = Registry::new();
+        let module_id = format!("{}.something", word);
+        let result = registry.register(
+            &module_id,
+            Box::new(StubModule),
+            make_descriptor(&module_id),
+        );
+        assert!(
+            result.is_err(),
+            "registering '{}' should fail — '{}' is reserved",
+            module_id, word
+        );
+    }
+}
+
+#[test]
+fn test_register_module_rejects_reserved_first_segment() {
+    let mut registry = Registry::new();
+    let result = registry.register_module("core.utils", Box::new(StubModule));
+    assert!(
+        result.is_err(),
+        "register_module with 'core.utils' should fail"
+    );
+}
+
 // Suppress unused-import warning — dummy_identity is available for future async tests.
 #[allow(dead_code)]
 fn _use_identity() -> Identity {

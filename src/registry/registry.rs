@@ -56,6 +56,11 @@ pub trait ModuleValidator: Send + Sync {
 /// Type alias for the event callback closure.
 type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
 
+/// Reserved words that cannot be used as the first segment of a module ID.
+///
+/// Aligned with the Python and TypeScript SDKs to ensure cross-language consistency.
+pub const RESERVED_WORDS: &[&str] = &["system", "internal", "core", "apcore", "plugin", "schema", "acl"];
+
 /// Central registry of modules.
 ///
 /// TODO(L-012): Add VersionedStore support for multi-version module management.
@@ -127,6 +132,18 @@ impl Registry {
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
+        // Reject module IDs whose first segment is a reserved word.
+        let first_segment = name.split('.').next().unwrap_or(name);
+        if RESERVED_WORDS.contains(&first_segment) {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Module ID '{}' uses reserved word '{}' as its first segment",
+                    name, first_segment
+                ),
+            ));
+        }
+
         if self.modules.contains_key(name) {
             return Err(ModuleError::new(
                 crate::errors::ErrorCode::ModuleLoadError,
