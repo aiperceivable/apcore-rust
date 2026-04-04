@@ -110,7 +110,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-apcore = "0.13"
+apcore = "0.16"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -348,12 +348,12 @@ impl Module for AddModule {
 
 #[tokio::main]
 async fn main() {
-    let identity = Identity {
-        id: "user-1".to_string(),
-        identity_type: "user".to_string(),
-        roles: vec!["user".to_string()],
-        attrs: HashMap::new(),
-    };
+    let identity = Identity::new(
+        "user-1".to_string(),
+        "user".to_string(),
+        vec!["user".to_string()],
+        HashMap::new(),
+    );
     let ctx: Context<Value> = Context::new(identity);
     let module = AddModule;
 
