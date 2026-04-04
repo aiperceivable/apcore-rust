@@ -705,7 +705,10 @@ fn conformance_config_env() {
             continue;
         }
 
-        let env_prefix = ns.get("env_prefix").and_then(|v| v.as_str()).map(String::from);
+        let env_prefix = ns
+            .get("env_prefix")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let max_depth = ns.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
         let env_map_obj = ns.get("env_map").and_then(|v| v.as_object()).map(|obj| {
