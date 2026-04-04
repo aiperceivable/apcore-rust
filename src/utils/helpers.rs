@@ -145,8 +145,7 @@ fn to_snake_case(segment: &str) -> String {
     for (i, &ch) in chars.iter().enumerate() {
         if i > 0 {
             let prev = chars[i - 1];
-            let boundary = if (prev.is_lowercase() || prev.is_ascii_digit()) && ch.is_uppercase()
-            {
+            let boundary = if (prev.is_lowercase() || prev.is_ascii_digit()) && ch.is_uppercase() {
                 true
             } else {
                 prev.is_uppercase()

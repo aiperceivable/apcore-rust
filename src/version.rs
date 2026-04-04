@@ -86,10 +86,7 @@ fn parse_semver(version: &str) -> Option<SemVer> {
 ///
 /// Returns the effective version string, or an error if the versions are
 /// incompatible (major mismatch or declared minor exceeds SDK minor).
-pub fn negotiate_version(
-    declared_version: &str,
-    sdk_version: &str,
-) -> Result<String, ModuleError> {
+pub fn negotiate_version(declared_version: &str, sdk_version: &str) -> Result<String, ModuleError> {
     let declared = parse_semver(declared_version).ok_or_else(|| {
         ModuleError::new(
             ErrorCode::VersionIncompatible,

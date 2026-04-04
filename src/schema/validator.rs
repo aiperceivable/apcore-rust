@@ -121,9 +121,10 @@ impl SchemaValidator {
         }
 
         // --- "pattern" check for strings ---
-        if let (Some(pattern_val), Some(str_val)) =
-            (schema_obj.get("pattern").and_then(|p| p.as_str()), value.as_str())
-        {
+        if let (Some(pattern_val), Some(str_val)) = (
+            schema_obj.get("pattern").and_then(|p| p.as_str()),
+            value.as_str(),
+        ) {
             if let Ok(re) = regex::Regex::new(pattern_val) {
                 if !re.is_match(str_val) {
                     let display_path = if path.is_empty() { "<root>" } else { &path };
@@ -183,10 +184,7 @@ impl SchemaValidator {
                             } else {
                                 format!("{}.{}", path, key)
                             };
-                            errors.push(format!(
-                                "{}: additional property not allowed",
-                                field_path
-                            ));
+                            errors.push(format!("{}: additional property not allowed", field_path));
                         }
                     }
                 }

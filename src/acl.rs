@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use crate::acl_handlers::{register_builtin_handlers, CONDITION_HANDLERS};
 use crate::context::Context;
@@ -558,7 +558,10 @@ impl ACL {
 
     /// Initialize built-in handlers. Call once during application startup.
     pub fn init_builtin_handlers() {
-        register_builtin_handlers(Self::evaluate_conditions);
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            register_builtin_handlers(Self::evaluate_conditions);
+        });
     }
 }
 

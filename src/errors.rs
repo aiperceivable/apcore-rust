@@ -1332,10 +1332,7 @@ impl ErrorCodeRegistry {
             }
         }
 
-        let existing = self
-            .module_codes
-            .entry(module_id.to_string())
-            .or_default();
+        let existing = self.module_codes.entry(module_id.to_string()).or_default();
         existing.extend(codes.iter().cloned());
 
         self.rebuild_all_codes();

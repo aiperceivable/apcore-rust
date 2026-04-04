@@ -15,10 +15,10 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::middleware::manager::MiddlewareManager;
+use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
-use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::registry::registry::Registry;
 use crate::utils::guard_call_chain;
 
@@ -664,7 +664,11 @@ impl Executor {
                     error: Some(e.to_dict()),
                     warnings: vec![],
                 });
-                return Ok(PreflightResult { valid, checks, requires_approval });
+                return Ok(PreflightResult {
+                    valid,
+                    checks,
+                    requires_approval,
+                });
             }
         }
 
@@ -693,7 +697,11 @@ impl Executor {
                     error: Some(err.to_dict()),
                     warnings: vec![],
                 });
-                return Ok(PreflightResult { valid, checks, requires_approval });
+                return Ok(PreflightResult {
+                    valid,
+                    checks,
+                    requires_approval,
+                });
             }
         };
 
@@ -711,7 +719,10 @@ impl Executor {
                     valid = false;
                     let err = ModuleError::new(
                         ErrorCode::AclDenied,
-                        format!("Access denied: caller '{:?}' cannot access '{}'", caller_id, module_id),
+                        format!(
+                            "Access denied: caller '{:?}' cannot access '{}'",
+                            caller_id, module_id
+                        ),
                     );
                     checks.push(PreflightCheckResult {
                         check: "acl".to_string(),
@@ -786,8 +797,12 @@ impl Executor {
                 .checks
                 .iter()
                 .filter(|c| !c.passed)
-                .filter_map(|c| c.warnings.first().cloned()
-                    .or_else(|| Some(format!("Preflight check '{}' failed", c.check))))
+                .filter_map(|c| {
+                    c.warnings
+                        .first()
+                        .cloned()
+                        .or_else(|| Some(format!("Preflight check '{}' failed", c.check)))
+                })
                 .collect();
             for w in &warnings {
                 tracing::warn!(module_id = module_id, warning = %w, "Preflight check warning (advisory)");
@@ -800,7 +815,11 @@ impl Executor {
             });
         }
 
-        Ok(PreflightResult { valid, checks, requires_approval })
+        Ok(PreflightResult {
+            valid,
+            checks,
+            requires_approval,
+        })
     }
 
     /// Check call depth limits before execution.
