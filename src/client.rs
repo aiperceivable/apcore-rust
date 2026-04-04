@@ -104,14 +104,14 @@ impl APCore {
         self.call(module_id, inputs, ctx, version_hint).await
     }
 
-    /// Validate module inputs without executing.
+    /// Validate module inputs without executing (spec §12.3).
     ///
-    /// Returns a `ValidationResult` containing any advisory preflight warnings.
+    /// Returns a `PreflightResult` with per-check status.
     pub async fn validate(
         &self,
         module_id: &str,
         inputs: &serde_json::Value,
-    ) -> Result<crate::executor::ValidationResult, ModuleError> {
+    ) -> Result<crate::module::PreflightResult, ModuleError> {
         self.executor.validate(module_id, inputs).await
     }
 

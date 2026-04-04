@@ -54,9 +54,9 @@ pub use errors::{ErrorCode, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
 pub use executor::{
     describe_pipeline, list_strategies, redact_sensitive, register_strategy, Executor,
-    ValidationResult, REDACTED_VALUE,
+    REDACTED_VALUE,
 };
-pub use module::Module;
+pub use module::{Module, PreflightCheckResult, PreflightResult};
 pub use observability::logging::ContextLogger;
 pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use pipeline::{

@@ -18,6 +18,7 @@ use crate::middleware::manager::MiddlewareManager;
 use crate::pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
+use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::registry::registry::Registry;
 use crate::utils::guard_call_chain;
 
@@ -176,12 +177,7 @@ fn redact_secret_prefix(data: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// Result of a validate() call. Preflight warnings are advisory and never block.
-#[derive(Debug, Clone, Default)]
-pub struct ValidationResult {
-    /// Warnings collected from preflight checks (advisory, never blocking).
-    pub warnings: Vec<String>,
-}
+// PreflightResult is re-exported from module.rs — used as the return type for Executor::validate().
 
 // ---------------------------------------------------------------------------
 // Global strategy registry (introspection)
@@ -626,15 +622,19 @@ impl Executor {
         self.call(module_id, inputs, ctx, version_hint).await
     }
 
-    /// Validate module inputs without executing (steps 1-7).
+    /// Validate module inputs without executing (steps 1-7, spec §12.3).
     ///
-    /// Returns a `ValidationResult` containing any preflight warnings.
-    /// Preflight failures are advisory and never block validation.
+    /// Returns a `PreflightResult` with per-check status. MUST NOT execute
+    /// module code or run middleware.
     pub async fn validate(
         &self,
         module_id: &str,
         inputs: &serde_json::Value,
-    ) -> Result<ValidationResult, ModuleError> {
+    ) -> Result<PreflightResult, ModuleError> {
+        let mut checks: Vec<PreflightCheckResult> = Vec::new();
+        let mut valid = true;
+        let mut requires_approval = false;
+
         // Step 1: Context
         let default_ctx = Context::<serde_json::Value>::new(Identity::new(
             "@external".to_string(),
@@ -643,133 +643,164 @@ impl Executor {
             Default::default(),
         ));
 
-        // Step 2: Safety Checks — guard on parent BEFORE creating child
-        crate::utils::guard_call_chain_with_repeat(
+        // Step 2: Safety Checks (call_chain)
+        match crate::utils::guard_call_chain_with_repeat(
             &default_ctx,
             module_id,
             self.config.max_call_depth,
             self.config.max_module_repeat as usize,
-        )?;
+        ) {
+            Ok(()) => checks.push(PreflightCheckResult {
+                check: "call_chain".to_string(),
+                passed: true,
+                error: None,
+                warnings: vec![],
+            }),
+            Err(e) => {
+                valid = false;
+                checks.push(PreflightCheckResult {
+                    check: "call_chain".to_string(),
+                    passed: false,
+                    error: Some(e.to_dict()),
+                    warnings: vec![],
+                });
+                return Ok(PreflightResult { valid, checks, requires_approval });
+            }
+        }
 
-        // Create child context
         let child_ctx = default_ctx.child(module_id);
 
         // Step 3: Module Lookup
-        let module = self.registry.get(module_id).ok_or_else(|| {
-            ModuleError::new(
-                ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found in registry", module_id),
-            )
-        })?;
+        let module = match self.registry.get(module_id) {
+            Some(m) => {
+                checks.push(PreflightCheckResult {
+                    check: "module_lookup".to_string(),
+                    passed: true,
+                    error: None,
+                    warnings: vec![],
+                });
+                m
+            }
+            None => {
+                valid = false;
+                let err = ModuleError::new(
+                    ErrorCode::ModuleNotFound,
+                    format!("Module '{}' not found in registry", module_id),
+                );
+                checks.push(PreflightCheckResult {
+                    check: "module_lookup".to_string(),
+                    passed: false,
+                    error: Some(err.to_dict()),
+                    warnings: vec![],
+                });
+                return Ok(PreflightResult { valid, checks, requires_approval });
+            }
+        };
 
         // Step 4: ACL Check
         if let Some(ref acl) = self.acl {
             let caller_id = child_ctx.caller_id.as_deref();
-            let allowed = acl.check(caller_id, module_id, Some(&child_ctx))?;
-            if !allowed {
-                return Err(ModuleError::new(
-                    ErrorCode::AclDenied,
-                    format!(
-                        "Access denied: caller '{:?}' cannot access module '{}'",
-                        caller_id, module_id
-                    ),
-                ));
-            }
-        }
-
-        // Step 5: Approval Gate
-        if let Some(ref handler) = self.approval_handler {
-            if let Some(desc) = self.registry.get_definition(module_id) {
-                if desc.annotations.requires_approval {
-                    let request = ApprovalRequest {
-                        module_id: module_id.to_string(),
-                        arguments: inputs.clone(),
-                        annotations: Default::default(),
-                        description: None,
-                        tags: vec![],
-                    };
-                    let approval_result = handler.request_approval(&request).await?;
-                    match approval_result.status.as_str() {
-                        "approved" => {}
-                        "rejected" => {
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalDenied,
-                                format!(
-                                    "Approval denied for module '{}': {}",
-                                    module_id,
-                                    approval_result
-                                        .reason
-                                        .unwrap_or_else(|| "no reason given".to_string())
-                                ),
-                            ));
-                        }
-                        "timeout" => {
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalTimeout,
-                                format!(
-                                    "Approval timed out for module '{}': {}",
-                                    module_id,
-                                    approval_result
-                                        .reason
-                                        .unwrap_or_else(|| "no reason given".to_string())
-                                ),
-                            ));
-                        }
-                        "pending" => {
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalPending,
-                                format!(
-                                    "Approval pending for module '{}': {}",
-                                    module_id,
-                                    approval_result
-                                        .reason
-                                        .unwrap_or_else(|| "no reason given".to_string())
-                                ),
-                            ));
-                        }
-                        _ => {
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalDenied,
-                                format!(
-                                    "Approval denied for module '{}': unknown status '{}'",
-                                    module_id, approval_result.status
-                                ),
-                            ));
-                        }
-                    }
+            match acl.check(caller_id, module_id, Some(&child_ctx)) {
+                Ok(true) => checks.push(PreflightCheckResult {
+                    check: "acl".to_string(),
+                    passed: true,
+                    error: None,
+                    warnings: vec![],
+                }),
+                Ok(false) => {
+                    valid = false;
+                    let err = ModuleError::new(
+                        ErrorCode::AclDenied,
+                        format!("Access denied: caller '{:?}' cannot access '{}'", caller_id, module_id),
+                    );
+                    checks.push(PreflightCheckResult {
+                        check: "acl".to_string(),
+                        passed: false,
+                        error: Some(err.to_dict()),
+                        warnings: vec![],
+                    });
+                }
+                Err(e) => {
+                    valid = false;
+                    checks.push(PreflightCheckResult {
+                        check: "acl".to_string(),
+                        passed: false,
+                        error: Some(e.to_dict()),
+                        warnings: vec![],
+                    });
                 }
             }
+        } else {
+            checks.push(PreflightCheckResult {
+                check: "acl".to_string(),
+                passed: true,
+                error: None,
+                warnings: vec![],
+            });
         }
 
-        // Step 6: Input Validation
-        let input_schema = module.input_schema();
-        validate_against_schema(inputs, &input_schema, "Input")?;
+        // Step 5: Approval (note requires_approval, but don't actually gate)
+        if let Some(desc) = self.registry.get_definition(module_id) {
+            if desc.annotations.requires_approval {
+                requires_approval = true;
+            }
+        }
+        checks.push(PreflightCheckResult {
+            check: "approval".to_string(),
+            passed: true,
+            error: None,
+            warnings: vec![],
+        });
 
-        // Step 7: Module Preflight (optional, advisory) — collect warnings, never block
-        let mut result = ValidationResult::default();
-        let preflight_result = module.preflight();
-        if !preflight_result.passed {
-            let failed_checks: Vec<String> = preflight_result
+        // Step 6: Schema Validation
+        let input_schema = module.input_schema();
+        match validate_against_schema(inputs, &input_schema, "Input") {
+            Ok(()) => checks.push(PreflightCheckResult {
+                check: "schema".to_string(),
+                passed: true,
+                error: None,
+                warnings: vec![],
+            }),
+            Err(e) => {
+                valid = false;
+                checks.push(PreflightCheckResult {
+                    check: "schema".to_string(),
+                    passed: false,
+                    error: Some(e.to_dict()),
+                    warnings: vec![],
+                });
+            }
+        }
+
+        // Step 7: Module Preflight (advisory, never blocks valid)
+        let preflight = module.preflight();
+        if preflight.checks.is_empty() {
+            checks.push(PreflightCheckResult {
+                check: "module_preflight".to_string(),
+                passed: true,
+                error: None,
+                warnings: vec![],
+            });
+        } else {
+            let warnings: Vec<String> = preflight
                 .checks
                 .iter()
                 .filter(|c| !c.passed)
-                .map(|c| {
-                    c.message
-                        .clone()
-                        .unwrap_or_else(|| format!("Check '{}' failed", c.name))
-                })
+                .filter_map(|c| c.warnings.first().cloned()
+                    .or_else(|| Some(format!("Preflight check '{}' failed", c.check))))
                 .collect();
-            for warning in failed_checks {
-                tracing::warn!(
-                    module_id = module_id,
-                    warning = %warning,
-                    "Preflight check warning (advisory)"
-                );
-                result.warnings.push(warning);
+            for w in &warnings {
+                tracing::warn!(module_id = module_id, warning = %w, "Preflight check warning (advisory)");
             }
+            checks.push(PreflightCheckResult {
+                check: "module_preflight".to_string(),
+                passed: true, // advisory only
+                error: None,
+                warnings,
+            });
         }
 
-        Ok(result)
+        Ok(PreflightResult { valid, checks, requires_approval })
     }
 
     /// Check call depth limits before execution.
@@ -1486,7 +1517,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_approval_timeout_status() {
+    async fn test_validate_notes_requires_approval_without_gating() {
+        // validate() per spec §12.8 MUST NOT actually request approval,
+        // it only reports requires_approval = true.
         let handler = MockApprovalHandler::with_status("timeout");
         let module = MockModule::echo();
         let annotations = ModuleAnnotations {
@@ -1496,23 +1529,9 @@ mod tests {
         let mut executor = build_executor_with_module(module, annotations);
         executor.set_approval_handler(Box::new(handler));
 
-        let err = executor.validate("test_mod", &json!({})).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::ApprovalTimeout);
-    }
-
-    #[tokio::test]
-    async fn test_validate_approval_pending_status() {
-        let handler = MockApprovalHandler::with_status("pending");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        let err = executor.validate("test_mod", &json!({})).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::ApprovalPending);
+        let result = executor.validate("test_mod", &json!({})).await.unwrap();
+        assert!(result.valid);
+        assert!(result.requires_approval);
     }
 
     #[tokio::test]

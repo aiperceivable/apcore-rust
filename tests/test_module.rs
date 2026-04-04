@@ -83,9 +83,10 @@ async fn test_failing_module_returns_error() {
 #[test]
 fn test_module_preflight_passes_by_default() {
     let module = EchoModule;
-    let PreflightResult { passed, checks } = module.preflight();
-    assert!(passed);
-    assert!(checks.is_empty());
+    let result = module.preflight();
+    assert!(result.valid);
+    assert!(result.checks.is_empty());
+    assert!(!result.requires_approval);
 }
 
 #[test]

@@ -27,12 +27,22 @@ pub trait Module: Send + Sync {
         ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError>;
 
+    /// Return a structured description of this module for AI/LLM consumption (spec §5.6).
+    /// Default: builds description from input_schema, output_schema, and description.
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "description": self.description(),
+            "input_schema": self.input_schema(),
+            "output_schema": self.output_schema(),
+        })
+    }
+
     /// Run preflight checks before execution.
     fn preflight(&self) -> PreflightResult {
-        // TODO: Implement
         PreflightResult {
-            passed: true,
+            valid: true,
             checks: vec![],
+            requires_approval: false,
         }
     }
 
@@ -124,7 +134,7 @@ pub struct ModuleExample {
     pub output: serde_json::Value,
 }
 
-/// Result of validating a single aspect.
+/// Result of validating a single aspect (used by SchemaValidator and ModuleValidator).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
     pub valid: bool,
@@ -134,18 +144,36 @@ pub struct ValidationResult {
     pub warnings: Vec<String>,
 }
 
-/// Result of a single preflight check.
+/// Result of a single preflight check (spec §12.8.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreflightCheckResult {
-    pub name: String,
+    /// Check name (e.g., "module_id", "module_lookup", "call_chain", "acl", "schema", "module_preflight").
+    pub check: String,
+    /// Whether the check passed.
     pub passed: bool,
+    /// Error details when `passed` is false; None when passed is true.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub error: Option<serde_json::Value>,
+    /// Non-fatal advisory messages (default: empty).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
-/// Aggregated preflight results.
+/// Aggregated preflight results returned by `Executor::validate()` (spec §12.8.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreflightResult {
-    pub passed: bool,
+    /// True only if ALL checks passed.
+    pub valid: bool,
+    /// Ordered list of check results.
     pub checks: Vec<PreflightCheckResult>,
+    /// True if the module has `requires_approval` annotation.
+    #[serde(default)]
+    pub requires_approval: bool,
+}
+
+impl PreflightResult {
+    /// Computed view: only checks where `passed` is false (duck-type ValidationResult.errors).
+    pub fn errors(&self) -> Vec<&PreflightCheckResult> {
+        self.checks.iter().filter(|c| !c.passed).collect()
+    }
 }
