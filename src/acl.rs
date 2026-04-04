@@ -333,23 +333,11 @@ impl ACL {
         target: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
-        // Caller OR-match: any pattern in callers list must match.
-        // Empty callers matches nothing (aligned with Python/TS).
-        let caller_match = rule
-            .callers
-            .iter()
-            .any(|p| Self::match_acl_pattern(p, caller));
-        if !caller_match {
+        if !Self::match_patterns(&rule.callers, caller, ctx) {
             return false;
         }
 
-        // Target OR-match: any pattern in targets list must match.
-        // Empty targets matches nothing (aligned with Python/TS).
-        let target_match = rule
-            .targets
-            .iter()
-            .any(|p| Self::match_acl_pattern(p, target));
-        if !target_match {
+        if !Self::match_patterns(&rule.targets, target, ctx) {
             return false;
         }
 
@@ -363,14 +351,61 @@ impl ACL {
         true
     }
 
+    /// Match a list of patterns against a value.
+    /// Supports compound operators: `$or` (any match) and `$not` (negate).
+    fn match_patterns(
+        patterns: &[String],
+        value: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        if patterns.is_empty() {
+            return false;
+        }
+
+        let first = patterns[0].as_str();
+        if first == "$or" {
+            return patterns[1..]
+                .iter()
+                .any(|p| Self::match_acl_pattern_with_ctx(p, value, ctx));
+        }
+        if first == "$not" {
+            if patterns.len() < 2 {
+                return false;
+            }
+            return !Self::match_acl_pattern_with_ctx(&patterns[1], value, ctx);
+        }
+
+        // Standard OR: any pattern matches
+        patterns
+            .iter()
+            .any(|p| Self::match_acl_pattern_with_ctx(p, value, ctx))
+    }
+
     /// Pattern matching for ACL patterns. Handles `@external`, `@system`, and
     /// delegates to `match_pattern()` for wildcard/glob matching.
     fn match_acl_pattern(pattern: &str, value: &str) -> bool {
-        // Special sentinel patterns match exactly.
-        if pattern == "@external" || pattern == "@system" {
-            return pattern == value;
+        if pattern == "@external" {
+            return value == "@external";
+        }
+        // @system is handled in match_acl_pattern_with_ctx (needs identity check)
+        if pattern == "@system" {
+            return false; // caller string is never literally "@system"
         }
         match_pattern(pattern, value)
+    }
+
+    fn match_acl_pattern_with_ctx(
+        pattern: &str,
+        value: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        if pattern == "@system" {
+            return ctx
+                .and_then(|c| c.identity.as_ref())
+                .map(|id| id.identity_type() == "system")
+                .unwrap_or(false);
+        }
+        Self::match_acl_pattern(pattern, value)
     }
 
     /// Evaluate conditions block against the context using registered handlers.
@@ -487,19 +522,11 @@ impl ACL {
         target: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
-        let caller_match = rule
-            .callers
-            .iter()
-            .any(|p| Self::match_acl_pattern(p, caller));
-        if !caller_match {
+        if !Self::match_patterns(&rule.callers, caller, ctx) {
             return false;
         }
 
-        let target_match = rule
-            .targets
-            .iter()
-            .any(|p| Self::match_acl_pattern(p, target));
-        if !target_match {
+        if !Self::match_patterns(&rule.targets, target, ctx) {
             return false;
         }
 

@@ -71,19 +71,40 @@ pub fn guard_call_chain_with_repeat(
     max_depth: u32,
     max_module_repeat: usize,
 ) -> Result<(), ModuleError> {
-    // Check call depth
-    if ctx.call_chain.len() as u32 >= max_depth {
+    // Check call depth (chain length must not exceed max_depth)
+    if ctx.call_chain.len() as u32 > max_depth {
         return Err(ModuleError::new(
             ErrorCode::CallDepthExceeded,
             format!(
-                "Call depth exceeded: chain length {} >= max_depth {}",
+                "Call depth exceeded: chain length {} > max_depth {}",
                 ctx.call_chain.len(),
                 max_depth
             ),
         ));
     }
 
-    // Count occurrences of module_name in call_chain
+    // Circular detection: strict cycles of length >= 2 in prior chain.
+    // The call chain's last entry is the current module (added by child()),
+    // so check prior entries for a previous occurrence forming A->...->A.
+    let prior = if ctx.call_chain.last().map(|s| s.as_str()) == Some(module_name) {
+        &ctx.call_chain[..ctx.call_chain.len() - 1]
+    } else {
+        &ctx.call_chain[..]
+    };
+    if let Some(last_idx) = prior.iter().rposition(|n| n.as_str() == module_name) {
+        let subsequence = &prior[last_idx + 1..];
+        if !subsequence.is_empty() {
+            return Err(ModuleError::new(
+                ErrorCode::CircularCall,
+                format!(
+                    "Circular call detected: '{}' already in call chain {:?}",
+                    module_name, ctx.call_chain
+                ),
+            ));
+        }
+    }
+
+    // Frequency throttle: module must not appear more than max_module_repeat times.
     let count = ctx
         .call_chain
         .iter()
@@ -96,21 +117,6 @@ pub fn guard_call_chain_with_repeat(
             format!(
                 "Module '{}' called {} times, exceeds max repeat limit of {}",
                 module_name, count, max_module_repeat
-            ),
-        ));
-    }
-
-    // Check for circular call (module already present in chain)
-    if ctx
-        .call_chain
-        .iter()
-        .any(|name| name.as_str() == module_name)
-    {
-        return Err(ModuleError::new(
-            ErrorCode::CircularCall,
-            format!(
-                "Circular call detected: '{}' already in call chain {:?}",
-                module_name, ctx.call_chain
             ),
         ));
     }
