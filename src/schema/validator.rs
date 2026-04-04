@@ -87,26 +87,51 @@ impl SchemaValidator {
             }
         }
 
-        // --- "type" check ---
+        // --- "type" check (supports single string or array of types) ---
         if let Some(type_val) = schema_obj.get("type") {
-            let type_str = type_val.as_str().unwrap_or("");
-            let type_ok = match type_str {
-                "string" => value.is_string(),
-                "integer" => value.is_i64() || value.is_u64(),
-                "number" => value.is_number(),
-                "boolean" => value.is_boolean(),
-                "object" => value.is_object(),
-                "array" => value.is_array(),
-                "null" => value.is_null(),
-                _ => true, // unknown type – permissive
+            let check_type = |t: &str, v: &serde_json::Value| -> bool {
+                match t {
+                    "string" => v.is_string(),
+                    "integer" => v.is_i64() || v.is_u64(),
+                    "number" => v.is_number(),
+                    "boolean" => v.is_boolean(),
+                    "object" => v.is_object(),
+                    "array" => v.is_array(),
+                    "null" => v.is_null(),
+                    _ => true,
+                }
+            };
+            let type_ok = if let Some(type_str) = type_val.as_str() {
+                check_type(type_str, value)
+            } else if let Some(type_arr) = type_val.as_array() {
+                type_arr
+                    .iter()
+                    .any(|t| t.as_str().is_some_and(|s| check_type(s, value)))
+            } else {
+                true
             };
             if !type_ok {
                 let display_path = if path.is_empty() { "<root>" } else { &path };
                 errors.push(format!(
-                    "{}: expected type '{}', got {:?}",
-                    display_path, type_str, value
+                    "{}: expected type {:?}, got {:?}",
+                    display_path, type_val, value
                 ));
                 return;
+            }
+        }
+
+        // --- "pattern" check for strings ---
+        if let (Some(pattern_val), Some(str_val)) =
+            (schema_obj.get("pattern").and_then(|p| p.as_str()), value.as_str())
+        {
+            if let Ok(re) = regex::Regex::new(pattern_val) {
+                if !re.is_match(str_val) {
+                    let display_path = if path.is_empty() { "<root>" } else { &path };
+                    errors.push(format!(
+                        "{}: value {:?} does not match pattern {:?}",
+                        display_path, str_val, pattern_val
+                    ));
+                }
             }
         }
 
@@ -132,7 +157,7 @@ impl SchemaValidator {
                 }
             }
 
-            // "properties" – recursive validation
+            // "properties" -- recursive validation
             if let Some(properties) = schema_obj.get("properties") {
                 if let Some(props) = properties.as_object() {
                     for (key, prop_schema) in props {
@@ -143,6 +168,25 @@ impl SchemaValidator {
                                 format!("{}.{}", path, key)
                             };
                             self.validate_inner(prop_value, prop_schema, child_path, errors);
+                        }
+                    }
+                }
+            }
+
+            // "additionalProperties": false -- reject unknown keys
+            if schema_obj.get("additionalProperties") == Some(&serde_json::Value::Bool(false)) {
+                if let Some(props) = schema_obj.get("properties").and_then(|p| p.as_object()) {
+                    for key in obj.keys() {
+                        if !props.contains_key(key) {
+                            let field_path = if path.is_empty() {
+                                key.clone()
+                            } else {
+                                format!("{}.{}", path, key)
+                            };
+                            errors.push(format!(
+                                "{}: additional property not allowed",
+                                field_path
+                            ));
                         }
                     }
                 }

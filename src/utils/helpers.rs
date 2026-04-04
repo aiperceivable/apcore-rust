@@ -131,11 +131,55 @@ pub fn propagate_error(error: ModuleError, context: &str) -> ModuleError {
     new_error
 }
 
-/// Normalize a module name or identifier to canonical form.
+/// Convert a single segment to snake_case by detecting case boundaries.
 ///
-/// Lowercases and trims whitespace.
-pub fn normalize_to_canonical_id(name: &str) -> String {
-    name.trim().to_lowercase()
+/// Matches Algorithm A02 from the apcore protocol spec:
+/// - Inserts `_` before an uppercase letter preceded by a lowercase/digit.
+/// - Inserts `_` between consecutive uppercase letters when followed by a lowercase letter
+///   (e.g., "HTTPClient" -> "http_client", "HTMLParser" -> "html_parser").
+/// - Collapses any resulting double underscores.
+fn to_snake_case(segment: &str) -> String {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut result = String::with_capacity(segment.len() + 4);
+
+    for (i, &ch) in chars.iter().enumerate() {
+        if i > 0 {
+            let prev = chars[i - 1];
+            if (prev.is_lowercase() || prev.is_ascii_digit()) && ch.is_uppercase() {
+                result.push('_');
+            } else if prev.is_uppercase() && ch.is_uppercase() {
+                if i + 1 < chars.len() && chars[i + 1].is_lowercase() {
+                    result.push('_');
+                }
+            }
+        }
+        result.push(ch.to_lowercase().next().unwrap_or(ch));
+    }
+
+    result.replace("__", "_")
+}
+
+/// Language-specific separators used to split local IDs into segments.
+fn separator_for_language(language: &str) -> &'static str {
+    match language {
+        "rust" => "::",
+        // Python, Go, Java, TypeScript all use "."
+        _ => ".",
+    }
+}
+
+/// Normalize a local module identifier to its canonical dotted snake_case form.
+///
+/// Implements Algorithm A02 from the apcore protocol spec.
+/// Splits `local_id` by the language-specific separator, converts each segment
+/// to snake_case, and joins with `"."`.
+pub fn normalize_to_canonical_id(local_id: &str, language: &str) -> String {
+    let separator = separator_for_language(language);
+    local_id
+        .split(separator)
+        .map(to_snake_case)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Calculate the specificity of a pattern for ACL rule ordering.

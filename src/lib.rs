@@ -50,7 +50,7 @@ pub use client::APCore;
 pub use config::{Config, ConfigMode, EnvStyle, MountSource, NamespaceInfo, NamespaceRegistration};
 pub use context::{Context, ContextFactory, Identity};
 pub use context_key::ContextKey;
-pub use errors::{ErrorCode, ModuleError};
+pub use errors::{ErrorCode, ErrorCodeRegistry, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
 pub use executor::{
     describe_pipeline, list_strategies, redact_sensitive, register_strategy, Executor,

@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Framework error code prefixes reserved by the protocol.
@@ -1264,5 +1264,122 @@ impl DependencyNotFoundError {
             serde_json::Value::String(self.dependency_id.clone()),
         );
         ModuleError::new(ErrorCode::DependencyNotFound, &self.message).with_details(details)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ErrorCodeRegistry — tracks module error codes and detects collisions
+// ---------------------------------------------------------------------------
+
+/// Registry that tracks which error codes belong to which modules,
+/// enforcing framework-prefix reservation and cross-module uniqueness.
+///
+/// Matches the Python `ErrorCodeRegistry` for conformance testing.
+pub struct ErrorCodeRegistry {
+    module_codes: HashMap<String, HashSet<String>>,
+    all_codes: HashSet<String>,
+}
+
+impl ErrorCodeRegistry {
+    pub fn new() -> Self {
+        Self {
+            module_codes: HashMap::new(),
+            all_codes: HashSet::new(),
+        }
+    }
+
+    /// Register a set of error codes for the given module.
+    ///
+    /// Returns `Err(ModuleError)` with `ErrorCode::ErrorCodeCollision` if any
+    /// code uses a reserved framework prefix or is already owned by a different
+    /// module. Re-registering the same code for the same module is idempotent.
+    pub fn register(
+        &mut self,
+        module_id: &str,
+        codes: &HashSet<String>,
+    ) -> Result<(), ModuleError> {
+        for code in codes {
+            // Check framework prefix collision
+            for prefix in FRAMEWORK_ERROR_CODE_PREFIXES {
+                if code.starts_with(prefix) {
+                    return Err(ErrorCodeCollisionError::new(
+                        format!(
+                            "Error code '{}' uses reserved framework prefix '{}'",
+                            code, prefix
+                        ),
+                        code,
+                        module_id,
+                        "framework",
+                    )
+                    .to_module_error());
+                }
+            }
+
+            // Check cross-module collision
+            if let Some(owner) = self.find_owner(code) {
+                if owner != module_id {
+                    return Err(ErrorCodeCollisionError::new(
+                        format!(
+                            "Error code '{}' already registered by module '{}'",
+                            code, owner
+                        ),
+                        code,
+                        module_id,
+                        &owner,
+                    )
+                    .to_module_error());
+                }
+            }
+        }
+
+        let existing = self
+            .module_codes
+            .entry(module_id.to_string())
+            .or_default();
+        existing.extend(codes.iter().cloned());
+
+        self.rebuild_all_codes();
+        Ok(())
+    }
+
+    /// Remove all error codes registered for the given module.
+    pub fn unregister(&mut self, module_id: &str) {
+        self.module_codes.remove(module_id);
+        self.rebuild_all_codes();
+    }
+
+    /// Find the module that owns the given error code, if any.
+    fn find_owner(&self, code: &str) -> Option<String> {
+        for (mid, codes) in &self.module_codes {
+            if codes.contains(code) {
+                return Some(mid.clone());
+            }
+        }
+        None
+    }
+
+    /// Rebuild the `all_codes` set from the current `module_codes`.
+    fn rebuild_all_codes(&mut self) {
+        self.all_codes = self
+            .module_codes
+            .values()
+            .flat_map(|codes| codes.iter().cloned())
+            .collect();
+    }
+
+    /// Returns a reference to the set of all currently registered codes.
+    pub fn all_codes(&self) -> &HashSet<String> {
+        &self.all_codes
+    }
+
+    /// Returns the codes registered for a specific module, if any.
+    pub fn codes_for_module(&self, module_id: &str) -> Option<&HashSet<String>> {
+        self.module_codes.get(module_id)
+    }
+}
+
+impl Default for ErrorCodeRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
