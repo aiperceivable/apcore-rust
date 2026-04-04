@@ -5,15 +5,23 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::context::Context;
 use crate::errors::ModuleError;
+use crate::module::ModuleAnnotations;
 
 /// Approval request sent before a sensitive operation.
+/// Spec §7.3.1: required fields are module_id, arguments, context, annotations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub module_id: String,
     pub arguments: serde_json::Value,
+    /// The execution context (trace_id, identity, call_chain).
+    /// Skipped during serialization as Context contains non-serializable runtime refs.
+    #[serde(skip)]
+    pub context: Option<Context<serde_json::Value>>,
+    /// Module behavior annotations (requires_approval is guaranteed true).
     #[serde(default)]
-    pub annotations: HashMap<String, serde_json::Value>,
+    pub annotations: ModuleAnnotations,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]

@@ -598,13 +598,14 @@ impl Config {
                     break;
                 }
             }
-            // Fallback: legacy APCORE_ prefix → route into the "apcore" sub-namespace.
+            // Fallback: APCORE_ prefix with no matching namespace → treat as
+            // top-level key (same as legacy mode). Per spec §9.8, un-matched
+            // env vars resolve to their natural dot-path without namespace prefix.
             if !matched {
                 if let Some(suffix) = env_key.strip_prefix("APCORE_") {
                     let dot_path = Self::env_key_to_dot_path(suffix);
-                    let full_path = format!("apcore.{dot_path}");
-                    tracing::debug!(env = %env_key, path = %full_path, "Applying legacy env override in namespace mode");
-                    self.set(&full_path, parsed);
+                    tracing::debug!(env = %env_key, path = %dot_path, "Applying fallback env override (no namespace match)");
+                    self.set(&dot_path, parsed);
                 }
             }
         }

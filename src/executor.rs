@@ -420,6 +420,7 @@ impl Executor {
                         let request = ApprovalRequest {
                             module_id: module_id.to_string(),
                             arguments: inputs.clone(),
+                            context: ctx.cloned(),
                             annotations: Default::default(),
                             description: None,
                             tags: vec![],

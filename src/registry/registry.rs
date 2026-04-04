@@ -26,7 +26,7 @@ pub struct ModuleDescriptor {
 /// Dependency information for a module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyInfo {
-    pub name: String,
+    pub module_id: String,
     pub version_constraint: String,
     #[serde(default)]
     pub optional: bool,
