@@ -2,7 +2,6 @@
 // executor-refactor, preset-strategies, call-with-trace, introspection
 
 use apcore::config::Config;
-use apcore::context::Context;
 use apcore::errors::ModuleError;
 use apcore::pipeline::{ExecutionStrategy, PipelineContext, Step, StepResult};
 use apcore::registry::registry::Registry;

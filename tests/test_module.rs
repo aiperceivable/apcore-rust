@@ -2,7 +2,7 @@
 
 use apcore::context::{Context, Identity};
 use apcore::errors::{ErrorCode, ModuleError};
-use apcore::module::{Module, ModuleAnnotations, ModuleExample, PreflightResult};
+use apcore::module::{Module, ModuleAnnotations, ModuleExample};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;

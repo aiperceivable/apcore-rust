@@ -145,12 +145,17 @@ fn to_snake_case(segment: &str) -> String {
     for (i, &ch) in chars.iter().enumerate() {
         if i > 0 {
             let prev = chars[i - 1];
-            if (prev.is_lowercase() || prev.is_ascii_digit()) && ch.is_uppercase() {
+            let boundary = if (prev.is_lowercase() || prev.is_ascii_digit()) && ch.is_uppercase()
+            {
+                true
+            } else {
+                prev.is_uppercase()
+                    && ch.is_uppercase()
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_lowercase()
+            };
+            if boundary {
                 result.push('_');
-            } else if prev.is_uppercase() && ch.is_uppercase() {
-                if i + 1 < chars.len() && chars[i + 1].is_lowercase() {
-                    result.push('_');
-                }
             }
         }
         result.push(ch.to_lowercase().next().unwrap_or(ch));
