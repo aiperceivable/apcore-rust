@@ -5,9 +5,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::acl::ACL;
+use crate::approval::ApprovalHandler;
+use crate::config::Config;
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
+use crate::middleware::manager::MiddlewareManager;
 use crate::module::Module;
+use crate::registry::registry::Registry;
+use crate::utils::helpers::match_pattern;
 
 // ---------------------------------------------------------------------------
 // Step trait
@@ -31,6 +37,26 @@ pub trait Step: Send + Sync {
 
     /// Whether this step's implementation can be swapped.
     fn replaceable(&self) -> bool;
+
+    /// Glob patterns for module IDs this step applies to. `None` = all.
+    fn match_modules(&self) -> Option<&[String]> {
+        None
+    }
+
+    /// `true` = step failure logs warning and continues. `false` = step failure aborts pipeline.
+    fn ignore_errors(&self) -> bool {
+        false
+    }
+
+    /// `true` = no side effects. Safe to run during `validate()` (dry_run mode).
+    fn pure(&self) -> bool {
+        false
+    }
+
+    /// Per-step timeout in milliseconds. `0` = no per-step timeout.
+    fn timeout_ms(&self) -> u64 {
+        0
+    }
 
     /// Execute the step, reading/writing shared [`PipelineContext`] state.
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError>;
@@ -131,6 +157,26 @@ pub struct PipelineContext {
     /// `true` when streaming mode was requested.
     pub stream: bool,
 
+    // -- Pipeline v2 --
+    /// `true` during `validate()`. PipelineEngine skips steps with `pure=false`.
+    pub dry_run: bool,
+    /// Passed through to module_lookup for version negotiation.
+    pub version_hint: Option<String>,
+    /// Tracks which middleware ran, enabling on_error recovery chain.
+    pub executed_middlewares: Vec<usize>,
+
+    // -- Executor resources (injected by Executor::call) --
+    /// Module registry for lookups.
+    pub registry: Option<Arc<Registry>>,
+    /// Executor configuration (timeouts, call depth limits, etc.).
+    pub config: Option<Arc<Config>>,
+    /// Access control list, if configured.
+    pub acl: Option<Arc<ACL>>,
+    /// Approval handler, if configured.
+    pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// Middleware manager for before/after chains.
+    pub middleware_manager: Option<Arc<MiddlewareManager>>,
+
     // -- Metadata --
     /// Name of the strategy driving this execution.
     pub strategy_name: String,
@@ -158,6 +204,14 @@ impl PipelineContext {
             output: None,
             validated_output: None,
             stream: false,
+            dry_run: false,
+            version_hint: None,
+            executed_middlewares: vec![],
+            registry: None,
+            config: None,
+            acl: None,
+            approval_handler: None,
+            middleware_manager: None,
             strategy_name,
         }
     }
@@ -180,6 +234,9 @@ pub struct StepTrace {
     pub skipped: bool,
     /// Whether this step is an AI decision point.
     pub decision_point: bool,
+    /// Reason the step was skipped: "no_match", "dry_run", or "error_ignored".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 /// Complete execution record for a pipeline run.
@@ -400,22 +457,124 @@ impl PipelineEngine {
 
         while idx < steps.len() {
             let step = &steps[idx];
-            let step_start = std::time::Instant::now();
 
-            let result = step.execute(ctx).await?;
+            // Read declarations (trait defaults for backward compat)
+            let step_match_modules = step.match_modules();
+            let step_ignore_errors = step.ignore_errors();
+            let step_pure = step.pure();
+            let step_timeout_ms = step.timeout_ms();
+
+            // (1) match_modules filter
+            if let Some(patterns) = step_match_modules {
+                let matched = patterns
+                    .iter()
+                    .any(|pattern| match_pattern(pattern, &ctx.module_id));
+                if !matched {
+                    ctx.trace.steps.push(StepTrace {
+                        name: step.name().to_string(),
+                        duration_ms: 0.0,
+                        result: StepResult::continue_step(),
+                        skipped: true,
+                        decision_point: false,
+                        skip_reason: Some("no_match".to_string()),
+                    });
+                    idx += 1;
+                    continue;
+                }
+            }
+
+            // (2) dry_run filter: skip steps with side effects
+            if ctx.dry_run && !step_pure {
+                ctx.trace.steps.push(StepTrace {
+                    name: step.name().to_string(),
+                    duration_ms: 0.0,
+                    result: StepResult::continue_step(),
+                    skipped: true,
+                    decision_point: false,
+                    skip_reason: Some("dry_run".to_string()),
+                });
+                idx += 1;
+                continue;
+            }
+
+            // (3) Execute with per-step timeout
+            let step_start = std::time::Instant::now();
+            let exec_result = if step_timeout_ms > 0 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(step_timeout_ms),
+                    step.execute(ctx),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => Err(ModuleError::new(
+                        ErrorCode::ModuleTimeout,
+                        format!(
+                            "Step '{}' timed out after {}ms",
+                            step.name(),
+                            step_timeout_ms
+                        ),
+                    )),
+                }
+            } else {
+                step.execute(ctx).await
+            };
+
             let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+
+            let result = match exec_result {
+                Ok(r) => r,
+                Err(err) => {
+                    // (4) ignore_errors: log and continue
+                    if step_ignore_errors {
+                        tracing::warn!(
+                            step = step.name(),
+                            error = %err,
+                            "Step failed (ignored)"
+                        );
+                        ctx.trace.steps.push(StepTrace {
+                            name: step.name().to_string(),
+                            duration_ms,
+                            result: StepResult {
+                                action: "continue".into(),
+                                explanation: Some(err.to_string()),
+                                ..Default::default()
+                            },
+                            skipped: false,
+                            decision_point: false,
+                            skip_reason: Some("error_ignored".to_string()),
+                        });
+                        idx += 1;
+                        continue;
+                    }
+                    // Not ignored: record and raise
+                    ctx.trace.steps.push(StepTrace {
+                        name: step.name().to_string(),
+                        duration_ms,
+                        result: StepResult::abort(&err.to_string()),
+                        skipped: false,
+                        decision_point: false,
+                        skip_reason: None,
+                    });
+                    ctx.trace.total_duration_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+                    return Err(err);
+                }
+            };
 
             let action = result.action.clone();
             let skip_target = result.skip_to.clone();
 
+            // (5) Record trace
             ctx.trace.steps.push(StepTrace {
                 name: step.name().to_string(),
                 duration_ms,
                 result,
                 skipped: false,
                 decision_point: false,
+                skip_reason: None,
             });
 
+            // (6) Handle abort / skip_to
             match action.as_str() {
                 "continue" => {
                     idx += 1;
@@ -442,6 +601,7 @@ impl PipelineEngine {
                                     result: StepResult::continue_step(),
                                     skipped: true,
                                     decision_point: false,
+                                    skip_reason: None,
                                 });
                             }
                             idx = target_idx;

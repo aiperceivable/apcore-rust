@@ -58,16 +58,16 @@ fn test_executor_with_strategy_stores_strategy() {
 
     let executor = Executor::with_strategy(registry, config, strategy);
 
-    let stored = executor.strategy().expect("strategy should be Some");
+    let stored = executor.strategy();
     assert_eq!(stored.name(), "testing");
 }
 
 #[test]
-fn test_executor_new_has_no_strategy() {
+fn test_executor_new_has_standard_strategy() {
     let registry = Registry::new();
     let config = Config::default();
     let executor = Executor::new(registry, config);
-    assert!(executor.strategy().is_none());
+    assert_eq!(executor.strategy().name(), "standard");
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ fn test_preset_testing_strategy() {
     let names = strategy.step_names();
     assert!(names.contains(&"context_creation".to_string()));
     assert!(names.contains(&"execute".to_string()));
-    assert!(!names.contains(&"safety_check".to_string()));
+    assert!(!names.contains(&"call_chain_guard".to_string()));
     assert!(!names.contains(&"acl_check".to_string()));
     assert!(!names.contains(&"approval_gate".to_string()));
 }
@@ -174,18 +174,21 @@ async fn test_call_with_trace_strategy_override() {
 }
 
 #[tokio::test]
-async fn test_call_with_trace_no_strategy_errors() {
+async fn test_call_with_trace_no_override_uses_default_strategy() {
     let registry = Registry::new();
     let config = Config::default();
     let executor = Executor::new(registry, config);
 
+    // Passing None for strategy uses the executor's default strategy.
+    // Module lookup will fail since the registry is empty, but the
+    // strategy itself is always available.
     let result = executor
-        .call_with_trace("mod", serde_json::json!({}), None, None)
+        .call_with_trace("nonexistent", serde_json::json!({}), None, None)
         .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.message.contains("No execution strategy"));
+    assert_eq!(err.code, apcore::errors::ErrorCode::ModuleNotFound);
 }
 
 // ---------------------------------------------------------------------------

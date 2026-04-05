@@ -26,6 +26,7 @@ pub mod middleware;
 pub mod module;
 pub mod observability;
 pub mod pipeline;
+pub mod pipeline_config;
 pub mod registry;
 pub mod schema;
 pub mod sys_modules;
@@ -42,9 +43,9 @@ pub use approval::{
 pub use async_task::TaskStatus;
 pub use builtin_steps::{
     build_internal_strategy, build_performance_strategy, build_standard_strategy,
-    build_testing_strategy, BuiltinACLCheck, BuiltinApprovalGate, BuiltinContextCreation,
-    BuiltinExecute, BuiltinInputValidation, BuiltinMiddlewareAfter, BuiltinMiddlewareBefore,
-    BuiltinModuleLookup, BuiltinOutputValidation, BuiltinReturnResult, BuiltinSafetyCheck,
+    build_testing_strategy, BuiltinACLCheck, BuiltinApprovalGate, BuiltinCallChainGuard,
+    BuiltinContextCreation, BuiltinExecute, BuiltinInputValidation, BuiltinMiddlewareAfter,
+    BuiltinMiddlewareBefore, BuiltinModuleLookup, BuiltinOutputValidation, BuiltinReturnResult,
 };
 pub use client::APCore;
 pub use config::{Config, ConfigMode, EnvStyle, MountSource, NamespaceInfo, NamespaceRegistration};
@@ -62,6 +63,10 @@ pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware}
 pub use pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, Step, StepResult, StepTrace,
     StrategyInfo,
+};
+pub use pipeline_config::{
+    build_strategy_from_config, register_step_type, registered_step_types, reset_step_registry,
+    unregister_step_type, StepFactory,
 };
 pub use registry::registry::Registry;
 pub use schema::{ExportProfile, SchemaDefinition, SchemaStrategy};

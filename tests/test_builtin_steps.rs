@@ -19,12 +19,12 @@ fn test_standard_strategy_step_names() {
     let strategy = build_standard_strategy();
     let expected = vec![
         "context_creation",
-        "safety_check",
+        "call_chain_guard",
         "module_lookup",
         "acl_check",
         "approval_gate",
-        "input_validation",
         "middleware_before",
+        "input_validation",
         "execute",
         "output_validation",
         "middleware_after",
@@ -41,12 +41,12 @@ fn test_standard_strategy_step_flags() {
     // (name, removable, replaceable)
     let expected_flags: Vec<(&str, bool, bool)> = vec![
         ("context_creation", false, false),
-        ("safety_check", true, true),
+        ("call_chain_guard", true, true),
         ("module_lookup", false, false),
         ("acl_check", true, true),
         ("approval_gate", true, true),
-        ("input_validation", true, true),
         ("middleware_before", true, false),
+        ("input_validation", true, true),
         ("execute", false, true),
         ("output_validation", true, true),
         ("middleware_after", true, false),

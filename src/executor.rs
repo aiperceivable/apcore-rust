@@ -2,28 +2,71 @@
 // Spec reference: Module execution engine
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use serde_json::Value;
 
 use crate::acl::ACL;
-use crate::approval::{ApprovalHandler, ApprovalRequest};
+use crate::approval::ApprovalHandler;
+use crate::builtin_steps::build_standard_strategy;
 use crate::config::Config;
 use crate::context::{Context, Identity};
 use crate::errors::{ErrorCode, ModuleError};
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::middleware::manager::MiddlewareManager;
+use crate::module::PreflightCheckResult as PfCheck;
 use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
 use crate::registry::registry::Registry;
-use crate::utils::guard_call_chain;
+
+/// Map pipeline step names to PreflightResult check names.
+fn step_to_check_name(step_name: &str) -> &str {
+    match step_name {
+        "context_creation" => "context",
+        "call_chain_guard" => "call_chain",
+        "module_lookup" => "module_lookup",
+        "acl_check" => "acl",
+        "approval_gate" => "approval",
+        "middleware_before" => "middleware",
+        "input_validation" => "schema",
+        other => other,
+    }
+}
+
+/// Convert `PipelineTrace` steps into `PreflightCheckResult` entries.
+fn trace_to_checks(trace: &PipelineTrace) -> Vec<PfCheck> {
+    trace
+        .steps
+        .iter()
+        .filter(|st| !st.skipped)
+        .map(|st| {
+            let check_name = step_to_check_name(&st.name).to_string();
+            let passed = st.result.action != "abort";
+            let error = if !passed {
+                st.result.explanation.as_ref().map(|msg| {
+                    serde_json::json!({
+                        "code": format!("STEP_{}_FAILED", st.name.to_uppercase()),
+                        "message": msg,
+                    })
+                })
+            } else {
+                None
+            };
+            PfCheck {
+                check: check_name,
+                passed,
+                error,
+                warnings: vec![],
+            }
+        })
+        .collect()
+}
 
 /// Returns true if the schema is non-trivial (not null and not an empty object).
-fn has_schema(schema: &Value) -> bool {
+pub fn has_schema(schema: &Value) -> bool {
     if schema.is_null() {
         return false;
     }
@@ -38,7 +81,7 @@ pub const REDACTED_VALUE: &str = "***REDACTED***";
 
 /// Validate a JSON value against a JSON Schema.
 /// Returns Ok(()) if valid, or a ModuleError with SchemaValidationError on failure.
-fn validate_against_schema(
+pub fn validate_against_schema(
     value: &Value,
     schema: &Value,
     direction: &str,
@@ -216,37 +259,39 @@ pub fn describe_pipeline(strategy: &ExecutionStrategy) -> StrategyInfo {
 /// Responsible for executing modules with middleware, ACL, and context management.
 #[derive(Debug)]
 pub struct Executor {
-    pub registry: Registry,
-    pub config: Config,
-    pub acl: Option<ACL>,
-    pub approval_handler: Option<Box<dyn ApprovalHandler>>,
-    pub middleware_manager: MiddlewareManager,
-    /// Optional default execution strategy for pipeline-based execution.
-    strategy: Option<ExecutionStrategy>,
+    pub registry: Arc<Registry>,
+    pub config: Arc<Config>,
+    pub acl: Option<Arc<ACL>>,
+    pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    pub middleware_manager: Arc<MiddlewareManager>,
+    /// Execution strategy — all calls go through PipelineEngine.
+    strategy: ExecutionStrategy,
 }
 
 impl Executor {
     /// Create a new executor with the given registry and config.
+    ///
+    /// Builds a standard execution strategy — all calls go through PipelineEngine.
     pub fn new(registry: Registry, config: Config) -> Self {
         Self {
-            registry,
-            config,
+            registry: Arc::new(registry),
+            config: Arc::new(config),
             acl: None,
             approval_handler: None,
-            middleware_manager: MiddlewareManager::new(),
-            strategy: None,
+            middleware_manager: Arc::new(MiddlewareManager::new()),
+            strategy: build_standard_strategy(),
         }
     }
 
-    /// Create a new executor with a default execution strategy.
+    /// Create a new executor with a custom execution strategy.
     pub fn with_strategy(registry: Registry, config: Config, strategy: ExecutionStrategy) -> Self {
         Self {
-            registry,
-            config,
+            registry: Arc::new(registry),
+            config: Arc::new(config),
             acl: None,
             approval_handler: None,
-            middleware_manager: MiddlewareManager::new(),
-            strategy: Some(strategy),
+            middleware_manager: Arc::new(MiddlewareManager::new()),
+            strategy,
         }
     }
 
@@ -269,12 +314,12 @@ impl Executor {
             }
         }
         Self {
-            registry,
-            config,
-            acl,
-            approval_handler,
-            middleware_manager,
-            strategy: None,
+            registry: Arc::new(registry),
+            config: Arc::new(config),
+            acl: acl.map(Arc::new),
+            approval_handler: approval_handler.map(|h| Arc::from(h) as Arc<dyn ApprovalHandler>),
+            middleware_manager: Arc::new(middleware_manager),
+            strategy: build_standard_strategy(),
         }
     }
 
@@ -290,24 +335,28 @@ impl Executor {
 
     /// Set the ACL for access control.
     pub fn set_acl(&mut self, acl: ACL) {
-        self.acl = Some(acl);
+        self.acl = Some(Arc::new(acl));
     }
 
     /// Set the approval handler.
     pub fn set_approval_handler(&mut self, handler: Box<dyn ApprovalHandler>) {
-        self.approval_handler = Some(handler);
+        self.approval_handler = Some(Arc::from(handler));
     }
 
     /// Add a middleware to the pipeline.
     ///
     /// Returns an error if the middleware's priority exceeds the allowed range.
     pub fn use_middleware(&mut self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
-        self.middleware_manager.add(middleware)
+        Arc::get_mut(&mut self.middleware_manager)
+            .expect("middleware_manager not shared yet")
+            .add(middleware)
     }
 
     /// Remove a middleware by name.
     pub fn remove(&mut self, name: &str) -> bool {
-        self.middleware_manager.remove(name)
+        Arc::get_mut(&mut self.middleware_manager)
+            .expect("middleware_manager not shared yet")
+            .remove(name)
     }
 
     /// Remove a middleware by name (legacy alias).
@@ -316,6 +365,8 @@ impl Executor {
     }
 
     /// Execute (call) a module by ID with the given inputs and context.
+    ///
+    /// Delegates to `PipelineEngine::run()` using the configured strategy.
     pub async fn call(
         &self,
         module_id: &str,
@@ -323,293 +374,22 @@ impl Executor {
         ctx: Option<&Context<serde_json::Value>>,
         _version_hint: Option<&str>,
     ) -> Result<serde_json::Value, ModuleError> {
-        // Step 1: Context — create or use default parent
-        let default_ctx;
-        let parent_ctx = match ctx {
-            Some(parent) => parent,
-            None => {
-                default_ctx = Context::<serde_json::Value>::new(Identity::new(
-                    "@external".to_string(),
-                    "external".to_string(),
-                    vec![],
-                    Default::default(),
-                ));
-                &default_ctx
-            }
+        let context = match ctx {
+            Some(c) => c.clone(),
+            None => Context::<serde_json::Value>::new(Identity::new(
+                "@external".to_string(),
+                "external".to_string(),
+                vec![],
+                Default::default(),
+            )),
         };
-
-        // Step 2: Safety Checks — guard call chain on parent BEFORE adding module_id
-        crate::utils::guard_call_chain_with_repeat(
-            parent_ctx,
-            module_id,
-            self.config.max_call_depth,
-            self.config.max_module_repeat as usize,
-        )?;
-
-        // Create child context (adds module_id to call_chain)
-        let mut child_ctx = parent_ctx.child(module_id);
-
-        // Set global deadline on root call (when no parent context was provided)
-        if ctx.is_none() && self.config.global_timeout_ms > 0 {
-            let now_epoch: f64 = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-            child_ctx.global_deadline =
-                Some(now_epoch + (self.config.global_timeout_ms as f64 / 1000.0));
+        let mut pipe_ctx = PipelineContext::new(module_id, inputs, context, self.strategy.name());
+        if let Some(hint) = _version_hint {
+            pipe_ctx.version_hint = Some(hint.to_string());
         }
-
-        // Step 3: Module Lookup
-        let module = self.registry.get(module_id).ok_or_else(|| {
-            ModuleError::new(
-                ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found in registry", module_id),
-            )
-        })?;
-
-        // Step 4: ACL Check
-        if let Some(ref acl) = self.acl {
-            let caller_id = child_ctx.caller_id.as_deref();
-            let allowed = acl.check(caller_id, module_id, Some(&child_ctx))?;
-            if !allowed {
-                return Err(ModuleError::new(
-                    ErrorCode::AclDenied,
-                    format!(
-                        "Access denied: caller '{:?}' cannot access module '{}'",
-                        caller_id, module_id
-                    ),
-                ));
-            }
-        }
-
-        // Step 5: Approval Gate (with _approval_token Phase B support)
-        let mut inputs = inputs;
-        if let Some(ref handler) = self.approval_handler {
-            if let Some(desc) = self.registry.get_definition(module_id) {
-                if desc.annotations.requires_approval {
-                    // Phase B: check for _approval_token in inputs
-                    let approval_result = if let Some(token) = inputs
-                        .as_object()
-                        .and_then(|obj| obj.get("_approval_token"))
-                    {
-                        let token_str = match token.as_str() {
-                            Some(s) => s.to_string(),
-                            None => {
-                                return Err(ModuleError::new(
-                                    ErrorCode::GeneralInvalidInput,
-                                    format!(
-                                        "_approval_token must be a string, got {}",
-                                        match token {
-                                            Value::Number(_) => "number",
-                                            Value::Bool(_) => "boolean",
-                                            Value::Array(_) => "array",
-                                            Value::Object(_) => "object",
-                                            Value::Null => "null",
-                                            _ => "unknown",
-                                        }
-                                    ),
-                                ));
-                            }
-                        };
-                        // Strip _approval_token from inputs
-                        if let Some(obj) = inputs.as_object_mut() {
-                            obj.remove("_approval_token");
-                        }
-                        handler.check_approval(&token_str).await?
-                    } else {
-                        let request = ApprovalRequest {
-                            module_id: module_id.to_string(),
-                            arguments: inputs.clone(),
-                            context: ctx.cloned(),
-                            annotations: Default::default(),
-                            description: None,
-                            tags: vec![],
-                        };
-                        handler.request_approval(&request).await?
-                    };
-
-                    // Fix 4: Differentiated approval error handling
-                    match approval_result.status.as_str() {
-                        "approved" => {} // proceed
-                        "rejected" => {
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalDenied,
-                                format!(
-                                    "Approval denied for module '{}': {}",
-                                    module_id,
-                                    approval_result
-                                        .reason
-                                        .unwrap_or_else(|| "no reason given".to_string())
-                                ),
-                            ));
-                        }
-                        "timeout" => {
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalTimeout,
-                                format!(
-                                    "Approval timed out for module '{}': {}",
-                                    module_id,
-                                    approval_result
-                                        .reason
-                                        .unwrap_or_else(|| "no reason given".to_string())
-                                ),
-                            ));
-                        }
-                        "pending" => {
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalPending,
-                                format!(
-                                    "Approval pending for module '{}': {}",
-                                    module_id,
-                                    approval_result
-                                        .reason
-                                        .unwrap_or_else(|| "no reason given".to_string())
-                                ),
-                            ));
-                        }
-                        _ => {
-                            // Unknown status treated as denied
-                            tracing::warn!(
-                                module_id = module_id,
-                                status = %approval_result.status,
-                                "Unknown approval status, treating as denied"
-                            );
-                            return Err(ModuleError::new(
-                                ErrorCode::ApprovalDenied,
-                                format!(
-                                    "Approval denied for module '{}': unknown status '{}'",
-                                    module_id, approval_result.status
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Step 6: Input Validation and Redaction
-        let input_schema = module.input_schema();
-        validate_against_schema(&inputs, &input_schema, "Input")?;
-        child_ctx.redacted_inputs = if has_schema(&input_schema) {
-            let redacted = redact_sensitive(&inputs, &input_schema);
-            Some(
-                redacted
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
-            )
-        } else {
-            None
-        };
-
-        // Step 7: Middleware Before
-        let (inputs, executed) = match self
-            .middleware_manager
-            .execute_before(module_id, inputs.clone(), &child_ctx)
-            .await
-        {
-            Ok((modified_inputs, executed)) => (modified_inputs, executed),
-            Err(e) => {
-                // On middleware before error, run on_error with original inputs for recovery.
-                // Design choice: we pass the original (pre-middleware) inputs, not partially
-                // modified ones, because the before chain did not complete successfully.
-                let recovery = self
-                    .middleware_manager
-                    .execute_on_error(module_id, inputs, &e, &child_ctx, &[])
-                    .await;
-                if let Some(recovery_value) = recovery {
-                    return Ok(recovery_value);
-                }
-                return Err(e);
-            }
-        };
-
-        // Step 8: Execute with dual-timeout enforcement
-        let per_module_timeout_ms = self.config.default_timeout_ms;
-        let effective_timeout_ms = compute_effective_timeout(
-            per_module_timeout_ms,
-            child_ctx.global_deadline,
-            module_id,
-            self.config.global_timeout_ms,
-        )?;
-
-        let execute_result = if effective_timeout_ms > 0 {
-            match tokio::time::timeout(
-                Duration::from_millis(effective_timeout_ms),
-                module.execute(inputs.clone(), &child_ctx),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => Err(ModuleError::new(
-                    ErrorCode::ModuleTimeout,
-                    format!(
-                        "Module '{}' execution timed out after {}ms",
-                        module_id, effective_timeout_ms
-                    ),
-                )),
-            }
-        } else {
-            module.execute(inputs.clone(), &child_ctx).await
-        };
-
-        let output = match execute_result {
-            Ok(output) => output,
-            Err(e) => {
-                // On execution error, run on_error for recovery.
-                // NOTE: If a middleware returns Some(value), it is treated as a
-                // recovery result (not a retry signal). The module is NOT
-                // re-executed. This matches the Python reference implementation
-                // where on_error recovery replaces the output. Actual retry
-                // logic requires a retry-aware executor loop (future work).
-                let recovery = self
-                    .middleware_manager
-                    .execute_on_error(module_id, inputs, &e, &child_ctx, &executed)
-                    .await;
-                if let Some(recovery_value) = recovery {
-                    return Ok(recovery_value);
-                }
-                return Err(e);
-            }
-        };
-
-        // Step 9: Output Validation and Redaction
-        let output_schema = module.output_schema();
-        validate_against_schema(&output, &output_schema, "Output")?;
-        if has_schema(&output_schema) {
-            child_ctx
-                .data
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    "_apcore.executor.redacted_output".to_string(),
-                    redact_sensitive(&output, &output_schema),
-                );
-        }
-
-        // Step 10: Middleware After
-        let output = match self
-            .middleware_manager
-            .execute_after(module_id, inputs.clone(), output, &child_ctx)
-            .await
-        {
-            Ok(modified_output) => modified_output,
-            Err(e) => {
-                // On middleware after error, run on_error for recovery
-                let recovery = self
-                    .middleware_manager
-                    .execute_on_error(module_id, inputs, &e, &child_ctx, &executed)
-                    .await;
-                if let Some(recovery_value) = recovery {
-                    return Ok(recovery_value);
-                }
-                return Err(e);
-            }
-        };
-
-        Ok(output)
+        self.inject_resources(&mut pipe_ctx);
+        let (output, _trace) = PipelineEngine::run(&self.strategy, &mut pipe_ctx).await?;
+        Ok(output.unwrap_or(serde_json::Value::Null))
     }
 
     /// Alias for `call()` — provided for spec compatibility.
@@ -625,229 +405,66 @@ impl Executor {
 
     /// Validate module inputs without executing (steps 1-7, spec §12.3).
     ///
-    /// Returns a `PreflightResult` with per-check status. MUST NOT execute
-    /// module code or run middleware.
+    /// Runs the pipeline in `dry_run` mode — pure steps only, side-effecting
+    /// steps are skipped automatically.
     pub async fn validate(
         &self,
         module_id: &str,
         inputs: &serde_json::Value,
     ) -> Result<PreflightResult, ModuleError> {
-        let mut checks: Vec<PreflightCheckResult> = Vec::new();
-        let mut valid = true;
-        let mut requires_approval = false;
-
-        // Step 1: Context
-        let default_ctx = Context::<serde_json::Value>::new(Identity::new(
+        let context = Context::<serde_json::Value>::new(Identity::new(
             "@external".to_string(),
             "external".to_string(),
             vec![],
             Default::default(),
         ));
+        let mut pipe_ctx =
+            PipelineContext::new(module_id, inputs.clone(), context, self.strategy.name());
+        pipe_ctx.dry_run = true;
+        self.inject_resources(&mut pipe_ctx);
 
-        // Step 2: Safety Checks (call_chain)
-        match crate::utils::guard_call_chain_with_repeat(
-            &default_ctx,
-            module_id,
-            self.config.max_call_depth,
-            self.config.max_module_repeat as usize,
-        ) {
-            Ok(()) => checks.push(PreflightCheckResult {
-                check: "call_chain".to_string(),
-                passed: true,
-                error: None,
-                warnings: vec![],
-            }),
+        let mut checks: Vec<PreflightCheckResult> = Vec::new();
+        let trace_result = PipelineEngine::run(&self.strategy, &mut pipe_ctx).await;
+        match trace_result {
+            Ok((_output, trace)) => {
+                checks.extend(trace_to_checks(&trace));
+            }
             Err(e) => {
-                valid = false;
+                // Pipeline step raised an error; convert to a failed check.
+                checks.extend(trace_to_checks(&pipe_ctx.trace));
+                let check_name = match e.code {
+                    ErrorCode::ModuleNotFound => "module_lookup",
+                    ErrorCode::AclDenied => "acl",
+                    ErrorCode::SchemaValidationError | ErrorCode::GeneralInvalidInput => "schema",
+                    ErrorCode::CallDepthExceeded | ErrorCode::CircularCall => "call_chain",
+                    _ => "unknown",
+                };
                 checks.push(PreflightCheckResult {
-                    check: "call_chain".to_string(),
+                    check: check_name.to_string(),
                     passed: false,
-                    error: Some(e.to_dict()),
+                    error: Some(serde_json::json!({
+                        "code": format!("{:?}", e.code),
+                        "message": e.message,
+                    })),
                     warnings: vec![],
-                });
-                return Ok(PreflightResult {
-                    valid,
-                    checks,
-                    requires_approval,
                 });
             }
         }
 
-        let child_ctx = default_ctx.child(module_id);
-
-        // Step 3: Module Lookup
-        let module = match self.registry.get(module_id) {
-            Some(m) => {
-                checks.push(PreflightCheckResult {
-                    check: "module_lookup".to_string(),
-                    passed: true,
-                    error: None,
-                    warnings: vec![],
-                });
-                m
-            }
-            None => {
-                valid = false;
-                let err = ModuleError::new(
-                    ErrorCode::ModuleNotFound,
-                    format!("Module '{}' not found in registry", module_id),
-                );
-                checks.push(PreflightCheckResult {
-                    check: "module_lookup".to_string(),
-                    passed: false,
-                    error: Some(err.to_dict()),
-                    warnings: vec![],
-                });
-                return Ok(PreflightResult {
-                    valid,
-                    checks,
-                    requires_approval,
-                });
-            }
-        };
-
-        // Step 4: ACL Check
-        if let Some(ref acl) = self.acl {
-            let caller_id = child_ctx.caller_id.as_deref();
-            match acl.check(caller_id, module_id, Some(&child_ctx)) {
-                Ok(true) => checks.push(PreflightCheckResult {
-                    check: "acl".to_string(),
-                    passed: true,
-                    error: None,
-                    warnings: vec![],
-                }),
-                Ok(false) => {
-                    valid = false;
-                    let err = ModuleError::new(
-                        ErrorCode::AclDenied,
-                        format!(
-                            "Access denied: caller '{:?}' cannot access '{}'",
-                            caller_id, module_id
-                        ),
-                    );
-                    checks.push(PreflightCheckResult {
-                        check: "acl".to_string(),
-                        passed: false,
-                        error: Some(err.to_dict()),
-                        warnings: vec![],
-                    });
-                }
-                Err(e) => {
-                    valid = false;
-                    checks.push(PreflightCheckResult {
-                        check: "acl".to_string(),
-                        passed: false,
-                        error: Some(e.to_dict()),
-                        warnings: vec![],
-                    });
-                }
-            }
-        } else {
-            checks.push(PreflightCheckResult {
-                check: "acl".to_string(),
-                passed: true,
-                error: None,
-                warnings: vec![],
-            });
-        }
-
-        // Step 5: Approval (note requires_approval, but don't actually gate)
+        // Detect requires_approval from module annotations.
+        let mut requires_approval = false;
         if let Some(desc) = self.registry.get_definition(module_id) {
             if desc.annotations.requires_approval {
                 requires_approval = true;
             }
         }
-        checks.push(PreflightCheckResult {
-            check: "approval".to_string(),
-            passed: true,
-            error: None,
-            warnings: vec![],
-        });
 
-        // Step 6: Schema Validation
-        let input_schema = module.input_schema();
-        match validate_against_schema(inputs, &input_schema, "Input") {
-            Ok(()) => checks.push(PreflightCheckResult {
-                check: "schema".to_string(),
-                passed: true,
-                error: None,
-                warnings: vec![],
-            }),
-            Err(e) => {
-                valid = false;
-                checks.push(PreflightCheckResult {
-                    check: "schema".to_string(),
-                    passed: false,
-                    error: Some(e.to_dict()),
-                    warnings: vec![],
-                });
-            }
-        }
-
-        // Step 7: Module Preflight (advisory, never blocks valid)
-        let preflight = module.preflight();
-        if preflight.checks.is_empty() {
-            checks.push(PreflightCheckResult {
-                check: "module_preflight".to_string(),
-                passed: true,
-                error: None,
-                warnings: vec![],
-            });
-        } else {
-            let warnings: Vec<String> = preflight
-                .checks
-                .iter()
-                .filter(|c| !c.passed)
-                .filter_map(|c| {
-                    c.warnings
-                        .first()
-                        .cloned()
-                        .or_else(|| Some(format!("Preflight check '{}' failed", c.check)))
-                })
-                .collect();
-            for w in &warnings {
-                tracing::warn!(module_id = module_id, warning = %w, "Preflight check warning (advisory)");
-            }
-            checks.push(PreflightCheckResult {
-                check: "module_preflight".to_string(),
-                passed: true, // advisory only
-                error: None,
-                warnings,
-            });
-        }
-
+        let valid = checks.iter().all(|c| c.passed);
         Ok(PreflightResult {
             valid,
             checks,
             requires_approval,
         })
-    }
-
-    /// Check call depth limits before execution.
-    pub fn check_call_depth(&self, ctx: &Context<serde_json::Value>) -> Result<(), ModuleError> {
-        // Delegate to guard_call_chain with a dummy module name to check depth only.
-        // guard_call_chain checks depth first, so if depth is exceeded it returns error
-        // before checking circular calls.
-        if ctx.call_chain.len() as u32 >= self.config.max_call_depth {
-            return Err(ModuleError::new(
-                ErrorCode::CallDepthExceeded,
-                format!(
-                    "Call depth exceeded: chain length {} >= max_depth {}",
-                    ctx.call_chain.len(),
-                    self.config.max_call_depth
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Check for circular calls in the call chain.
-    pub fn check_circular_call(
-        &self,
-        ctx: &Context<serde_json::Value>,
-        module_id: &str,
-    ) -> Result<(), ModuleError> {
-        guard_call_chain(ctx, module_id, self.config.max_call_depth)
     }
 
     /// Create an executor from a registry and config.
@@ -867,28 +484,24 @@ impl Executor {
         Ok(vec![result])
     }
 
-    /// Get a reference to the executor's default strategy, if set.
-    pub fn strategy(&self) -> Option<&ExecutionStrategy> {
-        self.strategy.as_ref()
+    /// Get a reference to the executor's execution strategy.
+    pub fn strategy(&self) -> &ExecutionStrategy {
+        &self.strategy
     }
 
     /// Return a human-readable description of the configured pipeline.
     pub fn describe_pipeline(&self) -> String {
-        match &self.strategy {
-            Some(s) => format!(
-                "{}-step pipeline: {}",
-                s.steps().len(),
-                s.step_names().join(" \u{2192} ")
-            ),
-            None => "11-step legacy pipeline (no strategy configured)".to_string(),
-        }
+        format!(
+            "{}-step pipeline: {}",
+            self.strategy.steps().len(),
+            self.strategy.step_names().join(" \u{2192} ")
+        )
     }
 
     /// Execute a module through the pipeline engine, returning both the output
     /// and a full execution trace.
     ///
-    /// Uses the provided `strategy` override, or falls back to the executor's
-    /// default strategy. Returns an error if no strategy is available.
+    /// Uses the provided `strategy` override, or the executor's default strategy.
     pub async fn call_with_trace(
         &self,
         module_id: &str,
@@ -896,13 +509,7 @@ impl Executor {
         ctx: Option<&Context<Value>>,
         strategy: Option<&ExecutionStrategy>,
     ) -> Result<(Value, PipelineTrace), ModuleError> {
-        let effective_strategy = strategy.or(self.strategy.as_ref()).ok_or_else(|| {
-            ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
-                "No execution strategy provided and no default strategy set on executor"
-                    .to_string(),
-            )
-        })?;
+        let effective_strategy = strategy.unwrap_or(&self.strategy);
 
         let context = match ctx {
             Some(c) => c.clone(),
@@ -916,59 +523,36 @@ impl Executor {
 
         let mut pipeline_ctx =
             PipelineContext::new(module_id, inputs, context, effective_strategy.name());
+        self.inject_resources(&mut pipeline_ctx);
 
         let (output, trace) = PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await?;
 
         Ok((output.unwrap_or(Value::Null), trace))
     }
 
+    /// Inject executor resources into a pipeline context so builtin steps
+    /// can access the registry, config, ACL, approval handler, and middleware.
+    fn inject_resources(&self, ctx: &mut PipelineContext) {
+        ctx.registry = Some(Arc::clone(&self.registry));
+        ctx.config = Some(Arc::clone(&self.config));
+        ctx.acl = self.acl.as_ref().map(Arc::clone);
+        ctx.approval_handler = self.approval_handler.as_ref().map(Arc::clone);
+        ctx.middleware_manager = Some(Arc::clone(&self.middleware_manager));
+    }
+
     /// Add a before middleware.
     pub fn use_before(&mut self, middleware: Box<dyn BeforeMiddleware>) -> Result<(), ModuleError> {
-        self.middleware_manager
+        Arc::get_mut(&mut self.middleware_manager)
+            .expect("middleware_manager not shared yet")
             .add(Box::new(BoxedBeforeMiddlewareAdapter(middleware)))
     }
 
     /// Add an after middleware.
     pub fn use_after(&mut self, middleware: Box<dyn AfterMiddleware>) -> Result<(), ModuleError> {
-        self.middleware_manager
+        Arc::get_mut(&mut self.middleware_manager)
+            .expect("middleware_manager not shared yet")
             .add(Box::new(BoxedAfterMiddlewareAdapter(middleware)))
     }
-}
-
-/// Compute the effective timeout for module execution, enforcing dual-timeout model.
-///
-/// Takes the per-module timeout and global deadline (epoch seconds, f64) into account.
-/// Returns the effective timeout in milliseconds.
-fn compute_effective_timeout(
-    per_module_timeout_ms: u64,
-    global_deadline: Option<f64>,
-    module_id: &str,
-    global_timeout_ms: u64,
-) -> Result<u64, ModuleError> {
-    let mut effective = per_module_timeout_ms;
-
-    if let Some(deadline_epoch) = global_deadline {
-        let now_epoch: f64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        if now_epoch >= deadline_epoch {
-            // Global deadline already expired
-            return Err(ModuleError::new(
-                ErrorCode::ModuleTimeout,
-                format!(
-                    "Global timeout expired before executing module '{}' (global_timeout={}ms)",
-                    module_id, global_timeout_ms
-                ),
-            ));
-        }
-        let remaining_ms = ((deadline_epoch - now_epoch) * 1000.0) as u64;
-        if effective == 0 || remaining_ms < effective {
-            effective = remaining_ms;
-        }
-    }
-
-    Ok(effective)
 }
 
 // Note: These boxed adapters are intentionally separate from the generic
@@ -1323,63 +907,6 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // compute_effective_timeout
-    // ═══════════════════════════════════════════════════════════════════
-
-    /// Helper: returns the current epoch seconds as f64.
-    fn now_epoch() -> f64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
-    }
-
-    #[test]
-    fn test_compute_effective_timeout_per_module_only() {
-        let result = compute_effective_timeout(5000, None, "mod", 0).unwrap();
-        assert_eq!(result, 5000);
-    }
-
-    #[test]
-    fn test_compute_effective_timeout_global_only() {
-        let deadline: f64 = now_epoch() + 3.0; // 3 seconds from now
-        let result = compute_effective_timeout(0, Some(deadline), "mod", 10000).unwrap();
-        // With per_module=0, the global remaining (~3000ms) should be used
-        assert!(result > 0 && result <= 3000);
-    }
-
-    #[test]
-    fn test_compute_effective_timeout_both_min_wins() {
-        // Global remaining is ~3000ms, per-module is 5000ms -> global wins
-        let deadline: f64 = now_epoch() + 3.0;
-        let result = compute_effective_timeout(5000, Some(deadline), "mod", 10000).unwrap();
-        assert!(result <= 3000);
-    }
-
-    #[test]
-    fn test_compute_effective_timeout_per_module_wins_when_smaller() {
-        // Global remaining is ~10000ms, per-module is 2000ms -> per-module wins
-        let deadline: f64 = now_epoch() + 10.0;
-        let result = compute_effective_timeout(2000, Some(deadline), "mod", 20000).unwrap();
-        assert_eq!(result, 2000);
-    }
-
-    #[test]
-    fn test_compute_effective_timeout_expired_deadline_returns_error() {
-        // Deadline in the past
-        let deadline: f64 = now_epoch() - 0.1;
-        let err = compute_effective_timeout(5000, Some(deadline), "mod", 10000).unwrap_err();
-        assert_eq!(err.code, ErrorCode::ModuleTimeout);
-        assert!(err.message.contains("Global timeout expired"));
-    }
-
-    #[test]
-    fn test_compute_effective_timeout_zero_per_module_no_deadline() {
-        let result = compute_effective_timeout(0, None, "mod", 0).unwrap();
-        assert_eq!(result, 0);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
     // _approval_token Phase B
     // ═══════════════════════════════════════════════════════════════════
 
@@ -1400,68 +927,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_approval_token_non_string_rejected_with_error() {
-        let handler = MockApprovalHandler::with_status("approved");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        // Integer token
-        let inputs = json!({"_approval_token": 42, "data": "hello"});
-        let err = executor
-            .call("test_mod", inputs, None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-        assert!(err.message.contains("_approval_token must be a string"));
-        assert!(err.message.contains("number"));
-    }
-
-    #[tokio::test]
-    async fn test_approval_token_boolean_rejected() {
-        let handler = MockApprovalHandler::with_status("approved");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        let inputs = json!({"_approval_token": true});
-        let err = executor
-            .call("test_mod", inputs, None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-        assert!(err.message.contains("boolean"));
-    }
-
-    #[tokio::test]
-    async fn test_approval_token_null_rejected() {
-        let handler = MockApprovalHandler::with_status("approved");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        let inputs = json!({"_approval_token": null});
-        let err = executor
-            .call("test_mod", inputs, None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-        assert!(err.message.contains("null"));
-    }
-
-    #[tokio::test]
     async fn test_approval_no_token_calls_request_approval() {
         let handler = MockApprovalHandler::with_status("approved");
         let module = MockModule::echo();
@@ -1476,64 +941,6 @@ mod tests {
         let inputs = json!({"data": "hello"});
         let result = executor.call("test_mod", inputs, None, None).await;
         assert!(result.is_ok());
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Approval differentiation
-    // ═══════════════════════════════════════════════════════════════════
-
-    #[tokio::test]
-    async fn test_approval_rejected_returns_approval_denied() {
-        let handler = MockApprovalHandler::with_status("rejected");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        let err = executor
-            .call("test_mod", json!({}), None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::ApprovalDenied);
-    }
-
-    #[tokio::test]
-    async fn test_approval_timeout_returns_approval_timeout() {
-        let handler = MockApprovalHandler::with_status("timeout");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        let err = executor
-            .call("test_mod", json!({}), None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::ApprovalTimeout);
-    }
-
-    #[tokio::test]
-    async fn test_approval_pending_returns_approval_pending() {
-        let handler = MockApprovalHandler::with_status("pending");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        let err = executor
-            .call("test_mod", json!({}), None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::ApprovalPending);
     }
 
     #[tokio::test]
@@ -1552,24 +959,5 @@ mod tests {
         let result = executor.validate("test_mod", &json!({})).await.unwrap();
         assert!(result.valid);
         assert!(result.requires_approval);
-    }
-
-    #[tokio::test]
-    async fn test_approval_unknown_status_returns_approval_denied() {
-        let handler = MockApprovalHandler::with_status("banana");
-        let module = MockModule::echo();
-        let annotations = ModuleAnnotations {
-            requires_approval: true,
-            ..Default::default()
-        };
-        let mut executor = build_executor_with_module(module, annotations);
-        executor.set_approval_handler(Box::new(handler));
-
-        let err = executor
-            .call("test_mod", json!({}), None, None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::ApprovalDenied);
-        assert!(err.message.contains("unknown status"));
     }
 }

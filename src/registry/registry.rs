@@ -69,7 +69,7 @@ pub const RESERVED_WORDS: &[&str] = &[
 /// This requires a separate `versioned_store` module with version-aware storage,
 /// conflict resolution, and migration support. For now, modules are single-version.
 pub struct Registry {
-    modules: HashMap<String, Box<dyn Module>>,
+    modules: HashMap<String, std::sync::Arc<dyn Module>>,
     descriptors: HashMap<String, ModuleDescriptor>,
     /// Reference counts for safe hot-reload — prevents unloading while in use.
     ref_counts: HashMap<String, usize>,
@@ -183,6 +183,7 @@ impl Registry {
         module.on_load();
 
         // Store module and descriptor
+        let module: std::sync::Arc<dyn Module> = module.into();
         self.modules.insert(name.to_string(), module);
         self.descriptors.insert(name.to_string(), descriptor);
 
@@ -249,9 +250,9 @@ impl Registry {
         Ok(())
     }
 
-    /// Get a reference to a module by name.
-    pub fn get(&self, name: &str) -> Option<&dyn Module> {
-        self.modules.get(name).map(|m| m.as_ref())
+    /// Get a shared reference to a module by name.
+    pub fn get(&self, name: &str) -> Option<std::sync::Arc<dyn Module>> {
+        self.modules.get(name).cloned()
     }
 
     /// Get the definition (descriptor) for a module by name.
@@ -349,6 +350,7 @@ impl Registry {
         module.on_load();
 
         // Store module and descriptor
+        let module: std::sync::Arc<dyn Module> = module.into();
         self.modules.insert(name.to_string(), module);
         self.descriptors.insert(name.to_string(), descriptor);
 

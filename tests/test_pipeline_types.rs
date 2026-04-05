@@ -110,6 +110,7 @@ fn test_pipeline_trace_serialization() {
         result: StepResult::continue_step(),
         skipped: false,
         decision_point: false,
+        skip_reason: None,
     });
     trace.total_duration_ms = 10.0;
     trace.success = true;

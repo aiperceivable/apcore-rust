@@ -17,7 +17,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 ## Features
 
 - **Schema-driven modules** — Define input/output contracts using `schemars`-derived types with automatic validation
-- **Execution Pipeline** — Context creation, safety checks, ACL enforcement, approval gate, validation, middleware chains, and execution with timeout support
+- **Execution Pipeline** — Context creation, call chain guard, ACL enforcement, approval gate, middleware before, validation, execution, output validation, middleware after, and return — with step metadata (`match_modules`, `ignore_errors`, `pure`, `timeout_ms`) and YAML pipeline configuration
 - **`Module` trait** — Implement the `Module` trait to create fully schema-aware modules
 - **YAML bindings** — Register modules declaratively without modifying source code
 - **Access control (ACL)** — Pattern-based, first-match-wins rules with wildcard support

@@ -130,8 +130,8 @@ impl APCore {
             tags: vec![],
             dependencies: vec![],
         };
-        self.executor
-            .registry
+        std::sync::Arc::get_mut(&mut self.executor.registry)
+            .expect("registry not shared yet")
             .register(module_id, module, descriptor)
     }
 
