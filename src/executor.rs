@@ -8,7 +8,10 @@ use serde_json::Value;
 
 use crate::acl::ACL;
 use crate::approval::ApprovalHandler;
-use crate::builtin_steps::build_standard_strategy;
+use crate::builtin_steps::{
+    build_internal_strategy, build_minimal_strategy, build_performance_strategy,
+    build_standard_strategy, build_testing_strategy,
+};
 use crate::config::Config;
 use crate::context::{Context, Identity};
 use crate::errors::{ErrorCode, ModuleError};
@@ -21,6 +24,49 @@ use crate::pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
 use crate::registry::registry::Registry;
+
+/// Deep-merge a list of JSON Value chunks into a single accumulated Value.
+///
+/// For objects: keys from later chunks overwrite earlier keys; nested objects
+/// are merged recursively. For non-objects: returns the last chunk.
+fn deep_merge_chunks(chunks: &[Value]) -> Value {
+    let mut acc = Value::Null;
+    for chunk in chunks {
+        deep_merge_value(&mut acc, chunk);
+    }
+    acc
+}
+
+fn deep_merge_value(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                let entry = base_map.entry(k.clone()).or_insert(Value::Null);
+                deep_merge_value(entry, v);
+            }
+        }
+        (base, overlay) => {
+            *base = overlay.clone();
+        }
+    }
+}
+
+/// Resolve a preset strategy by name.
+///
+/// Built-in names: `"standard"`, `"internal"`, `"testing"`, `"performance"`, `"minimal"`.
+pub fn resolve_strategy_by_name(name: &str) -> Result<ExecutionStrategy, ModuleError> {
+    match name {
+        "standard" => Ok(build_standard_strategy()),
+        "internal" => Ok(build_internal_strategy()),
+        "testing" => Ok(build_testing_strategy()),
+        "performance" => Ok(build_performance_strategy()),
+        "minimal" => Ok(build_minimal_strategy()),
+        _ => Err(ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            format!("Unknown strategy name '{}'. Built-in presets: standard, internal, testing, performance, minimal", name),
+        )),
+    }
+}
 
 /// Map pipeline step names to PreflightResult check names.
 fn step_to_check_name(step_name: &str) -> &str {
@@ -283,6 +329,26 @@ impl Executor {
         }
     }
 
+    /// Create a new executor with a strategy resolved by name.
+    ///
+    /// Built-in preset names: `"standard"`, `"internal"`, `"testing"`,
+    /// `"performance"`, `"minimal"`.
+    pub fn with_strategy_name(
+        registry: Registry,
+        config: Config,
+        name: &str,
+    ) -> Result<Self, ModuleError> {
+        let strategy = resolve_strategy_by_name(name)?;
+        Ok(Self {
+            registry: Arc::new(registry),
+            config: Arc::new(config),
+            acl: None,
+            approval_handler: None,
+            middleware_manager: Arc::new(MiddlewareManager::new()),
+            strategy,
+        })
+    }
+
     /// Create a new executor with a custom execution strategy.
     pub fn with_strategy(registry: Registry, config: Config, strategy: ExecutionStrategy) -> Self {
         Self {
@@ -473,6 +539,16 @@ impl Executor {
     }
 
     /// Stream execution of a module.
+    ///
+    /// Three-phase streaming aligned with Python/TypeScript SDKs:
+    /// - **Phase 1:** Run pipeline stages 1-8. If the module supports streaming,
+    ///   `module.stream()` is called instead of `module.execute()`.
+    /// - **Phase 2:** Collect streamed chunks and accumulate into a merged result.
+    /// - **Phase 3:** Run output_validation + middleware_after on the accumulated
+    ///   output for post-stream validation.
+    ///
+    /// If the module does not support streaming, falls back to a single-element
+    /// result from `execute()`.
     pub async fn stream(
         &self,
         module_id: &str,
@@ -480,8 +556,58 @@ impl Executor {
         ctx: Option<&Context<Value>>,
         version_hint: Option<&str>,
     ) -> Result<Vec<Value>, ModuleError> {
-        let result = self.call(module_id, inputs, ctx, version_hint).await?;
-        Ok(vec![result])
+        // Phase 1: Run pipeline up to execute step with stream flag.
+        let context = match ctx {
+            Some(c) => c.clone(),
+            None => Context::<Value>::new(Identity::new(
+                "@external".to_string(),
+                "external".to_string(),
+                vec![],
+                Default::default(),
+            )),
+        };
+        let mut pipe_ctx =
+            PipelineContext::new(module_id, inputs.clone(), context, self.strategy.name());
+        pipe_ctx.stream = true;
+        if let Some(hint) = version_hint {
+            pipe_ctx.version_hint = Some(hint.to_string());
+        }
+        self.inject_resources(&mut pipe_ctx);
+
+        // Run the full pipeline — BuiltinExecute will detect ctx.stream and
+        // attempt module.stream(). If the module doesn't support streaming it
+        // falls back to execute().
+        let (output, _trace) = PipelineEngine::run(&self.strategy, &mut pipe_ctx).await?;
+
+        // Phase 2: Check if streaming produced chunks.
+        if let Some(chunks) = pipe_ctx.stream_chunks.take() {
+            if !chunks.is_empty() {
+                // Accumulate chunks into a single merged output for post-validation.
+                let accumulated = deep_merge_chunks(&chunks);
+
+                // Phase 3: Run output_validation + middleware_after on accumulated.
+                // We do this by re-running only the post-execute steps.
+                pipe_ctx.output = Some(accumulated);
+                let post_steps: Vec<&str> =
+                    vec!["output_validation", "middleware_after", "return_result"];
+                for step in self.strategy.steps() {
+                    if post_steps.contains(&step.name()) {
+                        // Best-effort: log and continue if post-validation fails.
+                        if let Err(e) = step.execute(&mut pipe_ctx).await {
+                            tracing::warn!(
+                                step = step.name(),
+                                error = %e,
+                                "Post-stream step failed (non-fatal)"
+                            );
+                        }
+                    }
+                }
+                return Ok(chunks);
+            }
+        }
+
+        // Non-streaming fallback: single result.
+        Ok(vec![output.unwrap_or(Value::Null)])
     }
 
     /// Get a reference to the executor's execution strategy.

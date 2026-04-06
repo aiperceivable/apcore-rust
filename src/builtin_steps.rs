@@ -152,6 +152,9 @@ step_meta!(
 #[async_trait]
 impl Step for BuiltinContextCreation {
     impl_step_meta!(BuiltinContextCreation);
+    fn provides(&self) -> &[&str] {
+        &["context"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         // If the context has no caller_id, default to @external.
@@ -170,6 +173,9 @@ impl Step for BuiltinContextCreation {
 #[async_trait]
 impl Step for BuiltinCallChainGuard {
     impl_step_meta!(BuiltinCallChainGuard);
+    fn requires(&self) -> &[&str] {
+        &["context"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         let config = ctx
@@ -191,6 +197,9 @@ impl Step for BuiltinCallChainGuard {
 #[async_trait]
 impl Step for BuiltinModuleLookup {
     impl_step_meta!(BuiltinModuleLookup);
+    fn provides(&self) -> &[&str] {
+        &["module"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         let registry = ctx
@@ -211,6 +220,9 @@ impl Step for BuiltinModuleLookup {
 #[async_trait]
 impl Step for BuiltinACLCheck {
     impl_step_meta!(BuiltinACLCheck);
+    fn requires(&self) -> &[&str] {
+        &["context", "module"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         if let Some(ref acl) = ctx.acl {
@@ -233,6 +245,9 @@ impl Step for BuiltinACLCheck {
 #[async_trait]
 impl Step for BuiltinApprovalGate {
     impl_step_meta!(BuiltinApprovalGate);
+    fn requires(&self) -> &[&str] {
+        &["context", "module"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         let handler = match ctx.approval_handler {
@@ -354,6 +369,12 @@ impl Step for BuiltinApprovalGate {
 #[async_trait]
 impl Step for BuiltinInputValidation {
     impl_step_meta!(BuiltinInputValidation);
+    fn requires(&self) -> &[&str] {
+        &["module"]
+    }
+    fn provides(&self) -> &[&str] {
+        &["validated_inputs"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         let module = ctx
@@ -416,6 +437,12 @@ impl Step for BuiltinMiddlewareBefore {
 #[async_trait]
 impl Step for BuiltinExecute {
     impl_step_meta!(BuiltinExecute);
+    fn requires(&self) -> &[&str] {
+        &["module"]
+    }
+    fn provides(&self) -> &[&str] {
+        &["output"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         let module = ctx
@@ -428,7 +455,62 @@ impl Step for BuiltinExecute {
             .as_ref()
             .expect("config must be injected into PipelineContext");
 
-        let timeout_ms = config.default_timeout_ms;
+        // Compute effective timeout: clamp to remaining global deadline (dual-timeout model).
+        let mut timeout_ms = config.default_timeout_ms;
+        if let Some(deadline) = ctx.context.global_deadline {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            let remaining_ms = ((deadline - now) * 1000.0) as u64;
+            if remaining_ms == 0 {
+                return Err(ModuleError::new(
+                    ErrorCode::ModuleTimeout,
+                    format!(
+                        "Module '{}' execution aborted: global deadline already exceeded",
+                        ctx.module_id
+                    ),
+                ));
+            }
+            if timeout_ms == 0 || remaining_ms < timeout_ms {
+                timeout_ms = remaining_ms;
+            }
+        }
+
+        // Streaming path: if ctx.stream is true and module supports streaming,
+        // call module.stream() and store chunks, then skip to return_result.
+        if ctx.stream && module.supports_stream() {
+            let stream_result = module.stream(ctx.inputs.clone(), &ctx.context).await;
+            if let Some(result) = stream_result {
+                match result {
+                    Ok(chunks) => {
+                        // Store chunks for the executor's Phase 2/3 processing.
+                        ctx.stream_chunks = Some(chunks);
+                        return Ok(StepResult::skip_to("return_result"));
+                    }
+                    Err(e) => {
+                        // Stream failed — fall through to error recovery below.
+                        if let Some(ref mm) = ctx.middleware_manager {
+                            let recovery = mm
+                                .execute_on_error(
+                                    &ctx.module_id,
+                                    ctx.inputs.clone(),
+                                    &e,
+                                    &ctx.context,
+                                    &ctx.executed_middlewares,
+                                )
+                                .await;
+                            if let Some(recovery_value) = recovery {
+                                ctx.output = Some(recovery_value);
+                                return Ok(StepResult::skip_to("return_result"));
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            // module.stream() returned None — fall through to regular execute.
+        }
 
         let execute_result = if timeout_ms > 0 {
             match tokio::time::timeout(
@@ -481,6 +563,12 @@ impl Step for BuiltinExecute {
 #[async_trait]
 impl Step for BuiltinOutputValidation {
     impl_step_meta!(BuiltinOutputValidation);
+    fn requires(&self) -> &[&str] {
+        &["module", "output"]
+    }
+    fn provides(&self) -> &[&str] {
+        &["validated_output"]
+    }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         // In dry_run mode, execute step is skipped so output may be absent.
@@ -557,6 +645,9 @@ impl Step for BuiltinMiddlewareAfter {
 #[async_trait]
 impl Step for BuiltinReturnResult {
     impl_step_meta!(BuiltinReturnResult);
+    fn requires(&self) -> &[&str] {
+        &["output"]
+    }
 
     async fn execute(&self, _ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         // Output is already stored in ctx.output; PipelineEngine returns it.
@@ -614,6 +705,23 @@ pub fn build_performance_strategy() -> ExecutionStrategy {
     let mut s = build_standard_strategy();
     s.set_name("performance");
     s.remove("middleware_before").ok();
+    s.remove("middleware_after").ok();
+    s
+}
+
+/// Build a minimal strategy: context → lookup → execute → return only.
+///
+/// No safety checks, no ACL, no approval, no validation, no middleware.
+/// Suitable for pre-validated internal hot paths. Use with caution.
+pub fn build_minimal_strategy() -> ExecutionStrategy {
+    let mut s = build_standard_strategy();
+    s.set_name("minimal");
+    s.remove("call_chain_guard").ok();
+    s.remove("acl_check").ok();
+    s.remove("approval_gate").ok();
+    s.remove("middleware_before").ok();
+    s.remove("input_validation").ok();
+    s.remove("output_validation").ok();
     s.remove("middleware_after").ok();
     s
 }

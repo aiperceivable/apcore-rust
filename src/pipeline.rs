@@ -58,6 +58,16 @@ pub trait Step: Send + Sync {
         0
     }
 
+    /// PipelineContext fields this step reads (e.g. `["module", "context"]`). Advisory only.
+    fn requires(&self) -> &[&str] {
+        &[]
+    }
+
+    /// PipelineContext fields this step writes (e.g. `["output"]`). Advisory only.
+    fn provides(&self) -> &[&str] {
+        &[]
+    }
+
     /// Execute the step, reading/writing shared [`PipelineContext`] state.
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError>;
 }
@@ -156,6 +166,8 @@ pub struct PipelineContext {
     // -- Streaming --
     /// `true` when streaming mode was requested.
     pub stream: bool,
+    /// Accumulated stream chunks set by `BuiltinExecute` when streaming.
+    pub stream_chunks: Option<Vec<serde_json::Value>>,
 
     // -- Pipeline v2 --
     /// `true` during `validate()`. PipelineEngine skips steps with `pure=false`.
@@ -204,6 +216,7 @@ impl PipelineContext {
             output: None,
             validated_output: None,
             stream: false,
+            stream_chunks: None,
             dry_run: false,
             version_hint: None,
             executed_middlewares: vec![],
@@ -326,7 +339,30 @@ impl ExecutionStrategy {
                 ));
             }
         }
-        Ok(Self { name, steps })
+        let strategy = Self { name, steps };
+        strategy.validate_dependencies();
+        Ok(strategy)
+    }
+
+    /// Warn if any step's requires are not provided by a preceding step.
+    fn validate_dependencies(&self) {
+        let mut provided = std::collections::HashSet::new();
+        for step in &self.steps {
+            for req in step.requires() {
+                if !provided.contains(*req) {
+                    tracing::warn!(
+                        step = step.name(),
+                        requires = *req,
+                        "Step requires '{}', but no preceding step provides it. \
+                         This may cause runtime errors.",
+                        req,
+                    );
+                }
+            }
+            for p in step.provides() {
+                provided.insert(*p);
+            }
+        }
     }
 
     /// Strategy name.
@@ -354,6 +390,7 @@ impl ExecutionStrategy {
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx + 1, step);
+        self.validate_dependencies();
         Ok(())
     }
 
@@ -362,6 +399,7 @@ impl ExecutionStrategy {
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx, step);
+        self.validate_dependencies();
         Ok(())
     }
 

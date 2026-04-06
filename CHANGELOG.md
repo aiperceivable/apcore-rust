@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.17.1] - 2026-04-06
+
+### Added
+
+- **`build_minimal_strategy()`** — 4-step pipeline (context → lookup → execute → return) for pre-validated internal hot paths.
+- **`resolve_strategy_by_name()`** — Resolves preset strategy names (`"standard"`, `"internal"`, `"testing"`, `"performance"`, `"minimal"`) to `ExecutionStrategy` instances. Cross-language parity with Python/TypeScript string-based resolution.
+- **`Executor::with_strategy_name()`** — Constructor accepting a strategy name string instead of an `ExecutionStrategy` instance.
+- **`requires()` / `provides()` on `Step` trait** — Optional advisory methods declaring step dependencies. `ExecutionStrategy` validates dependency chains at construction and insertion, emitting `tracing::warn!` for unmet requirements.
+- **`Module::stream()` / `Module::supports_stream()`** — Default trait methods enabling streaming module execution. Returns `Option<Result<Vec<Value>>>` — `None` signals fallback to `execute()`.
+
+### Fixed
+
+- **`BuiltinExecute` global deadline clamp** — Effective timeout is now `min(default_timeout_ms, remaining_global_deadline)`, matching Python/TypeScript dual-timeout model. Returns `ModuleTimeout` immediately if global deadline already exceeded.
+- **Streaming support** — `Executor::stream()` now implements the three-phase streaming protocol (pipeline → chunk collection → post-stream validation) instead of wrapping `call()` in a `vec![]`.
+
+---
+
 ## [0.17.0] - 2026-04-05
 
 ### Added

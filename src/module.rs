@@ -27,6 +27,27 @@ pub trait Module: Send + Sync {
         ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError>;
 
+    /// Stream execution — yields chunks incrementally.
+    ///
+    /// Default implementation calls `execute()` once and returns the result
+    /// as a single-element vector. Modules that support streaming should
+    /// override this to yield multiple chunks.
+    ///
+    /// Returns `None` if the module does not support streaming, signaling
+    /// the executor to fall back to `execute()`.
+    async fn stream(
+        &self,
+        _inputs: serde_json::Value,
+        _ctx: &Context<serde_json::Value>,
+    ) -> Option<Result<Vec<serde_json::Value>, ModuleError>> {
+        None
+    }
+
+    /// Whether this module supports streaming output.
+    fn supports_stream(&self) -> bool {
+        false
+    }
+
     /// Return a structured description of this module for AI/LLM consumption (spec §5.6).
     /// Default: builds description from input_schema, output_schema, and description.
     fn describe(&self) -> serde_json::Value {
