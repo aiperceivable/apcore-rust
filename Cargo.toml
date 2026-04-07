@@ -1,6 +1,6 @@
 [package]
 name = "apcore"
-version = "0.17.1"
+version = "0.18.0"
 edition = "2021"
 description = "Schema-driven module standard for AI-perceivable interfaces"
 license = "Apache-2.0"

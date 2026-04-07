@@ -214,8 +214,9 @@ fn test_annotations_extra_with_values() {
 }
 
 #[test]
-fn test_annotations_serde_flatten_captures_unknown_keys() {
-    // AC-028: Unknown JSON keys captured into extra via serde(flatten)
+fn test_annotations_legacy_flattened_form_still_accepted() {
+    // PROTOCOL_SPEC §4.4.1 rule 6: legacy top-level overflow keys are
+    // tolerated for backward compatibility and normalized into `extra`.
     let data = r#"{
         "readonly": true,
         "future_field": 42,
@@ -225,6 +226,91 @@ fn test_annotations_serde_flatten_captures_unknown_keys() {
     assert!(ann.readonly);
     assert_eq!(ann.extra.get("future_field").unwrap(), &json!(42));
     assert_eq!(ann.extra.get("another_unknown").unwrap(), &json!("hello"));
+}
+
+#[test]
+fn test_annotations_canonical_nested_extra_round_trip() {
+    // PROTOCOL_SPEC §4.4.1 producer rules: extra MUST be serialized as a
+    // nested object under the `"extra"` key, never flattened.
+    let mut extra = HashMap::new();
+    extra.insert("mcp.category".to_string(), json!("tools"));
+    extra.insert("cli.approval_message".to_string(), json!("Are you sure?"));
+    let ann = ModuleAnnotations {
+        readonly: true,
+        extra,
+        ..Default::default()
+    };
+    let json_value = serde_json::to_value(&ann).unwrap();
+    let obj = json_value.as_object().unwrap();
+    // Producer MUST emit a nested `extra` object.
+    assert!(obj.contains_key("extra"));
+    let extra_obj = obj.get("extra").unwrap().as_object().unwrap();
+    assert_eq!(extra_obj.get("mcp.category").unwrap(), &json!("tools"));
+    assert_eq!(
+        extra_obj.get("cli.approval_message").unwrap(),
+        &json!("Are you sure?")
+    );
+    // Producer MUST NOT flatten extension keys to the root.
+    assert!(!obj.contains_key("mcp.category"));
+    assert!(!obj.contains_key("cli.approval_message"));
+
+    // Deserialize back and verify lossless round trip.
+    let restored: ModuleAnnotations = serde_json::from_value(json_value).unwrap();
+    assert!(restored.readonly);
+    assert_eq!(restored.extra.get("mcp.category").unwrap(), &json!("tools"));
+    assert_eq!(
+        restored.extra.get("cli.approval_message").unwrap(),
+        &json!("Are you sure?")
+    );
+    // Critical: must NOT have an `extra` key inside extra (the pre-0.17.2 bug).
+    assert!(!restored.extra.contains_key("extra"));
+}
+
+#[test]
+fn test_annotations_nested_extra_wins_over_top_level_collision() {
+    // PROTOCOL_SPEC §4.4.1 rule 7: when the same key appears both nested and
+    // at the root, the nested value MUST win.
+    let data = r#"{
+        "readonly": false,
+        "mcp.category": "LEGACY_VALUE",
+        "extra": {
+            "mcp.category": "CANONICAL_VALUE",
+            "cli.approval_message": "from nested only"
+        }
+    }"#;
+    let ann: ModuleAnnotations = serde_json::from_str(data).unwrap();
+    assert_eq!(
+        ann.extra.get("mcp.category").unwrap(),
+        &json!("CANONICAL_VALUE")
+    );
+    assert_eq!(
+        ann.extra.get("cli.approval_message").unwrap(),
+        &json!("from nested only")
+    );
+}
+
+#[test]
+fn test_annotations_python_typescript_payload_round_trips() {
+    // Regression for the pre-0.17.2 bug: a payload produced by apcore-python
+    // or apcore-typescript (nested `extra`) used to land in `extra["extra"]`.
+    let data = r#"{
+        "readonly": true,
+        "extra": {
+            "mcp.category": "tools"
+        }
+    }"#;
+    let ann: ModuleAnnotations = serde_json::from_str(data).unwrap();
+    assert_eq!(ann.extra.get("mcp.category").unwrap(), &json!("tools"));
+    assert!(!ann.extra.contains_key("extra"));
+}
+
+#[test]
+fn test_annotations_null_extra_treated_as_empty() {
+    // PROTOCOL_SPEC §4.4.1 rule 8: when `extra` is absent or null, treat as empty.
+    let data = r#"{ "readonly": true, "extra": null }"#;
+    let ann: ModuleAnnotations = serde_json::from_str(data).unwrap();
+    assert!(ann.readonly);
+    assert!(ann.extra.is_empty());
 }
 
 #[test]

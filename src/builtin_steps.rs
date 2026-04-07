@@ -185,8 +185,8 @@ impl Step for BuiltinCallChainGuard {
         crate::utils::guard_call_chain_with_repeat(
             &ctx.context,
             &ctx.module_id,
-            config.max_call_depth,
-            config.max_module_repeat as usize,
+            config.executor.max_call_depth,
+            config.executor.max_module_repeat as usize,
         )?;
         // Create child context (adds module_id to call_chain).
         ctx.context = ctx.context.child(&ctx.module_id);
@@ -456,7 +456,7 @@ impl Step for BuiltinExecute {
             .expect("config must be injected into PipelineContext");
 
         // Compute effective timeout: clamp to remaining global deadline (dual-timeout model).
-        let mut timeout_ms = config.default_timeout_ms;
+        let mut timeout_ms = config.executor.default_timeout;
         if let Some(deadline) = ctx.context.global_deadline {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

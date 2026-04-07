@@ -4,10 +4,12 @@ use tempfile::TempDir;
 fn write_valid_yaml(dir: &TempDir, filename: &str) -> std::path::PathBuf {
     let path = dir.path().join(filename);
     let mut f = std::fs::File::create(&path).unwrap();
-    writeln!(f, "max_call_depth: 32").unwrap();
-    writeln!(f, "max_module_repeat: 3").unwrap();
-    writeln!(f, "default_timeout_ms: 30000").unwrap();
-    writeln!(f, "global_timeout_ms: 60000").unwrap();
+    // PROTOCOL_SPEC §9.1 canonical nested namespace form (v0.18.0+).
+    writeln!(f, "executor:").unwrap();
+    writeln!(f, "  max_call_depth: 32").unwrap();
+    writeln!(f, "  max_module_repeat: 3").unwrap();
+    writeln!(f, "  default_timeout: 30000").unwrap();
+    writeln!(f, "  global_timeout: 60000").unwrap();
     path
 }
 
@@ -44,6 +46,6 @@ fn test_discover_falls_back_to_defaults_when_no_file_found() {
         result.err()
     );
     let config = result.unwrap();
-    // Defaults: max_call_depth = 32
-    assert_eq!(config.max_call_depth, 32);
+    // Defaults: executor.max_call_depth = 32
+    assert_eq!(config.executor.max_call_depth, 32);
 }

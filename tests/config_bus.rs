@@ -157,7 +157,7 @@ fn test_namespace_mode_get_set_dot_path() {
     // Force namespace mode so we can exercise namespace path handling.
     config.mode = ConfigMode::Namespace;
     config
-        .settings
+        .user_namespaces
         .insert("apcore".to_string(), serde_json::json!({}));
 
     config.set(
@@ -172,7 +172,7 @@ fn test_namespace_mode_get_set_dot_path() {
 fn test_namespace_method_returns_subtree() {
     let mut config = Config::from_defaults();
     config.mode = ConfigMode::Namespace;
-    config.settings.insert(
+    config.user_namespaces.insert(
         "widget".to_string(),
         serde_json::json!({"color": "blue", "size": 42}),
     );
@@ -196,7 +196,7 @@ fn test_namespace_method_returns_none_for_unknown() {
 fn test_mount_dict_merges_into_namespace() {
     let mut config = Config::from_defaults();
     config.mode = ConfigMode::Namespace;
-    config.settings.insert(
+    config.user_namespaces.insert(
         "plugins".to_string(),
         serde_json::json!({"existing_key": true}),
     );
@@ -235,7 +235,7 @@ struct PluginConfig {
 fn test_bind_namespace_into_typed_struct() {
     let mut config = Config::from_defaults();
     config.mode = ConfigMode::Namespace;
-    config.settings.insert(
+    config.user_namespaces.insert(
         "plugin_bind_test".to_string(),
         serde_json::json!({"enabled": true, "max_workers": 4}),
     );
@@ -258,7 +258,7 @@ fn test_get_typed_returns_value() {
     let mut config = Config::from_defaults();
     config.mode = ConfigMode::Namespace;
     config
-        .settings
+        .user_namespaces
         .insert("svc".to_string(), serde_json::json!({"port": 8080}));
 
     let port: u64 = config.get_typed("svc.port").unwrap();
@@ -325,7 +325,7 @@ fn test_env_style_flat_preserves_underscores() {
     let yaml_path = tmp_dir.join("cfg.yaml");
     std::fs::write(
         &yaml_path,
-        "max_call_depth: 32\nmax_module_repeat: 3\ndefault_timeout_ms: 30000\nglobal_timeout_ms: 60000\napcore:\n  version: '1.0.0'\n",
+        "executor:\n  max_call_depth: 32\n  max_module_repeat: 3\n  default_timeout: 30000\n  global_timeout: 60000\napcore:\n  version: '1.0.0'\n",
     )
     .unwrap();
     let config = Config::load(&yaml_path).unwrap();
@@ -346,7 +346,7 @@ fn test_env_style_flat_preserves_underscores() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-const NS_YAML: &str = "max_call_depth: 32\nmax_module_repeat: 3\ndefault_timeout_ms: 30000\nglobal_timeout_ms: 60000\napcore:\n  version: '1.0.0'\n";
+const NS_YAML: &str = "executor:\n  max_call_depth: 32\n  max_module_repeat: 3\n  default_timeout: 30000\n  global_timeout: 60000\napcore:\n  version: '1.0.0'\n";
 
 #[test]
 fn test_env_style_auto_resolves_mixed_flat_and_nested() {

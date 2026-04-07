@@ -768,7 +768,7 @@ fn conformance_config_env() {
             let yaml_path = dir.join("apcore.yaml");
             std::fs::write(
                 &yaml_path,
-                "max_call_depth: 32\nmax_module_repeat: 3\napcore:\n  version: \"0.16.0\"\n",
+                "executor:\n  max_call_depth: 32\n  max_module_repeat: 3\napcore:\n  version: \"0.16.0\"\n",
             )
             .unwrap();
             Config::load(yaml_path.as_path()).unwrap()

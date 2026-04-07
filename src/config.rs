@@ -1,8 +1,8 @@
 // APCore Protocol — Configuration
 // Spec reference: Configuration loading, validation, and environment variable overrides (Algorithm A12)
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
@@ -81,44 +81,147 @@ fn env_map_claimed() -> &'static RwLock<HashMap<String, String>> {
 
 const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
 
+/// Executor namespace configuration (PROTOCOL_SPEC §9.1).
+///
+/// All timeouts are in milliseconds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecutorConfig {
+    /// Per-module execution timeout (milliseconds). 0 means no per-module timeout.
+    pub default_timeout: u64,
+    /// Whole-call-chain deadline (milliseconds). 0 means no global deadline.
+    pub global_timeout: u64,
+    /// Maximum call chain depth before `MODULE_CALL_DEPTH_EXCEEDED` is raised.
+    pub max_call_depth: u32,
+    /// Maximum repeat count for the same module within a single call chain.
+    pub max_module_repeat: u32,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout: 30_000,
+            global_timeout: 60_000,
+            max_call_depth: 32,
+            max_module_repeat: 3,
+        }
+    }
+}
+
+/// Observability namespace configuration (PROTOCOL_SPEC §9.1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObservabilityConfig {
+    pub tracing: TracingConfig,
+    pub metrics: MetricsConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TracingConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+}
+
+/// Top-level apcore configuration (PROTOCOL_SPEC §9.1).
+///
+/// Canonical wire format is a nested JSON/YAML object with `executor`,
+/// `observability`, and any user-defined namespaces as siblings:
+///
+/// ```yaml
+/// modules_path: ./modules
+/// executor:
+///   max_call_depth: 32
+///   default_timeout: 30000
+/// observability:
+///   tracing:
+///     enabled: true
+/// my_vendor:
+///   custom_setting: foo
+/// ```
+///
+/// **v0.18.0 BREAKING CHANGE.** Prior versions accepted root-level
+/// `max_call_depth`, `default_timeout_ms`, etc. The custom `Deserialize` impl
+/// now rejects these with a hard error pointing at `MIGRATION-v0.18.md`.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modules_path: Option<PathBuf>,
     #[serde(default)]
-    pub max_call_depth: u32,
+    pub executor: ExecutorConfig,
     #[serde(default)]
-    pub max_module_repeat: u32,
-    #[serde(default)]
-    pub default_timeout_ms: u64,
-    #[serde(default)]
-    pub global_timeout_ms: u64,
-    #[serde(default)]
-    pub enable_tracing: bool,
-    #[serde(default)]
-    pub enable_metrics: bool,
+    pub observability: ObservabilityConfig,
+    /// User-defined and vendor namespaces. Captures any top-level key not
+    /// matching a canonical namespace above. Per spec §9.1, custom namespace
+    /// names should follow `[a-z][a-z0-9-]*`.
     #[serde(flatten)]
-    pub settings: HashMap<String, serde_json::Value>,
+    pub user_namespaces: HashMap<String, serde_json::Value>,
     #[serde(skip)]
     pub yaml_path: Option<PathBuf>,
     #[serde(skip)]
     pub mode: ConfigMode,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            modules_path: None,
-            max_call_depth: 32,
-            max_module_repeat: 3,
-            default_timeout_ms: 30000,
-            global_timeout_ms: 60000,
-            enable_tracing: false,
-            enable_metrics: false,
-            settings: HashMap::new(),
+/// Legacy v0.17.x root-level field names that are no longer accepted in v0.18.0.
+const LEGACY_ROOT_FIELDS: &[(&str, &str)] = &[
+    ("max_call_depth", "executor.max_call_depth"),
+    ("max_module_repeat", "executor.max_module_repeat"),
+    ("default_timeout_ms", "executor.default_timeout"),
+    ("global_timeout_ms", "executor.global_timeout"),
+    ("enable_tracing", "observability.tracing.enabled"),
+    ("enable_metrics", "observability.metrics.enabled"),
+];
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Two-pass: first parse the wire form into a generic JSON object,
+        // detect any v0.17.x legacy root-level fields, then materialize the
+        // canonical struct via a helper that mirrors the serialized shape.
+        let raw = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+
+        let mut violations: Vec<String> = Vec::new();
+        for (legacy, canonical) in LEGACY_ROOT_FIELDS {
+            if raw.contains_key(*legacy) {
+                violations.push(format!("'{legacy}' → '{canonical}'"));
+            }
+        }
+        if !violations.is_empty() {
+            return Err(D::Error::custom(format!(
+                "apcore v0.18.0 changed Config layout: root-level fields {} are no longer accepted. \
+                 Move them to their canonical nested namespace. \
+                 See MIGRATION-v0.18.md for the full migration guide.",
+                violations.join(", ")
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct ConfigHelper {
+            #[serde(default)]
+            modules_path: Option<PathBuf>,
+            #[serde(default)]
+            executor: ExecutorConfig,
+            #[serde(default)]
+            observability: ObservabilityConfig,
+            #[serde(flatten, default)]
+            user_namespaces: HashMap<String, serde_json::Value>,
+        }
+
+        let helper: ConfigHelper =
+            serde_json::from_value(serde_json::Value::Object(raw)).map_err(D::Error::custom)?;
+
+        Ok(Config {
+            modules_path: helper.modules_path,
+            executor: helper.executor,
+            observability: helper.observability,
+            user_namespaces: helper.user_namespaces,
             yaml_path: None,
             mode: ConfigMode::default(),
-        }
+        })
     }
 }
 
@@ -184,21 +287,20 @@ impl Config {
     pub fn validate(&self) -> Result<(), ModuleError> {
         let mut errors: Vec<String> = Vec::new();
 
-        if self.max_call_depth < 1 {
-            errors.push("max_call_depth must be >= 1".to_string());
+        if self.executor.max_call_depth < 1 {
+            errors.push("executor.max_call_depth must be >= 1".to_string());
         }
-        if self.max_module_repeat < 1 {
-            errors.push("max_module_repeat must be >= 1".to_string());
+        if self.executor.max_module_repeat < 1 {
+            errors.push("executor.max_module_repeat must be >= 1".to_string());
         }
-        // default_timeout_ms == 0 means no timeout, which is allowed
-        // but any positive value is fine too, so no constraint needed beyond >= 0 (u64 is always >= 0)
-        if self.global_timeout_ms > 0
-            && self.default_timeout_ms > 0
-            && self.global_timeout_ms < self.default_timeout_ms
+        // default_timeout == 0 means no timeout, which is allowed.
+        if self.executor.global_timeout > 0
+            && self.executor.default_timeout > 0
+            && self.executor.global_timeout < self.executor.default_timeout
         {
             errors.push(format!(
-                "global_timeout_ms ({}) must be >= default_timeout_ms ({})",
-                self.global_timeout_ms, self.default_timeout_ms
+                "executor.global_timeout ({}) must be >= executor.default_timeout ({})",
+                self.executor.global_timeout, self.executor.default_timeout
             ));
         }
 
@@ -231,20 +333,23 @@ impl Config {
 
     /// Get a config value by dot-path key.
     ///
-    /// First checks typed fields (e.g. "executor.max_call_depth"), then falls
-    /// back to the `settings` HashMap for arbitrary nested config.
+    /// Walks the canonical nested namespace tree (`executor.*`,
+    /// `observability.*`, `modules_path`) and falls back to user-defined
+    /// namespaces. Per spec §9.1, all keys MUST use the canonical
+    /// `<namespace>.<field>` form. Legacy v0.17.x short-form aliases
+    /// (e.g. bare `max_call_depth`) are NOT accepted.
     pub fn get(&self, key: &str) -> Option<serde_json::Value> {
-        // Check typed fields first
+        // Check canonical typed fields first.
         if let Some(val) = self.get_typed_field(key) {
             return Some(val);
         }
 
-        // Fall back to settings HashMap with dot-path traversal
+        // Fall back to user namespaces with dot-path traversal.
         let parts: Vec<&str> = key.split('.').collect();
         if parts.is_empty() {
             return None;
         }
-        let top = self.settings.get(parts[0])?;
+        let top = self.user_namespaces.get(parts[0])?;
         if parts.len() == 1 {
             return Some(top.clone());
         }
@@ -257,24 +362,25 @@ impl Config {
 
     /// Set a config value by dot-path key.
     ///
-    /// Attempts to set typed fields first, then falls back to the settings HashMap.
+    /// Attempts to set canonical typed fields first, then falls back to
+    /// user namespaces. Returns silently on type mismatch.
     pub fn set(&mut self, key: &str, value: serde_json::Value) {
-        // Try to set a typed field
+        // Try canonical typed fields.
         if self.set_typed_field(key, &value) {
             return;
         }
 
-        // Fall back to settings HashMap
+        // Fall back to user namespaces.
         let parts: Vec<&str> = key.split('.').collect();
         if parts.is_empty() {
             return;
         }
         if parts.len() == 1 {
-            self.settings.insert(key.to_string(), value);
+            self.user_namespaces.insert(key.to_string(), value);
             return;
         }
         let root = self
-            .settings
+            .user_namespaces
             .entry(parts[0].to_string())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         let mut current = root;
@@ -313,62 +419,10 @@ impl Config {
         Ok(())
     }
 
-    /// Return a `serde_json::Value` representing the full config as a nested
-    /// JSON object — typed fields merged on top of the settings map.
+    /// Return a `serde_json::Value` representing the full config as the
+    /// canonical nested JSON object (PROTOCOL_SPEC §9.1 wire format).
     pub fn data(&self) -> serde_json::Value {
-        // Start with settings as the base
-        let mut root = serde_json::Map::new();
-        for (k, v) in &self.settings {
-            root.insert(k.clone(), v.clone());
-        }
-
-        // Merge typed fields under "executor" namespace
-        let executor = root
-            .entry("executor".to_string())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let Some(obj) = executor.as_object_mut() {
-            obj.insert(
-                "max_call_depth".to_string(),
-                serde_json::Value::Number(self.max_call_depth.into()),
-            );
-            obj.insert(
-                "max_module_repeat".to_string(),
-                serde_json::Value::Number(self.max_module_repeat.into()),
-            );
-            obj.insert(
-                "default_timeout_ms".to_string(),
-                serde_json::Value::Number(self.default_timeout_ms.into()),
-            );
-            obj.insert(
-                "global_timeout_ms".to_string(),
-                serde_json::Value::Number(self.global_timeout_ms.into()),
-            );
-        }
-
-        // Merge typed fields under "observability" namespace
-        let observability = root
-            .entry("observability".to_string())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let Some(obj) = observability.as_object_mut() {
-            obj.insert(
-                "enable_tracing".to_string(),
-                serde_json::Value::Bool(self.enable_tracing),
-            );
-            obj.insert(
-                "enable_metrics".to_string(),
-                serde_json::Value::Bool(self.enable_metrics),
-            );
-        }
-
-        // Add modules_path at the top level if set
-        if let Some(ref p) = self.modules_path {
-            root.insert(
-                "modules_path".to_string(),
-                serde_json::Value::String(p.to_string_lossy().into_owned()),
-            );
-        }
-
-        serde_json::Value::Object(root)
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
 
     // --- Namespace registration (class methods) ---
@@ -449,7 +503,7 @@ impl Config {
     // --- Namespace instance methods ---
 
     pub fn namespace(&self, name: &str) -> Option<serde_json::Value> {
-        self.settings.get(name).cloned()
+        self.user_namespaces.get(name).cloned()
     }
 
     pub fn mount(&mut self, namespace: &str, source: MountSource) -> Result<(), ModuleError> {
@@ -476,7 +530,7 @@ impl Config {
             ));
         }
         let entry = self
-            .settings
+            .user_namespaces
             .entry(namespace.to_string())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if let (Some(target), Some(source_map)) = (entry.as_object_mut(), data.as_object()) {
@@ -488,8 +542,28 @@ impl Config {
     }
 
     pub fn bind<T: DeserializeOwned>(&self, namespace: &str) -> Result<T, ModuleError> {
+        // Special-case canonical namespaces so `bind::<ExecutorConfig>("executor")`
+        // returns the typed struct directly.
+        match namespace {
+            "executor" => {
+                return serde_json::from_value(
+                    serde_json::to_value(&self.executor)
+                        .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))?,
+                )
+                .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
+            }
+            "observability" => {
+                return serde_json::from_value(
+                    serde_json::to_value(&self.observability)
+                        .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))?,
+                )
+                .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
+            }
+            _ => {}
+        }
+
         let value = self
-            .settings
+            .user_namespaces
             .get(namespace)
             .ok_or_else(|| ModuleError::config_bind_error(namespace, "namespace not found"))?;
         serde_json::from_value(value.clone())
@@ -509,7 +583,7 @@ impl Config {
     fn detect_mode(&mut self) {
         // W-3: Only activate namespace mode when "apcore" key is a mapping.
         // A null or scalar value is not a valid namespace indicator.
-        self.mode = match self.settings.get("apcore") {
+        self.mode = match self.user_namespaces.get("apcore") {
             Some(serde_json::Value::Object(_)) => ConfigMode::Namespace,
             _ => ConfigMode::Legacy,
         };
@@ -611,26 +685,29 @@ impl Config {
         }
     }
 
-    /// Map a dot-path key to a typed field value, if it matches a known field.
+    /// Map a canonical dot-path key to a typed field value.
+    ///
+    /// Recognizes only the canonical `<namespace>.<field>` form per spec §9.1.
+    /// Legacy bare-name aliases are NOT accepted.
     fn get_typed_field(&self, key: &str) -> Option<serde_json::Value> {
         match key {
-            "executor.max_call_depth" | "max_call_depth" => {
-                Some(serde_json::Value::Number(self.max_call_depth.into()))
+            "executor.max_call_depth" => Some(serde_json::Value::Number(
+                self.executor.max_call_depth.into(),
+            )),
+            "executor.max_module_repeat" => Some(serde_json::Value::Number(
+                self.executor.max_module_repeat.into(),
+            )),
+            "executor.default_timeout" => Some(serde_json::Value::Number(
+                self.executor.default_timeout.into(),
+            )),
+            "executor.global_timeout" => Some(serde_json::Value::Number(
+                self.executor.global_timeout.into(),
+            )),
+            "observability.tracing.enabled" => {
+                Some(serde_json::Value::Bool(self.observability.tracing.enabled))
             }
-            "executor.max_module_repeat" | "max_module_repeat" => {
-                Some(serde_json::Value::Number(self.max_module_repeat.into()))
-            }
-            "executor.default_timeout_ms" | "default_timeout_ms" => {
-                Some(serde_json::Value::Number(self.default_timeout_ms.into()))
-            }
-            "executor.global_timeout_ms" | "global_timeout_ms" => {
-                Some(serde_json::Value::Number(self.global_timeout_ms.into()))
-            }
-            "observability.enable_tracing" | "enable_tracing" => {
-                Some(serde_json::Value::Bool(self.enable_tracing))
-            }
-            "observability.enable_metrics" | "enable_metrics" => {
-                Some(serde_json::Value::Bool(self.enable_metrics))
+            "observability.metrics.enabled" => {
+                Some(serde_json::Value::Bool(self.observability.metrics.enabled))
             }
             "modules_path" => self
                 .modules_path
@@ -640,42 +717,42 @@ impl Config {
         }
     }
 
-    /// Try to set a typed field from a dot-path key. Returns true if matched.
+    /// Try to set a canonical typed field. Returns true if matched.
     fn set_typed_field(&mut self, key: &str, value: &serde_json::Value) -> bool {
         match key {
-            "executor.max_call_depth" | "max_call_depth" => {
+            "executor.max_call_depth" => {
                 if let Some(n) = value.as_u64() {
-                    self.max_call_depth = n as u32;
+                    self.executor.max_call_depth = n as u32;
                     return true;
                 }
             }
-            "executor.max_module_repeat" | "max_module_repeat" => {
+            "executor.max_module_repeat" => {
                 if let Some(n) = value.as_u64() {
-                    self.max_module_repeat = n as u32;
+                    self.executor.max_module_repeat = n as u32;
                     return true;
                 }
             }
-            "executor.default_timeout_ms" | "default_timeout_ms" => {
+            "executor.default_timeout" => {
                 if let Some(n) = value.as_u64() {
-                    self.default_timeout_ms = n;
+                    self.executor.default_timeout = n;
                     return true;
                 }
             }
-            "executor.global_timeout_ms" | "global_timeout_ms" => {
+            "executor.global_timeout" => {
                 if let Some(n) = value.as_u64() {
-                    self.global_timeout_ms = n;
+                    self.executor.global_timeout = n;
                     return true;
                 }
             }
-            "observability.enable_tracing" | "enable_tracing" => {
+            "observability.tracing.enabled" => {
                 if let Some(b) = value.as_bool() {
-                    self.enable_tracing = b;
+                    self.observability.tracing.enabled = b;
                     return true;
                 }
             }
-            "observability.enable_metrics" | "enable_metrics" => {
+            "observability.metrics.enabled" => {
                 if let Some(b) = value.as_bool() {
-                    self.enable_metrics = b;
+                    self.observability.metrics.enabled = b;
                     return true;
                 }
             }

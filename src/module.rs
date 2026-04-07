@@ -2,8 +2,10 @@
 // Spec reference: Module definition, annotations, preflight checks
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
@@ -86,44 +88,108 @@ pub trait Module: Send + Sync {
 
 /// Metadata annotations attached to a module.
 /// Describes behavioral characteristics of the module.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// **Wire format (PROTOCOL_SPEC §4.4.1):** the `extra` field is serialized as a
+/// nested JSON object under the key `"extra"`. Extension keys MUST NOT be
+/// flattened to the annotations root. The custom `Deserialize` impl below
+/// accepts both the canonical nested form and the legacy flattened form
+/// (apcore-rust ≤ 0.17.1) for one MINOR backward-compat cycle.
+#[derive(Debug, Clone, Serialize)]
 pub struct ModuleAnnotations {
-    #[serde(default)]
     pub readonly: bool,
-    #[serde(default)]
     pub destructive: bool,
-    #[serde(default)]
     pub idempotent: bool,
-    #[serde(default)]
     pub requires_approval: bool,
-    #[serde(default = "default_true")]
     pub open_world: bool,
-    #[serde(default)]
     pub streaming: bool,
-    #[serde(default)]
     pub cacheable: bool,
-    #[serde(default)]
     pub cache_ttl: u64,
-    #[serde(default)]
     pub cache_key_fields: Option<Vec<String>>,
-    #[serde(default)]
     pub paginated: bool,
-    #[serde(default = "default_pagination_style")]
     pub pagination_style: String, // "cursor" | "offset" | "page"
     /// Extension map for ecosystem package metadata.
-    /// Unknown JSON keys are captured here via serde(flatten).
-    #[serde(default, flatten)]
+    /// Serialized as a nested `"extra"` object per spec §4.4.1.
     pub extra: HashMap<String, serde_json::Value>,
     // Legacy fields moved to ModuleDescriptor:
     // name, version, author, description, tags, category, deprecated,
     // deprecated_message, since, hidden, examples, dependencies, metadata
 }
 
-fn default_true() -> bool {
-    true
-}
-fn default_pagination_style() -> String {
-    "cursor".to_string()
+impl<'de> Deserialize<'de> for ModuleAnnotations {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AnnotationsVisitor;
+
+        impl<'de> Visitor<'de> for AnnotationsVisitor {
+            type Value = ModuleAnnotations;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a ModuleAnnotations JSON object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<ModuleAnnotations, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut ann = ModuleAnnotations::default();
+                let mut explicit_extra: Option<HashMap<String, serde_json::Value>> = None;
+                let mut overflow: HashMap<String, serde_json::Value> = HashMap::new();
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "readonly" => ann.readonly = map.next_value()?,
+                        "destructive" => ann.destructive = map.next_value()?,
+                        "idempotent" => ann.idempotent = map.next_value()?,
+                        "requires_approval" => ann.requires_approval = map.next_value()?,
+                        "open_world" => ann.open_world = map.next_value()?,
+                        "streaming" => ann.streaming = map.next_value()?,
+                        "cacheable" => ann.cacheable = map.next_value()?,
+                        "cache_ttl" => ann.cache_ttl = map.next_value()?,
+                        "cache_key_fields" => ann.cache_key_fields = map.next_value()?,
+                        "paginated" => ann.paginated = map.next_value()?,
+                        "pagination_style" => ann.pagination_style = map.next_value()?,
+                        "extra" => {
+                            // Tolerate `null` extra → empty map.
+                            let v: serde_json::Value = map.next_value()?;
+                            explicit_extra = Some(match v {
+                                serde_json::Value::Null => HashMap::new(),
+                                serde_json::Value::Object(obj) => obj.into_iter().collect(),
+                                _ => {
+                                    return Err(serde::de::Error::custom(
+                                        "ModuleAnnotations.extra must be an object",
+                                    ))
+                                }
+                            });
+                        }
+                        _ => {
+                            // Legacy flattened form (apcore-rust ≤ 0.17.1):
+                            // unknown keys at the root are captured into overflow
+                            // and later normalized into `extra`.
+                            let v: serde_json::Value = map.next_value()?;
+                            overflow.insert(key, v);
+                        }
+                    }
+                }
+
+                // §4.4.1 rule 7: nested explicit `extra` wins over legacy
+                // top-level overflow. Build the merged map by writing overflow
+                // first and then explicit_extra so the latter overwrites on
+                // collision.
+                let mut merged = overflow;
+                if let Some(ex) = explicit_extra {
+                    for (k, v) in ex {
+                        merged.insert(k, v);
+                    }
+                }
+                ann.extra = merged;
+                Ok(ann)
+            }
+        }
+
+        deserializer.deserialize_map(AnnotationsVisitor)
+    }
 }
 
 impl Default for ModuleAnnotations {

@@ -12,6 +12,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.0] - 2026-04-07
+
+### Changed (BREAKING)
+
+- **`Config` struct restructured to namespaced form per PROTOCOL_SPEC §9.1.** Executor and observability settings now live under nested sub-structs `ExecutorConfig` and `ObservabilityConfig` instead of being flat fields on `Config`. The mapping is:
+
+  | Before (≤ 0.17.x)              | After (0.18.0+)                          |
+  |--------------------------------|------------------------------------------|
+  | `config.max_call_depth`        | `config.executor.max_call_depth`         |
+  | `config.max_module_repeat`     | `config.executor.max_module_repeat`      |
+  | `config.default_timeout_ms`    | `config.executor.default_timeout`        |
+  | `config.global_timeout_ms`     | `config.executor.global_timeout`         |
+  | `config.enable_tracing`        | `config.observability.tracing.enabled`   |
+  | `config.enable_metrics`        | `config.observability.metrics.enabled`   |
+  | `config.settings`              | `config.user_namespaces`                 |
+
+  The `_ms` suffix is dropped from timeout fields to align with spec §9.1 and the Python/TypeScript SDKs (units stay milliseconds; documented in field doc comments).
+
+  **Wire format (YAML/JSON) is also breaking.** Producers MUST use the canonical nested form:
+
+  ```yaml
+  executor:
+    max_call_depth: 32
+    default_timeout: 30000
+  observability:
+    tracing:
+      enabled: true
+  ```
+
+  Loading a v0.17.x-style config with root-level `max_call_depth`, `default_timeout_ms`, etc. now produces a hard error pointing at `MIGRATION-v0.18.md`. There is no silent migration. See the migration guide for the rationale.
+
+- **`Config::get()` / `Config::set()` no longer accept legacy bare field names** — `config.get("max_call_depth")` returns `None` in v0.18.0; use `config.get("executor.max_call_depth")` instead. Cross-language parity with Python/TypeScript.
+
+- **`Config::bind()` now special-cases canonical namespaces** — `config.bind::<ExecutorConfig>("executor")` returns the typed sub-struct directly without going through `user_namespaces`.
+
+### Fixed
+
+- **`Config` no longer silently ignores spec-conformant YAML.** A YAML file using the canonical `executor: { max_call_depth: 100 }` shape would previously be captured into the unused `settings` HashMap and the typed `max_call_depth` field would remain at default 32. Discovered during the v0.18.0 cross-language audit.
+
+- **`ModuleAnnotations.extra` wire format aligned with PROTOCOL_SPEC §4.4.1** — Removed `#[serde(flatten)]` on the `extra` field. The struct now serializes `extra` as a nested `"extra"` object, matching `apcore-python` and `apcore-typescript`. This fixes a silent cross-language data-loss bug where Python/TypeScript payloads carrying nested `extra` would deserialize on the Rust side as `extra["extra"] = {...}` (one level too deep). The custom `Deserialize` impl tolerates legacy flattened input from `apcore-rust ≤ 0.17.1` for one MINOR backward-compat cycle. When the same key appears in both forms, the nested value wins per spec rule 7.
+
+### Changed
+
+- **`ModuleAnnotations` Deserialize is now hand-rolled** — Replaced `#[derive(Deserialize)]` with a custom `Visitor` to support both nested and legacy flattened wire forms with deterministic precedence. The public API of the struct is unchanged; only the on-the-wire format is corrected.
+
+### Added
+
+- **`ExecutorConfig`, `ObservabilityConfig`, `TracingConfig`, `MetricsConfig`** — New public sub-structs for canonical namespace binding. Available via `apcore::config::*` and re-exported from the crate root.
+
+### Removed
+
+- **`Config.settings` field** → renamed to `Config.user_namespaces` to clarify intent (it captures user-defined namespaces only, not canonical ones).
+- **`default_true` and `default_pagination_style` private helpers** in `module.rs` — No longer needed now that `Deserialize` for `ModuleAnnotations` is custom; defaults flow through `Default::default()`.
+
 ## [0.17.1] - 2026-04-06
 
 ### Added

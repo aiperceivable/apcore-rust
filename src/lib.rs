@@ -48,7 +48,10 @@ pub use builtin_steps::{
     BuiltinMiddlewareBefore, BuiltinModuleLookup, BuiltinOutputValidation, BuiltinReturnResult,
 };
 pub use client::APCore;
-pub use config::{Config, ConfigMode, EnvStyle, MountSource, NamespaceInfo, NamespaceRegistration};
+pub use config::{
+    Config, ConfigMode, EnvStyle, ExecutorConfig, MetricsConfig, MountSource, NamespaceInfo,
+    NamespaceRegistration, ObservabilityConfig, TracingConfig,
+};
 pub use context::{Context, ContextFactory, Identity};
 pub use context_key::ContextKey;
 pub use errors::{ErrorCode, ErrorCodeRegistry, ModuleError};
