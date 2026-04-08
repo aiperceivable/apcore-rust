@@ -12,7 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.18.0] - 2026-04-07
+## [0.18.0] - 2026-04-08
+
+### Added
+
+- **`pub const MAX_MODULE_ID_LENGTH: usize = 192`** in `apcore::registry::registry`, re-exported from `apcore::registry` and the crate root (`apcore::MAX_MODULE_ID_LENGTH`). Tracks PROTOCOL_SPEC §2.7 EBNF constraint #1 and aligns with `apcore-python` / `apcore-typescript`.
+- **`Registry::register` now enforces module ID length** per PROTOCOL_SPEC §2.7. Module IDs longer than `MAX_MODULE_ID_LENGTH` are rejected with `ErrorCode::GeneralInvalidInput` carrying the message `"Module ID exceeds maximum length of {N}: {actual}"`. **This was a previously undetected spec compliance gap** — the constraint is `MUST` in the protocol but the Rust SDK never validated it. Python and TypeScript SDKs have always enforced it.
+- **`module_id_pattern()` function** returning `&'static Regex` (lazy `OnceLock<Regex>`) for the canonical EBNF pattern. Re-exported at the crate root as `apcore::module_id_pattern`.
+- **`REGISTRY_EVENTS` constants** — `pub mod registry_events { pub const REGISTER, UNREGISTER }`, `pub struct RegistryEvents` with associated consts, and the `pub const REGISTRY_EVENTS: RegistryEvents` singleton. Closes a §12.2 MUST violation: all SDKs must export these event names as named constants. Aligned with apcore-python (`REGISTRY_EVENTS` dict) and apcore-typescript (`REGISTRY_EVENTS` frozen object).
+- **Crate-root re-exports for parity with apcore-python and apcore-typescript:** `MiddlewareManager`, `Middleware`, `BeforeMiddleware`, `AfterMiddleware`, `LoggingMiddleware`, `RetryMiddleware`, `RetryConfig`, `PlatformNotifyMiddleware`, `ErrorHistoryMiddleware`, `MetricsMiddleware`, `UsageMiddleware`, `ObsLoggingMiddleware`, `ErrorFormatterRegistry`, `ErrorFormatter`, `build_minimal_strategy`, `BindingLoader`, `BindingDefinition`, `BindingTarget`, `CancelToken`, `FunctionModule`, `Extension`, `ExtensionManager`, `ExtensionPoint`, `AsyncTaskManager`, `TaskInfo`, `ErrorHistory`, `ErrorEntry`, `MetricsCollector`, `UsageCollector`, `UsageStats`, `Span`, `SpanExporter`, `StdoutExporter`, `InMemoryExporter`, `OTLPExporter`, `SchemaLoader`, `SchemaValidator`, `SchemaExporter`, `RefResolver`, `TraceContext`, `TraceParent`. All previously required `apcore::module_path::*` access; now reachable directly from `apcore::*`.
+- **`Registry::register_internal` now enforces empty / EBNF pattern / length / duplicate checks** via the shared `validate_module_id()` helper (was previously bypassing all validation). The reserved-word check is the only step skipped (so sys modules can use the `system.*` prefix). Aligned with apcore-typescript `registerInternal()`.
+- **Boundary tests** in `tests/test_registry.rs`: `test_max_module_id_length_matches_spec`, `test_register_accepts_module_id_at_max_length`, `test_register_rejects_module_id_exceeding_max_length`, plus 6 `test_register_internal_*` parity tests.
+- **`tests/test_crate_root_exports.rs`** — 7 regression tests asserting that every spec-required and Python/TS-parity symbol is reachable from `apcore::*`.
+- **`test_validate_accepts_optional_context`** regression test in `tests/test_executor.rs`.
+
+### Changed
+
+- **`Executor::validate()` signature gained an optional context parameter** — `pub async fn validate(&self, module_id: &str, inputs: &Value, ctx: Option<&Context<Value>>) -> Result<PreflightResult, ModuleError>`. Aligns with PROTOCOL_SPEC §12.2 line 6405 and matches apcore-python / apcore-typescript. When `None` is passed, an anonymous `@external` context is synthesized internally for backward compatibility (existing behavior preserved). When a real context is passed, call-chain checks (depth limit, circular call detection) and ACL caller-identity matching see real caller state. **This is a source-incompatible change for any code calling `executor.validate(id, inputs)` — add a third `None` argument.**
+- **`Registry::register` and `Registry::register_internal` duplicate-detection error code changed from `ErrorCode::ModuleLoadError` to `ErrorCode::GeneralInvalidInput`.** Aligns with apcore-python / apcore-typescript which use `InvalidInputError` (`GENERAL_INVALID_INPUT`) for the same condition. `ModuleLoadError` is reserved for actual module load failures (file I/O, parse errors); a duplicate ID is invalid input from the caller. **Clients catching errors by code in Rust will see a different code than before** — update any `match` arms.
+- **Duplicate-registration error message canonicalized** to `"Module ID '<name>' is already registered"` (was `"Module '<name>' is already registered"` — added the "ID" word). Both `register()` and `register_internal()` emit the same string. Now byte-identical to apcore-python and apcore-typescript.
+- **README installation snippet bumped from `apcore = "0.16"` to `apcore = "0.18"`** — was 2 minor versions stale and would have given new users a broken install of the v0.16 surface.
+
+### Compatibility (in addition to the BREAKING items below)
+
+- **`Executor::validate()` is source-incompatible** for callers that passed only two arguments — add `None` as the third argument. The semantics with `None` are identical to the previous two-arg behavior.
+- **Duplicate-error consumers in Rust must update error-code matches** from `ErrorCode::ModuleLoadError` to `ErrorCode::GeneralInvalidInput` for the registration-duplicate path.
+- **`register_internal()` is source-compatible** but stricter at runtime. Existing in-tree callers (`apcore::sys_modules::*`) all use canonical-shape IDs and are unaffected. External adapter authors who used `register_internal()` as a generic escape hatch for non-canonical IDs should review.
+- **New rejection path for over-length IDs.** Code that previously registered module IDs longer than 192 characters in Rust will now fail at `register()`. Python and TypeScript already rejected such IDs at the previous 128-char threshold; no consistent cross-language behavior was possible before this fix.
 
 ### Changed (BREAKING)
 

@@ -106,13 +106,16 @@ impl APCore {
 
     /// Validate module inputs without executing (spec §12.3).
     ///
-    /// Returns a `PreflightResult` with per-check status.
+    /// Returns a `PreflightResult` with per-check status. `ctx` enables
+    /// call-chain checks against real caller state; pass `None` to validate
+    /// from an anonymous external context.
     pub async fn validate(
         &self,
         module_id: &str,
         inputs: &serde_json::Value,
+        ctx: Option<&crate::context::Context<serde_json::Value>>,
     ) -> Result<crate::module::PreflightResult, ModuleError> {
-        self.executor.validate(module_id, inputs).await
+        self.executor.validate(module_id, inputs, ctx).await
     }
 
     /// Register a module with the given module_id.

@@ -2,8 +2,10 @@
 // Spec reference: Module registration, discovery, validation, and descriptors
 
 use async_trait::async_trait;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations, ValidationResult};
@@ -62,6 +64,116 @@ type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
 pub const RESERVED_WORDS: &[&str] = &[
     "system", "internal", "core", "apcore", "plugin", "schema", "acl",
 ];
+
+/// Maximum allowed length for a module ID.
+///
+/// Per PROTOCOL_SPEC §2.7 EBNF constraint #1. 192 is filesystem-safe
+/// (`192 + ".binding.yaml".len() = 205 < 255`-byte filename limit on
+/// ext4/xfs/NTFS/APFS/btrfs) and accommodates Java/.NET deep-namespace
+/// FQN-derived IDs. Bumped from 128 in spec 1.6.0-draft (2026-04-08).
+///
+/// Aligned with `apcore-python` and `apcore-typescript` `MAX_MODULE_ID_LENGTH`.
+pub const MAX_MODULE_ID_LENGTH: usize = 192;
+
+/// Standard registry event names per PROTOCOL_SPEC §12.2.
+///
+/// All SDKs **MUST** export these event names as named constants so that
+/// consumers do not hardcode the underlying string literals. Aligned with
+/// `apcore-python.REGISTRY_EVENTS` and `apcore-typescript.REGISTRY_EVENTS`.
+///
+/// Usage: `registry.on(REGISTRY_EVENTS.REGISTER, callback);`
+pub mod registry_events {
+    /// Fired after a module is successfully registered.
+    pub const REGISTER: &str = "register";
+
+    /// Fired before a module is removed from the registry.
+    pub const UNREGISTER: &str = "unregister";
+}
+
+/// Container for the standard registry event names.
+///
+/// Provides the same `REGISTRY_EVENTS.REGISTER` / `REGISTRY_EVENTS.UNREGISTER`
+/// access pattern used by `apcore-python` (dict) and `apcore-typescript`
+/// (frozen object), so that idiomatic usage is consistent across SDKs.
+pub struct RegistryEvents;
+
+impl RegistryEvents {
+    pub const REGISTER: &'static str = registry_events::REGISTER;
+    pub const UNREGISTER: &'static str = registry_events::UNREGISTER;
+}
+
+/// Singleton instance providing `REGISTRY_EVENTS.REGISTER` / `REGISTRY_EVENTS.UNREGISTER`
+/// access pattern matching the Python and TypeScript SDKs.
+pub const REGISTRY_EVENTS: RegistryEvents = RegistryEvents;
+
+/// Canonical EBNF pattern for module IDs per PROTOCOL_SPEC §2.7.
+///
+/// Equivalent regex of: `canonical_id = segment ("." segment)*` where
+/// `segment = [a-z][a-z0-9_]*`. Aligned with `apcore-python` and
+/// `apcore-typescript` `MODULE_ID_PATTERN`.
+pub fn module_id_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$").unwrap())
+}
+
+/// Validate a module ID against PROTOCOL_SPEC §2.7 in canonical order:
+/// 1. non-empty
+/// 2. matches EBNF pattern
+/// 3. length ≤ MAX_MODULE_ID_LENGTH
+/// 4. (if `allow_reserved == false`) no segment is a reserved word
+///
+/// Duplicate detection is the caller's responsibility (it requires registry
+/// state). `register_internal` calls this with `allow_reserved=true` so sys
+/// modules can use the `system.*` prefix; everything else still validates.
+///
+/// Aligned with `apcore-python._validate_module_id` and
+/// `apcore-typescript._validateModuleId`.
+fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleError> {
+    // 1. empty check
+    if name.is_empty() {
+        return Err(ModuleError::new(
+            crate::errors::ErrorCode::GeneralInvalidInput,
+            "module_id must be a non-empty string".to_string(),
+        ));
+    }
+
+    // 2. EBNF pattern check
+    if !module_id_pattern().is_match(name) {
+        return Err(ModuleError::new(
+            crate::errors::ErrorCode::GeneralInvalidInput,
+            format!(
+                "Invalid module ID: '{}'. Must match pattern: ^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$ (lowercase, digits, underscores, dots only; no hyphens)",
+                name
+            ),
+        ));
+    }
+
+    // 3. length check
+    if name.len() > MAX_MODULE_ID_LENGTH {
+        return Err(ModuleError::new(
+            crate::errors::ErrorCode::GeneralInvalidInput,
+            format!(
+                "Module ID exceeds maximum length of {}: {}",
+                MAX_MODULE_ID_LENGTH,
+                name.len()
+            ),
+        ));
+    }
+
+    // 4. reserved word per-segment check (skipped for register_internal)
+    if !allow_reserved {
+        for segment in name.split('.') {
+            if RESERVED_WORDS.contains(&segment) {
+                return Err(ModuleError::new(
+                    crate::errors::ErrorCode::GeneralInvalidInput,
+                    format!("Module ID contains reserved word: '{}'", segment),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Central registry of modules.
 ///
@@ -128,28 +240,22 @@ impl Registry {
     }
 
     /// Register a module with the given name.
+    ///
+    /// Validation order (PROTOCOL_SPEC §2.7, aligned with apcore-python /
+    /// apcore-typescript): empty → pattern → length → reserved (per-segment)
+    /// → duplicate.
     pub fn register(
         &mut self,
         name: &str,
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
-        // Reject module IDs whose first segment is a reserved word.
-        let first_segment = name.split('.').next().unwrap_or(name);
-        if RESERVED_WORDS.contains(&first_segment) {
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::GeneralInvalidInput,
-                format!(
-                    "Module ID '{}' uses reserved word '{}' as its first segment",
-                    name, first_segment
-                ),
-            ));
-        }
+        validate_module_id(name, false)?;
 
         if self.modules.contains_key(name) {
             return Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleLoadError,
-                format!("Module '{}' is already registered", name),
+                crate::errors::ErrorCode::GeneralInvalidInput,
+                format!("Module ID '{}' is already registered", name),
             ));
         }
 
@@ -321,17 +427,26 @@ impl Registry {
         Ok(registered_names)
     }
 
-    /// Register a module without validation.
+    /// Register a sys/internal module that bypasses **only** the reserved
+    /// word check. All other PROTOCOL_SPEC §2.7 validations (empty, EBNF
+    /// pattern, length, duplicate) still apply.
+    ///
+    /// The intended use case is registering modules under reserved prefixes
+    /// like `system.health` or `system.control.toggle_feature` from
+    /// `apcore::sys_modules`. Aligned with apcore-typescript
+    /// `Registry.registerInternal`.
     pub fn register_internal(
         &mut self,
         name: &str,
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
+        validate_module_id(name, true)?;
+
         if self.modules.contains_key(name) {
             return Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleLoadError,
-                format!("Module '{}' is already registered", name),
+                crate::errors::ErrorCode::GeneralInvalidInput,
+                format!("Module ID '{}' is already registered", name),
             ));
         }
 

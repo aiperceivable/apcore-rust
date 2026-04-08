@@ -167,3 +167,46 @@ async fn test_apcore_registry_accessor() {
     assert!(client.registry().has("math.add"));
     assert_eq!(client.registry().count(), 1);
 }
+
+// Regression for sync finding A-002 — Executor.validate() must accept an
+// optional context parameter per PROTOCOL_SPEC §12.2 line 6405. Aligns Rust
+// signature with apcore-python and apcore-typescript.
+#[tokio::test]
+async fn test_validate_accepts_optional_context() {
+    use apcore::context::{Context, Identity};
+
+    let mut client = APCore::new();
+    client.register("math.add", Box::new(AddModule)).unwrap();
+
+    // Path 1: validate with no context — anonymous external context synthesized internally.
+    let r1 = client
+        .validate("math.add", &json!({"a": 1, "b": 2}), None)
+        .await
+        .unwrap();
+    assert!(
+        r1.valid,
+        "validate(.., None) should pass for a valid module"
+    );
+
+    // Path 2: validate with an explicit context — call_chain checks see real caller state.
+    let identity = Identity::new(
+        "test_caller".to_string(),
+        "user".to_string(),
+        vec!["tester".to_string()],
+        Default::default(),
+    );
+    let ctx: Context<serde_json::Value> = Context::new(identity);
+    let r2 = client
+        .validate("math.add", &json!({"a": 1, "b": 2}), Some(&ctx))
+        .await
+        .unwrap();
+    assert!(
+        r2.valid,
+        "validate(.., Some(ctx)) should pass for a valid module"
+    );
+    assert_eq!(
+        r1.checks.len(),
+        r2.checks.len(),
+        "context shape should not change the number of preflight checks executed"
+    );
+}

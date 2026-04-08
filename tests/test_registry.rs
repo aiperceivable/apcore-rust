@@ -224,7 +224,10 @@ fn test_register_rejects_reserved_first_segment() {
 }
 
 #[test]
-fn test_register_allows_reserved_word_in_non_first_segment() {
+fn test_register_rejects_reserved_word_in_any_segment() {
+    // PROTOCOL_SPEC §2.7: reserved words MUST NOT appear as ANY segment of a
+    // module ID (not just the first). Aligned with apcore-python and
+    // apcore-typescript, both of which reject 'email.system' for this reason.
     let mut registry = Registry::new();
     let result = registry.register(
         "email.system",
@@ -232,8 +235,14 @@ fn test_register_allows_reserved_word_in_non_first_segment() {
         make_descriptor("email.system"),
     );
     assert!(
-        result.is_ok(),
-        "registering 'email.system' should succeed — 'system' is not the first segment"
+        result.is_err(),
+        "registering 'email.system' must fail — 'system' is reserved in any segment"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("reserved word") && msg.contains("system"),
+        "error should mention reserved word 'system', got: {}",
+        msg
     );
 }
 
@@ -275,6 +284,191 @@ fn test_register_module_rejects_reserved_first_segment() {
     assert!(
         result.is_err(),
         "register_module with 'core.utils' should fail"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Module ID length boundary tests (PROTOCOL_SPEC §2.7 EBNF constraint #1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_max_module_id_length_matches_spec() {
+    // Per PROTOCOL_SPEC §2.7. Bumped from 128 to 192 in spec 1.6.0-draft.
+    // Filesystem-safe: 192 + ".binding.yaml".len()=13 = 205 < 255-byte filename limit.
+    use apcore::registry::MAX_MODULE_ID_LENGTH;
+    assert_eq!(MAX_MODULE_ID_LENGTH, 192);
+}
+
+#[test]
+fn test_register_accepts_module_id_at_max_length() {
+    use apcore::registry::MAX_MODULE_ID_LENGTH;
+    let mut registry = Registry::new();
+    // Pure 'a' run satisfies the EBNF pattern [a-z][a-z0-9_]*.
+    let exact_id = "a".repeat(MAX_MODULE_ID_LENGTH);
+    let result = registry.register(&exact_id, Box::new(StubModule), make_descriptor(&exact_id));
+    assert!(
+        result.is_ok(),
+        "registering an ID at exactly MAX_MODULE_ID_LENGTH should succeed"
+    );
+}
+
+#[test]
+fn test_register_rejects_module_id_exceeding_max_length() {
+    use apcore::registry::MAX_MODULE_ID_LENGTH;
+    let mut registry = Registry::new();
+    let overlong_id = "a".repeat(MAX_MODULE_ID_LENGTH + 1);
+    let result = registry.register(
+        &overlong_id,
+        Box::new(StubModule),
+        make_descriptor(&overlong_id),
+    );
+    assert!(
+        result.is_err(),
+        "registering an ID longer than MAX_MODULE_ID_LENGTH should fail"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("maximum length"),
+        "error should mention maximum length, got: {}",
+        msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PROTOCOL_SPEC §2.7 EBNF compliance — empty / pattern checks
+// (parity with apcore-python and apcore-typescript)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_register_rejects_empty_module_id() {
+    let mut registry = Registry::new();
+    let result = registry.register("", Box::new(StubModule), make_descriptor(""));
+    assert!(result.is_err(), "registering empty ID must fail");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("non-empty"),
+        "error should mention non-empty, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_register_rejects_invalid_pattern() {
+    let mut registry = Registry::new();
+    for bad_id in [
+        "INVALID-ID", // hyphens not allowed
+        "1abc",       // starts with digit
+        "Module",     // uppercase
+        "a..b",       // consecutive dots
+        ".leading",   // leading dot
+        "trailing.",  // trailing dot
+        "has space",  // space
+        "has!bang",   // special char
+    ] {
+        let result = registry.register(bad_id, Box::new(StubModule), make_descriptor(bad_id));
+        assert!(
+            result.is_err(),
+            "registering pattern-invalid ID '{}' must fail",
+            bad_id
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Invalid module ID") || msg.contains("Must match pattern"),
+            "error for '{}' should mention pattern, got: {}",
+            bad_id,
+            msg
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// register_internal — bypasses ONLY reserved word check
+// (parity with apcore-python and apcore-typescript)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_register_internal_accepts_reserved_first_segment() {
+    let mut registry = Registry::new();
+    let result = registry.register_internal(
+        "system.health",
+        Box::new(StubModule),
+        make_descriptor("system.health"),
+    );
+    assert!(
+        result.is_ok(),
+        "register_internal must accept reserved first segment 'system'"
+    );
+}
+
+#[test]
+fn test_register_internal_accepts_reserved_any_segment() {
+    let mut registry = Registry::new();
+    let result = registry.register_internal(
+        "myapp.system.config",
+        Box::new(StubModule),
+        make_descriptor("myapp.system.config"),
+    );
+    assert!(
+        result.is_ok(),
+        "register_internal must accept reserved word in any segment"
+    );
+}
+
+#[test]
+fn test_register_internal_still_rejects_empty() {
+    let mut registry = Registry::new();
+    let result = registry.register_internal("", Box::new(StubModule), make_descriptor(""));
+    assert!(
+        result.is_err(),
+        "register_internal must still reject empty IDs"
+    );
+}
+
+#[test]
+fn test_register_internal_still_rejects_invalid_pattern() {
+    let mut registry = Registry::new();
+    let result = registry.register_internal(
+        "INVALID-ID",
+        Box::new(StubModule),
+        make_descriptor("INVALID-ID"),
+    );
+    assert!(
+        result.is_err(),
+        "register_internal must still enforce EBNF pattern"
+    );
+}
+
+#[test]
+fn test_register_internal_still_rejects_over_length() {
+    use apcore::registry::MAX_MODULE_ID_LENGTH;
+    let mut registry = Registry::new();
+    let overlong = "a".repeat(MAX_MODULE_ID_LENGTH + 1);
+    let result =
+        registry.register_internal(&overlong, Box::new(StubModule), make_descriptor(&overlong));
+    assert!(
+        result.is_err(),
+        "register_internal must still enforce length limit"
+    );
+}
+
+#[test]
+fn test_register_internal_rejects_duplicate() {
+    let mut registry = Registry::new();
+    registry
+        .register_internal(
+            "system.dup",
+            Box::new(StubModule),
+            make_descriptor("system.dup"),
+        )
+        .expect("first register_internal should succeed");
+    let result = registry.register_internal(
+        "system.dup",
+        Box::new(StubModule),
+        make_descriptor("system.dup"),
+    );
+    assert!(
+        result.is_err(),
+        "register_internal must reject duplicate IDs"
     );
 }
 

@@ -473,17 +473,30 @@ impl Executor {
     ///
     /// Runs the pipeline in `dry_run` mode — pure steps only, side-effecting
     /// steps are skipped automatically.
+    ///
+    /// `ctx` is the optional execution context. When provided, call-chain
+    /// checks (depth limit, circular-call detection) and ACL caller-identity
+    /// matching can run against real caller state. When omitted, an anonymous
+    /// `@external` context is synthesized for backward compatibility, in which
+    /// case call-chain checks are no-ops.
+    ///
+    /// Aligned with `apcore-python.Executor.validate(module_id, inputs, context=None)`
+    /// and `apcore-typescript.Executor.validate(moduleId, inputs?, context?)` per
+    /// PROTOCOL_SPEC §12.2.
     pub async fn validate(
         &self,
         module_id: &str,
         inputs: &serde_json::Value,
+        ctx: Option<&Context<serde_json::Value>>,
     ) -> Result<PreflightResult, ModuleError> {
-        let context = Context::<serde_json::Value>::new(Identity::new(
-            "@external".to_string(),
-            "external".to_string(),
-            vec![],
-            Default::default(),
-        ));
+        let context = ctx.cloned().unwrap_or_else(|| {
+            Context::<serde_json::Value>::new(Identity::new(
+                "@external".to_string(),
+                "external".to_string(),
+                vec![],
+                Default::default(),
+            ))
+        });
         let mut pipe_ctx =
             PipelineContext::new(module_id, inputs.clone(), context, self.strategy.name());
         pipe_ctx.dry_run = true;
@@ -1082,7 +1095,10 @@ mod tests {
         let mut executor = build_executor_with_module(module, annotations);
         executor.set_approval_handler(Box::new(handler));
 
-        let result = executor.validate("test_mod", &json!({})).await.unwrap();
+        let result = executor
+            .validate("test_mod", &json!({}), None)
+            .await
+            .unwrap();
         assert!(result.valid);
         assert!(result.requires_approval);
     }

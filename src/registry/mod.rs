@@ -5,6 +5,7 @@
 pub mod registry;
 
 pub use registry::{
-    DependencyInfo, DiscoveredModule, Discoverer, ModuleDescriptor, ModuleValidator, Registry,
-    RESERVED_WORDS,
+    module_id_pattern, registry_events, DependencyInfo, DiscoveredModule, Discoverer,
+    ModuleDescriptor, ModuleValidator, Registry, RegistryEvents, MAX_MODULE_ID_LENGTH,
+    REGISTRY_EVENTS, RESERVED_WORDS,
 };
