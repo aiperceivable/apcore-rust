@@ -80,6 +80,19 @@ impl APCore {
         }
     }
 
+    /// Create a new APCore client from a pre-built Registry and Executor.
+    ///
+    /// Builds an `Executor` from the given `registry` and a default `Config`.
+    /// To supply a custom config, use [`with_options`] instead.
+    pub fn with_components(registry: Registry, config: Config) -> Self {
+        let executor = Executor::new(registry, config.clone());
+        Self {
+            config,
+            executor,
+            event_emitter: None,
+        }
+    }
+
     /// Call (execute) a module by ID with the given inputs.
     pub async fn call(
         &self,
@@ -138,26 +151,32 @@ impl APCore {
             .register(module_id, module, descriptor)
     }
 
-    /// Trigger module discovery.
+    /// Trigger module discovery from configured extension directories.
+    ///
+    /// Returns the number of newly discovered modules, or 0 if no discoverer
+    /// is configured on the registry.
     pub async fn discover(&mut self) -> Result<usize, ModuleError> {
-        // No discoverer configured by default
-        Ok(0)
+        let registry = std::sync::Arc::get_mut(&mut self.executor.registry).ok_or_else(|| {
+            ModuleError::new(
+                crate::errors::ErrorCode::GeneralInternalError,
+                "Cannot discover: registry is shared".to_string(),
+            )
+        })?;
+        match registry.discover_internal().await {
+            Ok(names) => Ok(names.len()),
+            Err(e) if e.code == crate::errors::ErrorCode::ModuleLoadError => {
+                // No discoverer configured — not an error, just nothing to discover.
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// List all registered modules, optionally filtered by tags and/or prefix.
-    pub fn list_modules(&self, tags: Option<&[String]>, prefix: Option<&str>) -> Vec<String> {
-        // Convert &[String] to &[&str] for the registry API
-        let tag_refs: Vec<&str>;
-        let tags_param = match tags {
-            Some(t) => {
-                tag_refs = t.iter().map(|s| s.as_str()).collect();
-                Some(tag_refs.as_slice())
-            }
-            None => None,
-        };
+    pub fn list_modules(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<String> {
         self.executor
             .registry
-            .list(tags_param, prefix)
+            .list(tags, prefix)
             .into_iter()
             .map(|s| s.to_string())
             .collect()
@@ -166,21 +185,18 @@ impl APCore {
     /// Add a middleware to the execution pipeline.
     ///
     /// Returns an error if the middleware's priority exceeds the allowed range.
+    /// Returns `&mut Self` for chaining.
     pub fn use_middleware(
         &mut self,
         middleware: Box<dyn Middleware>,
-    ) -> Result<(), crate::errors::ModuleError> {
-        self.executor.use_middleware(middleware)
+    ) -> Result<&mut Self, crate::errors::ModuleError> {
+        self.executor.use_middleware(middleware)?;
+        Ok(self)
     }
 
     /// Remove a middleware by name.
     pub fn remove(&mut self, name: &str) -> bool {
         self.executor.remove(name)
-    }
-
-    /// Remove a middleware by name (legacy alias).
-    pub fn remove_middleware(&mut self, name: &str) -> bool {
-        self.remove(name)
     }
 
     /// Get a reference to the registry.
@@ -193,25 +209,43 @@ impl APCore {
         &self.executor
     }
 
-    /// Disable a module with an optional reason.
-    pub fn disable(&mut self, _module_id: &str, _reason: Option<&str>) -> Result<(), ModuleError> {
-        // Needs sys_modules support — no-op for now
-        Ok(())
+    /// Disable a module. Calls to disabled modules will raise ModuleDisabledError.
+    pub fn disable(&mut self, module_id: &str, reason: Option<&str>) -> Result<(), ModuleError> {
+        let _ = reason; // reason logging reserved for future use
+        let registry = std::sync::Arc::get_mut(&mut self.executor.registry).ok_or_else(|| {
+            ModuleError::new(
+                crate::errors::ErrorCode::GeneralInternalError,
+                format!("Cannot disable '{}': registry is shared", module_id),
+            )
+        })?;
+        registry.disable(module_id)
     }
 
     /// Re-enable a previously disabled module.
-    pub fn enable(&mut self, _module_id: &str, _reason: Option<&str>) -> Result<(), ModuleError> {
-        // Needs sys_modules support — no-op for now
-        Ok(())
+    pub fn enable(&mut self, module_id: &str, reason: Option<&str>) -> Result<(), ModuleError> {
+        let _ = reason; // reason logging reserved for future use
+        let registry = std::sync::Arc::get_mut(&mut self.executor.registry).ok_or_else(|| {
+            ModuleError::new(
+                crate::errors::ErrorCode::GeneralInternalError,
+                format!("Cannot enable '{}': registry is shared", module_id),
+            )
+        })?;
+        registry.enable(module_id)
     }
 
     /// Subscribe to an event type. Returns the subscriber ID.
     ///
+    /// The `event_type` is bound to the subscriber so it only receives matching
+    /// events (glob patterns like `"apcore.*"` are supported).
     /// Lazily initializes the event emitter on first use.
-    pub fn on(&mut self, _event_type: &str, subscriber: Box<dyn EventSubscriber>) -> String {
+    pub fn on(&mut self, event_type: &str, subscriber: Box<dyn EventSubscriber>) -> String {
+        let wrapped = Box::new(EventTypeSubscriber {
+            event_type: event_type.to_string(),
+            inner: subscriber,
+        });
         let emitter = self.event_emitter.get_or_insert_with(EventEmitter::new);
-        let id = subscriber.subscriber_id().to_string();
-        emitter.subscribe(subscriber);
+        let id = wrapped.subscriber_id().to_string();
+        emitter.subscribe(wrapped);
         id
     }
 
@@ -262,19 +296,47 @@ impl APCore {
         }
     }
 
-    /// Add a before callback middleware.
+    /// Add a before callback middleware. Returns `&mut Self` for chaining.
     pub fn use_before(
         &mut self,
         middleware: Box<dyn BeforeMiddleware>,
-    ) -> Result<(), crate::errors::ModuleError> {
-        self.executor.use_before(middleware)
+    ) -> Result<&mut Self, crate::errors::ModuleError> {
+        self.executor.use_before(middleware)?;
+        Ok(self)
     }
 
-    /// Add an after callback middleware.
+    /// Add an after callback middleware. Returns `&mut Self` for chaining.
     pub fn use_after(
         &mut self,
         middleware: Box<dyn AfterMiddleware>,
-    ) -> Result<(), crate::errors::ModuleError> {
-        self.executor.use_after(middleware)
+    ) -> Result<&mut Self, crate::errors::ModuleError> {
+        self.executor.use_after(middleware)?;
+        Ok(self)
+    }
+}
+
+/// Wrapper that binds an `event_type` pattern to an inner subscriber,
+/// overriding its `event_pattern()` so the emitter only delivers matching events.
+#[derive(Debug)]
+struct EventTypeSubscriber {
+    event_type: String,
+    inner: Box<dyn EventSubscriber>,
+}
+
+#[async_trait::async_trait]
+impl EventSubscriber for EventTypeSubscriber {
+    fn subscriber_id(&self) -> &str {
+        self.inner.subscriber_id()
+    }
+
+    fn event_pattern(&self) -> &str {
+        &self.event_type
+    }
+
+    async fn on_event(
+        &self,
+        event: &crate::events::emitter::ApCoreEvent,
+    ) -> Result<(), ModuleError> {
+        self.inner.on_event(event).await
     }
 }

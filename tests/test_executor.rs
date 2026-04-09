@@ -76,6 +76,43 @@ impl Middleware for PrefixMiddleware {
     }
 }
 
+#[derive(Debug)]
+struct TagMiddleware;
+
+#[async_trait]
+impl Middleware for TagMiddleware {
+    fn name(&self) -> &str {
+        "tag"
+    }
+    async fn before(
+        &self,
+        _module_id: &str,
+        inputs: Value,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(Some(inputs))
+    }
+    async fn after(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        mut output: Value,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        output["_tagged"] = json!(true);
+        Ok(Some(output))
+    }
+    async fn on_error(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        _error: &ModuleError,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -166,6 +203,95 @@ async fn test_apcore_registry_accessor() {
 
     assert!(client.registry().has("math.add"));
     assert_eq!(client.registry().count(), 1);
+}
+
+#[tokio::test]
+async fn test_apcore_with_components() {
+    use apcore::config::Config;
+    use apcore::registry::registry::Registry;
+
+    let registry = Registry::new();
+    // Verify with_components builds a working client from registry + config
+    let config = Config::default();
+    let mut client = APCore::with_components(registry, config);
+    client.register("math.add", Box::new(AddModule)).unwrap();
+
+    let result = client
+        .call("math.add", json!({"a": 3, "b": 7}), None, None)
+        .await
+        .unwrap();
+    assert_eq!(result["result"], 10);
+}
+
+#[tokio::test]
+async fn test_apcore_disable_enable() {
+    let mut client = APCore::new();
+    client.register("math.add", Box::new(AddModule)).unwrap();
+
+    // Disable the module
+    client.disable("math.add", Some("testing")).unwrap();
+
+    // Verify calling disabled module fails
+    let err = client
+        .call("math.add", json!({"a": 1, "b": 2}), None, None)
+        .await;
+    assert!(err.is_err(), "calling a disabled module should fail");
+
+    // Re-enable the module
+    client.enable("math.add", Some("test done")).unwrap();
+
+    // Verify it works again
+    let result = client
+        .call("math.add", json!({"a": 1, "b": 2}), None, None)
+        .await
+        .unwrap();
+    assert_eq!(result["result"], 3);
+}
+
+#[tokio::test]
+async fn test_apcore_disable_nonexistent_module() {
+    let mut client = APCore::new();
+    let err = client.disable("nonexistent.module", None);
+    assert!(err.is_err(), "disabling a nonexistent module should fail");
+}
+
+#[tokio::test]
+async fn test_apcore_middleware_chaining() {
+    let mut client = APCore::new();
+    client.register("math.add", Box::new(AddModule)).unwrap();
+
+    // Verify middleware methods are truly chainable via Result<&mut Self>
+    client
+        .use_middleware(Box::new(PrefixMiddleware))
+        .unwrap()
+        .use_middleware(Box::new(TagMiddleware))
+        .unwrap();
+
+    // Verify both middleware were applied
+    let result = client
+        .call("math.add", json!({"a": 1, "b": 2}), None, None)
+        .await
+        .unwrap();
+    assert!(
+        result.get("_suffixed").is_some(),
+        "PrefixMiddleware after() should add _suffixed"
+    );
+    assert!(
+        result.get("_tagged").is_some(),
+        "TagMiddleware after() should add _tagged"
+    );
+}
+
+#[tokio::test]
+async fn test_apcore_list_modules_with_tags() {
+    let client = APCore::new();
+
+    // Verify list_modules accepts &[&str] for tags
+    let modules = client.list_modules(Some(&["math"]), None);
+    assert!(modules.is_empty());
+
+    let modules = client.list_modules(None, Some("system."));
+    assert!(modules.is_empty());
 }
 
 // Regression for sync finding A-002 — Executor.validate() must accept an

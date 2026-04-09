@@ -212,6 +212,13 @@ impl Step for BuiltinModuleLookup {
                 format!("Module '{}' not found in registry", ctx.module_id),
             )
         })?;
+        // Check if the module is disabled before proceeding.
+        if let Some(false) = registry.is_enabled(&ctx.module_id) {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleDisabled,
+                format!("Module '{}' is disabled", ctx.module_id),
+            ));
+        }
         ctx.module = Some(module);
         Ok(StepResult::continue_step())
     }
