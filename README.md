@@ -294,6 +294,35 @@ let loader = BindingLoader::new();
 loader.load_from_file(std::path::Path::new("binding.yaml")).unwrap();
 ```
 
+### Annotation overlay (cross-SDK difference)
+
+The Python and TypeScript SDKs support `*_meta.yaml` sidecar files that override
+code-defined module annotations at load time (PROTOCOL_SPEC.md  §4.13: field-level
+merge, YAML wins over code). The Rust SDK **does not** implement this feature.
+
+This is a deliberate design choice:
+
+- **Spec §4.13 is conditional**: it mandates field-level merge only "*when both* YAML
+  metadata file and code define Annotations". If the SDK never loads YAML metadata
+  files, the rule is never triggered.
+- **Rust favours explicit configuration**: annotations are declared via
+  `ModuleAnnotations` in code and are type-checked at compile time. YAML-based
+  override introduces implicit, late-bound behavior that conflicts with Rust's
+  "explicit > implicit" philosophy.
+- **No user demand**: as of v0.18.0 there are zero issues or RFCs requesting YAML
+  annotation overlays for the Rust SDK.
+
+If you need runtime-configurable annotations (e.g., ops teams toggling `readonly` or
+`requires_approval` without recompiling), you can load a YAML/JSON file yourself and
+construct `ModuleAnnotations` via `serde`:
+
+```rust
+let yaml: serde_json::Value = serde_yaml::from_reader(file)?;
+let annotations: ModuleAnnotations = serde_json::from_value(yaml)?;
+let descriptor = ModuleDescriptor { annotations, ..default_descriptor };
+registry.register("my.module", module, descriptor)?;
+```
+
 ## Examples
 
 The `examples/` directory contains runnable demos. Run any example with:
