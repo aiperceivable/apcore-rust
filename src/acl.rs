@@ -205,6 +205,9 @@ impl ACL {
 
     /// Check whether the given caller is allowed to access the target.
     /// Uses first-match-wins evaluation. Maps `None` caller to `@external`.
+    ///
+    /// Sync entry point. The shared post-decision audit logic lives in
+    /// `finalize_*` helpers so this method and `async_check` cannot drift.
     pub fn check(
         &self,
         caller_id: Option<&str>,
@@ -214,48 +217,16 @@ impl ACL {
         let caller = caller_id.unwrap_or("@external");
 
         if self.rules.is_empty() {
-            let entry = self.build_audit_entry(
-                caller,
-                target_id,
-                &self.default_effect,
-                "no_rules",
-                None,
-                None,
-                ctx,
-            );
-            self.emit_audit(&entry);
-            return Ok(self.default_effect == "allow");
+            return Ok(self.finalize_no_rules(caller, target_id, ctx));
         }
 
         for (idx, rule) in self.rules.iter().enumerate() {
             if self.matches_rule(rule, caller, target_id, ctx) {
-                let decision = &rule.effect;
-                let entry = self.build_audit_entry(
-                    caller,
-                    target_id,
-                    decision,
-                    "rule_match",
-                    rule.description.as_deref(),
-                    Some(idx),
-                    ctx,
-                );
-                self.emit_audit(&entry);
-                return Ok(decision == "allow");
+                return Ok(self.finalize_rule_match(idx, rule, caller, target_id, ctx));
             }
         }
 
-        // No rule matched — use default effect.
-        let entry = self.build_audit_entry(
-            caller,
-            target_id,
-            &self.default_effect,
-            "default_effect",
-            None,
-            None,
-            ctx,
-        );
-        self.emit_audit(&entry);
-        Ok(self.default_effect == "allow")
+        Ok(self.finalize_default_effect(caller, target_id, ctx))
     }
 
     /// Load ACL rules from a YAML file.
@@ -430,6 +401,93 @@ impl ACL {
         Self::evaluate_conditions(&map, ctx)
     }
 
+    /// Async counterpart to `check_conditions`. Drives async condition handlers
+    /// via `evaluate_conditions_async` so handlers that genuinely suspend are
+    /// awaited rather than treated as unsatisfied.
+    async fn check_conditions_async(
+        &self,
+        conditions: &serde_json::Value,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        let ctx = match ctx {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let obj = match conditions.as_object() {
+            Some(o) => o,
+            None => return false,
+        };
+
+        let map: HashMap<String, serde_json::Value> =
+            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        Self::evaluate_conditions_async(&map, ctx).await
+    }
+
+    /// Audit + return for the empty-rules path. Shared by `check` and `async_check`.
+    fn finalize_no_rules(
+        &self,
+        caller: &str,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        let entry = self.build_audit_entry(
+            caller,
+            target_id,
+            &self.default_effect,
+            "no_rules",
+            None,
+            None,
+            ctx,
+        );
+        self.emit_audit(&entry);
+        self.default_effect == "allow"
+    }
+
+    /// Audit + return for a matched rule. Shared by `check` and `async_check`.
+    fn finalize_rule_match(
+        &self,
+        idx: usize,
+        rule: &ACLRule,
+        caller: &str,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        let entry = self.build_audit_entry(
+            caller,
+            target_id,
+            &rule.effect,
+            "rule_match",
+            rule.description.as_deref(),
+            Some(idx),
+            ctx,
+        );
+        self.emit_audit(&entry);
+        rule.effect == "allow"
+    }
+
+    /// Audit + return for the no-rule-matched path. Shared by `check` and
+    /// `async_check`.
+    fn finalize_default_effect(
+        &self,
+        caller: &str,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        let entry = self.build_audit_entry(
+            caller,
+            target_id,
+            &self.default_effect,
+            "default_effect",
+            None,
+            None,
+            ctx,
+        );
+        self.emit_audit(&entry);
+        self.default_effect == "allow"
+    }
+
     /// Build an audit entry from the check parameters and context.
     #[allow(clippy::too_many_arguments)]
     fn build_audit_entry(
@@ -462,6 +520,10 @@ impl ACL {
 
     /// Async check whether the given caller is allowed to access the target.
     /// Uses first-match-wins evaluation with async condition handler support.
+    ///
+    /// Async entry point. Shares all audit construction with `check` via the
+    /// `finalize_*` helpers so the two methods cannot drift on logging fields,
+    /// reason strings, or default-effect mapping.
     pub async fn async_check(
         &self,
         caller_id: Option<&str>,
@@ -471,50 +533,22 @@ impl ACL {
         let caller = caller_id.unwrap_or("@external");
 
         if self.rules.is_empty() {
-            let entry = self.build_audit_entry(
-                caller,
-                target_id,
-                &self.default_effect,
-                "no_rules",
-                None,
-                None,
-                ctx,
-            );
-            self.emit_audit(&entry);
-            return Ok(self.default_effect == "allow");
+            return Ok(self.finalize_no_rules(caller, target_id, ctx));
         }
 
         for (idx, rule) in self.rules.iter().enumerate() {
             if self.matches_rule_async(rule, caller, target_id, ctx).await {
-                let decision = &rule.effect;
-                let entry = self.build_audit_entry(
-                    caller,
-                    target_id,
-                    decision,
-                    "rule_match",
-                    rule.description.as_deref(),
-                    Some(idx),
-                    ctx,
-                );
-                self.emit_audit(&entry);
-                return Ok(decision == "allow");
+                return Ok(self.finalize_rule_match(idx, rule, caller, target_id, ctx));
             }
         }
 
-        let entry = self.build_audit_entry(
-            caller,
-            target_id,
-            &self.default_effect,
-            "default_effect",
-            None,
-            None,
-            ctx,
-        );
-        self.emit_audit(&entry);
-        Ok(self.default_effect == "allow")
+        Ok(self.finalize_default_effect(caller, target_id, ctx))
     }
 
     /// Async version of matches_rule that awaits async condition handlers.
+    /// Mirrors the sync `matches_rule` exactly except it routes condition
+    /// evaluation through `check_conditions_async` so async handlers are awaited
+    /// rather than polled-once.
     async fn matches_rule_async(
         &self,
         rule: &ACLRule,
@@ -531,17 +565,7 @@ impl ACL {
         }
 
         if let Some(ref conditions) = rule.conditions {
-            let ctx = match ctx {
-                Some(c) => c,
-                None => return false,
-            };
-            let obj = match conditions.as_object() {
-                Some(o) => o,
-                None => return false,
-            };
-            let map: HashMap<String, serde_json::Value> =
-                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            if !Self::evaluate_conditions_async(&map, ctx).await {
+            if !self.check_conditions_async(conditions, ctx).await {
                 return false;
             }
         }
