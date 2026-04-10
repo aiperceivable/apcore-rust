@@ -165,13 +165,16 @@ async fn main() {
 ### With configuration
 
 ```rust
-use apcore::{APCore, Config};
-use std::path::Path;
+use apcore::APCore;
 
 #[tokio::main]
 async fn main() {
-    let config = Config::from_yaml_file(Path::new("apcore.yaml")).unwrap();
-    let client = APCore::with_config(config);
+    // Load directly from file path
+    let client = APCore::from_path("apcore.yaml").unwrap();
+
+    // Or load and modify config before constructing
+    // let config = Config::from_yaml_file(Path::new("apcore.yaml")).unwrap();
+    // let client = APCore::with_config(config);
 }
 ```
 

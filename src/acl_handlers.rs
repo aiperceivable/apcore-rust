@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::context::Context;
 
@@ -17,11 +17,11 @@ pub trait ACLConditionHandler: Send + Sync {
 }
 
 /// Global registry of condition handlers.
-pub static CONDITION_HANDLERS: LazyLock<RwLock<HashMap<String, Box<dyn ACLConditionHandler>>>> =
+pub static CONDITION_HANDLERS: LazyLock<RwLock<HashMap<String, Arc<dyn ACLConditionHandler>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Register a condition handler globally. Replaces any existing handler for the same key.
-pub fn register_condition(key: impl Into<String>, handler: Box<dyn ACLConditionHandler>) {
+pub fn register_condition(key: impl Into<String>, handler: Arc<dyn ACLConditionHandler>) {
     if let Ok(mut map) = CONDITION_HANDLERS.write() {
         map.insert(key.into(), handler);
     }
@@ -149,9 +149,9 @@ impl ACLConditionHandler for NotHandler {
 
 /// Register all built-in handlers. Called once during initialization.
 pub fn register_builtin_handlers(evaluate_fn: EvalFn) {
-    register_condition("identity_types", Box::new(IdentityTypesHandler));
-    register_condition("roles", Box::new(RolesHandler));
-    register_condition("max_call_depth", Box::new(MaxCallDepthHandler));
-    register_condition("$or", Box::new(OrHandler::new(evaluate_fn)));
-    register_condition("$not", Box::new(NotHandler::new(evaluate_fn)));
+    register_condition("identity_types", Arc::new(IdentityTypesHandler));
+    register_condition("roles", Arc::new(RolesHandler));
+    register_condition("max_call_depth", Arc::new(MaxCallDepthHandler));
+    register_condition("$or", Arc::new(OrHandler::new(evaluate_fn)));
+    register_condition("$not", Arc::new(NotHandler::new(evaluate_fn)));
 }

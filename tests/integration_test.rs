@@ -59,6 +59,20 @@ fn test_cancel_token() {
 }
 
 #[test]
+fn test_apcore_from_path() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("apcore.yaml");
+    std::fs::write(
+        &config_path,
+        "apcore:\n  executor:\n    max_call_depth: 42\n",
+    )
+    .unwrap();
+
+    let client = apcore::client::APCore::from_path(config_path).unwrap();
+    assert_eq!(client.config.executor.max_call_depth, 42);
+}
+
+#[test]
 fn test_identity_creation() {
     let identity = Identity::new(
         "user-1".to_string(),

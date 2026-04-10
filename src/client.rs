@@ -93,6 +93,12 @@ impl APCore {
         }
     }
 
+    /// Create a new APCore client from a configuration file path.
+    pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self, ModuleError> {
+        let config = Config::load(path.as_ref())?;
+        Ok(Self::with_config(config))
+    }
+
     /// Call (execute) a module by ID with the given inputs.
     pub async fn call(
         &self,
@@ -104,17 +110,6 @@ impl APCore {
         self.executor
             .call(module_id, inputs, ctx, version_hint)
             .await
-    }
-
-    /// Alias for `call()` — provided for spec compatibility.
-    pub async fn call_async(
-        &self,
-        module_id: &str,
-        inputs: serde_json::Value,
-        ctx: Option<&Context<serde_json::Value>>,
-        version_hint: Option<&str>,
-    ) -> Result<serde_json::Value, ModuleError> {
-        self.call(module_id, inputs, ctx, version_hint).await
     }
 
     /// Validate module inputs without executing (spec §12.3).

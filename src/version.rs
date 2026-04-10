@@ -3,9 +3,6 @@
 
 use crate::errors::{ErrorCode, ModuleError, VersionIncompatibleError};
 
-/// The current protocol version supported by this SDK.
-pub const PROTOCOL_VERSION: &str = "0.16.0";
-
 /// A parsed semver version with optional prerelease suffix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SemVer {
@@ -131,15 +128,4 @@ pub fn negotiate_version(declared_version: &str, sdk_version: &str) -> Result<St
     // Same minor -> return max(declared, sdk)
     let effective = std::cmp::max(&declared, &sdk);
     Ok(effective.to_string_repr())
-}
-
-/// Check if two versions are compatible (same major, server minor >= client minor).
-pub fn is_compatible(client_version: &str, server_version: &str) -> bool {
-    let client = parse_semver(client_version);
-    let server = parse_semver(server_version);
-
-    match (client, server) {
-        (Some(c), Some(s)) => c.major == s.major && s.minor >= c.minor,
-        _ => false,
-    }
 }

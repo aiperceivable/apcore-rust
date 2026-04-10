@@ -199,6 +199,21 @@ impl<'de> Deserialize<'de> for Config {
             )));
         }
 
+        let mut core_data = raw.clone();
+        let mut mode = ConfigMode::Legacy;
+
+        // §9.6: If "apcore" key is present, it's namespace mode.
+        if let Some(apcore_val) = raw.get("apcore") {
+            if let Some(apcore_obj) = apcore_val.as_object() {
+                mode = ConfigMode::Namespace;
+                // Merge apcore-namespace fields into the top-level core_data
+                // so ConfigHelper can find them.
+                for (k, v) in apcore_obj {
+                    core_data.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
         #[derive(Deserialize)]
         struct ConfigHelper {
             #[serde(default)]
@@ -211,8 +226,8 @@ impl<'de> Deserialize<'de> for Config {
             user_namespaces: HashMap<String, serde_json::Value>,
         }
 
-        let helper: ConfigHelper =
-            serde_json::from_value(serde_json::Value::Object(raw)).map_err(D::Error::custom)?;
+        let helper: ConfigHelper = serde_json::from_value(serde_json::Value::Object(core_data))
+            .map_err(D::Error::custom)?;
 
         Ok(Config {
             modules_path: helper.modules_path,
@@ -220,7 +235,7 @@ impl<'de> Deserialize<'de> for Config {
             observability: helper.observability,
             user_namespaces: helper.user_namespaces,
             yaml_path: None,
-            mode: ConfigMode::default(),
+            mode,
         })
     }
 }

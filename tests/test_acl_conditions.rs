@@ -64,7 +64,7 @@ fn test_register_condition_adds_handler() {
         }
     }
 
-    register_condition("_test_custom_rs", Box::new(TestHandler));
+    register_condition("_test_custom_rs", Arc::new(TestHandler));
     let handlers = CONDITION_HANDLERS.read().unwrap();
     assert!(handlers.contains_key("_test_custom_rs"));
 }

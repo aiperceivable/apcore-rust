@@ -124,13 +124,6 @@ pub fn guard_call_chain_with_repeat(
     Ok(())
 }
 
-/// Propagate an error with additional context appended to the message.
-pub fn propagate_error(error: ModuleError, context: &str) -> ModuleError {
-    let mut new_error = error.clone();
-    new_error.message = format!("{} [context: {}]", error.message, context);
-    new_error
-}
-
 /// Convert a single segment to snake_case by detecting case boundaries.
 ///
 /// Matches Algorithm A02 from the apcore protocol spec:

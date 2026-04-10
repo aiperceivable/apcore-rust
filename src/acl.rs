@@ -111,21 +111,28 @@ impl ACL {
         conditions: &HashMap<String, serde_json::Value>,
         ctx: &Context<serde_json::Value>,
     ) -> bool {
-        let handlers = match CONDITION_HANDLERS.read() {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("Condition handler registry lock poisoned: {}", e);
-                return false;
-            }
-        };
-        for (key, value) in conditions {
-            let handler = match handlers.get(key.as_str()) {
-                Some(h) => h,
-                None => {
-                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+        let mut to_evaluate = Vec::with_capacity(conditions.len());
+        {
+            let handlers = match CONDITION_HANDLERS.read() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!("Condition handler registry lock poisoned: {}", e);
                     return false;
                 }
             };
+            for (key, value) in conditions {
+                let handler = match handlers.get(key.as_str()) {
+                    Some(h) => h.clone(),
+                    None => {
+                        tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                        return false;
+                    }
+                };
+                to_evaluate.push((key, handler, value));
+            }
+        }
+
+        for (key, handler, value) in to_evaluate {
             // Built-in handlers are trivially async (return immediately).
             // We poll the future once — if it's not ready, treat as unsatisfied.
             let fut = handler.evaluate(value, ctx);
@@ -155,26 +162,32 @@ impl ACL {
     /// as `Box<dyn ACLConditionHandler>` (not `Arc`) and must be borrowed from
     /// the map.  All built-in handlers resolve immediately (no real suspension),
     /// and the registry is only mutated at startup, so contention is negligible.
-    #[allow(clippy::await_holding_lock)] // see doc comment above
     pub async fn evaluate_conditions_async(
         conditions: &HashMap<String, serde_json::Value>,
         ctx: &Context<serde_json::Value>,
     ) -> bool {
-        let handlers = match CONDITION_HANDLERS.read() {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("Condition handler registry lock poisoned: {}", e);
-                return false;
-            }
-        };
-        for (key, value) in conditions {
-            let handler = match handlers.get(key.as_str()) {
-                Some(h) => h,
-                None => {
-                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+        let mut to_evaluate = Vec::with_capacity(conditions.len());
+        {
+            let handlers = match CONDITION_HANDLERS.read() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!("Condition handler registry lock poisoned: {}", e);
                     return false;
                 }
             };
+            for (key, value) in conditions {
+                let handler = match handlers.get(key.as_str()) {
+                    Some(h) => h.clone(),
+                    None => {
+                        tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                        return false;
+                    }
+                };
+                to_evaluate.push((handler, value));
+            }
+        }
+
+        for (handler, value) in to_evaluate {
             if !handler.evaluate(value, ctx).await {
                 return false;
             }

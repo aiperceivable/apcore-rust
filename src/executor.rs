@@ -458,17 +458,6 @@ impl Executor {
         Ok(output.unwrap_or(serde_json::Value::Null))
     }
 
-    /// Alias for `call()` — provided for spec compatibility.
-    pub async fn call_async(
-        &self,
-        module_id: &str,
-        inputs: serde_json::Value,
-        ctx: Option<&Context<serde_json::Value>>,
-        version_hint: Option<&str>,
-    ) -> Result<serde_json::Value, ModuleError> {
-        self.call(module_id, inputs, ctx, version_hint).await
-    }
-
     /// Validate module inputs without executing (steps 1-7, spec §12.3).
     ///
     /// Runs the pipeline in `dry_run` mode — pure steps only, side-effecting
