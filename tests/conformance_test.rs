@@ -489,7 +489,7 @@ fn build_context_from_input(input: &Value) -> Context<Value> {
     }
 
     if let Some(data_obj) = input.get("data").and_then(|d| d.as_object()) {
-        let mut data = ctx.data.write().unwrap();
+        let mut data = ctx.data.write();
         for (k, v) in data_obj {
             data.insert(k.clone(), v.clone());
         }

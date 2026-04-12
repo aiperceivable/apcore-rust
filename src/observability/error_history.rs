@@ -3,9 +3,10 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
@@ -54,7 +55,7 @@ impl ErrorHistory {
 
     /// Record an error for a module. Deduplicates by (error_code, message).
     pub fn record(&self, module_id: &str, error: &ModuleError) {
-        let mut map = self.entries.lock().unwrap();
+        let mut map = self.entries.lock();
         let error_code = format!("{:?}", error.code);
         let now = Utc::now();
 
@@ -118,7 +119,7 @@ impl ErrorHistory {
 
     /// Get errors for a specific module, newest first.
     pub fn get(&self, module_id: &str, limit: Option<usize>) -> Vec<ErrorEntry> {
-        let map = self.entries.lock().unwrap();
+        let map = self.entries.lock();
         match map.get(module_id) {
             Some(entries) => {
                 let mut result: Vec<ErrorEntry> = entries.iter().cloned().collect();
@@ -134,7 +135,7 @@ impl ErrorHistory {
 
     /// Get all recorded errors across all modules, sorted by last_occurred desc.
     pub fn get_all(&self, limit: Option<usize>) -> Vec<ErrorEntry> {
-        let map = self.entries.lock().unwrap();
+        let map = self.entries.lock();
         let mut all: Vec<ErrorEntry> = map
             .values()
             .flat_map(|entries| entries.iter().cloned())
@@ -148,7 +149,7 @@ impl ErrorHistory {
 
     /// Clear errors. If module_id is Some, clear only that module; otherwise clear all.
     pub fn clear(&self, module_id: Option<&str>) {
-        let mut map = self.entries.lock().unwrap();
+        let mut map = self.entries.lock();
         match module_id {
             Some(id) => {
                 map.remove(id);

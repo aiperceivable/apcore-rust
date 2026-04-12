@@ -7,7 +7,9 @@ pub mod manifest;
 pub mod usage;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -43,22 +45,19 @@ impl ToggleState {
     }
 
     pub fn is_disabled(&self, module_id: &str) -> bool {
-        // INVARIANT: RwLock is only poisoned on a panic inside a write guard.
-        self.disabled.read().unwrap().contains(module_id)
+        self.disabled.read().contains(module_id)
     }
 
     pub fn disable(&self, module_id: &str) {
-        // INVARIANT: as above.
-        self.disabled.write().unwrap().insert(module_id.to_string());
+        self.disabled.write().insert(module_id.to_string());
     }
 
     pub fn enable(&self, module_id: &str) {
-        // INVARIANT: RwLock is only poisoned on a panic inside a write guard.
-        self.disabled.write().unwrap().remove(module_id);
+        self.disabled.write().remove(module_id);
     }
 
     pub fn clear(&self) {
-        self.disabled.write().unwrap().clear();
+        self.disabled.write().clear();
     }
 }
 
@@ -193,14 +192,12 @@ pub struct SysModulesContext {
 /// 4. Register health, manifest, and usage modules (always).
 /// 5. If `sys_modules.events.enabled`: register control modules + EventEmitter.
 ///
-/// # Panics
-///
-/// Panics if called from within a tokio async runtime. This function uses
-/// `blocking_lock()` internally and must be called from a synchronous context
-/// (e.g. application startup, before entering the async runtime).
+/// The registry is shared via `Arc<Registry>` — `Registry` provides interior
+/// mutability, so no external `Mutex` wrapper is needed and this function is
+/// fully synchronous and runtime-agnostic.
 pub fn register_sys_modules(
-    registry: Arc<Mutex<Registry>>,
-    executor: &mut Executor,
+    registry: Arc<Registry>,
+    executor: &Executor,
     config: &Config,
     metrics_collector: Option<MetricsCollector>,
 ) -> Option<SysModulesContext> {
@@ -231,7 +228,35 @@ pub fn register_sys_modules(
     let _ = executor.use_middleware(Box::new(usage_middleware));
 
     let config_arc = Arc::new(Mutex::new(config.clone()));
-    let emitter_arc = Arc::new(Mutex::new(EventEmitter::new()));
+
+    // Build the EventEmitter up-front as an owned value so we can populate
+    // its subscribers from config synchronously, then wrap it in the Arc<Mutex<_>>
+    // shared with sys modules.
+    let mut emitter = EventEmitter::new();
+
+    let events_enabled = config
+        .get("sys_modules.events.enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if events_enabled {
+        // Instantiate subscribers from config while we still own `emitter`
+        // directly — no lock required.
+        if let Some(subs) = config.get("sys_modules.events.subscribers") {
+            if let Some(arr) = subs.as_array() {
+                for sub_config in arr {
+                    match create_subscriber(sub_config) {
+                        Ok(subscriber) => emitter.subscribe(subscriber),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to create subscriber from config");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let emitter_arc = Arc::new(Mutex::new(emitter));
     let toggle_state = Arc::new(ToggleState::new());
 
     // --- Step 4: Build module list (health + manifest + usage always) ---
@@ -287,11 +312,6 @@ pub fn register_sys_modules(
     ];
 
     // --- Step 5: Control modules only if events.enabled ---
-    let events_enabled = config
-        .get("sys_modules.events.enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
     if events_enabled {
         // Step 5a: PlatformNotifyMiddleware (gets its own EventEmitter instance).
         let error_rate_threshold = config
@@ -309,21 +329,6 @@ pub fn register_sys_modules(
             latency_p99_threshold,
         );
         let _ = executor.use_middleware(Box::new(pn_middleware));
-
-        // Step 5b: Instantiate subscribers from config
-        if let Some(subs) = config.get("sys_modules.events.subscribers") {
-            if let Some(arr) = subs.as_array() {
-                let mut em = emitter_arc.blocking_lock();
-                for sub_config in arr {
-                    match create_subscriber(sub_config) {
-                        Ok(subscriber) => em.subscribe(subscriber),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to create subscriber from config");
-                        }
-                    }
-                }
-            }
-        }
 
         // Step 5c: Control modules
         modules.push((
@@ -355,9 +360,6 @@ pub fn register_sys_modules(
 
     // --- Register all modules ---
     let mut registered: HashMap<String, serde_json::Value> = HashMap::new();
-    // INVARIANT: This function is called from a synchronous context; no
-    // concurrent holder of this lock exists before registration completes.
-    let mut reg = registry.blocking_lock();
 
     for (id, module, tags) in modules {
         let is_control = tags.contains(&"control".to_string());
@@ -379,7 +381,7 @@ pub fn register_sys_modules(
             "name": id,
             "description": module.description(),
         });
-        match reg.register_internal(id, module, descriptor) {
+        match registry.register_internal(id, module, descriptor) {
             Ok(()) => {
                 registered.insert(id.to_string(), info);
             }
@@ -389,17 +391,15 @@ pub fn register_sys_modules(
         }
     }
 
-    // Step 5d: Bridge registry events to EventEmitter.
-    // Registry callbacks are synchronous; emit is async. We log the event
-    // and use try_lock to best-effort emit without blocking.
+    // Step 5d: Bridge registry events to tracing logs.
     if events_enabled {
-        reg.on(
+        registry.on(
             "register",
             Box::new(move |module_id: &str, _module: &dyn Module| {
                 tracing::info!(module_id = %module_id, "module_registered");
             }),
         );
-        reg.on(
+        registry.on(
             "unregister",
             Box::new(move |module_id: &str, _module: &dyn Module| {
                 tracing::info!(module_id = %module_id, "module_unregistered");

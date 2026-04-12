@@ -1,9 +1,13 @@
 // APCore Protocol — Executor
 // Spec reference: Module execution engine
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
 
+use futures_core::Stream;
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::acl::ACL;
@@ -124,6 +128,28 @@ pub fn has_schema(schema: &Value) -> bool {
 
 /// Sentinel value used to replace sensitive fields in redacted output.
 pub const REDACTED_VALUE: &str = "***REDACTED***";
+
+/// Internal: result of `Executor::prepare_stream`. Carries everything the
+/// streaming body needs to invoke `module.stream()` and run Phase 3.
+struct StreamSetup {
+    module: Arc<dyn crate::module::Module>,
+    inputs: Value,
+    context: Context<Value>,
+    output_schema: Value,
+    middleware_manager: Option<Arc<MiddlewareManager>>,
+}
+
+/// Build a `ModuleError` for the case where a module does not implement
+/// `stream()` (returns `None`).
+fn streaming_not_supported_error(module_id: &str) -> ModuleError {
+    ModuleError::new(
+        ErrorCode::GeneralNotImplemented,
+        format!(
+            "Module '{}' does not support streaming (Module::stream returned None)",
+            module_id
+        ),
+    )
+}
 
 /// Validate a JSON value against a JSON Schema.
 /// Returns Ok(()) if valid, or a ModuleError with SchemaValidationError on failure.
@@ -280,7 +306,7 @@ static STRATEGY_REGISTRY: LazyLock<RwLock<Vec<StrategyInfo>>> =
 ///
 /// Replaces any existing entry with the same name.
 pub fn register_strategy(info: StrategyInfo) {
-    let mut registry = STRATEGY_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    let mut registry = STRATEGY_REGISTRY.write();
     // Replace existing entry with same name, or append.
     if let Some(existing) = registry.iter_mut().find(|s| s.name == info.name) {
         *existing = info;
@@ -291,15 +317,7 @@ pub fn register_strategy(info: StrategyInfo) {
 
 /// List all registered strategy summaries.
 pub fn list_strategies() -> Vec<StrategyInfo> {
-    STRATEGY_REGISTRY
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-/// Describe a pipeline by returning step names and descriptions from a strategy.
-pub fn describe_pipeline(strategy: &ExecutionStrategy) -> StrategyInfo {
-    strategy.info()
+    STRATEGY_REGISTRY.read().clone()
 }
 
 /// Responsible for executing modules with middleware, ACL, and context management.
@@ -315,13 +333,15 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// Create a new executor with the given registry and config.
+    /// Create a new executor with the given (shared) registry and config.
     ///
     /// Builds a standard execution strategy — all calls go through PipelineEngine.
-    pub fn new(registry: Registry, config: Config) -> Self {
+    /// Accepts either an owned `Registry`/`Config` (convenient for tests) or a
+    /// pre-shared `Arc<Registry>`/`Arc<Config>` (required for runtime wiring).
+    pub fn new(registry: impl Into<Arc<Registry>>, config: impl Into<Arc<Config>>) -> Self {
         Self {
-            registry: Arc::new(registry),
-            config: Arc::new(config),
+            registry: registry.into(),
+            config: config.into(),
             acl: None,
             approval_handler: None,
             middleware_manager: Arc::new(MiddlewareManager::new()),
@@ -334,14 +354,14 @@ impl Executor {
     /// Built-in preset names: `"standard"`, `"internal"`, `"testing"`,
     /// `"performance"`, `"minimal"`.
     pub fn with_strategy_name(
-        registry: Registry,
-        config: Config,
+        registry: impl Into<Arc<Registry>>,
+        config: impl Into<Arc<Config>>,
         name: &str,
     ) -> Result<Self, ModuleError> {
         let strategy = resolve_strategy_by_name(name)?;
         Ok(Self {
-            registry: Arc::new(registry),
-            config: Arc::new(config),
+            registry: registry.into(),
+            config: config.into(),
             acl: None,
             approval_handler: None,
             middleware_manager: Arc::new(MiddlewareManager::new()),
@@ -350,10 +370,14 @@ impl Executor {
     }
 
     /// Create a new executor with a custom execution strategy.
-    pub fn with_strategy(registry: Registry, config: Config, strategy: ExecutionStrategy) -> Self {
+    pub fn with_strategy(
+        registry: impl Into<Arc<Registry>>,
+        config: impl Into<Arc<Config>>,
+        strategy: ExecutionStrategy,
+    ) -> Self {
         Self {
-            registry: Arc::new(registry),
-            config: Arc::new(config),
+            registry: registry.into(),
+            config: config.into(),
             acl: None,
             approval_handler: None,
             middleware_manager: Arc::new(MiddlewareManager::new()),
@@ -363,13 +387,13 @@ impl Executor {
 
     /// Create a new executor with all optional parameters.
     pub fn with_options(
-        registry: Registry,
-        config: Config,
+        registry: impl Into<Arc<Registry>>,
+        config: impl Into<Arc<Config>>,
         middlewares: Option<Vec<Box<dyn Middleware>>>,
         acl: Option<ACL>,
         approval_handler: Option<Box<dyn ApprovalHandler>>,
     ) -> Self {
-        let mut middleware_manager = MiddlewareManager::new();
+        let middleware_manager = MiddlewareManager::new();
         if let Some(mws) = middlewares {
             for mw in mws {
                 // Middleware provided at construction time is trusted; log and
@@ -380,8 +404,8 @@ impl Executor {
             }
         }
         Self {
-            registry: Arc::new(registry),
-            config: Arc::new(config),
+            registry: registry.into(),
+            config: config.into(),
             acl: acl.map(Arc::new),
             approval_handler: approval_handler.map(|h| Arc::from(h) as Arc<dyn ApprovalHandler>),
             middleware_manager: Arc::new(middleware_manager),
@@ -412,21 +436,23 @@ impl Executor {
     /// Add a middleware to the pipeline.
     ///
     /// Returns an error if the middleware's priority exceeds the allowed range.
-    pub fn use_middleware(&mut self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
-        Arc::get_mut(&mut self.middleware_manager)
-            .expect("middleware_manager not shared yet")
-            .add(middleware)
+    ///
+    /// Takes `&self` — `MiddlewareManager` uses interior mutability, so the
+    /// executor can be held behind a shared reference and still have
+    /// middleware added after construction. This removes the previous
+    /// `Arc::get_mut` hack that panicked once the middleware manager was
+    /// cloned into a pipeline context.
+    pub fn use_middleware(&self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
+        self.middleware_manager.add(middleware)
     }
 
     /// Remove a middleware by name.
-    pub fn remove(&mut self, name: &str) -> bool {
-        Arc::get_mut(&mut self.middleware_manager)
-            .expect("middleware_manager not shared yet")
-            .remove(name)
+    pub fn remove(&self, name: &str) -> bool {
+        self.middleware_manager.remove(name)
     }
 
     /// Remove a middleware by name (legacy alias).
-    pub fn remove_middleware(&mut self, name: &str) -> bool {
+    pub fn remove_middleware(&self, name: &str) -> bool {
         self.remove(name)
     }
 
@@ -502,7 +528,7 @@ impl Executor {
                 checks.extend(trace_to_checks(&pipe_ctx.trace));
                 let check_name = match e.code {
                     ErrorCode::ModuleNotFound => "module_lookup",
-                    ErrorCode::AclDenied => "acl",
+                    ErrorCode::ACLDenied => "acl",
                     ErrorCode::SchemaValidationError | ErrorCode::GeneralInvalidInput => "schema",
                     ErrorCode::CallDepthExceeded | ErrorCode::CircularCall => "call_chain",
                     _ => "unknown",
@@ -536,80 +562,191 @@ impl Executor {
     }
 
     /// Create an executor from a registry and config.
-    pub fn from_registry(registry: Registry, config: Config) -> Self {
+    pub fn from_registry(
+        registry: impl Into<Arc<Registry>>,
+        config: impl Into<Arc<Config>>,
+    ) -> Self {
         Self::new(registry, config)
     }
 
     /// Stream execution of a module.
     ///
-    /// Three-phase streaming aligned with Python/TypeScript SDKs:
-    /// - **Phase 1:** Run pipeline stages 1-8. If the module supports streaming,
-    ///   `module.stream()` is called instead of `module.execute()`.
-    /// - **Phase 2:** Collect streamed chunks and accumulate into a merged result.
-    /// - **Phase 3:** Run output_validation + middleware_after on the accumulated
-    ///   output for post-stream validation.
+    /// Returns an async `Stream` of output chunks. Each chunk is delivered to
+    /// the caller *as soon as it is produced* by the underlying module — no
+    /// buffering — so this is true incremental streaming.
     ///
-    /// If the module does not support streaming, falls back to a single-element
-    /// result from `execute()`.
-    pub async fn stream(
-        &self,
+    /// Pipeline phases:
+    /// - **Phase 1 (pre-stream):** context creation, call-chain guard, module
+    ///   lookup, ACL check, approval gate, before-middleware, input validation.
+    ///   Any failure surfaces as the first (and only) `Err` item in the stream.
+    /// - **Phase 2 (body):** call `module.stream()`, forward each chunk to the
+    ///   caller as it arrives, and accumulate copies into a buffer for Phase 3.
+    /// - **Phase 3 (post-stream):** after the inner stream is exhausted,
+    ///   deep-merge the accumulated chunks, validate the merged result against
+    ///   the module's output schema, then run after-middleware. If either step
+    ///   fails, the error is yielded as the final item of the output stream.
+    ///
+    /// If the module does not implement `stream()` (returns `None`), an error
+    /// with `ErrorCode::GeneralNotImplemented` is yielded.
+    pub fn stream<'a>(
+        &'a self,
         module_id: &str,
         inputs: Value,
         ctx: Option<&Context<Value>>,
         version_hint: Option<&str>,
-    ) -> Result<Vec<Value>, ModuleError> {
-        // Phase 1: Run pipeline up to execute step with stream flag.
-        let context = match ctx {
-            Some(c) => c.clone(),
-            None => Context::<Value>::new(Identity::new(
+    ) -> Pin<Box<dyn Stream<Item = Result<Value, ModuleError>> + Send + 'a>> {
+        // Capture by value so the returned Stream is `'a` (only borrowing &self).
+        let module_id_owned = module_id.to_string();
+        let version_hint_owned = version_hint.map(str::to_string);
+        let initial_context = ctx.cloned();
+
+        Box::pin(async_stream::try_stream! {
+            // Phase 1: pre-stream setup. Any error short-circuits the whole stream.
+            let mut setup = self
+                .prepare_stream(
+                    &module_id_owned,
+                    inputs,
+                    initial_context,
+                    version_hint_owned.as_deref(),
+                )
+                .await?;
+
+            // Phase 2: invoke module.stream() and forward chunks as they arrive.
+            let mut inner = match setup.module.stream(setup.inputs.clone(), &setup.context) {
+                Some(s) => s,
+                None => {
+                    Err(streaming_not_supported_error(&module_id_owned))?;
+                    // Unreachable: the `?` above always returns from the block.
+                    return;
+                }
+            };
+
+            let mut accumulated: Vec<Value> = Vec::new();
+            while let Some(chunk_result) = inner.next().await {
+                let chunk = chunk_result?;
+                accumulated.push(chunk.clone());
+                yield chunk;
+            }
+
+            // Phase 3: post-stream validation + middleware_after on the merged output.
+            // Errors here become the final `Err` item delivered to the caller.
+            let merged = deep_merge_chunks(&accumulated);
+            validate_against_schema(&merged, &setup.output_schema, "Output")?;
+            if let Some(ref mm) = setup.middleware_manager {
+                mm.execute_after(&module_id_owned, setup.inputs.clone(), merged, &setup.context)
+                    .await?;
+            }
+            // We intentionally do NOT yield the merged result — chunks are the
+            // payload, Phase 3 is pure side effects (validation + observation).
+            let _ = &mut setup; // silence unused-mut on the no-error path
+        })
+    }
+
+    /// Run Phase 1 of the streaming pipeline: every step up to (but not
+    /// including) `execute`. Returns the resolved module, the (possibly
+    /// middleware-mutated) inputs, the prepared context, the module's output
+    /// schema, and a handle to the middleware manager for after-middleware.
+    async fn prepare_stream(
+        &self,
+        module_id: &str,
+        inputs: Value,
+        ctx: Option<Context<Value>>,
+        version_hint: Option<&str>,
+    ) -> Result<StreamSetup, ModuleError> {
+        let context = ctx.unwrap_or_else(|| {
+            Context::<Value>::new(Identity::new(
                 "@external".to_string(),
                 "external".to_string(),
                 vec![],
                 Default::default(),
-            )),
-        };
-        let mut pipe_ctx =
-            PipelineContext::new(module_id, inputs.clone(), context, self.strategy.name());
-        pipe_ctx.stream = true;
+            ))
+        });
+
+        let mut pipe_ctx = PipelineContext::new(module_id, inputs, context, self.strategy.name());
         if let Some(hint) = version_hint {
             pipe_ctx.version_hint = Some(hint.to_string());
         }
         self.inject_resources(&mut pipe_ctx);
 
-        // Run the full pipeline — BuiltinExecute will detect ctx.stream and
-        // attempt module.stream(). If the module doesn't support streaming it
-        // falls back to execute().
-        let (output, _trace) = PipelineEngine::run(&self.strategy, &mut pipe_ctx).await?;
-
-        // Phase 2: Check if streaming produced chunks.
-        if let Some(chunks) = pipe_ctx.stream_chunks.take() {
-            if !chunks.is_empty() {
-                // Accumulate chunks into a single merged output for post-validation.
-                let accumulated = deep_merge_chunks(&chunks);
-
-                // Phase 3: Run output_validation + middleware_after on accumulated.
-                // We do this by re-running only the post-execute steps.
-                pipe_ctx.output = Some(accumulated);
-                let post_steps: Vec<&str> =
-                    vec!["output_validation", "middleware_after", "return_result"];
-                for step in self.strategy.steps() {
-                    if post_steps.contains(&step.name()) {
-                        // Best-effort: log and continue if post-validation fails.
-                        if let Err(e) = step.execute(&mut pipe_ctx).await {
-                            tracing::warn!(
-                                step = step.name(),
-                                error = %e,
-                                "Post-stream step failed (non-fatal)"
-                            );
+        // Run every step in the strategy that comes BEFORE `execute`. We
+        // intentionally piggyback on the existing built-in steps so the
+        // streaming path inherits any custom pipeline configuration (e.g.
+        // user-installed pre-execute steps in a custom strategy).
+        //
+        // We honor `continue` and `skip_to` flow control. `abort` and any
+        // step error short-circuit setup with an error.
+        let steps = self.strategy.steps();
+        let mut idx: usize = 0;
+        while idx < steps.len() {
+            let step = &steps[idx];
+            if step.name() == "execute" {
+                break;
+            }
+            let result = step.execute(&mut pipe_ctx).await?;
+            match result.action.as_str() {
+                "continue" => idx += 1,
+                "skip_to" => {
+                    let target = result.skip_to.as_deref().unwrap_or("");
+                    // Stop early if the skip target is at or after `execute`.
+                    let target_idx = steps.iter().position(|s| s.name() == target);
+                    match target_idx {
+                        Some(t) if t > idx => {
+                            // If we're skipping to or past `execute`, halt setup.
+                            let execute_idx = steps.iter().position(|s| s.name() == "execute");
+                            if let Some(eidx) = execute_idx {
+                                if t >= eidx {
+                                    break;
+                                }
+                            }
+                            idx = t;
+                        }
+                        _ => {
+                            return Err(ModuleError::new(
+                                ErrorCode::GeneralInvalidInput,
+                                format!(
+                                    "skip_to target '{}' not found after step '{}'",
+                                    target,
+                                    step.name(),
+                                ),
+                            ));
                         }
                     }
                 }
-                return Ok(chunks);
+                "abort" => {
+                    return Err(ModuleError::new(
+                        ErrorCode::GeneralInternalError,
+                        result
+                            .explanation
+                            .unwrap_or_else(|| "pre-stream pipeline aborted".to_string()),
+                    ));
+                }
+                other => {
+                    return Err(ModuleError::new(
+                        ErrorCode::GeneralInvalidInput,
+                        format!("Unknown step action: '{}'", other),
+                    ));
+                }
             }
         }
 
-        // Non-streaming fallback: single result.
-        Ok(vec![output.unwrap_or(Value::Null)])
+        let module = pipe_ctx.module.clone().ok_or_else(|| {
+            ModuleError::new(
+                ErrorCode::ModuleNotFound,
+                format!(
+                    "Module '{}' was not resolved during pre-stream setup",
+                    module_id
+                ),
+            )
+        })?;
+        let output_schema = module.output_schema();
+
+        Ok(StreamSetup {
+            module,
+            inputs: pipe_ctx.inputs,
+            context: pipe_ctx.context,
+            output_schema,
+            middleware_manager: pipe_ctx.middleware_manager.clone(),
+        })
     }
 
     /// Get a reference to the executor's execution strategy.
@@ -669,26 +806,22 @@ impl Executor {
     }
 
     /// Add a before middleware.
-    pub fn use_before(&mut self, middleware: Box<dyn BeforeMiddleware>) -> Result<(), ModuleError> {
-        Arc::get_mut(&mut self.middleware_manager)
-            .expect("middleware_manager not shared yet")
+    pub fn use_before(&self, middleware: Box<dyn BeforeMiddleware>) -> Result<(), ModuleError> {
+        self.middleware_manager
             .add(Box::new(BoxedBeforeMiddlewareAdapter(middleware)))
     }
 
     /// Add an after middleware.
-    pub fn use_after(&mut self, middleware: Box<dyn AfterMiddleware>) -> Result<(), ModuleError> {
-        Arc::get_mut(&mut self.middleware_manager)
-            .expect("middleware_manager not shared yet")
+    pub fn use_after(&self, middleware: Box<dyn AfterMiddleware>) -> Result<(), ModuleError> {
+        self.middleware_manager
             .add(Box::new(BoxedAfterMiddlewareAdapter(middleware)))
     }
 }
 
-// Note: These boxed adapters are intentionally separate from the generic
-// BeforeMiddlewareAdapter<T>/AfterMiddlewareAdapter<T> in adapters.rs.
-// The generic versions require T: BeforeMiddleware (sized), while these
-// wrap Box<dyn BeforeMiddleware> (unsized trait object). Rust's type system
-// does not allow BeforeMiddlewareAdapter<Box<dyn BeforeMiddleware>> without
-// a blanket impl of BeforeMiddleware for Box<dyn BeforeMiddleware>.
+// These boxed adapters wrap `Box<dyn BeforeMiddleware>` / `Box<dyn AfterMiddleware>`
+// (unsized trait objects) into the full `Middleware` trait. They are private to
+// this module because they are only needed by `Executor::use_before` /
+// `Executor::use_after`.
 
 /// Wraps a boxed BeforeMiddleware into a full Middleware trait object.
 struct BoxedBeforeMiddlewareAdapter(Box<dyn BeforeMiddleware>);
@@ -888,7 +1021,7 @@ mod tests {
     // ── Helper: build executor with a registered module ──────────────
 
     fn build_executor_with_module(module: MockModule, annotations: ModuleAnnotations) -> Executor {
-        let mut registry = Registry::new();
+        let registry = Registry::new();
         let descriptor = ModuleDescriptor {
             name: "test_mod".to_string(),
             annotations,

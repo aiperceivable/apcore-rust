@@ -11,8 +11,8 @@ fn test_error_code_variants_exist() {
     let codes = [
         ErrorCode::ConfigNotFound,
         ErrorCode::ConfigInvalid,
-        ErrorCode::AclRuleError,
-        ErrorCode::AclDenied,
+        ErrorCode::ACLRuleError,
+        ErrorCode::ACLDenied,
         ErrorCode::ModuleNotFound,
         ErrorCode::ModuleDisabled,
         ErrorCode::ModuleTimeout,

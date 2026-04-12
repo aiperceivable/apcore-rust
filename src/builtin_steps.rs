@@ -237,7 +237,7 @@ impl Step for BuiltinACLCheck {
             let allowed = acl.check(caller_id, &ctx.module_id, Some(&ctx.context))?;
             if !allowed {
                 return Err(ModuleError::new(
-                    ErrorCode::AclDenied,
+                    ErrorCode::ACLDenied,
                     format!(
                         "Access denied: caller '{:?}' cannot access module '{}'",
                         caller_id, ctx.module_id
@@ -484,40 +484,10 @@ impl Step for BuiltinExecute {
             }
         }
 
-        // Streaming path: if ctx.stream is true and module supports streaming,
-        // call module.stream() and store chunks, then skip to return_result.
-        if ctx.stream && module.supports_stream() {
-            let stream_result = module.stream(ctx.inputs.clone(), &ctx.context).await;
-            if let Some(result) = stream_result {
-                match result {
-                    Ok(chunks) => {
-                        // Store chunks for the executor's Phase 2/3 processing.
-                        ctx.stream_chunks = Some(chunks);
-                        return Ok(StepResult::skip_to("return_result"));
-                    }
-                    Err(e) => {
-                        // Stream failed — fall through to error recovery below.
-                        if let Some(ref mm) = ctx.middleware_manager {
-                            let recovery = mm
-                                .execute_on_error(
-                                    &ctx.module_id,
-                                    ctx.inputs.clone(),
-                                    &e,
-                                    &ctx.context,
-                                    &ctx.executed_middlewares,
-                                )
-                                .await;
-                            if let Some(recovery_value) = recovery {
-                                ctx.output = Some(recovery_value);
-                                return Ok(StepResult::skip_to("return_result"));
-                            }
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-            // module.stream() returned None — fall through to regular execute.
-        }
+        // Note: Streaming is handled exclusively by `Executor::stream()`, which
+        // bypasses this step entirely. `ctx.stream` is intentionally ignored
+        // here — `BuiltinExecute` always calls `module.execute()` for the
+        // unary path. See `Executor::stream` for the streaming pipeline.
 
         let execute_result = if timeout_ms > 0 {
             match tokio::time::timeout(
@@ -591,14 +561,10 @@ impl Step for BuiltinOutputValidation {
         validate_against_schema(output, &output_schema, "Output")?;
 
         if has_schema(&output_schema) {
-            ctx.context
-                .data
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    "_apcore.executor.redacted_output".to_string(),
-                    redact_sensitive(output, &output_schema),
-                );
+            ctx.context.data.write().insert(
+                "_apcore.executor.redacted_output".to_string(),
+                redact_sensitive(output, &output_schema),
+            );
         }
         ctx.validated_output = ctx.output.clone();
         Ok(StepResult::continue_step())

@@ -119,7 +119,7 @@ impl Middleware for TagMiddleware {
 
 #[tokio::test]
 async fn test_apcore_register_and_call() {
-    let mut client = APCore::new();
+    let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
 
     let result = client
@@ -143,7 +143,7 @@ async fn test_apcore_call_missing_module() {
 
 #[tokio::test]
 async fn test_apcore_middleware_before_and_after() {
-    let mut client = APCore::new();
+    let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
     client.use_middleware(Box::new(PrefixMiddleware)).unwrap();
 
@@ -160,7 +160,7 @@ async fn test_apcore_middleware_before_and_after() {
 
 #[tokio::test]
 async fn test_apcore_remove_middleware() {
-    let mut client = APCore::new();
+    let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
     client.use_middleware(Box::new(PrefixMiddleware)).unwrap();
 
@@ -180,7 +180,7 @@ async fn test_apcore_remove_middleware() {
 
 #[tokio::test]
 async fn test_apcore_list_modules() {
-    let mut client = APCore::new();
+    let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
 
     let modules = client.list_modules(None, None);
@@ -189,7 +189,7 @@ async fn test_apcore_list_modules() {
 
 #[tokio::test]
 async fn test_apcore_describe_module() {
-    let mut client = APCore::new();
+    let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
 
     let desc = client.describe("math.add");
@@ -198,7 +198,11 @@ async fn test_apcore_describe_module() {
 
 #[tokio::test]
 async fn test_apcore_registry_accessor() {
-    let mut client = APCore::new();
+    // Disable auto-registration of sys_modules so the registry only holds
+    // what this test registers explicitly.
+    let mut config = apcore::config::Config::default();
+    config.set("sys_modules.enabled", json!(false));
+    let client = APCore::with_config(config);
     client.register("math.add", Box::new(AddModule)).unwrap();
 
     assert!(client.registry().has("math.add"));
@@ -213,7 +217,7 @@ async fn test_apcore_with_components() {
     let registry = Registry::new();
     // Verify with_components builds a working client from registry + config
     let config = Config::default();
-    let mut client = APCore::with_components(registry, config);
+    let client = APCore::with_components(registry, config);
     client.register("math.add", Box::new(AddModule)).unwrap();
 
     let result = client
@@ -225,39 +229,50 @@ async fn test_apcore_with_components() {
 
 #[tokio::test]
 async fn test_apcore_disable_enable() {
-    let mut client = APCore::new();
+    // Enable sys_modules.events so the control modules get registered.
+    let mut config = apcore::config::Config::default();
+    config.set("sys_modules.events.enabled", json!(true));
+    let client = APCore::with_config(config);
     client.register("math.add", Box::new(AddModule)).unwrap();
 
-    // Disable the module
-    client.disable("math.add", Some("testing")).unwrap();
+    // Disable through the pipeline.
+    let result = client.disable("math.add", Some("test")).await;
+    assert!(result.is_ok(), "disable should succeed: {:?}", result);
 
-    // Verify calling disabled module fails
-    let err = client
-        .call("math.add", json!({"a": 1, "b": 2}), None, None)
-        .await;
-    assert!(err.is_err(), "calling a disabled module should fail");
-
-    // Re-enable the module
-    client.enable("math.add", Some("test done")).unwrap();
-
-    // Verify it works again
-    let result = client
+    // Next call should fail with ModuleDisabled.
+    let call_err = client
         .call("math.add", json!({"a": 1, "b": 2}), None, None)
         .await
-        .unwrap();
-    assert_eq!(result["result"], 3);
+        .expect_err("call on disabled module should fail");
+    assert_eq!(call_err.code, ErrorCode::ModuleDisabled);
+
+    // Re-enable and call should succeed again.
+    let result = client.enable("math.add", Some("test")).await;
+    assert!(result.is_ok(), "enable should succeed: {:?}", result);
+
+    let ok = client
+        .call("math.add", json!({"a": 1, "b": 2}), None, None)
+        .await
+        .expect("call should succeed after re-enable");
+    assert_eq!(ok["result"], 3);
 }
 
 #[tokio::test]
 async fn test_apcore_disable_nonexistent_module() {
-    let mut client = APCore::new();
-    let err = client.disable("nonexistent.module", None);
-    assert!(err.is_err(), "disabling a nonexistent module should fail");
+    let mut config = apcore::config::Config::default();
+    config.set("sys_modules.events.enabled", json!(true));
+    let client = APCore::with_config(config);
+
+    let err = client
+        .disable("nonexistent.module", None)
+        .await
+        .expect_err("disable on nonexistent should fail");
+    assert_eq!(err.code, ErrorCode::ModuleNotFound);
 }
 
 #[tokio::test]
 async fn test_apcore_middleware_chaining() {
-    let mut client = APCore::new();
+    let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
 
     // Verify middleware methods are truly chainable via Result<&mut Self>
@@ -284,7 +299,11 @@ async fn test_apcore_middleware_chaining() {
 
 #[tokio::test]
 async fn test_apcore_list_modules_with_tags() {
-    let client = APCore::new();
+    // Disable auto-registration so sys_modules don't add unexpected
+    // `system.*` modules to the list.
+    let mut config = apcore::config::Config::default();
+    config.set("sys_modules.enabled", json!(false));
+    let client = APCore::with_config(config);
 
     // Verify list_modules accepts &[&str] for tags
     let modules = client.list_modules(Some(&["math"]), None);
@@ -301,7 +320,7 @@ async fn test_apcore_list_modules_with_tags() {
 async fn test_validate_accepts_optional_context() {
     use apcore::context::{Context, Identity};
 
-    let mut client = APCore::new();
+    let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
 
     // Path 1: validate with no context — anonymous external context synthesized internally.

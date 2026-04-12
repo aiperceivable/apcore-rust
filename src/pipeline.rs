@@ -163,12 +163,6 @@ pub struct PipelineContext {
     /// Set by `output_validation` step.
     pub validated_output: Option<serde_json::Value>,
 
-    // -- Streaming --
-    /// `true` when streaming mode was requested.
-    pub stream: bool,
-    /// Accumulated stream chunks set by `BuiltinExecute` when streaming.
-    pub stream_chunks: Option<Vec<serde_json::Value>>,
-
     // -- Pipeline v2 --
     /// `true` during `validate()`. PipelineEngine skips steps with `pure=false`.
     pub dry_run: bool,
@@ -215,8 +209,6 @@ impl PipelineContext {
             validated_inputs: None,
             output: None,
             validated_output: None,
-            stream: false,
-            stream_chunks: None,
             dry_run: false,
             version_hint: None,
             executed_middlewares: vec![],
@@ -921,7 +913,6 @@ mod tests {
         );
         assert_eq!(pctx.module_id, "test_module");
         assert_eq!(pctx.strategy_name, "default");
-        assert!(!pctx.stream);
         assert!(pctx.module.is_none());
         assert!(pctx.validated_inputs.is_none());
         assert!(pctx.output.is_none());

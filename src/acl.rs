@@ -3,6 +3,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_yaml_ng as serde_yaml;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Once};
@@ -113,13 +114,7 @@ impl ACL {
     ) -> bool {
         let mut to_evaluate = Vec::with_capacity(conditions.len());
         {
-            let handlers = match CONDITION_HANDLERS.read() {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!("Condition handler registry lock poisoned: {}", e);
-                    return false;
-                }
-            };
+            let handlers = CONDITION_HANDLERS.read();
             for (key, value) in conditions {
                 let handler = match handlers.get(key.as_str()) {
                     Some(h) => h.clone(),
@@ -158,23 +153,16 @@ impl ACL {
 
     /// Async evaluate all conditions with AND logic using the handler registry.
     ///
-    /// The RwLock read guard is held across `.await` because handlers are stored
-    /// as `Box<dyn ACLConditionHandler>` (not `Arc`) and must be borrowed from
-    /// the map.  All built-in handlers resolve immediately (no real suspension),
-    /// and the registry is only mutated at startup, so contention is negligible.
+    /// Handlers are cloned out of the registry (as `Arc<dyn ACLConditionHandler>`)
+    /// before the read guard is dropped, so no parking_lot lock guard is held
+    /// across `.await`.
     pub async fn evaluate_conditions_async(
         conditions: &HashMap<String, serde_json::Value>,
         ctx: &Context<serde_json::Value>,
     ) -> bool {
         let mut to_evaluate = Vec::with_capacity(conditions.len());
         {
-            let handlers = match CONDITION_HANDLERS.read() {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!("Condition handler registry lock poisoned: {}", e);
-                    return false;
-                }
-            };
+            let handlers = CONDITION_HANDLERS.read();
             for (key, value) in conditions {
                 let handler = match handlers.get(key.as_str()) {
                     Some(h) => h.clone(),

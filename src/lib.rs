@@ -4,10 +4,14 @@
 // everywhere would change the public API, so we suppress this lint crate-wide.
 #![allow(clippy::result_large_err)]
 
+/// The compile-time version of this crate, sourced from Cargo.toml.
+///
+/// Mirrors `apcore.__version__` in Python and `VERSION` in TypeScript.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod acl;
 pub mod acl_handlers;
 pub mod approval;
-pub mod async_task;
 pub mod bindings;
 pub mod builtin_steps;
 pub mod cancel;
@@ -21,7 +25,6 @@ pub mod error_formatter;
 pub mod errors;
 pub mod events;
 pub mod executor;
-pub mod extensions;
 pub mod middleware;
 pub mod module;
 pub mod observability;
@@ -40,7 +43,6 @@ pub use acl_handlers::ACLConditionHandler;
 pub use approval::{
     AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,
 };
-pub use async_task::{AsyncTaskManager, TaskInfo, TaskStatus};
 pub use bindings::{BindingDefinition, BindingLoader, BindingTarget};
 pub use builtin_steps::{
     build_internal_strategy, build_minimal_strategy, build_performance_strategy,
@@ -57,20 +59,22 @@ pub use config::{
 };
 pub use context::{Context, ContextFactory, Identity};
 pub use context_key::ContextKey;
+pub use context_keys::{
+    LOGGING_START, METRICS_STARTS, REDACTED_OUTPUT, RETRY_COUNT_BASE, TRACING_SAMPLED,
+    TRACING_SPANS,
+};
 pub use decorator::FunctionModule;
 pub use error_formatter::{ErrorFormatter, ErrorFormatterRegistry};
 pub use errors::{ErrorCode, ErrorCodeRegistry, ModuleError};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
 pub use executor::{
-    describe_pipeline, list_strategies, redact_sensitive, register_strategy, Executor,
-    REDACTED_VALUE,
+    list_strategies, redact_sensitive, register_strategy, Executor, REDACTED_VALUE,
 };
-pub use extensions::{Extension, ExtensionManager, ExtensionPoint};
 pub use middleware::{
     AfterMiddleware, BeforeMiddleware, LoggingMiddleware, Middleware, MiddlewareManager,
     PlatformNotifyMiddleware, RetryConfig, RetryMiddleware,
 };
-pub use module::{Module, PreflightCheckResult, PreflightResult};
+pub use module::{chunks_to_stream, ChunkStream, Module, PreflightCheckResult, PreflightResult};
 pub use observability::error_history::{ErrorEntry, ErrorHistory, ErrorHistoryMiddleware};
 pub use observability::exporters::{InMemoryExporter, OTLPExporter, StdoutExporter};
 pub use observability::logging::{ContextLogger, ObsLoggingMiddleware};
@@ -83,12 +87,11 @@ pub use pipeline::{
     StrategyInfo,
 };
 pub use pipeline_config::{
-    build_strategy_from_config, register_step_type, registered_step_types, reset_step_registry,
-    unregister_step_type, StepFactory,
+    build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,
 };
 pub use registry::registry::{
     module_id_pattern, registry_events, Registry, RegistryEvents, MAX_MODULE_ID_LENGTH,
-    REGISTRY_EVENTS, RESERVED_WORDS,
+    MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
 pub use schema::{
     ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader, SchemaStrategy,

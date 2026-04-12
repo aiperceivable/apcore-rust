@@ -11,8 +11,11 @@ use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::module::Module;
 use crate::observability::error_history::ErrorHistory;
-use crate::observability::metrics::MetricsCollector;
+use crate::observability::metrics::{estimate_p99_from_histogram, MetricsCollector};
 use crate::registry::registry::Registry;
+
+// NOTE: `registry` is now a plain `Arc<Registry>` — interior mutability via
+// `parking_lot::RwLock` means no external lock is needed.
 
 fn classify_health(error_rate: f64, total_calls: u64, threshold: f64) -> &'static str {
     if total_calls == 0 {
@@ -29,7 +32,7 @@ fn classify_health(error_rate: f64, total_calls: u64, threshold: f64) -> &'stati
 
 /// system.health.summary — Aggregated health overview of all registered modules.
 pub struct HealthSummaryModule {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
     metrics: Option<MetricsCollector>,
     error_history: ErrorHistory,
     config: Arc<Mutex<Config>>,
@@ -37,7 +40,7 @@ pub struct HealthSummaryModule {
 
 impl HealthSummaryModule {
     pub fn new(
-        registry: Arc<Mutex<Registry>>,
+        registry: Arc<Registry>,
         metrics: Option<MetricsCollector>,
         error_history: ErrorHistory,
         config: Arc<Mutex<Config>>,
@@ -85,8 +88,7 @@ impl Module for HealthSummaryModule {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let reg = self.registry.lock().await;
-        let module_ids = reg.list(None, None);
+        let module_ids = self.registry.list(None, None);
 
         let project_name = {
             let cfg = self.config.lock().await;
@@ -103,7 +105,7 @@ impl Module for HealthSummaryModule {
         for mid in &module_ids {
             let (total_calls, errors) = snapshot
                 .as_ref()
-                .map(|s| extract_call_counts(s, mid))
+                .map(|s| extract_call_counts(s, mid.as_str()))
                 .unwrap_or((0, 0));
             let error_rate = if total_calls > 0 {
                 errors as f64 / total_calls as f64
@@ -123,14 +125,18 @@ impl Module for HealthSummaryModule {
                 continue;
             }
 
-            let top_error = self.error_history.get(mid, Some(1)).first().map(|e| {
-                json!({
-                    "code": e.error_code,
-                    "message": e.message,
-                    "ai_guidance": e.ai_guidance,
-                    "count": e.count,
-                })
-            });
+            let top_error = self
+                .error_history
+                .get(mid.as_str(), Some(1))
+                .first()
+                .map(|e| {
+                    json!({
+                        "code": e.error_code,
+                        "message": e.message,
+                        "ai_guidance": e.ai_guidance,
+                        "count": e.count,
+                    })
+                });
 
             modules.push(json!({
                 "module_id": mid,
@@ -156,14 +162,14 @@ impl Module for HealthSummaryModule {
 
 /// system.health.module — Detailed health for a single module.
 pub struct HealthModuleModule {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
     metrics: Option<MetricsCollector>,
     error_history: ErrorHistory,
 }
 
 impl HealthModuleModule {
     pub fn new(
-        registry: Arc<Mutex<Registry>>,
+        registry: Arc<Registry>,
         metrics: Option<MetricsCollector>,
         error_history: ErrorHistory,
     ) -> Self {
@@ -212,14 +218,11 @@ impl Module for HealthModuleModule {
             .and_then(|v| v.as_u64())
             .unwrap_or(10) as usize;
 
-        {
-            let reg = self.registry.lock().await;
-            if !reg.has(module_id) {
-                return Err(ModuleError::new(
-                    ErrorCode::ModuleNotFound,
-                    format!("Module '{}' not found", module_id),
-                ));
-            }
+        if !self.registry.has(module_id) {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleNotFound,
+                format!("Module '{}' not found", module_id),
+            ));
         }
 
         let snapshot = self.metrics.as_ref().map(|m| m.snapshot());
@@ -312,20 +315,7 @@ fn extract_latency_stats(snapshot: &serde_json::Value, module_id: &str) -> (f64,
 
     // Estimate p99 from histogram buckets.
     let p99_ms = if let Some(buckets) = data.get("buckets").and_then(|b| b.as_array()) {
-        let target = (count as f64 * 0.99).ceil() as u64;
-        let mut p99 = 0.0_f64;
-        for bucket in buckets {
-            let le = bucket
-                .get("le")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(f64::INFINITY);
-            let cnt = bucket.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-            if cnt >= target {
-                p99 = le * 1000.0; // seconds → ms
-                break;
-            }
-        }
-        p99
+        estimate_p99_from_histogram(buckets, count)
     } else {
         0.0
     };

@@ -1,11 +1,13 @@
 // APCore Protocol — Configuration
 // Spec reference: Configuration loading, validation, and environment variable overrides (Algorithm A12)
 
+use parking_lot::RwLock;
 use serde::de::{DeserializeOwned, Error as DeError};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_yaml_ng as serde_yaml;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 
 use crate::errors::{ErrorCode, ModuleError};
 
@@ -450,9 +452,7 @@ impl Config {
         if reg.env_prefix.is_none() {
             reg.env_prefix = Some(reg.name.to_uppercase().replace('-', "_"));
         }
-        let mut map = global_ns_registry()
-            .write()
-            .map_err(|_| ModuleError::config_mount_error(&reg.name, "registry lock poisoned"))?;
+        let mut map = global_ns_registry().write();
         if map.contains_key(&reg.name) {
             return Err(ModuleError::config_namespace_duplicate(&reg.name));
         }
@@ -465,14 +465,14 @@ impl Config {
         }
         // Validate env_map: no env var can be claimed twice.
         if let Some(ref em) = reg.env_map {
-            let claimed = env_map_claimed().read().unwrap_or_else(|e| e.into_inner());
+            let claimed = env_map_claimed().read();
             for env_var in em.keys() {
                 if let Some(owner) = claimed.get(env_var) {
                     return Err(ModuleError::config_env_map_conflict(env_var, owner));
                 }
             }
             drop(claimed);
-            let mut claimed = env_map_claimed().write().unwrap_or_else(|e| e.into_inner());
+            let mut claimed = env_map_claimed().write();
             for env_var in em.keys() {
                 claimed.insert(env_var.clone(), reg.name.clone());
             }
@@ -484,15 +484,15 @@ impl Config {
     /// Register global bare env var → top-level config key mappings.
     pub fn env_map(mapping: HashMap<String, String>) -> Result<(), ModuleError> {
         let claimed_lock = env_map_claimed();
-        let claimed = claimed_lock.read().unwrap_or_else(|e| e.into_inner());
+        let claimed = claimed_lock.read();
         for env_var in mapping.keys() {
             if let Some(owner) = claimed.get(env_var) {
                 return Err(ModuleError::config_env_map_conflict(env_var, owner));
             }
         }
         drop(claimed);
-        let mut claimed = claimed_lock.write().unwrap_or_else(|e| e.into_inner());
-        let mut gmap = global_env_map().write().unwrap_or_else(|e| e.into_inner());
+        let mut claimed = claimed_lock.write();
+        let mut gmap = global_env_map().write();
         for (env_var, config_key) in mapping {
             claimed.insert(env_var.clone(), "__global__".to_string());
             gmap.insert(env_var, config_key);
@@ -503,16 +503,13 @@ impl Config {
     pub fn registered_namespaces() -> Vec<NamespaceInfo> {
         global_ns_registry()
             .read()
-            .map(|m| {
-                m.values()
-                    .map(|r| NamespaceInfo {
-                        name: r.name.clone(),
-                        env_prefix: r.env_prefix.clone(),
-                        has_schema: r.schema.is_some(),
-                    })
-                    .collect()
+            .values()
+            .map(|r| NamespaceInfo {
+                name: r.name.clone(),
+                env_prefix: r.env_prefix.clone(),
+                has_schema: r.schema.is_some(),
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     // --- Namespace instance methods ---
@@ -627,10 +624,8 @@ impl Config {
 
     /// §9.10: Namespace-aware env routing via longest-prefix-match.
     fn apply_namespace_env_overrides(&mut self) {
-        let registry = global_ns_registry()
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let gmap = global_env_map().read().unwrap_or_else(|e| e.into_inner());
+        let registry = global_ns_registry().read();
+        let gmap = global_env_map().read();
 
         // Build namespace env_map lookup.
         let mut ns_env_maps: HashMap<&str, (&str, &str)> = HashMap::new();
@@ -907,11 +902,33 @@ fn init_builtin_namespaces() {
                 name: "observability".to_string(),
                 env_prefix: Some("APCORE_OBSERVABILITY".to_string()),
                 defaults: Some(serde_json::json!({
-                    "tracing": { "enabled": false, "sampling_rate": 1.0 },
-                    "metrics": { "enabled": false }
+                    "tracing": {
+                        "enabled": false,
+                        "sampling_rate": 1.0,
+                        "strategy": "full",
+                        "exporter": "stdout",
+                        "otlp_endpoint": "http://localhost:4318"
+                    },
+                    "metrics": {
+                        "enabled": false,
+                        "exporter": "in_memory"
+                    },
+                    "logging": {
+                        "level": "info",
+                        "format": "json",
+                        "redact_keys": ["password", "secret", "token", "api_key"]
+                    },
+                    "error_history": {
+                        "max_entries_per_module": 50,
+                        "max_total_entries": 1000
+                    },
+                    "platform_notify": {
+                        "error_rate_threshold": 0.1,
+                        "latency_p99_threshold_ms": 5000.0
+                    }
                 })),
                 schema: None,
-                env_style: EnvStyle::Nested,
+                env_style: EnvStyle::Auto,
                 max_depth: DEFAULT_MAX_DEPTH,
                 env_map: None,
             },
@@ -928,14 +945,10 @@ fn init_builtin_namespaces() {
                         "enabled": false,
                         "subscribers": [],
                         "thresholds": { "error_rate": 0.1, "latency_p99_ms": 5000.0 }
-                    },
-                    "error_history": {
-                        "max_entries_per_module": 50,
-                        "max_total_entries": 1000
                     }
                 })),
                 schema: None,
-                env_style: EnvStyle::Nested,
+                env_style: EnvStyle::Auto,
                 max_depth: DEFAULT_MAX_DEPTH,
                 env_map: None,
             },

@@ -9,7 +9,7 @@ use apcore::errors::{ErrorCode, ModuleError};
 #[test]
 fn test_error_code_equality() {
     assert_eq!(ErrorCode::ModuleNotFound, ErrorCode::ModuleNotFound);
-    assert_ne!(ErrorCode::ModuleNotFound, ErrorCode::AclDenied);
+    assert_ne!(ErrorCode::ModuleNotFound, ErrorCode::ACLDenied);
 }
 
 #[test]
@@ -22,7 +22,7 @@ fn test_error_code_serialization() {
 #[test]
 fn test_error_code_deserialization() {
     let code: ErrorCode = serde_json::from_str("\"ACL_DENIED\"").unwrap();
-    assert_eq!(code, ErrorCode::AclDenied);
+    assert_eq!(code, ErrorCode::ACLDenied);
 }
 
 #[test]
@@ -31,8 +31,8 @@ fn test_all_error_codes_defined() {
     let codes = [
         ErrorCode::ConfigNotFound,
         ErrorCode::ConfigInvalid,
-        ErrorCode::AclRuleError,
-        ErrorCode::AclDenied,
+        ErrorCode::ACLRuleError,
+        ErrorCode::ACLDenied,
         ErrorCode::ModuleNotFound,
         ErrorCode::ModuleDisabled,
         ErrorCode::ModuleTimeout,
@@ -107,9 +107,9 @@ fn test_module_error_no_trace_id_by_default() {
 
 #[test]
 fn test_module_error_display() {
-    let err = ModuleError::new(ErrorCode::AclDenied, "access denied");
+    let err = ModuleError::new(ErrorCode::ACLDenied, "access denied");
     let s = format!("{err}");
-    assert!(s.contains("AclDenied"));
+    assert!(s.contains("ACLDenied"));
     assert!(s.contains("access denied"));
 }
 

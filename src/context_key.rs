@@ -37,34 +37,29 @@ impl<T: serde::de::DeserializeOwned> ContextKey<T> {
     /// Return the deserialized value for this key, or `None` if absent or
     /// deserialization fails.
     pub fn get<S>(&self, ctx: &Context<S>) -> Option<T> {
-        let map = ctx.data.read().ok()?;
+        let map = ctx.data.read();
         let val = map.get(self.name.as_ref())?;
         serde_json::from_value(val.clone()).ok()
     }
 
     /// Return true if this key is present in context.data.
     pub fn exists<S>(&self, ctx: &Context<S>) -> bool {
-        ctx.data
-            .read()
-            .map(|map| map.contains_key(self.name.as_ref()))
-            .unwrap_or(false)
+        ctx.data.read().contains_key(self.name.as_ref())
     }
 }
 
 impl<T: serde::Serialize> ContextKey<T> {
     /// Store `value` under this key in context.data.
     pub fn set<S>(&self, ctx: &Context<S>, value: T) {
-        if let Ok(mut map) = ctx.data.write() {
-            if let Ok(v) = serde_json::to_value(value) {
-                map.insert(self.name.to_string(), v);
-            }
+        let mut map = ctx.data.write();
+        if let Ok(v) = serde_json::to_value(value) {
+            map.insert(self.name.to_string(), v);
         }
     }
 
     /// Remove this key from context.data (no-op if absent).
     pub fn delete<S>(&self, ctx: &Context<S>) {
-        if let Ok(mut map) = ctx.data.write() {
-            map.remove(self.name.as_ref());
-        }
+        let mut map = ctx.data.write();
+        map.remove(self.name.as_ref());
     }
 }

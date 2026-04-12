@@ -31,7 +31,7 @@ fn test_set_writes_to_data() {
     let key: ContextKey<String> = ContextKey::new("test.name");
     let ctx = make_ctx();
     key.set(&ctx, "hello".to_string());
-    let map = ctx.data.read().unwrap();
+    let map = ctx.data.read();
     assert_eq!(map.get("test.name"), Some(&json!("hello")));
 }
 
@@ -42,7 +42,7 @@ fn test_delete_removes_key() {
     let ctx = make_ctx();
     key.set(&ctx, 10);
     key.delete(&ctx);
-    let map = ctx.data.read().unwrap();
+    let map = ctx.data.read();
     assert!(!map.contains_key("test.temp"));
 }
 

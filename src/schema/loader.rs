@@ -1,6 +1,7 @@
 // APCore Protocol — Schema loader
 // Spec reference: Loading schemas from files and inline definitions
 
+use serde_yaml_ng as serde_yaml;
 use std::collections::HashMap;
 use std::path::Path;
 

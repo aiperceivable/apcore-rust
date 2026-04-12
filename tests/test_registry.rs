@@ -87,7 +87,7 @@ fn test_registry_get_definition_unknown_returns_none() {
 #[test]
 fn test_registry_list_returns_vec_of_str() {
     let registry = Registry::new();
-    let list: Vec<&str> = registry.list(None, None);
+    let list: Vec<String> = registry.list(None, None);
     assert!(list.is_empty());
 }
 
@@ -103,7 +103,7 @@ fn test_export_schema_returns_none_for_unregistered_module() {
 
 #[test]
 fn test_export_schema_returns_schema_after_registration() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let descriptor = make_descriptor("math.add");
     registry
         .register_internal("math.add", Box::new(StubModule), descriptor)
@@ -131,7 +131,7 @@ fn test_is_enabled_returns_none_for_unregistered_module() {
 
 #[test]
 fn test_disable_returns_error_for_unregistered_module() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let err = registry
         .disable("not.registered")
         .expect_err("should fail for unregistered module");
@@ -143,7 +143,7 @@ fn test_disable_returns_error_for_unregistered_module() {
 
 #[test]
 fn test_enable_returns_error_for_unregistered_module() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let err = registry
         .enable("not.registered")
         .expect_err("should fail for unregistered module");
@@ -152,7 +152,7 @@ fn test_enable_returns_error_for_unregistered_module() {
 
 #[test]
 fn test_disable_sets_enabled_to_false() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry
         .register_internal(
             "email.send",
@@ -171,7 +171,7 @@ fn test_disable_sets_enabled_to_false() {
 
 #[test]
 fn test_enable_restores_enabled_to_true() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry
         .register_internal("greet", Box::new(StubModule), make_descriptor("greet"))
         .expect("registration should succeed");
@@ -185,7 +185,7 @@ fn test_enable_restores_enabled_to_true() {
 
 #[test]
 fn test_module_enabled_by_default_after_registration() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry
         .register_internal(
             "util.noop",
@@ -207,7 +207,7 @@ fn test_module_enabled_by_default_after_registration() {
 
 #[test]
 fn test_register_rejects_reserved_first_segment() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register(
         "system.health",
         Box::new(StubModule),
@@ -228,7 +228,7 @@ fn test_register_rejects_reserved_word_in_any_segment() {
     // PROTOCOL_SPEC §2.7: reserved words MUST NOT appear as ANY segment of a
     // module ID (not just the first). Aligned with apcore-python and
     // apcore-typescript, both of which reject 'email.system' for this reason.
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register(
         "email.system",
         Box::new(StubModule),
@@ -248,7 +248,7 @@ fn test_register_rejects_reserved_word_in_any_segment() {
 
 #[test]
 fn test_register_allows_normal_module_id() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register(
         "email.send",
         Box::new(StubModule),
@@ -261,7 +261,7 @@ fn test_register_allows_normal_module_id() {
 fn test_register_rejects_all_reserved_words() {
     use apcore::registry::RESERVED_WORDS;
     for word in RESERVED_WORDS {
-        let mut registry = Registry::new();
+        let registry = Registry::new();
         let module_id = format!("{}.something", word);
         let result = registry.register(
             &module_id,
@@ -279,7 +279,7 @@ fn test_register_rejects_all_reserved_words() {
 
 #[test]
 fn test_register_module_rejects_reserved_first_segment() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register_module("core.utils", Box::new(StubModule));
     assert!(
         result.is_err(),
@@ -302,7 +302,7 @@ fn test_max_module_id_length_matches_spec() {
 #[test]
 fn test_register_accepts_module_id_at_max_length() {
     use apcore::registry::MAX_MODULE_ID_LENGTH;
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     // Pure 'a' run satisfies the EBNF pattern [a-z][a-z0-9_]*.
     let exact_id = "a".repeat(MAX_MODULE_ID_LENGTH);
     let result = registry.register(&exact_id, Box::new(StubModule), make_descriptor(&exact_id));
@@ -315,7 +315,7 @@ fn test_register_accepts_module_id_at_max_length() {
 #[test]
 fn test_register_rejects_module_id_exceeding_max_length() {
     use apcore::registry::MAX_MODULE_ID_LENGTH;
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let overlong_id = "a".repeat(MAX_MODULE_ID_LENGTH + 1);
     let result = registry.register(
         &overlong_id,
@@ -341,7 +341,7 @@ fn test_register_rejects_module_id_exceeding_max_length() {
 
 #[test]
 fn test_register_rejects_empty_module_id() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register("", Box::new(StubModule), make_descriptor(""));
     assert!(result.is_err(), "registering empty ID must fail");
     let msg = format!("{}", result.unwrap_err());
@@ -354,7 +354,7 @@ fn test_register_rejects_empty_module_id() {
 
 #[test]
 fn test_register_rejects_invalid_pattern() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     for bad_id in [
         "INVALID-ID", // hyphens not allowed
         "1abc",       // starts with digit
@@ -388,7 +388,7 @@ fn test_register_rejects_invalid_pattern() {
 
 #[test]
 fn test_register_internal_accepts_reserved_first_segment() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register_internal(
         "system.health",
         Box::new(StubModule),
@@ -402,7 +402,7 @@ fn test_register_internal_accepts_reserved_first_segment() {
 
 #[test]
 fn test_register_internal_accepts_reserved_any_segment() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register_internal(
         "myapp.system.config",
         Box::new(StubModule),
@@ -416,7 +416,7 @@ fn test_register_internal_accepts_reserved_any_segment() {
 
 #[test]
 fn test_register_internal_still_rejects_empty() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register_internal("", Box::new(StubModule), make_descriptor(""));
     assert!(
         result.is_err(),
@@ -426,7 +426,7 @@ fn test_register_internal_still_rejects_empty() {
 
 #[test]
 fn test_register_internal_still_rejects_invalid_pattern() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let result = registry.register_internal(
         "INVALID-ID",
         Box::new(StubModule),
@@ -441,7 +441,7 @@ fn test_register_internal_still_rejects_invalid_pattern() {
 #[test]
 fn test_register_internal_still_rejects_over_length() {
     use apcore::registry::MAX_MODULE_ID_LENGTH;
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let overlong = "a".repeat(MAX_MODULE_ID_LENGTH + 1);
     let result =
         registry.register_internal(&overlong, Box::new(StubModule), make_descriptor(&overlong));
@@ -453,7 +453,7 @@ fn test_register_internal_still_rejects_over_length() {
 
 #[test]
 fn test_register_internal_rejects_duplicate() {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry
         .register_internal(
             "system.dup",

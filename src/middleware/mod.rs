@@ -14,14 +14,15 @@ pub use manager::MiddlewareManager;
 pub use retry::{RetryConfig, RetryMiddleware};
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use async_trait::async_trait;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
-use crate::observability::metrics::MetricsCollector;
+use crate::observability::metrics::{estimate_p99_from_histogram, MetricsCollector};
 
 /// Platform notification middleware — monitors error rates and latency,
 /// emits threshold events with hysteresis.
@@ -119,7 +120,7 @@ impl PlatformNotifyMiddleware {
     /// Check error rate threshold; returns an event to emit if threshold exceeded (with hysteresis).
     fn check_error_rate_threshold(&self, module_id: &str) -> Option<ApCoreEvent> {
         let error_rate = self.compute_error_rate(module_id);
-        let mut alerted = self.alerted.lock().unwrap();
+        let mut alerted = self.alerted.lock();
         let module_alerts = alerted.entry(module_id.to_string()).or_default();
 
         if error_rate >= self.error_rate_threshold && !module_alerts.contains("error_rate") {
@@ -155,22 +156,9 @@ impl PlatformNotifyMiddleware {
 
         // Estimate p99 from cumulative histogram buckets.
         let buckets = data.get("buckets")?.as_array()?;
-        let target = (count as f64 * 0.99).ceil() as u64;
-        let mut p99_sec = 0.0_f64;
-        for bucket in buckets {
-            let le = bucket
-                .get("le")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(f64::INFINITY);
-            let cnt = bucket.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-            if cnt >= target {
-                p99_sec = le;
-                break;
-            }
-        }
-        let p99_ms = p99_sec * 1000.0;
+        let p99_ms = estimate_p99_from_histogram(buckets, count);
 
-        let mut alerted = self.alerted.lock().unwrap();
+        let mut alerted = self.alerted.lock();
         let module_alerts = alerted.entry(module_id.to_string()).or_default();
         if p99_ms >= self.latency_p99_threshold_ms && !module_alerts.contains("latency") {
             let event = ApCoreEvent::with_module(
@@ -191,7 +179,7 @@ impl PlatformNotifyMiddleware {
     /// Check if error rate has recovered; returns an event to emit if recovered.
     fn check_error_recovery(&self, module_id: &str) -> Option<ApCoreEvent> {
         let error_rate = self.compute_error_rate(module_id);
-        let mut alerted = self.alerted.lock().unwrap();
+        let mut alerted = self.alerted.lock();
 
         let has_alert = alerted
             .get(module_id)

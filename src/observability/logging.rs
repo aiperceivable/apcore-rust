@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
@@ -251,7 +252,7 @@ impl Middleware for ObsLoggingMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Store start time keyed by trace_id for concurrency safety
         {
-            let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut starts = self.starts.lock();
             starts.insert(ctx.trace_id.clone(), std::time::Instant::now());
         }
 
@@ -282,7 +283,7 @@ impl Middleware for ObsLoggingMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Remove start time by trace_id and compute duration
         let duration_ms = {
-            let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
                 .map(|s| s.elapsed().as_secs_f64() * 1000.0)
@@ -320,7 +321,7 @@ impl Middleware for ObsLoggingMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Remove start time by trace_id and compute duration
         let duration_ms = {
-            let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
                 .map(|s| s.elapsed().as_secs_f64() * 1000.0)

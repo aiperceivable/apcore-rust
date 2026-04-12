@@ -2,8 +2,9 @@
 // Spec reference: Built-in span export destinations
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::span::{Span, SpanExporter};
 use crate::errors::ModuleError;
@@ -59,12 +60,12 @@ impl InMemoryExporter {
 
     /// Get all exported spans.
     pub fn get_spans(&self) -> Vec<Span> {
-        self.spans.lock().unwrap().iter().cloned().collect()
+        self.spans.lock().iter().cloned().collect()
     }
 
     /// Clear all exported spans.
     pub fn clear(&self) {
-        self.spans.lock().unwrap().clear();
+        self.spans.lock().clear();
     }
 }
 
@@ -77,7 +78,7 @@ impl Default for InMemoryExporter {
 #[async_trait]
 impl SpanExporter for InMemoryExporter {
     async fn export(&self, span: &Span) -> Result<(), ModuleError> {
-        let mut spans = self.spans.lock().unwrap();
+        let mut spans = self.spans.lock();
         spans.push_back(span.clone());
         while spans.len() > self.max_spans {
             spans.pop_front();
@@ -91,8 +92,6 @@ impl SpanExporter for InMemoryExporter {
 }
 
 /// Exports spans to an OTLP-compatible endpoint.
-/// Note: Full HTTP transport requires an HTTP client dependency.
-/// This is a placeholder that logs the intent.
 #[derive(Debug)]
 pub struct OTLPExporter {
     pub endpoint: String,
@@ -107,16 +106,75 @@ impl OTLPExporter {
     }
 }
 
+/// Convert a Span to OTLP JSON format.
+#[cfg(feature = "events")]
+fn span_to_otlp(span: &Span) -> serde_json::Value {
+    let mut otlp_span = serde_json::json!({
+        "traceId": span.trace_id,
+        "spanId": span.span_id,
+        "name": span.name,
+        "startTimeUnixNano": (span.start_time * 1_000_000_000.0) as u64,
+        "status": match span.status {
+            super::span::SpanStatus::Ok => serde_json::json!({"code": 1}),
+            super::span::SpanStatus::Error => serde_json::json!({"code": 2}),
+            super::span::SpanStatus::Unset => serde_json::json!({"code": 0}),
+        },
+        "attributes": span.attributes.iter().map(|(k, v)| {
+            serde_json::json!({
+                "key": k,
+                "value": { "stringValue": v.to_string() }
+            })
+        }).collect::<Vec<_>>(),
+    });
+    if let Some(ref parent_id) = span.parent_span_id {
+        otlp_span["parentSpanId"] = serde_json::json!(parent_id);
+    }
+    if let Some(end_time) = span.end_time {
+        otlp_span["endTimeUnixNano"] = serde_json::json!((end_time * 1_000_000_000.0) as u64);
+    }
+    otlp_span
+}
+
+#[cfg(feature = "events")]
 #[async_trait]
 impl SpanExporter for OTLPExporter {
     async fn export(&self, span: &Span) -> Result<(), ModuleError> {
-        // Placeholder: OTLP export requires an HTTP client (e.g., reqwest).
-        // Log the span that would be exported.
-        eprintln!(
-            "OTLPExporter: would export span {} to {}",
-            span.span_id, self.endpoint
-        );
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [span_to_otlp(span)]
+                }]
+            }]
+        });
+        client
+            .post(format!("{}/v1/traces", self.endpoint))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                ModuleError::new(
+                    crate::errors::ErrorCode::GeneralInternalError,
+                    format!("OTLP export failed: {}", e),
+                )
+            })?;
         Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), ModuleError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "events"))]
+#[async_trait]
+impl SpanExporter for OTLPExporter {
+    async fn export(&self, _span: &Span) -> Result<(), ModuleError> {
+        Err(ModuleError::new(
+            crate::errors::ErrorCode::GeneralInternalError,
+            "OTLPExporter requires the 'events' feature",
+        ))
     }
 
     async fn shutdown(&self) -> Result<(), ModuleError> {

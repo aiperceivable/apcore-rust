@@ -4,9 +4,10 @@
 // (identity_types, roles, max_call_depth), and two compound operators ($or, $not).
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock};
 
 use crate::context::Context;
 
@@ -22,13 +23,12 @@ pub static CONDITION_HANDLERS: LazyLock<RwLock<HashMap<String, Arc<dyn ACLCondit
 
 /// Register a condition handler globally. Replaces any existing handler for the same key.
 pub fn register_condition(key: impl Into<String>, handler: Arc<dyn ACLConditionHandler>) {
-    if let Ok(mut map) = CONDITION_HANDLERS.write() {
-        map.insert(key.into(), handler);
-    }
+    let mut map = CONDITION_HANDLERS.write();
+    map.insert(key.into(), handler);
 }
 
 /// Type alias for the sync evaluation function used by compound handlers.
-pub type EvalFn = fn(&HashMap<String, Value>, &Context<Value>) -> bool;
+pub(crate) type EvalFn = fn(&HashMap<String, Value>, &Context<Value>) -> bool;
 
 // ---------------------------------------------------------------------------
 // Basic handlers
@@ -92,12 +92,12 @@ impl ACLConditionHandler for MaxCallDepthHandler {
 // ---------------------------------------------------------------------------
 
 /// $or: list of condition dicts. Returns true if ANY sub-set passes.
-pub struct OrHandler {
+pub(crate) struct OrHandler {
     evaluate_fn: EvalFn,
 }
 
 impl OrHandler {
-    pub fn new(evaluate_fn: EvalFn) -> Self {
+    pub(crate) fn new(evaluate_fn: EvalFn) -> Self {
         Self { evaluate_fn }
     }
 }
@@ -123,12 +123,12 @@ impl ACLConditionHandler for OrHandler {
 }
 
 /// $not: single condition dict. Returns true if the sub-set FAILS.
-pub struct NotHandler {
+pub(crate) struct NotHandler {
     evaluate_fn: EvalFn,
 }
 
 impl NotHandler {
-    pub fn new(evaluate_fn: EvalFn) -> Self {
+    pub(crate) fn new(evaluate_fn: EvalFn) -> Self {
         Self { evaluate_fn }
     }
 }

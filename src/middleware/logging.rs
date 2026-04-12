@@ -10,9 +10,6 @@ use super::base::Middleware;
 use crate::context::Context;
 use crate::errors::ModuleError;
 
-/// Context data key used to store the call start time.
-const START_TIME_KEY: &str = "_apcore.mw.logging.start_time";
-
 /// Structured logging middleware with security-aware redaction.
 ///
 /// Logs module call start, completion (with duration), and errors using
@@ -26,7 +23,7 @@ pub struct LoggingMiddleware {
     log_errors: bool,
     /// Per-call start times indexed by a nonce stored in context.data.
     /// Using a concurrent map keyed by trace_id + module_id to stay thread-safe.
-    start_times: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    start_times: parking_lot::Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 impl LoggingMiddleware {
@@ -36,7 +33,7 @@ impl LoggingMiddleware {
             log_inputs,
             log_outputs,
             log_errors,
-            start_times: std::sync::Mutex::new(std::collections::HashMap::new()),
+            start_times: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -77,7 +74,7 @@ impl Middleware for LoggingMiddleware {
         // Record start time in our interior map.
         let key = Self::timing_key(module_id, ctx);
         {
-            let mut times = self.start_times.lock().unwrap_or_else(|e| e.into_inner());
+            let mut times = self.start_times.lock();
             times.insert(key, Instant::now());
         }
 
@@ -99,11 +96,6 @@ impl Middleware for LoggingMiddleware {
             );
         }
 
-        // Also store a marker in context.data so other middleware can see timing
-        // is active. We cannot mutate ctx (shared ref), so the real timing lives
-        // in our interior map. The START_TIME_KEY marker is informational only.
-        let _ = START_TIME_KEY; // reference to suppress unused warning
-
         Ok(None)
     }
 
@@ -116,7 +108,7 @@ impl Middleware for LoggingMiddleware {
     ) -> Result<Option<Value>, ModuleError> {
         let key = Self::timing_key(module_id, ctx);
         let duration_ms = {
-            let mut times = self.start_times.lock().unwrap_or_else(|e| e.into_inner());
+            let mut times = self.start_times.lock();
             times
                 .remove(&key)
                 .map(|start| start.elapsed().as_secs_f64() * 1000.0)
@@ -148,7 +140,7 @@ impl Middleware for LoggingMiddleware {
         // Clean up timing entry if present.
         let key = Self::timing_key(module_id, ctx);
         {
-            let mut times = self.start_times.lock().unwrap_or_else(|e| e.into_inner());
+            let mut times = self.start_times.lock();
             times.remove(&key);
         }
 

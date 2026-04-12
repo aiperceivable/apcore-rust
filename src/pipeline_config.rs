@@ -1,8 +1,9 @@
 // APCore Protocol — Pipeline YAML configuration: step type registry and strategy builder.
 // Spec reference: design-execution-pipeline.md (Section 8)
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -15,7 +16,8 @@ use crate::pipeline::{ExecutionStrategy, Step};
 // ---------------------------------------------------------------------------
 
 /// Factory function that creates a `Step` from a config dict.
-pub type StepFactory = Box<dyn Fn(&Value) -> Result<Box<dyn Step>, ModuleError> + Send + Sync>;
+pub(crate) type StepFactory =
+    Box<dyn Fn(&Value) -> Result<Box<dyn Step>, ModuleError> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Global step type registry (OnceLock + RwLock pattern)
@@ -39,9 +41,7 @@ pub fn register_step_type(name: &str, factory: StepFactory) -> Result<(), Module
             format!("Invalid step type name: '{name}'"),
         ));
     }
-    let mut map = global_step_factories()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = global_step_factories().write();
     if map.contains_key(name) {
         return Err(ModuleError::new(
             ErrorCode::GeneralInvalidInput,
@@ -54,25 +54,20 @@ pub fn register_step_type(name: &str, factory: StepFactory) -> Result<(), Module
 
 /// Remove a registered step type. Returns `true` if found and removed.
 pub fn unregister_step_type(name: &str) -> bool {
-    let mut map = global_step_factories()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = global_step_factories().write();
     map.remove(name).is_some()
 }
 
 /// Return a list of all registered step type names.
 pub fn registered_step_types() -> Vec<String> {
-    let map = global_step_factories()
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
+    let map = global_step_factories().read();
     map.keys().cloned().collect()
 }
 
 /// Clear the step type registry (for testing only).
-pub fn reset_step_registry() {
-    let mut map = global_step_factories()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+#[cfg(test)]
+pub(crate) fn reset_step_registry() {
+    let mut map = global_step_factories().write();
     map.clear();
 }
 
@@ -98,9 +93,7 @@ fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
         )
     })?;
 
-    let map = global_step_factories()
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
+    let map = global_step_factories().read();
     let factory = map.get(type_name).ok_or_else(|| {
         ModuleError::new(
             ErrorCode::GeneralInvalidInput,

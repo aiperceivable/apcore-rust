@@ -2,13 +2,34 @@
 // Spec reference: Module definition, annotations, preflight checks
 
 use async_trait::async_trait;
+use futures_core::Stream;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::pin::Pin;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
+
+/// A stream of output chunks from a streaming module.
+///
+/// Each item is a `Result<Value, ModuleError>` so a module can fail mid-stream.
+/// The stream is `Send + 'static` (no borrows from the producing module) so the
+/// executor can drive it across `.await` points without lifetime issues.
+pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<serde_json::Value, ModuleError>> + Send>>;
+
+/// Convert a pre-computed vector of chunks into a `ChunkStream`.
+///
+/// Useful when a module produces all of its chunks up-front but still wants to
+/// conform to the streaming trait shape.
+pub fn chunks_to_stream(chunks: Vec<Result<serde_json::Value, ModuleError>>) -> ChunkStream {
+    Box::pin(async_stream::stream! {
+        for chunk in chunks {
+            yield chunk;
+        }
+    })
+}
 
 /// Core trait that all APCore modules must implement.
 #[async_trait]
@@ -29,25 +50,24 @@ pub trait Module: Send + Sync {
         ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError>;
 
-    /// Stream execution — yields chunks incrementally.
-    ///
-    /// Default implementation calls `execute()` once and returns the result
-    /// as a single-element vector. Modules that support streaming should
-    /// override this to yield multiple chunks.
+    /// Stream execution — returns an async `Stream` of output chunks.
     ///
     /// Returns `None` if the module does not support streaming, signaling
-    /// the executor to fall back to `execute()`.
-    async fn stream(
+    /// the executor to fall back to `execute()`. Modules that support
+    /// streaming should override this to yield chunks incrementally — each
+    /// `yield` is delivered to the caller as soon as it is produced (true
+    /// streaming, no buffering).
+    ///
+    /// Note: this method is *not* `async` even though it returns a stream.
+    /// The returned `ChunkStream` is itself an async iterator; constructing
+    /// it must be cheap and synchronous so the executor can wire it into
+    /// its own pipeline before the first chunk is awaited.
+    fn stream(
         &self,
         _inputs: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
-    ) -> Option<Result<Vec<serde_json::Value>, ModuleError>> {
+    ) -> Option<ChunkStream> {
         None
-    }
-
-    /// Whether this module supports streaming output.
-    fn supports_stream(&self) -> bool {
-        false
     }
 
     /// Return a structured description of this module for AI/LLM consumption (spec §5.6).

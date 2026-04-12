@@ -219,7 +219,7 @@ async fn test_retry_middleware_resets_on_success() {
 async fn test_middleware_manager_pipeline_order() {
     use apcore::middleware::MiddlewareManager;
 
-    let mut mgr = MiddlewareManager::new();
+    let mgr = MiddlewareManager::new();
     // add() takes Box, so we verify snapshot order
     mgr.add(Box::new(TrackingMiddleware::new("first"))).unwrap();
     mgr.add(Box::new(TrackingMiddleware::new("second")))
@@ -233,7 +233,7 @@ async fn test_middleware_manager_pipeline_order() {
 fn test_middleware_manager_remove() {
     use apcore::middleware::MiddlewareManager;
 
-    let mut mgr = MiddlewareManager::new();
+    let mgr = MiddlewareManager::new();
     mgr.add(Box::new(TrackingMiddleware::new("alpha"))).unwrap();
     mgr.add(Box::new(TrackingMiddleware::new("beta"))).unwrap();
 

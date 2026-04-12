@@ -27,8 +27,8 @@ fn make_emitter() -> Arc<Mutex<EventEmitter>> {
     Arc::new(Mutex::new(EventEmitter::new()))
 }
 
-fn make_registry() -> Arc<Mutex<Registry>> {
-    Arc::new(Mutex::new(Registry::new()))
+fn make_registry() -> Arc<Registry> {
+    Arc::new(Registry::new())
 }
 
 fn dummy_ctx() -> Context<serde_json::Value> {
@@ -40,7 +40,7 @@ fn dummy_ctx() -> Context<serde_json::Value> {
     ))
 }
 
-async fn register_dummy(registry: &Arc<Mutex<Registry>>, id: &str) {
+fn register_dummy(registry: &Arc<Registry>, id: &str) {
     struct DummyModule;
     #[async_trait::async_trait]
     impl Module for DummyModule {
@@ -72,8 +72,6 @@ async fn register_dummy(registry: &Arc<Mutex<Registry>>, id: &str) {
         dependencies: vec![],
     };
     registry
-        .lock()
-        .await
         .register_internal(id, Box::new(DummyModule), descriptor)
         .expect("register_internal should succeed");
 }
@@ -215,7 +213,7 @@ async fn test_update_config_module_restricted_key_returns_error() {
 #[tokio::test]
 async fn test_toggle_feature_module_disables_and_enables() {
     let registry = make_registry();
-    register_dummy(&registry, "my.module").await;
+    register_dummy(&registry, "my.module");
 
     let emitter = make_emitter();
     let toggle_state = Arc::new(ToggleState::new());
@@ -287,12 +285,12 @@ async fn test_toggle_feature_module_not_found_returns_error() {
 
 #[test]
 fn test_register_sys_modules_returns_none_when_disabled() {
-    let registry = Arc::new(Mutex::new(Registry::new()));
+    let registry = Arc::new(Registry::new());
     let mut config = Config::default();
     config.set("sys_modules.enabled", serde_json::json!(false));
-    let mut executor = Executor::new(Registry::new(), Config::default());
+    let executor = Executor::new(Arc::clone(&registry), Config::default());
 
-    let result = register_sys_modules(Arc::clone(&registry), &mut executor, &config, None);
+    let result = register_sys_modules(Arc::clone(&registry), &executor, &config, None);
     assert!(
         result.is_none(),
         "should return None when sys_modules.enabled=false"
@@ -301,82 +299,65 @@ fn test_register_sys_modules_returns_none_when_disabled() {
 
 #[test]
 fn test_register_sys_modules_registers_health_but_not_control_when_events_disabled() {
-    let registry = Arc::new(Mutex::new(Registry::new()));
+    let registry = Arc::new(Registry::new());
     let mut config = Config::default();
     config.set("sys_modules.enabled", serde_json::json!(true));
     // events.enabled defaults to false, but set explicitly for clarity
     config.set("sys_modules.events.enabled", serde_json::json!(false));
-    let mut executor = Executor::new(Registry::new(), Config::default());
+    let executor = Executor::new(Arc::clone(&registry), Config::default());
 
-    let ctx = register_sys_modules(Arc::clone(&registry), &mut executor, &config, None);
+    let ctx = register_sys_modules(Arc::clone(&registry), &executor, &config, None);
     assert!(
         ctx.is_some(),
         "should return Some when sys_modules enabled but events disabled"
     );
 
-    // Verify health/manifest/usage modules ARE registered, but control modules are NOT
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime should build");
-    rt.block_on(async {
-        let reg = registry.lock().await;
-        assert!(
-            reg.has("system.health.summary"),
-            "health.summary should be registered even without events"
-        );
-        assert!(
-            reg.has("system.manifest.full"),
-            "manifest.full should be registered even without events"
-        );
-        assert!(
-            reg.has("system.usage.summary"),
-            "usage.summary should be registered even without events"
-        );
-        assert!(
-            !reg.has("system.control.update_config"),
-            "control modules should NOT be registered when events.enabled=false"
-        );
-        assert!(
-            !reg.has("system.control.toggle_feature"),
-            "toggle_feature should NOT be registered when events.enabled=false"
-        );
-    });
+    assert!(
+        registry.has("system.health.summary"),
+        "health.summary should be registered even without events"
+    );
+    assert!(
+        registry.has("system.manifest.full"),
+        "manifest.full should be registered even without events"
+    );
+    assert!(
+        registry.has("system.usage.summary"),
+        "usage.summary should be registered even without events"
+    );
+    assert!(
+        !registry.has("system.control.update_config"),
+        "control modules should NOT be registered when events.enabled=false"
+    );
+    assert!(
+        !registry.has("system.control.toggle_feature"),
+        "toggle_feature should NOT be registered when events.enabled=false"
+    );
 }
 
 #[test]
 fn test_register_sys_modules_registers_control_modules_into_caller_registry() {
-    // register_sys_modules is synchronous and uses blocking_lock internally;
-    // call it outside any tokio runtime, then use block_on only for async assertions.
-    let registry = Arc::new(Mutex::new(Registry::new()));
+    let registry = Arc::new(Registry::new());
     let mut config = Config::default();
     config.set("sys_modules.enabled", serde_json::json!(true));
     config.set("sys_modules.events.enabled", serde_json::json!(true));
-    let mut executor = Executor::new(Registry::new(), Config::default());
+    let executor = Executor::new(Arc::clone(&registry), Config::default());
 
-    let ctx = register_sys_modules(Arc::clone(&registry), &mut executor, &config, None);
+    let ctx = register_sys_modules(Arc::clone(&registry), &executor, &config, None);
     assert!(
         ctx.is_some(),
         "should return Some when sys_modules.enabled=true"
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime should build");
-    rt.block_on(async {
-        let reg = registry.lock().await;
-        assert!(
-            reg.has("system.control.update_config"),
-            "update_config should be in caller's registry"
-        );
-        assert!(
-            reg.has("system.control.reload_module"),
-            "reload_module should be in caller's registry"
-        );
-        assert!(
-            reg.has("system.control.toggle_feature"),
-            "toggle_feature should be in caller's registry"
-        );
-    });
+    assert!(
+        registry.has("system.control.update_config"),
+        "update_config should be in caller's registry"
+    );
+    assert!(
+        registry.has("system.control.reload_module"),
+        "reload_module should be in caller's registry"
+    );
+    assert!(
+        registry.has("system.control.toggle_feature"),
+        "toggle_feature should be in caller's registry"
+    );
 }

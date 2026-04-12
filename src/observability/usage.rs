@@ -3,17 +3,19 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
+use crate::observability::metrics::estimate_p99_from_sorted;
 
 /// A single usage record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageRecord {
+pub(crate) struct UsageRecord {
     pub timestamp: String,
     pub caller_id: Option<String>,
     pub latency_ms: f64,
@@ -91,7 +93,7 @@ impl UsageCollector {
         };
 
         let bucket = Self::bucket_key();
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let module = data
             .entry(module_id.to_string())
             .or_insert_with(ModuleData::new);
@@ -144,21 +146,21 @@ impl UsageCollector {
 
     /// Get usage summary for a specific module.
     pub fn get_module_summary(&self, module_id: &str) -> Option<UsageStats> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.get(module_id).map(|md| Self::aggregate(module_id, md))
     }
 
     /// Get all usage summaries.
     pub fn get_all_summaries(&self) -> Vec<UsageStats> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.iter()
             .map(|(mid, md)| Self::aggregate(mid, md))
             .collect()
     }
 
     /// Get per-caller breakdown for a module.
-    pub fn get_caller_breakdown(&self, module_id: &str) -> Vec<CallerStats> {
-        let data = self.data.lock().unwrap();
+    pub(crate) fn get_caller_breakdown(&self, module_id: &str) -> Vec<CallerStats> {
+        let data = self.data.lock();
         let module_data = match data.get(module_id) {
             Some(md) => md,
             None => return Vec::new(),
@@ -191,8 +193,8 @@ impl UsageCollector {
     }
 
     /// Get hourly distribution for a module (sorted by hour ascending).
-    pub fn get_hourly_distribution(&self, module_id: &str) -> Vec<HourlyBucket> {
-        let data = self.data.lock().unwrap();
+    pub(crate) fn get_hourly_distribution(&self, module_id: &str) -> Vec<HourlyBucket> {
+        let data = self.data.lock();
         let module_data = match data.get(module_id) {
             Some(md) => md,
             None => return Vec::new(),
@@ -216,7 +218,7 @@ impl UsageCollector {
 
     /// Compute p99 latency (ms) for a module from stored records.
     pub fn get_p99_latency_ms(&self, module_id: &str) -> f64 {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         let module_data = match data.get(module_id) {
             Some(md) => md,
             None => return 0.0,
@@ -230,19 +232,18 @@ impl UsageCollector {
             return 0.0;
         }
         latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((latencies.len() as f64) * 0.99).ceil() as usize;
-        latencies[idx.min(latencies.len()) - 1]
+        estimate_p99_from_sorted(&latencies)
     }
 
     /// Reset all stats.
     pub fn reset(&self) {
-        self.data.lock().unwrap().clear();
+        self.data.lock().clear();
     }
 }
 
 /// Per-caller usage statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CallerStats {
+pub(crate) struct CallerStats {
     pub caller_id: String,
     pub call_count: u64,
     pub error_count: u64,
@@ -251,7 +252,7 @@ pub struct CallerStats {
 
 /// Hourly usage bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HourlyBucket {
+pub(crate) struct HourlyBucket {
     pub hour: String,
     pub call_count: u64,
     pub error_count: u64,
@@ -300,7 +301,7 @@ impl Middleware for UsageMiddleware {
         _inputs: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut starts = self.starts.lock();
         starts.insert(_ctx.trace_id.clone(), std::time::Instant::now());
         Ok(None)
     }
@@ -313,7 +314,7 @@ impl Middleware for UsageMiddleware {
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         let latency_ms = {
-            let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
                 .map(|s| s.elapsed().as_secs_f64() * 1000.0)
@@ -334,7 +335,7 @@ impl Middleware for UsageMiddleware {
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         let latency_ms = {
-            let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
                 .map(|s| s.elapsed().as_secs_f64() * 1000.0)

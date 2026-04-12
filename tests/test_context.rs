@@ -113,7 +113,7 @@ fn test_context_with_cancel_token() {
 fn test_context_data_starts_empty() {
     let id = make_identity("user-1", "Alice", vec![]);
     let ctx: Context<Value> = Context::new(id);
-    assert!(ctx.data.read().unwrap().is_empty());
+    assert!(ctx.data.read().is_empty());
 }
 
 #[test]
@@ -133,11 +133,10 @@ fn test_shared_data_between_parent_and_child() {
     parent
         .data
         .write()
-        .unwrap()
         .insert("key".to_string(), serde_json::json!("from_parent"));
 
     // Read from child's data — should see parent's write since they share Arc
-    let child_data = child.data.read().unwrap();
+    let child_data = child.data.read();
     assert_eq!(
         child_data.get("key").unwrap(),
         &serde_json::json!("from_parent")
@@ -150,7 +149,6 @@ fn test_context_serde_roundtrip() {
     let ctx: Context<Value> = Context::new(id);
     ctx.data
         .write()
-        .unwrap()
         .insert("foo".to_string(), serde_json::json!(42));
 
     let json = serde_json::to_value(&ctx).unwrap();
@@ -162,7 +160,7 @@ fn test_context_serde_roundtrip() {
         ctx.identity.as_ref().unwrap().id()
     );
     assert_eq!(
-        restored.data.read().unwrap().get("foo"),
+        restored.data.read().get("foo"),
         Some(&serde_json::json!(42))
     );
 }

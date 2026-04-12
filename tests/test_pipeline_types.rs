@@ -245,7 +245,6 @@ async fn test_pipeline_context_fields_initially_none() {
     assert!(pctx.validated_inputs.is_none());
     assert!(pctx.output.is_none());
     assert!(pctx.validated_output.is_none());
-    assert!(!pctx.stream);
 }
 
 // ---------------------------------------------------------------------------

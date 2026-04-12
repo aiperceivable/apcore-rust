@@ -2,10 +2,11 @@
 // Spec reference: Module registration, discovery, validation, and descriptors
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations, ValidationResult};
@@ -56,7 +57,7 @@ pub trait ModuleValidator: Send + Sync {
 }
 
 /// Type alias for the event callback closure.
-type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
+pub type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
 
 /// Reserved words that cannot be used as the first segment of a module ID.
 ///
@@ -106,6 +107,13 @@ impl RegistryEvents {
 /// access pattern matching the Python and TypeScript SDKs.
 pub const REGISTRY_EVENTS: RegistryEvents = RegistryEvents;
 
+/// Canonical regex source for the module ID pattern (PROTOCOL_SPEC §2.7).
+///
+/// Raw string form, matching `apcore-python` / `apcore-typescript`
+/// `MODULE_ID_PATTERN`. Consumers needing a compiled pattern should call
+/// [`module_id_pattern`] instead.
+pub const MODULE_ID_PATTERN: &str = r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$";
+
 /// Canonical EBNF pattern for module IDs per PROTOCOL_SPEC §2.7.
 ///
 /// Equivalent regex of: `canonical_id = segment ("." segment)*` where
@@ -113,7 +121,7 @@ pub const REGISTRY_EVENTS: RegistryEvents = RegistryEvents;
 /// `apcore-typescript` `MODULE_ID_PATTERN`.
 pub fn module_id_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| Regex::new(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$").unwrap())
+    PATTERN.get_or_init(|| Regex::new(MODULE_ID_PATTERN).unwrap())
 }
 
 /// Validate a module ID against PROTOCOL_SPEC §2.7 in canonical order:
@@ -175,48 +183,83 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
     Ok(())
 }
 
-/// Central registry of modules.
+/// Internal shared state for `Registry`, protected by a single `RwLock`.
 ///
-/// TODO(L-012): Add VersionedStore support for multi-version module management.
-/// This requires a separate `versioned_store` module with version-aware storage,
-/// conflict resolution, and migration support. For now, modules are single-version.
-pub struct Registry {
-    modules: HashMap<String, std::sync::Arc<dyn Module>>,
+/// All mutating methods acquire `core.write()` for the duration of the
+/// mutation and release before invoking any user callbacks.
+struct RegistryCore {
+    modules: HashMap<String, Arc<dyn Module>>,
     descriptors: HashMap<String, ModuleDescriptor>,
     /// Reference counts for safe hot-reload — prevents unloading while in use.
     ref_counts: HashMap<String, usize>,
     /// Modules marked for unload (draining active requests before removal).
     draining: HashSet<String>,
-    /// Drain completion notification — signaled when a draining module reaches zero refs.
-    drain_events: HashMap<String, std::sync::Arc<tokio::sync::Notify>>,
-    /// Event callbacks keyed by event name (e.g. "register", "unregister").
-    callbacks: HashMap<String, Vec<Box<ModuleCallbackFn>>>,
     /// Case-insensitive lookup: lowercase name -> canonical name.
     lowercase_map: HashMap<String, String>,
     /// Cached JSON schemas for registered modules.
     schema_cache: HashMap<String, serde_json::Value>,
+}
+
+impl RegistryCore {
+    fn new() -> Self {
+        Self {
+            modules: HashMap::new(),
+            descriptors: HashMap::new(),
+            ref_counts: HashMap::new(),
+            draining: HashSet::new(),
+            lowercase_map: HashMap::new(),
+            schema_cache: HashMap::new(),
+        }
+    }
+}
+
+/// Central registry of modules.
+///
+/// The `Registry` uses interior mutability via `parking_lot::RwLock` so that
+/// a single `Arc<Registry>` may be cloned freely and shared across the
+/// pipeline, sys modules, and user code. All methods take `&self`; callers
+/// never need `Arc::get_mut` or an external `Mutex` wrapper.
+///
+/// Critical invariant: no Registry lock is ever held across an `.await`.
+/// All methods are synchronous, callback invocations clone the callbacks
+/// out of their lock before running them, and the drain-wait logic releases
+/// the core lock before awaiting.
+pub struct Registry {
+    core: RwLock<RegistryCore>,
+    /// Event callbacks keyed by event name (e.g. "register", "unregister").
+    ///
+    /// Callbacks are stored as `Arc` so they can be cloned out of the lock
+    /// before invocation — holding this lock while calling a callback would
+    /// deadlock if the callback tried to register or unregister a module.
+    callbacks: RwLock<HashMap<String, Vec<Arc<ModuleCallbackFn>>>>,
+    /// Drain completion notification — signaled when a draining module reaches zero refs.
+    drain_events: RwLock<HashMap<String, Arc<tokio::sync::Notify>>>,
     /// Optional discoverer for module discovery.
-    discoverer: Option<Box<dyn Discoverer>>,
+    discoverer: RwLock<Option<Box<dyn Discoverer>>>,
     /// Optional validator for module validation.
-    validator: Option<Box<dyn ModuleValidator>>,
+    validator: RwLock<Option<Box<dyn ModuleValidator>>>,
 }
 
 impl std::fmt::Debug for Registry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let core = self.core.read();
         f.debug_struct("Registry")
-            .field("modules", &self.modules.keys().collect::<Vec<_>>())
-            .field("descriptors", &self.descriptors)
-            .field("ref_counts", &self.ref_counts)
-            .field("draining", &self.draining)
+            .field("modules", &core.modules.keys().collect::<Vec<_>>())
+            .field("descriptors", &core.descriptors)
+            .field("ref_counts", &core.ref_counts)
+            .field("draining", &core.draining)
             .field(
                 "drain_events_keys",
-                &self.drain_events.keys().collect::<Vec<_>>(),
+                &self.drain_events.read().keys().cloned().collect::<Vec<_>>(),
             )
-            .field("callbacks_keys", &self.callbacks.keys().collect::<Vec<_>>())
-            .field("lowercase_map", &self.lowercase_map)
+            .field(
+                "callbacks_keys",
+                &self.callbacks.read().keys().cloned().collect::<Vec<_>>(),
+            )
+            .field("lowercase_map", &core.lowercase_map)
             .field(
                 "schema_cache_keys",
-                &self.schema_cache.keys().collect::<Vec<_>>(),
+                &core.schema_cache.keys().collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -226,17 +269,22 @@ impl Registry {
     /// Create a new empty registry.
     pub fn new() -> Self {
         Self {
-            modules: HashMap::new(),
-            descriptors: HashMap::new(),
-            ref_counts: HashMap::new(),
-            draining: HashSet::new(),
-            drain_events: HashMap::new(),
-            callbacks: HashMap::new(),
-            lowercase_map: HashMap::new(),
-            schema_cache: HashMap::new(),
-            discoverer: None,
-            validator: None,
+            core: RwLock::new(RegistryCore::new()),
+            callbacks: RwLock::new(HashMap::new()),
+            drain_events: RwLock::new(HashMap::new()),
+            discoverer: RwLock::new(None),
+            validator: RwLock::new(None),
         }
+    }
+
+    /// Snapshot the callbacks for a given event name so they can be invoked
+    /// without holding the callbacks lock.
+    fn snapshot_callbacks(&self, event: &str) -> Vec<Arc<ModuleCallbackFn>> {
+        self.callbacks
+            .read()
+            .get(event)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Register a module with the given name.
@@ -245,22 +293,16 @@ impl Registry {
     /// apcore-typescript): empty → pattern → length → reserved (per-segment)
     /// → duplicate.
     pub fn register(
-        &mut self,
+        &self,
         name: &str,
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
         validate_module_id(name, false)?;
 
-        if self.modules.contains_key(name) {
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::GeneralInvalidInput,
-                format!("Module ID '{}' is already registered", name),
-            ));
-        }
-
-        // Run validation callbacks if a validator is set
-        if let Some(ref validator) = self.validator {
+        // Run validation callbacks if a validator is set (do NOT hold the
+        // core lock while calling user-supplied code).
+        if let Some(validator) = self.validator.read().as_ref() {
             let result = validator.validate(module.as_ref(), &descriptor);
             if !result.valid {
                 return Err(ModuleError::new(
@@ -274,42 +316,41 @@ impl Registry {
             }
         }
 
-        // Cache the schema
-        let schema = serde_json::json!({
-            "input": descriptor.input_schema,
-            "output": descriptor.output_schema,
-        });
-        self.schema_cache.insert(name.to_string(), schema);
-
-        // Update lowercase map
-        self.lowercase_map
-            .insert(name.to_lowercase(), name.to_string());
-
-        // Call on_load lifecycle hook
+        // Call on_load lifecycle hook before taking the core lock.
         module.on_load();
 
-        // Store module and descriptor
-        let module: std::sync::Arc<dyn Module> = module.into();
-        self.modules.insert(name.to_string(), module);
-        self.descriptors.insert(name.to_string(), descriptor);
-
-        // Fire "register" callbacks
-        if let Some(cbs) = self.callbacks.get("register") {
-            let m = self.modules.get(name).unwrap();
-            for cb in cbs {
-                cb(name, m.as_ref());
+        let module_arc: Arc<dyn Module> = module.into();
+        let module_clone = Arc::clone(&module_arc);
+        {
+            let mut core = self.core.write();
+            if core.modules.contains_key(name) {
+                return Err(ModuleError::new(
+                    crate::errors::ErrorCode::GeneralInvalidInput,
+                    format!("Module ID '{}' is already registered", name),
+                ));
             }
+
+            let schema = serde_json::json!({
+                "input": descriptor.input_schema,
+                "output": descriptor.output_schema,
+            });
+            core.schema_cache.insert(name.to_string(), schema);
+            core.lowercase_map
+                .insert(name.to_lowercase(), name.to_string());
+            core.modules.insert(name.to_string(), module_arc);
+            core.descriptors.insert(name.to_string(), descriptor);
+        }
+
+        // Fire "register" callbacks outside any lock.
+        for cb in self.snapshot_callbacks("register") {
+            cb(name, module_clone.as_ref());
         }
 
         Ok(())
     }
 
     /// Register a module with auto-generated descriptor.
-    pub fn register_module(
-        &mut self,
-        name: &str,
-        module: Box<dyn Module>,
-    ) -> Result<(), ModuleError> {
+    pub fn register_module(&self, name: &str, module: Box<dyn Module>) -> Result<(), ModuleError> {
         let descriptor = ModuleDescriptor {
             name: name.to_string(),
             annotations: ModuleAnnotations::default(),
@@ -323,47 +364,55 @@ impl Registry {
     }
 
     /// Unregister a module by name.
-    pub fn unregister(&mut self, name: &str) -> Result<(), ModuleError> {
-        if !self.modules.contains_key(name) {
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", name),
-            ));
-        }
-
-        // Fire "unregister" callbacks before removal
-        if let Some(cbs) = self.callbacks.get("unregister") {
-            let m = self.modules.get(name).unwrap();
-            for cb in cbs {
-                cb(name, m.as_ref());
+    pub fn unregister(&self, name: &str) -> Result<(), ModuleError> {
+        // Extract module + fire callbacks outside the lock.
+        let removed: Arc<dyn Module> = {
+            let core = self.core.read();
+            match core.modules.get(name) {
+                Some(m) => Arc::clone(m),
+                None => {
+                    return Err(ModuleError::new(
+                        crate::errors::ErrorCode::ModuleNotFound,
+                        format!("Module '{}' not found", name),
+                    ));
+                }
             }
+        };
+
+        // Fire "unregister" callbacks before removal (no lock held).
+        for cb in self.snapshot_callbacks("unregister") {
+            cb(name, removed.as_ref());
         }
 
-        // Call on_unload lifecycle hook
-        if let Some(module) = self.modules.get(name) {
-            module.on_unload();
-        }
+        // Call on_unload lifecycle hook.
+        removed.on_unload();
 
-        // Remove from all maps
-        self.modules.remove(name);
-        self.descriptors.remove(name);
-        self.lowercase_map.remove(&name.to_lowercase());
-        self.schema_cache.remove(name);
-        self.ref_counts.remove(name);
-        self.draining.remove(name);
-        self.drain_events.remove(name);
+        // Now actually remove the module under the core write lock.
+        {
+            let mut core = self.core.write();
+            core.modules.remove(name);
+            core.descriptors.remove(name);
+            core.lowercase_map.remove(&name.to_lowercase());
+            core.schema_cache.remove(name);
+            core.ref_counts.remove(name);
+            core.draining.remove(name);
+        }
+        self.drain_events.write().remove(name);
 
         Ok(())
     }
 
     /// Get a shared reference to a module by name.
-    pub fn get(&self, name: &str) -> Option<std::sync::Arc<dyn Module>> {
-        self.modules.get(name).cloned()
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Module>> {
+        self.core.read().modules.get(name).cloned()
     }
 
     /// Get the definition (descriptor) for a module by name.
-    pub fn get_definition(&self, name: &str) -> Option<&ModuleDescriptor> {
-        self.descriptors.get(name)
+    ///
+    /// Returns a cloned `ModuleDescriptor` because the underlying storage
+    /// is behind a lock — we cannot hand out borrowed references.
+    pub fn get_definition(&self, name: &str) -> Option<ModuleDescriptor> {
+        self.core.read().descriptors.get(name).cloned()
     }
 
     /// List registered module names with optional filtering.
@@ -372,8 +421,11 @@ impl Registry {
     ///   contain ALL of the specified tags.
     /// - `prefix`: if provided, only return modules whose name starts with the prefix.
     /// - When both are `None`, returns all registered module names.
-    pub fn list(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<&str> {
-        self.modules
+    ///
+    /// Returns owned `String` values because the storage is behind a lock.
+    pub fn list(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<String> {
+        let core = self.core.read();
+        core.modules
             .keys()
             .filter(|name| {
                 if let Some(pfx) = prefix {
@@ -382,7 +434,7 @@ impl Registry {
                     }
                 }
                 if let Some(required_tags) = tags {
-                    if let Some(desc) = self.descriptors.get(name.as_str()) {
+                    if let Some(desc) = core.descriptors.get(name.as_str()) {
                         let module_tags = &desc.tags;
                         if !required_tags
                             .iter()
@@ -391,37 +443,33 @@ impl Registry {
                             return false;
                         }
                     } else {
-                        // No descriptor means no tags — exclude when tag filter is active
                         return false;
                     }
                 }
                 true
             })
-            .map(|k| k.as_str())
+            .cloned()
             .collect()
     }
 
     /// Check if a module is registered.
     pub fn has(&self, name: &str) -> bool {
-        self.modules.contains_key(name)
+        self.core.read().modules.contains_key(name)
     }
 
     /// Discover and register modules from a discoverer.
-    pub async fn discover(
-        &mut self,
-        discoverer: &dyn Discoverer,
-    ) -> Result<Vec<String>, ModuleError> {
+    pub async fn discover(&self, discoverer: &dyn Discoverer) -> Result<Vec<String>, ModuleError> {
         let discovered = discoverer.discover().await?;
         let mut registered_names = Vec::new();
 
-        for dm in discovered {
-            // Discovery returns descriptors but not actual module implementations.
-            // We record the name; actual module objects would need to be constructed
-            // by a loader. For now, store the descriptor and track the name.
-            self.descriptors.insert(dm.name.clone(), dm.descriptor);
-            self.lowercase_map
-                .insert(dm.name.to_lowercase(), dm.name.clone());
-            registered_names.push(dm.name);
+        {
+            let mut core = self.core.write();
+            for dm in discovered {
+                core.descriptors.insert(dm.name.clone(), dm.descriptor);
+                core.lowercase_map
+                    .insert(dm.name.to_lowercase(), dm.name.clone());
+                registered_names.push(dm.name);
+            }
         }
 
         Ok(registered_names)
@@ -436,110 +484,112 @@ impl Registry {
     /// `apcore::sys_modules`. Aligned with apcore-typescript
     /// `Registry.registerInternal`.
     pub fn register_internal(
-        &mut self,
+        &self,
         name: &str,
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
         validate_module_id(name, true)?;
 
-        if self.modules.contains_key(name) {
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::GeneralInvalidInput,
-                format!("Module ID '{}' is already registered", name),
-            ));
+        module.on_load();
+        let module_arc: Arc<dyn Module> = module.into();
+        let module_clone = Arc::clone(&module_arc);
+
+        {
+            let mut core = self.core.write();
+            if core.modules.contains_key(name) {
+                return Err(ModuleError::new(
+                    crate::errors::ErrorCode::GeneralInvalidInput,
+                    format!("Module ID '{}' is already registered", name),
+                ));
+            }
+
+            let schema = serde_json::json!({
+                "input": descriptor.input_schema,
+                "output": descriptor.output_schema,
+            });
+            core.schema_cache.insert(name.to_string(), schema);
+            core.lowercase_map
+                .insert(name.to_lowercase(), name.to_string());
+            core.modules.insert(name.to_string(), module_arc);
+            core.descriptors.insert(name.to_string(), descriptor);
         }
 
-        // Cache the schema
-        let schema = serde_json::json!({
-            "input": descriptor.input_schema,
-            "output": descriptor.output_schema,
-        });
-        self.schema_cache.insert(name.to_string(), schema);
-
-        // Update lowercase map
-        self.lowercase_map
-            .insert(name.to_lowercase(), name.to_string());
-
-        // Call on_load lifecycle hook
-        module.on_load();
-
-        // Store module and descriptor
-        let module: std::sync::Arc<dyn Module> = module.into();
-        self.modules.insert(name.to_string(), module);
-        self.descriptors.insert(name.to_string(), descriptor);
-
-        // Fire "register" callbacks
-        if let Some(cbs) = self.callbacks.get("register") {
-            let m = self.modules.get(name).unwrap();
-            for cb in cbs {
-                cb(name, m.as_ref());
-            }
+        // Fire "register" callbacks outside any lock.
+        for cb in self.snapshot_callbacks("register") {
+            cb(name, module_clone.as_ref());
         }
 
         Ok(())
     }
 
-    /// Iterate over modules.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &dyn Module)> {
-        self.modules
-            .iter()
-            .map(|(name, module)| (name.as_str(), module.as_ref()))
+    /// Apply a closure to every registered module.
+    ///
+    /// The closure is invoked while holding a read lock on the core, so it
+    /// MUST NOT recursively acquire any Registry lock.
+    pub fn for_each_module(&self, mut f: impl FnMut(&str, &dyn Module)) {
+        let core = self.core.read();
+        for (name, module) in core.modules.iter() {
+            f(name.as_str(), module.as_ref());
+        }
     }
 
     /// Human-readable module description.
     pub fn describe(&self, name: &str) -> String {
-        match self.modules.get(name) {
+        match self.core.read().modules.get(name) {
             Some(module) => module.description().to_string(),
             None => "Module not found".to_string(),
         }
     }
 
     /// Draining-aware unregister.
-    pub async fn safe_unregister(
-        &mut self,
-        name: &str,
-        timeout_ms: u64,
-    ) -> Result<bool, ModuleError> {
-        if !self.modules.contains_key(name) {
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", name),
-            ));
-        }
+    pub async fn safe_unregister(&self, name: &str, timeout_ms: u64) -> Result<bool, ModuleError> {
+        // Mark draining, check ref_count. If zero we can proceed immediately.
+        let need_wait_notify: Option<Arc<tokio::sync::Notify>> = {
+            let mut core = self.core.write();
+            if !core.modules.contains_key(name) {
+                return Err(ModuleError::new(
+                    crate::errors::ErrorCode::ModuleNotFound,
+                    format!("Module '{}' not found", name),
+                ));
+            }
+            core.draining.insert(name.to_string());
+            let current_refs = core.ref_counts.get(name).copied().unwrap_or(0);
+            if current_refs == 0 {
+                None
+            } else {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                self.drain_events
+                    .write()
+                    .insert(name.to_string(), Arc::clone(&notify));
+                Some(notify)
+            }
+        };
 
-        // Mark as draining
-        self.draining.insert(name.to_string());
-
-        // Check if ref_count is already zero
-        let current_refs = self.ref_counts.get(name).copied().unwrap_or(0);
-        if current_refs == 0 {
-            self.unregister(name)?;
-            return Ok(true);
-        }
-
-        // Set up a notification for when draining completes
-        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        self.drain_events.insert(name.to_string(), notify.clone());
-
-        // Wait for ref_count to reach 0 or timeout
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            notify.notified(),
-        )
-        .await;
-
-        match result {
-            Ok(_) => {
-                // Drain completed, unregister
+        match need_wait_notify {
+            None => {
                 self.unregister(name)?;
                 Ok(true)
             }
-            Err(_) => {
-                // Timeout — remove draining flag but don't unregister
-                self.draining.remove(name);
-                self.drain_events.remove(name);
-                Ok(false)
+            Some(notify) => {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    notify.notified(),
+                )
+                .await;
+
+                match result {
+                    Ok(_) => {
+                        self.unregister(name)?;
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        // Timeout — remove draining flag but don't unregister.
+                        self.core.write().draining.remove(name);
+                        self.drain_events.write().remove(name);
+                        Ok(false)
+                    }
+                }
             }
         }
     }
@@ -549,35 +599,46 @@ impl Registry {
     /// Increments the reference count for the module before returning it.
     /// Call `release_ref()` when done to decrement the count. This is required
     /// for `safe_unregister()` drain logic to work correctly.
-    pub fn acquire_ref(&mut self, name: &str) -> Result<&dyn Module, ModuleError> {
-        if self.draining.contains(name) {
+    pub fn acquire_ref(&self, name: &str) -> Result<Arc<dyn Module>, ModuleError> {
+        let mut core = self.core.write();
+        if core.draining.contains(name) {
             return Err(ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
                 format!("Module '{}' is draining", name),
             ));
         }
-        let module = self.modules.get(name).map(|m| m.as_ref()).ok_or_else(|| {
+        let module = core.modules.get(name).cloned().ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
                 format!("Module '{}' not found", name),
             )
         })?;
-        *self.ref_counts.entry(name.to_string()).or_insert(0) += 1;
+        *core.ref_counts.entry(name.to_string()).or_insert(0) += 1;
         Ok(module)
     }
 
     /// Decrement the reference count for a module. Notifies drain waiters when count reaches 0.
-    pub fn release_ref(&mut self, name: &str) {
-        if let Some(count) = self.ref_counts.get_mut(name) {
-            if *count > 0 {
-                *count -= 1;
-            }
-            if *count == 0 {
-                self.ref_counts.remove(name);
-                // Notify drain waiters
-                if let Some(notify) = self.drain_events.get(name) {
-                    notify.notify_one();
+    pub fn release_ref(&self, name: &str) {
+        let should_notify = {
+            let mut core = self.core.write();
+            if let Some(count) = core.ref_counts.get_mut(name) {
+                if *count > 0 {
+                    *count -= 1;
                 }
+                if *count == 0 {
+                    core.ref_counts.remove(name);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if should_notify {
+            if let Some(notify) = self.drain_events.read().get(name) {
+                notify.notify_one();
             }
         }
     }
@@ -587,14 +648,15 @@ impl Registry {
     /// Checks draining status before returning the module reference.
     /// Note: For safe-unregister scenarios, use `acquire_ref()`/`release_ref()`
     /// instead, which track reference counts for drain logic.
-    pub fn acquire(&self, name: &str) -> Result<&dyn Module, ModuleError> {
-        if self.draining.contains(name) {
+    pub fn acquire(&self, name: &str) -> Result<Arc<dyn Module>, ModuleError> {
+        let core = self.core.read();
+        if core.draining.contains(name) {
             return Err(ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
                 format!("Module '{}' is draining", name),
             ));
         }
-        self.modules.get(name).map(|m| m.as_ref()).ok_or_else(|| {
+        core.modules.get(name).cloned().ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
                 format!("Module '{}' not found", name),
@@ -604,85 +666,124 @@ impl Registry {
 
     /// Check if a module is draining.
     pub fn is_draining(&self, name: &str) -> bool {
-        self.draining.contains(name)
+        self.core.read().draining.contains(name)
     }
 
     /// Event subscription.
-    pub fn on(&mut self, event: &str, callback: Box<ModuleCallbackFn>) {
+    pub fn on(&self, event: &str, callback: Box<ModuleCallbackFn>) {
         self.callbacks
+            .write()
             .entry(event.to_string())
             .or_default()
-            .push(callback);
+            .push(Arc::from(callback));
     }
 
     /// Filesystem watching (no-op — filesystem watching is platform-specific).
-    pub async fn watch(&mut self) -> Result<(), ModuleError> {
+    pub async fn watch(&self) -> Result<(), ModuleError> {
         // No-op: filesystem watching requires platform-specific dependencies
         // (e.g. notify crate). Stubbed for API compatibility.
         Ok(())
     }
 
     /// Stop filesystem watching (no-op).
-    pub fn unwatch(&mut self) {
+    pub fn unwatch(&self) {
         // No-op: filesystem watching is not implemented yet.
     }
 
     /// Discover modules using the internally-set discoverer.
-    pub async fn discover_internal(&mut self) -> Result<Vec<String>, ModuleError> {
-        let discoverer = self.discoverer.as_ref().ok_or_else(|| {
-            ModuleError::new(
-                crate::errors::ErrorCode::ModuleLoadError,
-                "No discoverer configured".to_string(),
-            )
-        })?;
-        let discovered = discoverer.discover().await?;
-        let mut registered_names = Vec::new();
+    pub async fn discover_internal(&self) -> Result<Vec<String>, ModuleError> {
+        // Run discovery outside of any lock, but we need to briefly check
+        // that a discoverer is set. We can't hold the discoverer lock across
+        // `.await`, so we invoke it through a short-lived critical section
+        // instead — we need the discoverer to survive across the await, so
+        // the call itself happens while we still hold a read lock but that
+        // is a `parking_lot::RwLockReadGuard` which is `Send`. However, we
+        // must NOT hold it across `.await`. Workaround: require the
+        // discoverer's `discover()` future to be pollable independently.
+        //
+        // We achieve this by extracting nothing from the discoverer guard —
+        // instead we do discovery on a separate dedicated path: the
+        // discoverer must provide its own internal sync. In practice we
+        // simply call discoverer.discover().await inside the block, but we
+        // cannot hold a parking_lot guard across await.
+        //
+        // Since Box<dyn Discoverer> can't be moved out of the Option under
+        // a read lock, we accept a subtle limitation: discovery and
+        // set_discoverer are mutually exclusive in time. We hold the
+        // discoverer write lock briefly, replace it with None, perform the
+        // discovery, then put it back.
+        let discoverer_opt = self.discoverer.write().take();
+        let discoverer = match discoverer_opt {
+            Some(d) => d,
+            None => {
+                return Err(ModuleError::new(
+                    crate::errors::ErrorCode::ModuleLoadError,
+                    "No discoverer configured".to_string(),
+                ));
+            }
+        };
 
-        for dm in discovered {
-            self.descriptors.insert(dm.name.clone(), dm.descriptor);
-            self.lowercase_map
-                .insert(dm.name.to_lowercase(), dm.name.clone());
-            registered_names.push(dm.name);
+        let discover_result = discoverer.discover().await;
+        // Put the discoverer back, but only if no concurrent `set_discoverer`
+        // swapped a new one in during the await. Otherwise the new one wins.
+        {
+            let mut slot = self.discoverer.write();
+            if slot.is_none() {
+                *slot = Some(discoverer);
+            }
+        }
+
+        let discovered = discover_result?;
+        let mut registered_names = Vec::new();
+        {
+            let mut core = self.core.write();
+            for dm in discovered {
+                core.descriptors.insert(dm.name.clone(), dm.descriptor);
+                core.lowercase_map
+                    .insert(dm.name.to_lowercase(), dm.name.clone());
+                registered_names.push(dm.name);
+            }
         }
 
         Ok(registered_names)
     }
 
     /// Set the discoverer.
-    pub fn set_discoverer(&mut self, discoverer: Box<dyn Discoverer>) {
-        self.discoverer = Some(discoverer);
+    pub fn set_discoverer(&self, discoverer: Box<dyn Discoverer>) {
+        *self.discoverer.write() = Some(discoverer);
     }
 
     /// Set the validator.
-    pub fn set_validator(&mut self, validator: Box<dyn ModuleValidator>) {
-        self.validator = Some(validator);
+    pub fn set_validator(&self, validator: Box<dyn ModuleValidator>) {
+        *self.validator.write() = Some(validator);
     }
 
     /// Return count of registered modules.
     pub fn count(&self) -> usize {
-        self.modules.len()
+        self.core.read().modules.len()
     }
 
     /// Return all module IDs, sorted alphabetically.
     pub fn module_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.modules.keys().cloned().collect();
+        let mut ids: Vec<String> = self.core.read().modules.keys().cloned().collect();
         ids.sort();
         ids
     }
 
     /// Export the combined input/output schema for a module.
     ///
-    /// Returns the cached schema JSON, or `None` if the module is not registered.
-    pub fn export_schema(&self, name: &str) -> Option<&serde_json::Value> {
-        self.schema_cache.get(name)
+    /// Returns a cloned schema JSON, or `None` if the module is not registered.
+    pub fn export_schema(&self, name: &str) -> Option<serde_json::Value> {
+        self.core.read().schema_cache.get(name).cloned()
     }
 
     /// Mark a module as disabled in its descriptor.
     ///
     /// Disabled modules remain registered but callers should check `is_enabled()`
     /// before dispatching. Returns an error if the module is not found.
-    pub fn disable(&mut self, name: &str) -> Result<(), ModuleError> {
-        let descriptor = self.descriptors.get_mut(name).ok_or_else(|| {
+    pub fn disable(&self, name: &str) -> Result<(), ModuleError> {
+        let mut core = self.core.write();
+        let descriptor = core.descriptors.get_mut(name).ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
                 format!("Module '{}' not found", name),
@@ -695,8 +796,9 @@ impl Registry {
     /// Mark a module as enabled in its descriptor.
     ///
     /// Returns an error if the module is not found.
-    pub fn enable(&mut self, name: &str) -> Result<(), ModuleError> {
-        let descriptor = self.descriptors.get_mut(name).ok_or_else(|| {
+    pub fn enable(&self, name: &str) -> Result<(), ModuleError> {
+        let mut core = self.core.write();
+        let descriptor = core.descriptors.get_mut(name).ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
                 format!("Module '{}' not found", name),
@@ -710,7 +812,7 @@ impl Registry {
     ///
     /// Returns `None` if the module is not registered.
     pub fn is_enabled(&self, name: &str) -> Option<bool> {
-        self.descriptors.get(name).map(|d| d.enabled)
+        self.core.read().descriptors.get(name).map(|d| d.enabled)
     }
 }
 

@@ -23,7 +23,7 @@ fn make_ctx() -> Context<()> {
         identity: Some(identity),
         services: (),
         caller_id: Some("api.users.get".to_string()),
-        data: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+        data: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         call_chain: vec!["api.users.get".to_string()],
         redacted_inputs: None,
         cancel_token: None,
@@ -104,7 +104,7 @@ fn test_serialize_filters_underscore_data_keys() {
     // AC-005
     let ctx = make_ctx();
     {
-        let mut data = ctx.data.write().unwrap();
+        let mut data = ctx.data.write();
         data.insert("_apcore.internal".to_string(), serde_json::json!("hidden"));
         data.insert("_secret_key".to_string(), serde_json::json!("hidden"));
         data.insert("public.counter".to_string(), serde_json::json!(42));
@@ -122,7 +122,7 @@ fn test_serialize_filters_underscore_data_keys() {
 fn test_serialize_empty_data() {
     let ctx = make_ctx();
     {
-        let mut data = ctx.data.write().unwrap();
+        let mut data = ctx.data.write();
         data.insert("_private".to_string(), serde_json::json!("hidden"));
     }
     let serialized = ctx.serialize();
@@ -134,14 +134,14 @@ fn test_serialize_empty_data() {
 fn test_deserialize_roundtrip() {
     let ctx = make_ctx();
     {
-        let mut data = ctx.data.write().unwrap();
+        let mut data = ctx.data.write();
         data.insert("app.counter".to_string(), serde_json::json!(42));
     }
     let serialized = ctx.serialize();
     let restored: Context<()> = Context::deserialize(serialized).unwrap();
     assert_eq!(restored.trace_id, ctx.trace_id);
     assert_eq!(restored.caller_id, ctx.caller_id);
-    let data = restored.data.read().unwrap();
+    let data = restored.data.read();
     assert_eq!(data.get("app.counter"), Some(&serde_json::json!(42)));
 }
 
@@ -203,6 +203,6 @@ fn test_deserialize_unknown_top_level_fields() {
     });
     let restored: Context<()> = Context::deserialize(data).unwrap();
     assert_eq!(restored.trace_id, "abc-123");
-    let data_map = restored.data.read().unwrap();
+    let data_map = restored.data.read();
     assert_eq!(data_map.get("custom"), Some(&serde_json::json!("value")));
 }

@@ -22,13 +22,13 @@ pub struct Span {
     #[serde(default)]
     pub attributes: HashMap<String, serde_json::Value>,
     #[serde(default)]
-    pub events: Vec<SpanEvent>,
+    pub(crate) events: Vec<SpanEvent>,
     pub status: SpanStatus,
 }
 
 /// An event within a span.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpanEvent {
+pub(crate) struct SpanEvent {
     pub name: String,
     pub timestamp: DateTime<Utc>,
     #[serde(default)]

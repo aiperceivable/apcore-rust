@@ -1,7 +1,9 @@
 // APCore Protocol — Middleware manager
 // Spec reference: Middleware pipeline execution
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use super::base::Middleware;
 use crate::context::Context;
@@ -32,7 +34,12 @@ impl MiddlewareManager {
     ///
     /// Returns an error if the middleware's priority exceeds 1000 (the spec-defined
     /// maximum from section 11.2).
-    pub fn add(&mut self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
+    ///
+    /// Takes `&self` — the internal list is protected by a `Mutex`, so mutation
+    /// is possible through a shared reference. This allows `MiddlewareManager`
+    /// to be held as `Arc<MiddlewareManager>` and mutated without `Arc::get_mut`
+    /// hacks, even after the `Arc` has been cloned into pipeline contexts.
+    pub fn add(&self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
         let priority = middleware.priority();
         if priority > 1000 {
             tracing::warn!(
@@ -50,7 +57,7 @@ impl MiddlewareManager {
                 ),
             ));
         }
-        let mut mws = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mws = self.middlewares.lock();
         let arc: Arc<dyn Middleware> = Arc::from(middleware);
         // Find the first position where existing priority is strictly less than
         // the new priority. Insert before that position to maintain stable
@@ -67,8 +74,10 @@ impl MiddlewareManager {
     ///
     /// Removes only the first match (not all), matching Python's
     /// identity-based semantics which also removes exactly one instance.
-    pub fn remove(&mut self, name: &str) -> bool {
-        let mut mws = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
+    ///
+    /// Takes `&self` — mutation goes through the internal `Mutex`.
+    pub fn remove(&self, name: &str) -> bool {
+        let mut mws = self.middlewares.lock();
         let pos = mws.iter().position(|m| m.name() == name);
         if let Some(i) = pos {
             mws.remove(i);
@@ -80,7 +89,7 @@ impl MiddlewareManager {
 
     /// Return a snapshot of middleware names in pipeline order.
     pub fn snapshot(&self) -> Vec<String> {
-        let mws = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
+        let mws = self.middlewares.lock();
         mws.iter().map(|m| m.name().to_string()).collect()
     }
 
@@ -101,7 +110,7 @@ impl MiddlewareManager {
     ) -> Result<(serde_json::Value, Vec<usize>), ModuleError> {
         // Clone Arc pointers so the mutex is not held across .await points.
         let mws: Vec<Arc<dyn Middleware>> = {
-            let guard = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self.middlewares.lock();
             guard.iter().map(Arc::clone).collect()
         };
         let mut executed: Vec<usize> = Vec::new();
@@ -144,7 +153,7 @@ impl MiddlewareManager {
     ) -> Result<serde_json::Value, ModuleError> {
         // Clone Arc pointers so the mutex is not held across .await points.
         let mws: Vec<Arc<dyn Middleware>> = {
-            let guard = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self.middlewares.lock();
             guard.iter().map(Arc::clone).collect()
         };
         for mw in mws.iter().rev() {
@@ -180,7 +189,7 @@ impl MiddlewareManager {
     ) -> Option<serde_json::Value> {
         // Clone Arc pointers so the mutex is not held across .await points.
         let mws: Vec<Arc<dyn Middleware>> = {
-            let guard = self.middlewares.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self.middlewares.lock();
             guard.iter().map(Arc::clone).collect()
         };
         let mut recovery: Option<serde_json::Value> = None;
@@ -282,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_higher_priority_executes_first_in_before() {
-        let mut mgr = MiddlewareManager::new();
+        let mgr = MiddlewareManager::new();
         mgr.add(TestMiddleware::boxed("low", 1)).unwrap();
         mgr.add(TestMiddleware::boxed("high", 10)).unwrap();
         mgr.add(TestMiddleware::boxed("mid", 5)).unwrap();
@@ -293,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_equal_priority_preserves_registration_order() {
-        let mut mgr = MiddlewareManager::new();
+        let mgr = MiddlewareManager::new();
         mgr.add(TestMiddleware::boxed("first", 5)).unwrap();
         mgr.add(TestMiddleware::boxed("second", 5)).unwrap();
         mgr.add(TestMiddleware::boxed("third", 5)).unwrap();
@@ -304,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_default_priority_orders_after_explicit_priority() {
-        let mut mgr = MiddlewareManager::new();
+        let mgr = MiddlewareManager::new();
         mgr.add(TestMiddleware::boxed("default_a", 0)).unwrap();
         mgr.add(TestMiddleware::boxed("explicit", 1)).unwrap();
         mgr.add(TestMiddleware::boxed("default_b", 0)).unwrap();
@@ -315,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_reflects_priority_sorted_order() {
-        let mut mgr = MiddlewareManager::new();
+        let mgr = MiddlewareManager::new();
         mgr.add(TestMiddleware::boxed("d", 0)).unwrap();
         mgr.add(TestMiddleware::boxed("a", 100)).unwrap();
         mgr.add(TestMiddleware::boxed("c", 5)).unwrap();
@@ -327,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_add_rejects_priority_above_1000() {
-        let mut mgr = MiddlewareManager::new();
+        let mgr = MiddlewareManager::new();
         let result = mgr.add(TestMiddleware::boxed("over_limit", 1001));
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -342,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_add_accepts_priority_at_1000() {
-        let mut mgr = MiddlewareManager::new();
+        let mgr = MiddlewareManager::new();
         mgr.add(TestMiddleware::boxed("at_limit", 1000)).unwrap();
         assert_eq!(mgr.snapshot(), vec!["at_limit"]);
     }

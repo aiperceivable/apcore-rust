@@ -3,7 +3,8 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use super::span::{Span, SpanExporter, SpanStatus};
 use crate::context::Context;
@@ -81,19 +82,13 @@ impl TracingMiddleware {
     /// Determine if this request should be sampled, inheriting from parent if available.
     fn should_sample(&self, ctx: &Context<serde_json::Value>) -> bool {
         // Check for inherited decision first (from context.data)
-        if let Some(sampled) = ctx
-            .data
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get("_apcore.mw.tracing.sampled")
-            .cloned()
-        {
+        if let Some(sampled) = ctx.data.read().get("_apcore.mw.tracing.sampled").cloned() {
             if let Some(b) = sampled.as_bool() {
                 return b;
             }
         }
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock();
 
         // Check cached decision for this trace
         if let Some(&decision) = state.sampling.get(&ctx.trace_id) {
@@ -141,7 +136,7 @@ impl Middleware for TracingMiddleware {
 
         // Single lock scope: read parent span_id and push the new span
         {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock();
             let stack = state.spans.entry(ctx.trace_id.clone()).or_default();
             if let Some(parent) = stack.last() {
                 span.parent_span_id = Some(parent.span_id.clone());
@@ -161,7 +156,7 @@ impl Middleware for TracingMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Single lock scope: pop span and clean up empty stacks
         let (span, should_clean_sampling) = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock();
             let popped = state
                 .spans
                 .get_mut(&ctx.trace_id)
@@ -199,7 +194,7 @@ impl Middleware for TracingMiddleware {
         // Clean up sampling decision after export (needs separate lock since
         // should_sample/export happened between the two lock scopes)
         if should_clean_sampling {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock();
             state.sampling.remove(&ctx.trace_id);
         }
 
@@ -215,7 +210,7 @@ impl Middleware for TracingMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Single lock scope: pop span and clean up empty stacks
         let (span, should_clean_sampling) = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock();
             let popped = state
                 .spans
                 .get_mut(&ctx.trace_id)
@@ -267,7 +262,7 @@ impl Middleware for TracingMiddleware {
 
         // Clean up sampling decision after export
         if should_clean_sampling {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock();
             state.sampling.remove(&ctx.trace_id);
         }
 
@@ -379,7 +374,7 @@ mod tests {
             .unwrap();
 
         // State should be fully cleaned up — no leftover entries
-        let state = mw.state.lock().unwrap();
+        let state = mw.state.lock();
         assert!(
             !state.spans.contains_key("trace-cleanup"),
             "span stack should be removed after all spans are popped"
@@ -408,7 +403,7 @@ mod tests {
 
         // Verify the decision is cached
         {
-            let state = mw.state.lock().unwrap();
+            let state = mw.state.lock();
             assert_eq!(
                 state.sampling.get("trace-inherit"),
                 Some(&true),
@@ -422,7 +417,7 @@ mod tests {
             .unwrap();
 
         {
-            let state = mw.state.lock().unwrap();
+            let state = mw.state.lock();
             assert_eq!(
                 state.sampling.get("trace-inherit"),
                 Some(&true),

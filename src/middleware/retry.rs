@@ -4,8 +4,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use super::base::Middleware;
 use crate::context::Context;
@@ -131,10 +132,7 @@ impl Middleware for RetryMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Reset retry count on successful execution so retries don't persist
         // across separate call sequences.
-        self.retry_counts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(module_id);
+        self.retry_counts.lock().remove(module_id);
         Ok(None)
     }
 
@@ -151,7 +149,7 @@ impl Middleware for RetryMiddleware {
         }
 
         let retry_count = {
-            let counts = self.retry_counts.lock().unwrap_or_else(|e| e.into_inner());
+            let counts = self.retry_counts.lock();
             *counts.get(module_id).unwrap_or(&0)
         };
 
@@ -179,7 +177,7 @@ impl Middleware for RetryMiddleware {
 
         // Increment the retry count.
         {
-            let mut counts = self.retry_counts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut counts = self.retry_counts.lock();
             *counts.entry(module_id.to_string()).or_insert(0) += 1;
         }
 

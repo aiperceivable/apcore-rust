@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use crate::cancel::CancelToken;
 use crate::observability::logging::ContextLogger;
@@ -85,8 +86,13 @@ impl Identity {
 /// Shared mutable data map that is readable/writable along the call chain.
 ///
 /// Parent and child contexts share the same underlying `HashMap` through
-/// an `Arc<RwLock<...>>`. Use `data.read().unwrap_or_else(|e| e.into_inner())`
-/// / `data.write().unwrap_or_else(|e| e.into_inner())` to access entries.
+/// an `Arc<parking_lot::RwLock<...>>`. Use `data.read()` / `data.write()`
+/// to access entries — the guards are infallible (not `Result`), so no
+/// `.unwrap()` is required.
+///
+/// IMPORTANT: `parking_lot::RwLock` guards are synchronous. Never hold a
+/// guard across an `.await` point — copy or clone the data you need and
+/// drop the guard first.
 ///
 /// Note: deserialization creates a new `Arc` (not shared with the original).
 pub type SharedData = Arc<RwLock<HashMap<String, serde_json::Value>>>;
@@ -132,7 +138,7 @@ fn serialize_shared_data<S>(data: &SharedData, serializer: S) -> Result<S::Ok, S
 where
     S: serde::Serializer,
 {
-    let map = data.read().map_err(serde::ser::Error::custom)?;
+    let map = data.read();
     map.serialize(serializer)
 }
 
@@ -267,13 +273,10 @@ impl<T: Default> Context<T> {
         let filtered: HashMap<String, serde_json::Value> = self
             .data
             .read()
-            .map(|map| {
-                map.iter()
-                    .filter(|(k, _)| !k.starts_with('_'))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
         result["data"] = serde_json::to_value(filtered).unwrap_or_default();
         result

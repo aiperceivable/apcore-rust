@@ -1,0 +1,204 @@
+//! Tests for SchemaLoader — loading schemas from files and inline values.
+
+use apcore::schema::{SchemaLoader, SchemaStrategy};
+use serde_json::json;
+use std::io::Write;
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_new_defaults_to_yaml_first() {
+    let loader = SchemaLoader::new();
+    assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
+}
+
+#[test]
+fn test_schema_loader_with_strategy() {
+    let loader = SchemaLoader::with_strategy(SchemaStrategy::NativeFirst);
+    assert_eq!(loader.strategy, SchemaStrategy::NativeFirst);
+}
+
+#[test]
+fn test_schema_loader_with_strategy_yaml_only() {
+    let loader = SchemaLoader::with_strategy(SchemaStrategy::YamlOnly);
+    assert_eq!(loader.strategy, SchemaStrategy::YamlOnly);
+}
+
+#[test]
+fn test_schema_loader_default() {
+    let loader = SchemaLoader::default();
+    assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
+}
+
+// ---------------------------------------------------------------------------
+// load_from_value
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_load_from_value_and_get() {
+    let mut loader = SchemaLoader::new();
+    let schema = json!({ "type": "object" });
+    loader
+        .load_from_value("test_schema", schema.clone())
+        .unwrap();
+    let loaded = loader.get("test_schema").unwrap();
+    assert_eq!(loaded, &schema);
+}
+
+#[test]
+fn test_schema_loader_load_from_value_overwrites() {
+    let mut loader = SchemaLoader::new();
+    loader
+        .load_from_value("s", json!({ "type": "string" }))
+        .unwrap();
+    loader
+        .load_from_value("s", json!({ "type": "integer" }))
+        .unwrap();
+    assert_eq!(loader.get("s").unwrap(), &json!({ "type": "integer" }));
+}
+
+#[test]
+fn test_schema_loader_get_missing_returns_none() {
+    let loader = SchemaLoader::new();
+    assert!(loader.get("nonexistent").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_list_empty() {
+    let loader = SchemaLoader::new();
+    assert!(loader.list().is_empty());
+}
+
+#[test]
+fn test_schema_loader_list_returns_all_names() {
+    let mut loader = SchemaLoader::new();
+    loader.load_from_value("a", json!({})).unwrap();
+    loader.load_from_value("b", json!({})).unwrap();
+    let mut names = loader.list();
+    names.sort();
+    assert_eq!(names, vec!["a", "b"]);
+}
+
+// ---------------------------------------------------------------------------
+// load_from_file — JSON
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_load_from_json_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.json");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        r#"{{"type": "object", "properties": {{"x": {{"type": "integer"}}}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    let mut loader = SchemaLoader::new();
+    loader.load_from_file("json_schema", &path).unwrap();
+    let loaded = loader.get("json_schema").unwrap();
+    assert_eq!(loaded["type"], "object");
+    assert!(loaded["properties"]["x"].is_object());
+}
+
+// ---------------------------------------------------------------------------
+// load_from_file — YAML
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_load_from_yaml_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.yaml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        "type: object\nproperties:\n  name:\n    type: string\n"
+    )
+    .unwrap();
+    drop(file);
+
+    let mut loader = SchemaLoader::new();
+    loader.load_from_file("yaml_schema", &path).unwrap();
+    let loaded = loader.get("yaml_schema").unwrap();
+    assert_eq!(loaded["type"], "object");
+    assert_eq!(loaded["properties"]["name"]["type"], "string");
+}
+
+#[test]
+fn test_schema_loader_load_from_yml_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.yml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(file, "type: string").unwrap();
+    drop(file);
+
+    let mut loader = SchemaLoader::new();
+    loader.load_from_file("yml_schema", &path).unwrap();
+    assert_eq!(
+        loader.get("yml_schema").unwrap(),
+        &json!({ "type": "string" })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// load_from_file — error conditions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_load_from_file_not_found() {
+    let mut loader = SchemaLoader::new();
+    let result = loader.load_from_file("missing", std::path::Path::new("/nonexistent/schema.json"));
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaNotFound);
+    assert!(err.message.contains("Failed to read"));
+}
+
+#[test]
+fn test_schema_loader_load_from_file_invalid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.json");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(file, "{{not valid json}}").unwrap();
+    drop(file);
+
+    let mut loader = SchemaLoader::new();
+    let result = loader.load_from_file("bad", &path);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaParseError);
+    assert!(err.message.contains("Failed to parse JSON"));
+}
+
+#[test]
+fn test_schema_loader_load_from_file_invalid_yaml() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.yaml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(file, ":\n  - :\n    bad: [unclosed").unwrap();
+    drop(file);
+
+    let mut loader = SchemaLoader::new();
+    let result = loader.load_from_file("bad", &path);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaParseError);
+}
+
+// ---------------------------------------------------------------------------
+// SchemaStrategy equality
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_strategy_equality() {
+    assert_eq!(SchemaStrategy::YamlFirst, SchemaStrategy::YamlFirst);
+    assert_ne!(SchemaStrategy::YamlFirst, SchemaStrategy::NativeFirst);
+    assert_ne!(SchemaStrategy::NativeFirst, SchemaStrategy::YamlOnly);
+}

@@ -7,7 +7,8 @@
 //! navigate the internal module path.
 //!
 //! Regression for sync findings A-003, A-004, A-005, A-007, A-008 from
-//! 2026-04-08. Adding a new spec-required symbol? Add a row here too.
+//! 2026-04-08, and D1-004, D1-005 from 2026-04-10.
+//! Adding a new spec-required symbol? Add a row here too.
 
 #![allow(unused_imports, dead_code)]
 
@@ -87,12 +88,45 @@ fn test_registry_events_constants_at_crate_root() {
 }
 
 #[test]
+fn test_pipeline_engine_at_crate_root() {
+    // D1-004: parity with apcore-typescript's `PipelineEngine` export.
+    use apcore::{
+        ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, Step, StepResult,
+        StepTrace, StrategyInfo,
+    };
+    // Compile-time — confirms the type resolves at the crate root.
+    let _: Option<PipelineTrace> = None;
+    let _: Option<StepTrace> = None;
+    let _: Option<StrategyInfo> = None;
+}
+
+#[test]
+fn test_builtin_pipeline_steps_at_crate_root() {
+    // D1-005: parity with apcore-typescript's 11 Builtin* step exports.
+    use apcore::{
+        BuiltinACLCheck, BuiltinApprovalGate, BuiltinCallChainGuard, BuiltinContextCreation,
+        BuiltinExecute, BuiltinInputValidation, BuiltinMiddlewareAfter, BuiltinMiddlewareBefore,
+        BuiltinModuleLookup, BuiltinOutputValidation, BuiltinReturnResult,
+    };
+    // Compile-time references — if any aren't at the crate root, this test fails to compile.
+    let _ = BuiltinContextCreation;
+    let _ = BuiltinCallChainGuard;
+    let _ = BuiltinModuleLookup;
+    let _ = BuiltinACLCheck;
+    let _ = BuiltinApprovalGate;
+    let _ = BuiltinInputValidation;
+    let _ = BuiltinMiddlewareBefore;
+    let _ = BuiltinExecute;
+    let _ = BuiltinOutputValidation;
+    let _ = BuiltinMiddlewareAfter;
+    let _ = BuiltinReturnResult;
+}
+
+#[test]
 fn test_other_required_exports_at_crate_root() {
     // Parity sweep — every symbol Python/TypeScript expose at the package root
     // should also be reachable from `apcore::*`.
     use apcore::{
-        // Async tasks
-        AsyncTaskManager,
         // Bindings
         BindingDefinition,
         BindingLoader,
@@ -102,10 +136,6 @@ fn test_other_required_exports_at_crate_root() {
         // Observability extras
         ErrorEntry,
         ErrorHistory,
-        // Extensions
-        Extension,
-        ExtensionManager,
-        ExtensionPoint,
         // Decorator
         FunctionModule,
         InMemoryExporter,
@@ -119,8 +149,6 @@ fn test_other_required_exports_at_crate_root() {
         Span,
         SpanExporter,
         StdoutExporter,
-        TaskInfo,
-        TaskStatus,
         // Tracing
         TraceContext,
         TraceParent,
@@ -129,5 +157,4 @@ fn test_other_required_exports_at_crate_root() {
     };
     // Compile-time references — if any of these aren't at the crate root, this test fails to compile.
     let _: Option<CancelToken> = None;
-    let _: Option<TaskStatus> = None;
 }

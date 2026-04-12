@@ -4,7 +4,6 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
@@ -84,12 +83,12 @@ impl Module for UsageSummaryModule {
 
 /// system.usage.module — Detailed usage for a single module.
 pub struct UsageModuleModule {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
     collector: UsageCollector,
 }
 
 impl UsageModuleModule {
-    pub fn new(registry: Arc<Mutex<Registry>>, collector: UsageCollector) -> Self {
+    pub fn new(registry: Arc<Registry>, collector: UsageCollector) -> Self {
         Self {
             registry,
             collector,
@@ -134,14 +133,11 @@ impl Module for UsageModuleModule {
             .and_then(|v| v.as_str())
             .unwrap_or("24h");
 
-        {
-            let reg = self.registry.lock().await;
-            if !reg.has(module_id) {
-                return Err(ModuleError::new(
-                    ErrorCode::ModuleNotFound,
-                    format!("Module '{}' not found", module_id),
-                ));
-            }
+        if !self.registry.has(module_id) {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleNotFound,
+                format!("Module '{}' not found", module_id),
+            ));
         }
 
         let stats = self.collector.get_module_summary(module_id);

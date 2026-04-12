@@ -65,14 +65,14 @@ fn test_register_condition_adds_handler() {
     }
 
     register_condition("_test_custom_rs", Arc::new(TestHandler));
-    let handlers = CONDITION_HANDLERS.read().unwrap();
+    let handlers = CONDITION_HANDLERS.read();
     assert!(handlers.contains_key("_test_custom_rs"));
 }
 
 #[test]
 fn test_builtin_handlers_registered() {
     init_handlers();
-    let handlers = CONDITION_HANDLERS.read().unwrap();
+    let handlers = CONDITION_HANDLERS.read();
     for key in &["identity_types", "roles", "max_call_depth", "$or", "$not"] {
         assert!(
             handlers.contains_key(*key),

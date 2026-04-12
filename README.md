@@ -26,10 +26,22 @@ A schema-enforced module standard for the AI-Perceivable era.
 - **Async support** — Built on `tokio` for seamless async module execution
 - **Safety guards** — Call depth limits, circular call detection, frequency throttling
 - **Approval system** — Pluggable approval gate with async handlers, Phase B resume, and audit events
-- **Extension points** — Unified extension management for discoverers, middleware, ACL, approval handlers, span exporters, and module validators
-- **Async task management** — Background module execution with status tracking, cancellation, and concurrency limiting
 - **Behavioral annotations** — Declare module traits (readonly, destructive, idempotent, cacheable, paginated, streaming) for AI-aware orchestration
 - **W3C Trace Context** — `traceparent` header injection/extraction for distributed tracing interop
+
+## Cross-Language Feature Parity
+
+The Rust SDK tracks the apcore protocol spec but currently omits two
+language-specific extensions that ship in the Python and TypeScript SDKs:
+
+| Feature | Python | TypeScript | Rust |
+|---------|:------:|:----------:|:----:|
+| `AsyncTaskManager` (background task execution) | Yes | Yes | Not yet |
+| `ExtensionManager` / `ExtensionPoint` (plugin registry) | Yes | Yes | Not yet |
+
+Both will be reintroduced when their Rust implementations are wired into
+`Executor` with real concurrency and plugin loading. For now, code that
+needs these features should stay in Python or TypeScript.
 
 ## API Overview
 
@@ -83,16 +95,18 @@ A schema-enforced module standard for the AI-Perceivable era.
 | `ErrorHistory` | Ring buffer of recent errors with deduplication |
 | `UsageCollector` | Per-module usage statistics and trends |
 
-**Events & Extensions**
+**Events & Utilities**
 
 | Type | Description |
 |------|-------------|
 | `EventEmitter` | Event system — subscribe, unsubscribe, emit, emit_filtered, flush |
 | `WebhookSubscriber` | Built-in event subscriber |
-| `ExtensionManager` | Unified extension point management |
-| `AsyncTaskManager` | Background module execution with status tracking |
 | `CancelToken` | Cooperative cancellation token |
 | `BindingLoader` | Load modules from YAML binding files |
+
+> See [Cross-Language Feature Parity](#cross-language-feature-parity) for a note on
+> `ExtensionManager` and `AsyncTaskManager`, which exist in Python/TypeScript but
+> are not yet available in the Rust SDK.
 
 ## Documentation
 

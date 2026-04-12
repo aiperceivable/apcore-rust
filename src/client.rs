@@ -1,10 +1,13 @@
 // APCore Protocol — Client
 // Spec reference: APCore client entry point
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::context::Context;
+use crate::decorator::FunctionModule;
 use crate::errors::ModuleError;
 use crate::events::emitter::EventEmitter;
 use crate::events::subscribers::EventSubscriber;
@@ -12,21 +15,34 @@ use crate::executor::Executor;
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::module::ModuleAnnotations;
+use crate::observability::metrics::MetricsCollector;
 use crate::registry::registry::{ModuleDescriptor, Registry};
+use crate::sys_modules::SysModulesContext;
 
 /// Main entry point for interacting with the APCore system.
 pub struct APCore {
     pub config: Config,
     executor: Executor,
+    /// Single shared `Arc<Registry>` used by the executor, the pipeline, and
+    /// all sys modules. Interior mutability on `Registry` removes the need
+    /// for `Arc::get_mut` or an external `Mutex`.
+    registry: Arc<Registry>,
     event_emitter: Option<EventEmitter>,
+    metrics_collector: Option<MetricsCollector>,
+    sys_modules_context: Option<SysModulesContext>,
 }
 
 impl std::fmt::Debug for APCore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("APCore")
             .field("config", &self.config)
-            .field("registry", &self.executor.registry)
+            .field("registry", &self.registry)
             .field("event_emitter", &self.event_emitter)
+            .field("metrics_collector", &self.metrics_collector)
+            .field(
+                "sys_modules_registered",
+                &self.sys_modules_context.is_some(),
+            )
             .finish()
     }
 }
@@ -40,44 +56,77 @@ impl Default for APCore {
 impl APCore {
     /// Create a new APCore client with default configuration.
     pub fn new() -> Self {
-        let config = Config::default();
-        let executor = Executor::new(Registry::new(), config.clone());
-        Self {
-            config,
-            executor,
-            event_emitter: None,
-        }
+        Self::with_options(None, None, None, None)
     }
 
     /// Create a new APCore client with all optional parameters.
     ///
-    /// If both `executor` and `registry` are provided, the `executor` takes precedence
-    /// and the `registry` is ignored (the executor already contains its own registry).
+    /// A single `Arc<Registry>` is shared between the executor, the pipeline,
+    /// and every built-in sys module — there is exactly one registry
+    /// instance per APCore client.
+    ///
+    /// When `sys_modules.enabled` is true in the config (the default), built-in
+    /// system modules are automatically registered into the executor pipeline.
+    /// This registration is now fully synchronous and runtime-agnostic because
+    /// `Registry` uses `parking_lot::RwLock` for interior mutability.
+    ///
+    /// **Cross-language note:** Python and TypeScript expose `config_path` /
+    /// `configPath` as a 5th constructor parameter. Rust splits this into a
+    /// dedicated [`APCore::from_path`] constructor — use `with_options` when
+    /// you want to inject explicit components, and `from_path` when you want
+    /// to load configuration from a YAML file.
     pub fn with_options(
         registry: Option<Registry>,
         executor: Option<Executor>,
         config: Option<Config>,
-        metrics_collector: Option<crate::observability::metrics::MetricsCollector>,
+        metrics_collector: Option<MetricsCollector>,
     ) -> Self {
         let config = config.unwrap_or_default();
-        let executor =
-            executor.unwrap_or_else(|| Executor::new(registry.unwrap_or_default(), config.clone()));
-        let _ = metrics_collector; // reserved for future use
+
+        // Resolve the shared registry: use the executor's if provided,
+        // otherwise the explicit `registry` arg, otherwise a fresh default.
+        let registry: Arc<Registry> = match executor.as_ref() {
+            Some(e) => Arc::clone(&e.registry),
+            None => Arc::new(registry.unwrap_or_default()),
+        };
+
+        let executor = executor
+            .unwrap_or_else(|| Executor::new(Arc::clone(&registry), Arc::new(config.clone())));
+
+        let sys_modules_context = if Self::sys_modules_enabled(&config) {
+            crate::sys_modules::register_sys_modules(
+                Arc::clone(&registry),
+                &executor,
+                &config,
+                metrics_collector.clone(),
+            )
+        } else {
+            None
+        };
+
         Self {
             config,
             executor,
+            registry,
             event_emitter: None,
+            metrics_collector,
+            sys_modules_context,
         }
+    }
+
+    /// Return whether the sys_modules auto-registration is enabled
+    /// according to the given config. Defaults to `true` when the key
+    /// is absent.
+    fn sys_modules_enabled(config: &Config) -> bool {
+        config
+            .get("sys_modules.enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
     }
 
     /// Create a new APCore client with the given configuration.
     pub fn with_config(config: Config) -> Self {
-        let executor = Executor::new(Registry::new(), config.clone());
-        Self {
-            config,
-            executor,
-            event_emitter: None,
-        }
+        Self::with_options(None, None, Some(config), None)
     }
 
     /// Create a new APCore client from a pre-built Registry and Executor.
@@ -85,12 +134,7 @@ impl APCore {
     /// Builds an `Executor` from the given `registry` and a default `Config`.
     /// To supply a custom config, use [`with_options`] instead.
     pub fn with_components(registry: Registry, config: Config) -> Self {
-        let executor = Executor::new(registry, config.clone());
-        Self {
-            config,
-            executor,
-            event_emitter: None,
-        }
+        Self::with_options(Some(registry), None, Some(config), None)
     }
 
     /// Create a new APCore client from a configuration file path.
@@ -99,7 +143,92 @@ impl APCore {
         Ok(Self::with_config(config))
     }
 
+    /// Register a function as a module — convenience wrapper that creates a
+    /// [`FunctionModule`] and registers it in a single call.
+    ///
+    /// This mirrors the `module()` helper available in the Python and TypeScript
+    /// SDKs. The handler closure must be an async function that takes
+    /// `(serde_json::Value, &Context<serde_json::Value>)` and returns
+    /// `Result<serde_json::Value, ModuleError>`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// client.module(
+    ///     "math.add",
+    ///     "Add two numbers",
+    ///     serde_json::json!({"type": "object"}),
+    ///     serde_json::json!({"type": "object"}),
+    ///     None,  // documentation
+    ///     vec![], // tags
+    ///     None,  // version
+    ///     None,  // metadata
+    ///     vec![], // examples
+    ///     |inputs, _ctx| Box::pin(async move { Ok(inputs) }),
+    /// )?;
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn module<F>(
+        &mut self,
+        module_id: &str,
+        description: &str,
+        input_schema: serde_json::Value,
+        output_schema: serde_json::Value,
+        documentation: Option<String>,
+        tags: Vec<String>,
+        version: Option<&str>,
+        metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+        examples: Vec<crate::module::ModuleExample>,
+        handler: F,
+    ) -> Result<&mut Self, ModuleError>
+    where
+        F: for<'a> Fn(
+                serde_json::Value,
+                &'a Context<serde_json::Value>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ModuleError>>
+                        + Send
+                        + 'a,
+                >,
+            > + Send
+            + Sync
+            + 'static,
+    {
+        let resolved_version = version.unwrap_or("0.1.0").to_string();
+        let resolved_metadata = metadata.unwrap_or_default();
+        let func_module = FunctionModule::with_description(
+            ModuleAnnotations::default(),
+            input_schema.clone(),
+            output_schema.clone(),
+            description,
+            documentation,
+            tags.clone(),
+            &resolved_version,
+            resolved_metadata,
+            examples,
+            handler,
+        );
+        let descriptor = ModuleDescriptor {
+            name: module_id.to_string(),
+            annotations: ModuleAnnotations::default(),
+            input_schema,
+            output_schema,
+            enabled: true,
+            tags,
+            dependencies: vec![],
+        };
+        self.registry
+            .register(module_id, Box::new(func_module), descriptor)?;
+        Ok(self)
+    }
+
     /// Call (execute) a module by ID with the given inputs.
+    ///
+    /// In Rust, `call()` is already async — there is no separate sync variant.
+    /// This method is the equivalent of both `call()` and `call_async()` in the
+    /// Python and TypeScript SDKs.
+    #[doc(alias = "call_async")]
     pub async fn call(
         &self,
         module_id: &str,
@@ -128,7 +257,7 @@ impl APCore {
 
     /// Register a module with the given module_id.
     pub fn register(
-        &mut self,
+        &self,
         module_id: &str,
         module: Box<dyn crate::module::Module>,
     ) -> Result<(), ModuleError> {
@@ -141,23 +270,15 @@ impl APCore {
             tags: vec![],
             dependencies: vec![],
         };
-        std::sync::Arc::get_mut(&mut self.executor.registry)
-            .expect("registry not shared yet")
-            .register(module_id, module, descriptor)
+        self.registry.register(module_id, module, descriptor)
     }
 
     /// Trigger module discovery from configured extension directories.
     ///
     /// Returns the number of newly discovered modules, or 0 if no discoverer
     /// is configured on the registry.
-    pub async fn discover(&mut self) -> Result<usize, ModuleError> {
-        let registry = std::sync::Arc::get_mut(&mut self.executor.registry).ok_or_else(|| {
-            ModuleError::new(
-                crate::errors::ErrorCode::GeneralInternalError,
-                "Cannot discover: registry is shared".to_string(),
-            )
-        })?;
-        match registry.discover_internal().await {
+    pub async fn discover(&self) -> Result<usize, ModuleError> {
+        match self.registry.discover_internal().await {
             Ok(names) => Ok(names.len()),
             Err(e) if e.code == crate::errors::ErrorCode::ModuleLoadError => {
                 // No discoverer configured — not an error, just nothing to discover.
@@ -169,34 +290,57 @@ impl APCore {
 
     /// List all registered modules, optionally filtered by tags and/or prefix.
     pub fn list_modules(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<String> {
-        self.executor
-            .registry
-            .list(tags, prefix)
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect()
+        self.registry.list(tags, prefix)
     }
 
-    /// Add a middleware to the execution pipeline.
+    /// Register a middleware in the execution pipeline.
     ///
     /// Returns an error if the middleware's priority exceeds the allowed range.
-    /// Returns `&mut Self` for chaining.
+    /// Returns `&Self` for chaining. Takes `&self` — the underlying
+    /// `MiddlewareManager` uses interior mutability, so middleware can be
+    /// added after `APCore` has been shared behind an `Arc` or a shared
+    /// reference.
+    ///
+    /// **Cross-language note:** The Python and TypeScript SDKs expose this
+    /// method as `use()`. Rust names it `use_middleware` because `use` is a
+    /// reserved keyword.
     pub fn use_middleware(
-        &mut self,
+        &self,
         middleware: Box<dyn Middleware>,
-    ) -> Result<&mut Self, crate::errors::ModuleError> {
+    ) -> Result<&Self, crate::errors::ModuleError> {
         self.executor.use_middleware(middleware)?;
         Ok(self)
     }
 
-    /// Remove a middleware by name.
-    pub fn remove(&mut self, name: &str) -> bool {
+    /// Remove a middleware by its name string.
+    ///
+    /// This is a Rust-specific convenience that accepts a `&str` directly.
+    /// For an API closer to Python/TypeScript (which accept the middleware
+    /// object), see [`remove_middleware`](Self::remove_middleware).
+    pub fn remove(&self, name: &str) -> bool {
         self.executor.remove(name)
+    }
+
+    /// Remove a middleware by reference, extracting its name via
+    /// [`Middleware::name()`].
+    ///
+    /// This mirrors the Python and TypeScript `remove(middleware)` API,
+    /// which accept the middleware object directly. In Rust, since trait
+    /// objects do not support identity comparison, the middleware is matched
+    /// by its [`name()`](Middleware::name) return value.
+    pub fn remove_middleware(&self, middleware: &dyn Middleware) -> bool {
+        self.executor.remove(middleware.name())
     }
 
     /// Get a reference to the registry.
     pub fn registry(&self) -> &Registry {
-        &self.executor.registry
+        &self.registry
+    }
+
+    /// Get the shared registry as an `Arc<Registry>` (for handing out to
+    /// components that need to share ownership).
+    pub fn registry_arc(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry)
     }
 
     /// Get a reference to the executor.
@@ -204,28 +348,52 @@ impl APCore {
         &self.executor
     }
 
-    /// Disable a module. Calls to disabled modules will raise ModuleDisabledError.
-    pub fn disable(&mut self, module_id: &str, reason: Option<&str>) -> Result<(), ModuleError> {
-        let _ = reason; // reason logging reserved for future use
-        let registry = std::sync::Arc::get_mut(&mut self.executor.registry).ok_or_else(|| {
-            ModuleError::new(
-                crate::errors::ErrorCode::GeneralInternalError,
-                format!("Cannot disable '{}': registry is shared", module_id),
+    /// Disable a module by routing through the executor pipeline.
+    ///
+    /// This calls `system.control.toggle_feature` through the executor,
+    /// matching the Python and TypeScript SDK behavior (events, ACL, and
+    /// middleware are applied).
+    pub async fn disable(
+        &self,
+        module_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Value, ModuleError> {
+        self.executor
+            .call(
+                "system.control.toggle_feature",
+                serde_json::json!({
+                    "module_id": module_id,
+                    "enabled": false,
+                    "reason": reason.unwrap_or("Disabled via APCore client")
+                }),
+                None,
+                None,
             )
-        })?;
-        registry.disable(module_id)
+            .await
     }
 
-    /// Re-enable a previously disabled module.
-    pub fn enable(&mut self, module_id: &str, reason: Option<&str>) -> Result<(), ModuleError> {
-        let _ = reason; // reason logging reserved for future use
-        let registry = std::sync::Arc::get_mut(&mut self.executor.registry).ok_or_else(|| {
-            ModuleError::new(
-                crate::errors::ErrorCode::GeneralInternalError,
-                format!("Cannot enable '{}': registry is shared", module_id),
+    /// Re-enable a previously disabled module by routing through the executor pipeline.
+    ///
+    /// This calls `system.control.toggle_feature` through the executor,
+    /// matching the Python and TypeScript SDK behavior (events, ACL, and
+    /// middleware are applied).
+    pub async fn enable(
+        &self,
+        module_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Value, ModuleError> {
+        self.executor
+            .call(
+                "system.control.toggle_feature",
+                serde_json::json!({
+                    "module_id": module_id,
+                    "enabled": true,
+                    "reason": reason.unwrap_or("Enabled via APCore client")
+                }),
+                None,
+                None,
             )
-        })?;
-        registry.enable(module_id)
+            .await
     }
 
     /// Subscribe to an event type. Returns the subscriber ID.
@@ -258,53 +426,56 @@ impl APCore {
         self.event_emitter.as_ref()
     }
 
-    /// Reload modules from the configured modules path.
+    /// Reload configuration from disk.
+    ///
+    /// **Rust-specific:** This method is not available in Python or TypeScript
+    /// SDKs. It reloads the `Config` object; module re-discovery will be added
+    /// once the discoverer component is configured.
     pub async fn reload(&mut self) -> Result<(), ModuleError> {
         self.config.reload()?;
-        // Re-discovery would go here once discoverer is configured
-        Ok(())
-    }
-
-    /// Shut down the client and release resources.
-    pub async fn shutdown(&mut self) -> Result<(), ModuleError> {
         Ok(())
     }
 
     /// Stream execution of a module.
-    pub async fn stream(
-        &self,
+    ///
+    /// Returns an async `Stream` of chunks. Each chunk is delivered to the
+    /// caller as soon as it is produced by the underlying module — true
+    /// incremental streaming, no buffering. Phase 3 validation runs after
+    /// the inner stream is exhausted; if it fails, the error is yielded as
+    /// the final item.
+    pub fn stream<'a>(
+        &'a self,
         module_id: &str,
         inputs: Value,
         ctx: Option<&Context<Value>>,
         version_hint: Option<&str>,
-    ) -> Result<Vec<Value>, ModuleError> {
-        self.executor
-            .stream(module_id, inputs, ctx, version_hint)
-            .await
+    ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<Value, ModuleError>> + Send + 'a>>
+    {
+        self.executor.stream(module_id, inputs, ctx, version_hint)
     }
 
     /// Describe a module by ID.
     pub fn describe(&self, module_id: &str) -> String {
-        match self.executor.registry.get(module_id) {
+        match self.registry.get(module_id) {
             Some(module) => module.description().to_string(),
             None => format!("Module '{}' not found", module_id),
         }
     }
 
-    /// Add a before callback middleware. Returns `&mut Self` for chaining.
+    /// Add a before callback middleware. Returns `&Self` for chaining.
     pub fn use_before(
-        &mut self,
+        &self,
         middleware: Box<dyn BeforeMiddleware>,
-    ) -> Result<&mut Self, crate::errors::ModuleError> {
+    ) -> Result<&Self, crate::errors::ModuleError> {
         self.executor.use_before(middleware)?;
         Ok(self)
     }
 
-    /// Add an after callback middleware. Returns `&mut Self` for chaining.
+    /// Add an after callback middleware. Returns `&Self` for chaining.
     pub fn use_after(
-        &mut self,
+        &self,
         middleware: Box<dyn AfterMiddleware>,
-    ) -> Result<&mut Self, crate::errors::ModuleError> {
+    ) -> Result<&Self, crate::errors::ModuleError> {
         self.executor.use_after(middleware)?;
         Ok(self)
     }

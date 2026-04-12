@@ -6,7 +6,7 @@ setup:
 	@command -v apdev-rs >/dev/null 2>&1 || cargo install apdev-rs
 	@echo "Installing git pre-commit hook..."
 	@mkdir -p .git/hooks
-	@cp hooks/pre-commit .git/hooks/pre-commit
+	@cp .githooks/pre-commit .git/hooks/pre-commit
 	@chmod +x .git/hooks/pre-commit
 	@echo "Done! Development environment is ready."
 

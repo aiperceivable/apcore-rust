@@ -7,7 +7,7 @@ use apcore::pipeline::{ExecutionStrategy, PipelineContext, Step, StepResult};
 use apcore::registry::registry::Registry;
 use apcore::{
     build_internal_strategy, build_performance_strategy, build_standard_strategy,
-    build_testing_strategy, describe_pipeline, list_strategies, register_strategy, Executor,
+    build_testing_strategy, list_strategies, register_strategy, Executor,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -198,7 +198,7 @@ async fn test_call_with_trace_no_override_uses_default_strategy() {
 #[test]
 fn test_register_and_list_strategies() {
     let strategy = build_internal_strategy();
-    let info = describe_pipeline(&strategy);
+    let info = strategy.info();
     assert_eq!(info.name, "internal");
     assert_eq!(info.step_count, 9);
 
@@ -214,7 +214,7 @@ fn test_register_and_list_strategies() {
 #[test]
 fn test_describe_pipeline() {
     let strategy = build_standard_strategy();
-    let info = describe_pipeline(&strategy);
+    let info = strategy.info();
     assert_eq!(info.name, "standard");
     assert_eq!(info.step_count, 11);
     assert!(info.description.contains("context_creation"));

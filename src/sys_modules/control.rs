@@ -106,15 +106,6 @@ impl Module for UpdateConfigModule {
             "apcore.config.updated",
             "system.control.update_config",
             &timestamp,
-            event_data.clone(),
-        )
-        .await;
-        // W-9: DEPRECATED alias — emitted for backward compatibility during 0.15.x transition.
-        emit_event(
-            &self.emitter,
-            "config_changed",
-            "system.control.update_config",
-            &timestamp,
             event_data,
         )
         .await;
@@ -150,12 +141,12 @@ impl Module for UpdateConfigModule {
 /// is unregistered and callers must re-register manually. The event is always
 /// emitted with new_version == previous_version.
 pub struct ReloadModuleModule {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
     emitter: Arc<Mutex<EventEmitter>>,
 }
 
 impl ReloadModuleModule {
-    pub fn new(registry: Arc<Mutex<Registry>>, emitter: Arc<Mutex<EventEmitter>>) -> Self {
+    pub fn new(registry: Arc<Registry>, emitter: Arc<Mutex<EventEmitter>>) -> Self {
         Self { registry, emitter }
     }
 }
@@ -200,19 +191,15 @@ impl Module for ReloadModuleModule {
 
         let start = std::time::Instant::now();
 
-        // W-5: Single lock for the check-then-unregister sequence to eliminate TOCTOU.
         // W-1: Version is not tracked in the Rust registry descriptor; use "unknown".
-        let previous_version = {
-            let mut reg = self.registry.lock().await;
-            if !reg.has(&module_id) {
-                return Err(ModuleError::new(
-                    ErrorCode::ModuleNotFound,
-                    format!("Module '{}' not found", module_id),
-                ));
-            }
-            reg.safe_unregister(&module_id, 5000).await?;
-            "unknown".to_string()
-        };
+        if !self.registry.has(&module_id) {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleNotFound,
+                format!("Module '{}' not found", module_id),
+            ));
+        }
+        self.registry.safe_unregister(&module_id, 5000).await?;
+        let previous_version = "unknown".to_string();
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let new_version = previous_version.clone();
@@ -225,15 +212,6 @@ impl Module for ReloadModuleModule {
         emit_event(
             &self.emitter,
             "apcore.module.reloaded",
-            &module_id,
-            &timestamp,
-            event_data.clone(),
-        )
-        .await;
-        // W-9: DEPRECATED alias — emitted for backward compatibility during 0.15.x transition.
-        emit_event(
-            &self.emitter,
-            "config_changed",
             &module_id,
             &timestamp,
             event_data,
@@ -264,14 +242,14 @@ impl Module for ReloadModuleModule {
 
 /// Disable or enable a module without unloading it from the Registry (F19).
 pub struct ToggleFeatureModule {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
     emitter: Arc<Mutex<EventEmitter>>,
     toggle_state: Arc<ToggleState>,
 }
 
 impl ToggleFeatureModule {
     pub fn new(
-        registry: Arc<Mutex<Registry>>,
+        registry: Arc<Registry>,
         emitter: Arc<Mutex<EventEmitter>>,
         toggle_state: Arc<ToggleState>,
     ) -> Self {
@@ -329,19 +307,23 @@ impl Module for ToggleFeatureModule {
                 )
             })?;
 
-        {
-            let reg = self.registry.lock().await;
-            if !reg.has(&module_id) {
-                return Err(ModuleError::new(
-                    ErrorCode::ModuleNotFound,
-                    format!("Module '{}' not found", module_id),
-                ));
-            }
+        if !self.registry.has(&module_id) {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleNotFound,
+                format!("Module '{}' not found", module_id),
+            ));
         }
 
+        // Flip the descriptor's `enabled` flag in the Registry first — this is
+        // the fallible operation (it may return `ModuleNotFound`). Only after
+        // it succeeds do we update the infallible `ToggleState`. Doing it in
+        // this order guarantees the two stores cannot diverge if Registry
+        // rejects the update.
         if enabled {
+            self.registry.enable(&module_id)?;
             self.toggle_state.enable(&module_id);
         } else {
+            self.registry.disable(&module_id)?;
             self.toggle_state.disable(&module_id);
         }
 
@@ -351,15 +333,6 @@ impl Module for ToggleFeatureModule {
         emit_event(
             &self.emitter,
             "apcore.module.toggled",
-            &module_id,
-            &timestamp,
-            event_data.clone(),
-        )
-        .await;
-        // W-9: DEPRECATED alias — emitted for backward compatibility during 0.15.x transition.
-        emit_event(
-            &self.emitter,
-            "module_health_changed",
             &module_id,
             &timestamp,
             event_data,

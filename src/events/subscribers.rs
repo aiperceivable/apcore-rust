@@ -1,8 +1,9 @@
 // APCore Protocol — Event subscribers
 // Spec reference: Event subscription, webhook delivery, A2A delivery
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 #[cfg(feature = "events")]
@@ -119,14 +120,11 @@ impl EventSubscriber for WebhookSubscriber {
     }
 
     #[cfg(not(feature = "events"))]
-    async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
-        tracing::info!(
-            subscriber_id = %self.id,
-            url = %self.url,
-            event_type = %event.event_type,
-            "WebhookSubscriber: HTTP delivery requires 'events' feature"
-        );
-        Ok(())
+    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+        Err(ModuleError::new(
+            ErrorCode::GeneralInternalError,
+            "WebhookSubscriber requires the 'events' feature",
+        ))
     }
 }
 
@@ -230,14 +228,11 @@ impl EventSubscriber for A2ASubscriber {
     }
 
     #[cfg(not(feature = "events"))]
-    async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
-        tracing::info!(
-            subscriber_id = %self.id,
-            url = %self.platform_url,
-            event_type = %event.event_type,
-            "A2ASubscriber: HTTP delivery requires 'events' feature"
-        );
-        Ok(())
+    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+        Err(ModuleError::new(
+            ErrorCode::GeneralInternalError,
+            "A2ASubscriber requires the 'events' feature",
+        ))
     }
 }
 
@@ -248,103 +243,99 @@ impl EventSubscriber for A2ASubscriber {
 type SubscriberFactory =
     Box<dyn Fn(&serde_json::Value) -> Result<Box<dyn EventSubscriber>, ModuleError> + Send + Sync>;
 
-fn global_subscriber_factories() -> &'static RwLock<HashMap<String, SubscriberFactory>> {
-    static FACTORIES: OnceLock<RwLock<HashMap<String, SubscriberFactory>>> = OnceLock::new();
-    FACTORIES.get_or_init(|| {
-        let mut map: HashMap<String, SubscriberFactory> = HashMap::new();
+/// Register the webhook + a2a factories with the full config-honoring logic.
+fn register_builtin_factories(map: &mut HashMap<String, SubscriberFactory>) {
+    // Built-in: webhook
+    map.insert(
+        "webhook".to_string(),
+        Box::new(|config| {
+            let url = config
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ModuleError::new(ErrorCode::ConfigInvalid, "webhook: 'url' is required")
+                })?
+                .to_string();
+            let retry_count = config
+                .get("retry_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32;
+            let timeout_ms = config
+                .get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5000);
+            let mut headers = HashMap::new();
+            if let Some(h) = config.get("headers").and_then(|v| v.as_object()) {
+                for (k, v) in h {
+                    if let Some(vs) = v.as_str() {
+                        headers.insert(k.clone(), vs.to_string());
+                    }
+                }
+            }
+            let id = format!("webhook-{}", uuid::Uuid::new_v4());
+            let mut sub = WebhookSubscriber::new(id, url, "*");
+            sub.headers = headers;
+            sub.retry_count = retry_count;
+            sub.timeout_ms = timeout_ms;
+            Ok(Box::new(sub) as Box<dyn EventSubscriber>)
+        }),
+    );
 
-        // Built-in: webhook
-        map.insert(
-            "webhook".to_string(),
-            Box::new(|config| {
-                let url = config
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ModuleError::new(ErrorCode::ConfigInvalid, "webhook: 'url' is required")
-                    })?
-                    .to_string();
-                let retry_count = config
-                    .get("retry_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as u32;
-                let timeout_ms = config
-                    .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5000);
-                let mut headers = HashMap::new();
-                if let Some(h) = config.get("headers").and_then(|v| v.as_object()) {
-                    for (k, v) in h {
+    // Built-in: a2a
+    map.insert(
+        "a2a".to_string(),
+        Box::new(|config| {
+            let platform_url = config
+                .get("platform_url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ModuleError::new(ErrorCode::ConfigInvalid, "a2a: 'platform_url' is required")
+                })?
+                .to_string();
+            let timeout_ms = config
+                .get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5000);
+            let auth = match config.get("auth") {
+                Some(serde_json::Value::String(s)) => Some(A2AAuth::Bearer(s.clone())),
+                Some(serde_json::Value::Object(m)) => {
+                    let mut headers = HashMap::new();
+                    for (k, v) in m {
                         if let Some(vs) = v.as_str() {
                             headers.insert(k.clone(), vs.to_string());
                         }
                     }
+                    Some(A2AAuth::Headers(headers))
                 }
-                let id = format!("webhook-{}", uuid::Uuid::new_v4());
-                let mut sub = WebhookSubscriber::new(id, url, "*");
-                sub.headers = headers;
-                sub.retry_count = retry_count;
-                sub.timeout_ms = timeout_ms;
-                Ok(Box::new(sub) as Box<dyn EventSubscriber>)
-            }),
-        );
+                _ => None,
+            };
+            let id = format!("a2a-{}", uuid::Uuid::new_v4());
+            let mut sub = A2ASubscriber::new(id, platform_url, "*");
+            sub.auth = auth;
+            sub.timeout_ms = timeout_ms;
+            Ok(Box::new(sub) as Box<dyn EventSubscriber>)
+        }),
+    );
+}
 
-        // Built-in: a2a
-        map.insert(
-            "a2a".to_string(),
-            Box::new(|config| {
-                let platform_url = config
-                    .get("platform_url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ModuleError::new(
-                            ErrorCode::ConfigInvalid,
-                            "a2a: 'platform_url' is required",
-                        )
-                    })?
-                    .to_string();
-                let timeout_ms = config
-                    .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5000);
-                let auth = match config.get("auth") {
-                    Some(serde_json::Value::String(s)) => Some(A2AAuth::Bearer(s.clone())),
-                    Some(serde_json::Value::Object(m)) => {
-                        let mut headers = HashMap::new();
-                        for (k, v) in m {
-                            if let Some(vs) = v.as_str() {
-                                headers.insert(k.clone(), vs.to_string());
-                            }
-                        }
-                        Some(A2AAuth::Headers(headers))
-                    }
-                    _ => None,
-                };
-                let id = format!("a2a-{}", uuid::Uuid::new_v4());
-                let mut sub = A2ASubscriber::new(id, platform_url, "*");
-                sub.auth = auth;
-                sub.timeout_ms = timeout_ms;
-                Ok(Box::new(sub) as Box<dyn EventSubscriber>)
-            }),
-        );
-
+fn global_subscriber_factories() -> &'static RwLock<HashMap<String, SubscriberFactory>> {
+    static FACTORIES: OnceLock<RwLock<HashMap<String, SubscriberFactory>>> = OnceLock::new();
+    FACTORIES.get_or_init(|| {
+        let mut map: HashMap<String, SubscriberFactory> = HashMap::new();
+        register_builtin_factories(&mut map);
         RwLock::new(map)
     })
 }
 
 /// Register a custom subscriber type factory.
 pub fn register_subscriber_type(type_name: &str, factory: SubscriberFactory) {
-    let mut map = global_subscriber_factories()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = global_subscriber_factories().write();
     map.insert(type_name.to_string(), factory);
 }
 
 /// Unregister a subscriber type.
 pub fn unregister_subscriber_type(type_name: &str) -> Result<(), ModuleError> {
-    let mut map = global_subscriber_factories()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = global_subscriber_factories().write();
     if map.remove(type_name).is_none() {
         return Err(ModuleError::new(
             ErrorCode::GeneralInternalError,
@@ -356,46 +347,9 @@ pub fn unregister_subscriber_type(type_name: &str) -> Result<(), ModuleError> {
 
 /// Reset the subscriber factory registry to built-in types only.
 pub fn reset_subscriber_registry() {
-    let mut map = global_subscriber_factories()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = global_subscriber_factories().write();
     map.clear();
-    drop(map);
-    // Re-trigger OnceLock initialization by reading — but OnceLock is already init.
-    // Instead, re-insert built-ins manually.
-    let mut map = global_subscriber_factories()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    // Re-register webhook and a2a via register_subscriber_type after clearing.
-    // The OnceLock was already initialized, so we just re-populate.
-    map.insert(
-        "webhook".to_string(),
-        Box::new(|config| {
-            let url = config
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ModuleError::new(ErrorCode::ConfigInvalid, "webhook: 'url' is required")
-                })?
-                .to_string();
-            let id = format!("webhook-{}", uuid::Uuid::new_v4());
-            Ok(Box::new(WebhookSubscriber::new(id, url, "*")) as Box<dyn EventSubscriber>)
-        }),
-    );
-    map.insert(
-        "a2a".to_string(),
-        Box::new(|config| {
-            let platform_url = config
-                .get("platform_url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ModuleError::new(ErrorCode::ConfigInvalid, "a2a: 'platform_url' is required")
-                })?
-                .to_string();
-            let id = format!("a2a-{}", uuid::Uuid::new_v4());
-            Ok(Box::new(A2ASubscriber::new(id, platform_url, "*")) as Box<dyn EventSubscriber>)
-        }),
-    );
+    register_builtin_factories(&mut map);
 }
 
 /// Create a subscriber from config using the factory registry.
@@ -409,9 +363,7 @@ pub fn create_subscriber(
         )
     })?;
 
-    let map = global_subscriber_factories()
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
+    let map = global_subscriber_factories().read();
     let factory = map.get(type_name).ok_or_else(|| {
         ModuleError::new(
             ErrorCode::ConfigInvalid,

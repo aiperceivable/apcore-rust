@@ -14,12 +14,12 @@ use crate::registry::registry::Registry;
 
 /// system.manifest.module — Full manifest for a single registered module.
 pub struct ManifestModuleModule {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
     config: Arc<Mutex<Config>>,
 }
 
 impl ManifestModuleModule {
-    pub fn new(registry: Arc<Mutex<Registry>>, config: Arc<Mutex<Config>>) -> Self {
+    pub fn new(registry: Arc<Registry>, config: Arc<Mutex<Config>>) -> Self {
         Self { registry, config }
     }
 }
@@ -56,8 +56,7 @@ impl Module for ManifestModuleModule {
                 ModuleError::new(ErrorCode::GeneralInvalidInput, "'module_id' is required")
             })?;
 
-        let reg = self.registry.lock().await;
-        let descriptor = reg.get_definition(module_id).ok_or_else(|| {
+        let descriptor = self.registry.get_definition(module_id).ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ModuleNotFound,
                 format!("Module '{}' not found", module_id),
@@ -77,7 +76,7 @@ impl Module for ManifestModuleModule {
             format!("{}/{}.rs", source_root, module_id.replace('.', "/"))
         };
 
-        let module_ref = reg.get(module_id);
+        let module_ref = self.registry.get(module_id);
         let description = module_ref
             .map(|m| m.description().to_string())
             .unwrap_or_default();
@@ -108,12 +107,12 @@ impl Module for ManifestModuleModule {
 
 /// system.manifest.full — Complete system manifest with filtering.
 pub struct ManifestFullModule {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
     config: Arc<Mutex<Config>>,
 }
 
 impl ManifestFullModule {
-    pub fn new(registry: Arc<Mutex<Registry>>, config: Arc<Mutex<Config>>) -> Self {
+    pub fn new(registry: Arc<Registry>, config: Arc<Mutex<Config>>) -> Self {
         Self { registry, config }
     }
 }
@@ -172,8 +171,7 @@ impl Module for ManifestFullModule {
             (name, root)
         };
 
-        let reg = self.registry.lock().await;
-        let all_ids = reg.list(None, None);
+        let all_ids = self.registry.list(None, None);
 
         let mut modules = Vec::new();
         for mid in &all_ids {
@@ -183,7 +181,7 @@ impl Module for ManifestFullModule {
                     continue;
                 }
             }
-            let descriptor = match reg.get_definition(mid) {
+            let descriptor = match self.registry.get_definition(mid) {
                 Some(d) => d,
                 None => continue,
             };
@@ -197,7 +195,7 @@ impl Module for ManifestFullModule {
                 }
             }
 
-            let module_ref = reg.get(mid);
+            let module_ref = self.registry.get(mid);
             let description = module_ref
                 .map(|m| m.description().to_string())
                 .unwrap_or_default();

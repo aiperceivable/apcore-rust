@@ -1,8 +1,9 @@
 // APCore Protocol — ErrorFormatterRegistry (§8.8)
 // Allows adapter-specific error serialization while retaining a default fallback.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 
 use crate::errors::ModuleError;
 
@@ -34,9 +35,7 @@ impl ErrorFormatterRegistry {
         adapter_name: &str,
         formatter: Box<dyn ErrorFormatter>,
     ) -> Result<(), ModuleError> {
-        let mut map = global_formatters()
-            .write()
-            .map_err(|_| ModuleError::config_mount_error(adapter_name, "registry lock poisoned"))?;
+        let mut map = global_formatters().write();
 
         if map.contains_key(adapter_name) {
             return Err(ModuleError::error_formatter_duplicate(adapter_name));
@@ -53,10 +52,7 @@ impl ErrorFormatterRegistry {
         error: &ModuleError,
         context: Option<&dyn std::any::Any>,
     ) -> serde_json::Value {
-        let map = match global_formatters().read() {
-            Ok(guard) => guard,
-            Err(_) => return error.to_dict(),
-        };
+        let map = global_formatters().read();
         match map.get(adapter_name) {
             Some(formatter) => formatter.format(error, context),
             None => error.to_dict(),
@@ -65,10 +61,7 @@ impl ErrorFormatterRegistry {
 
     /// Returns true if a formatter is registered for `adapter_name`.
     pub fn is_registered(adapter_name: &str) -> bool {
-        global_formatters()
-            .read()
-            .map(|m| m.contains_key(adapter_name))
-            .unwrap_or(false)
+        global_formatters().read().contains_key(adapter_name)
     }
 }
 

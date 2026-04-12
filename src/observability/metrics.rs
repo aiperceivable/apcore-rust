@@ -2,15 +2,16 @@
 // Spec reference: Execution metrics and metrics middleware
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
 
 /// Default histogram bucket boundaries matching Python reference.
-pub const DEFAULT_BUCKETS: &[f64] = &[
+pub(crate) const DEFAULT_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
@@ -72,7 +73,7 @@ impl MetricsCollector {
     /// Increment a counter metric by `amount`.
     pub fn increment(&self, name: &str, labels: HashMap<String, String>, amount: f64) {
         let key = Self::make_key(name, &labels);
-        let mut counters = self.counters.lock().unwrap();
+        let mut counters = self.counters.lock();
         let entry = counters.entry(key).or_insert(0.0);
         *entry += amount;
     }
@@ -80,15 +81,15 @@ impl MetricsCollector {
     /// Observe a value for a histogram metric.
     pub fn observe(&self, name: &str, labels: HashMap<String, String>, value: f64) {
         let key = Self::make_key(name, &labels);
-        let mut histograms = self.histograms.lock().unwrap();
+        let mut histograms = self.histograms.lock();
         let entry = histograms.entry(key).or_insert_with(HistogramData::new);
         entry.observe(value);
     }
 
     /// Return a snapshot of all current metric values as JSON.
     pub fn snapshot(&self) -> serde_json::Value {
-        let counters = self.counters.lock().unwrap();
-        let histograms = self.histograms.lock().unwrap();
+        let counters = self.counters.lock();
+        let histograms = self.histograms.lock();
 
         let mut counters_map = serde_json::Map::new();
         for ((name, labels), value) in counters.iter() {
@@ -131,15 +132,15 @@ impl MetricsCollector {
 
     /// Reset all metrics.
     pub fn reset(&self) {
-        self.counters.lock().unwrap().clear();
-        self.histograms.lock().unwrap().clear();
+        self.counters.lock().clear();
+        self.histograms.lock().clear();
     }
 
     /// Export metrics in Prometheus text format.
     pub fn export_prometheus(&self) -> String {
         let mut output = String::new();
-        let counters = self.counters.lock().unwrap();
-        let histograms = self.histograms.lock().unwrap();
+        let counters = self.counters.lock();
+        let histograms = self.histograms.lock();
 
         // Export counters
         let mut seen_counter_names: std::collections::HashSet<String> =
@@ -223,6 +224,43 @@ fn format_prometheus_labels(labels: &BTreeMap<String, String>) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
+/// Estimate p99 latency from histogram buckets in a metrics snapshot.
+///
+/// Expects `buckets` to be a JSON array of `{"le": <f64>, "count": <u64>}` objects
+/// with cumulative counts, and `total_count` to be the total number of observations.
+///
+/// Returns the upper bound (`le`) of the first bucket whose cumulative count
+/// reaches or exceeds the 99th-percentile threshold, converted to milliseconds.
+/// Returns 0.0 if `total_count` is 0 or `buckets` is empty/missing.
+pub(crate) fn estimate_p99_from_histogram(buckets: &[serde_json::Value], total_count: u64) -> f64 {
+    if total_count == 0 || buckets.is_empty() {
+        return 0.0;
+    }
+    let target = (total_count as f64 * 0.99).ceil() as u64;
+    for bucket in buckets {
+        let le = bucket
+            .get("le")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::INFINITY);
+        let cnt = bucket.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        if cnt >= target {
+            return le * 1000.0; // seconds -> ms
+        }
+    }
+    0.0
+}
+
+/// Estimate p99 latency from a sorted slice of raw latency values (in ms).
+///
+/// Returns the value at the 99th-percentile index. Returns 0.0 if the slice is empty.
+pub(crate) fn estimate_p99_from_sorted(sorted_latencies: &[f64]) -> f64 {
+    if sorted_latencies.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted_latencies.len() as f64) * 0.99).ceil() as usize;
+    sorted_latencies[idx.min(sorted_latencies.len()) - 1]
+}
+
 impl Default for MetricsCollector {
     fn default() -> Self {
         Self::new()
@@ -266,7 +304,7 @@ impl Middleware for MetricsMiddleware {
         _inputs: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut starts = self.starts.lock();
         starts.insert(_ctx.trace_id.clone(), std::time::Instant::now());
         Ok(None)
     }
@@ -279,7 +317,7 @@ impl Middleware for MetricsMiddleware {
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         let duration_secs = {
-            let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut starts = self.starts.lock();
             starts
                 .remove(&_ctx.trace_id)
                 .map(|s| s.elapsed().as_secs_f64())
@@ -300,7 +338,7 @@ impl Middleware for MetricsMiddleware {
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         let duration_secs = {
-            let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut starts = self.starts.lock();
             starts
                 .remove(&_ctx.trace_id)
                 .map(|s| s.elapsed().as_secs_f64())
