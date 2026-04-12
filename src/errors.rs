@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Framework error code prefixes reserved by the protocol.
-pub(crate) const FRAMEWORK_ERROR_CODE_PREFIXES: &[&str] = &[
+pub const FRAMEWORK_ERROR_CODE_PREFIXES: &[&str] = &[
     "CONFIG_",
     "ACL_",
     "MODULE_",
@@ -23,6 +23,9 @@ pub(crate) const FRAMEWORK_ERROR_CODE_PREFIXES: &[&str] = &[
     "VERSION_",
     "ERROR_CODE_",
     "DEPENDENCY_",
+    "PIPELINE_",
+    "STEP_",
+    "STRATEGY_",
 ];
 
 /// All error codes defined by the APCore protocol.
@@ -75,6 +78,12 @@ pub enum ErrorCode {
     ConfigBindError,
     ConfigEnvMapConflict,
     ErrorFormatterDuplicate,
+    PipelineAbort,
+    StepNotFound,
+    StepNotRemovable,
+    StepNotReplaceable,
+    StepNameDuplicate,
+    StrategyNotFound,
 }
 
 /// Structured error returned by module execution.
@@ -117,31 +126,37 @@ impl ModuleError {
 
     // Builder methods
 
+    #[must_use]
     pub fn with_details(mut self, details: HashMap<String, serde_json::Value>) -> Self {
         self.details = details;
         self
     }
 
+    #[must_use]
     pub fn with_cause(mut self, cause: impl Into<String>) -> Self {
         self.cause = Some(cause.into());
         self
     }
 
+    #[must_use]
     pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
         self.trace_id = Some(trace_id.into());
         self
     }
 
+    #[must_use]
     pub fn with_ai_guidance(mut self, ai_guidance: impl Into<String>) -> Self {
         self.ai_guidance = Some(ai_guidance.into());
         self
     }
 
+    #[must_use]
     pub fn with_retryable(mut self, retryable: bool) -> Self {
         self.retryable = Some(retryable);
         self
     }
 
+    #[must_use]
     pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
         self.suggestion = Some(suggestion.into());
         self
@@ -157,7 +172,7 @@ impl ModuleError {
         details.insert("name".to_string(), serde_json::json!(name));
         Self::new(
             ErrorCode::ConfigNamespaceDuplicate,
-            format!("Namespace '{}' is already registered", name),
+            format!("Namespace '{name}' is already registered"),
         )
         .with_details(details)
     }
@@ -167,7 +182,7 @@ impl ModuleError {
         details.insert("name".to_string(), serde_json::json!(name));
         Self::new(
             ErrorCode::ConfigNamespaceReserved,
-            format!("Namespace '{}' is reserved", name),
+            format!("Namespace '{name}' is reserved"),
         )
         .with_details(details)
     }
@@ -177,7 +192,7 @@ impl ModuleError {
         details.insert("env_prefix".to_string(), serde_json::json!(prefix));
         Self::new(
             ErrorCode::ConfigEnvPrefixConflict,
-            format!("env_prefix '{}' conflicts with reserved pattern", prefix),
+            format!("env_prefix '{prefix}' conflicts with reserved pattern"),
         )
         .with_details(details)
     }
@@ -188,10 +203,7 @@ impl ModuleError {
         details.insert("owner".to_string(), serde_json::json!(owner));
         Self::new(
             ErrorCode::ConfigEnvMapConflict,
-            format!(
-                "Environment variable '{}' is already mapped by '{}'",
-                env_var, owner
-            ),
+            format!("Environment variable '{env_var}' is already mapped by '{owner}'"),
         )
         .with_details(details)
     }
@@ -201,7 +213,7 @@ impl ModuleError {
         details.insert("namespace".to_string(), serde_json::json!(namespace));
         Self::new(
             ErrorCode::ConfigMountError,
-            format!("Mount failed for '{}': {}", namespace, reason),
+            format!("Mount failed for '{namespace}': {reason}"),
         )
         .with_details(details)
     }
@@ -211,7 +223,7 @@ impl ModuleError {
         details.insert("namespace".to_string(), serde_json::json!(namespace));
         Self::new(
             ErrorCode::ConfigBindError,
-            format!("Bind failed for '{}': {}", namespace, reason),
+            format!("Bind failed for '{namespace}': {reason}"),
         )
         .with_details(details)
     }
@@ -221,12 +233,43 @@ impl ModuleError {
         details.insert("adapter_name".to_string(), serde_json::json!(adapter_name));
         Self::new(
             ErrorCode::ErrorFormatterDuplicate,
+            format!("ErrorFormatter for adapter '{adapter_name}' is already registered"),
+        )
+        .with_details(details)
+    }
+
+    pub fn pipeline_abort(step: &str, explanation: Option<&str>) -> Self {
+        let mut details = HashMap::new();
+        details.insert("step".to_string(), serde_json::json!(step));
+        Self::new(
+            ErrorCode::PipelineAbort,
             format!(
-                "ErrorFormatter for adapter '{}' is already registered",
-                adapter_name
+                "Pipeline aborted at step '{}': {}",
+                step,
+                explanation.unwrap_or("no explanation")
             ),
         )
         .with_details(details)
+    }
+
+    pub fn step_not_found(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::StepNotFound, message)
+    }
+
+    pub fn step_not_removable(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::StepNotRemovable, message)
+    }
+
+    pub fn step_not_replaceable(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::StepNotReplaceable, message)
+    }
+
+    pub fn step_name_duplicate(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::StepNameDuplicate, message)
+    }
+
+    pub fn strategy_not_found(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::StrategyNotFound, message)
     }
 }
 
@@ -395,10 +438,7 @@ impl ErrorCodeRegistry {
             for prefix in FRAMEWORK_ERROR_CODE_PREFIXES {
                 if code.starts_with(prefix) {
                     return Err(ErrorCodeCollisionError::new(
-                        format!(
-                            "Error code '{}' uses reserved framework prefix '{}'",
-                            code, prefix
-                        ),
+                        format!("Error code '{code}' uses reserved framework prefix '{prefix}'"),
                         code,
                         module_id,
                         "framework",
@@ -411,10 +451,7 @@ impl ErrorCodeRegistry {
             if let Some(owner) = self.find_owner(code) {
                 if owner != module_id {
                     return Err(ErrorCodeCollisionError::new(
-                        format!(
-                            "Error code '{}' already registered by module '{}'",
-                            code, owner
-                        ),
+                        format!("Error code '{code}' already registered by module '{owner}'"),
                         code,
                         module_id,
                         &owner,

@@ -4,6 +4,11 @@
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 
+/// Default maximum call chain depth before `CallDepthExceeded` is returned.
+pub const DEFAULT_MAX_CALL_DEPTH: usize = 32;
+/// Default maximum repeat count for a single module in the call chain.
+pub const DEFAULT_MAX_MODULE_REPEAT: usize = 3;
+
 /// Match a string against a glob-like pattern (supports `*` wildcards).
 ///
 /// Ported from apcore-python `utils/pattern.py::match_pattern`.
@@ -72,6 +77,8 @@ pub fn guard_call_chain_with_repeat(
     max_module_repeat: usize,
 ) -> Result<(), ModuleError> {
     // Check call depth (chain length must not exceed max_depth)
+    #[allow(clippy::cast_possible_truncation)]
+    // call_chain length is bounded by max_depth which is u32
     if ctx.call_chain.len() as u32 > max_depth {
         return Err(ModuleError::new(
             ErrorCode::CallDepthExceeded,
@@ -86,7 +93,7 @@ pub fn guard_call_chain_with_repeat(
     // Circular detection: strict cycles of length >= 2 in prior chain.
     // The call chain's last entry is the current module (added by child()),
     // so check prior entries for a previous occurrence forming A->...->A.
-    let prior = if ctx.call_chain.last().map(|s| s.as_str()) == Some(module_name) {
+    let prior = if ctx.call_chain.last().map(std::string::String::as_str) == Some(module_name) {
         &ctx.call_chain[..ctx.call_chain.len() - 1]
     } else {
         &ctx.call_chain[..]
@@ -115,8 +122,7 @@ pub fn guard_call_chain_with_repeat(
         return Err(ModuleError::new(
             ErrorCode::CallFrequencyExceeded,
             format!(
-                "Module '{}' called {} times, exceeds max repeat limit of {}",
-                module_name, count, max_module_repeat
+                "Module '{module_name}' called {count} times, exceeds max repeat limit of {max_module_repeat}"
             ),
         ));
     }
@@ -199,4 +205,189 @@ pub fn calculate_specificity(pattern: &str) -> u32 {
         }
     }
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Context;
+    use crate::errors::ErrorCode;
+
+    #[test]
+    fn test_match_pattern_wildcard_matches_everything() {
+        assert!(match_pattern("*", "anything"));
+        assert!(match_pattern("*", ""));
+        assert!(match_pattern("*", "a.b.c"));
+    }
+
+    #[test]
+    fn test_match_pattern_exact_match() {
+        assert!(match_pattern("foo.bar", "foo.bar"));
+        assert!(!match_pattern("foo.bar", "foo.baz"));
+        assert!(!match_pattern("foo.bar", "foo.bar.baz"));
+    }
+
+    #[test]
+    fn test_match_pattern_no_wildcards_no_match() {
+        assert!(!match_pattern("abc", "def"));
+    }
+
+    #[test]
+    fn test_match_pattern_prefix_wildcard() {
+        assert!(match_pattern("foo.*", "foo.bar"));
+        assert!(match_pattern("foo.*", "foo.anything"));
+        assert!(!match_pattern("foo.*", "bar.baz"));
+    }
+
+    #[test]
+    fn test_match_pattern_suffix_wildcard() {
+        assert!(match_pattern("*.bar", "foo.bar"));
+        assert!(match_pattern("*.bar", "x.y.bar"));
+        assert!(!match_pattern("*.bar", "foo.baz"));
+    }
+
+    #[test]
+    fn test_match_pattern_middle_wildcard() {
+        assert!(match_pattern("a.*.c", "a.b.c"));
+        assert!(match_pattern("a.*.c", "a.xyz.c"));
+        assert!(!match_pattern("a.*.c", "a.b.d"));
+    }
+
+    #[test]
+    fn test_match_pattern_multiple_wildcards() {
+        assert!(match_pattern("a.*.*.d", "a.b.c.d"));
+    }
+
+    #[test]
+    fn test_guard_call_chain_empty_chain_passes() {
+        let ctx = Context::<serde_json::Value>::anonymous();
+        assert!(guard_call_chain(&ctx, "mod.a", 10).is_ok());
+    }
+
+    #[test]
+    fn test_guard_call_chain_depth_exceeded() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let result = guard_call_chain(&ctx, "e", 3);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::CallDepthExceeded);
+    }
+
+    #[test]
+    fn test_guard_call_chain_circular_detection() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["mod.a".into(), "mod.b".into(), "mod.a".into()];
+        let result = guard_call_chain(&ctx, "mod.a", 100);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::CircularCall);
+    }
+
+    #[test]
+    fn test_guard_call_chain_frequency_exceeded() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        // Three adjacent occurrences: no cycle of length >= 2 is detected
+        // (subsequence between occurrences is empty), but count reaches
+        // the default max_module_repeat of 3.
+        ctx.call_chain = vec!["mod.a".into(), "mod.a".into(), "mod.a".into()];
+        let result = guard_call_chain(&ctx, "mod.a", 100);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
+    }
+
+    #[test]
+    fn test_guard_call_chain_with_repeat_custom_limit() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["mod.a".into()];
+        let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, 1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
+    }
+
+    #[test]
+    fn test_guard_call_chain_ok_within_limits() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["mod.a".into(), "mod.b".into()];
+        assert!(guard_call_chain(&ctx, "mod.c", 10).is_ok());
+    }
+
+    #[test]
+    fn test_normalize_python_dotted() {
+        assert_eq!(
+            normalize_to_canonical_id("MyModule.SendEmail", "python"),
+            "my_module.send_email"
+        );
+    }
+
+    #[test]
+    fn test_normalize_rust_double_colon() {
+        assert_eq!(
+            normalize_to_canonical_id("MyModule::SendEmail", "rust"),
+            "my_module.send_email"
+        );
+    }
+
+    #[test]
+    fn test_normalize_already_snake_case() {
+        assert_eq!(
+            normalize_to_canonical_id("my_module.send_email", "python"),
+            "my_module.send_email"
+        );
+    }
+
+    #[test]
+    fn test_normalize_acronym_handling() {
+        assert_eq!(
+            normalize_to_canonical_id("HTTPClient", "python"),
+            "http_client"
+        );
+        assert_eq!(
+            normalize_to_canonical_id("HTMLParser", "python"),
+            "html_parser"
+        );
+    }
+
+    #[test]
+    fn test_normalize_camel_case_boundary() {
+        assert_eq!(normalize_to_canonical_id("getValue", "python"), "get_value");
+    }
+
+    #[test]
+    fn test_normalize_digit_boundary() {
+        assert_eq!(normalize_to_canonical_id("log2Base", "python"), "log2_base");
+    }
+
+    #[test]
+    fn test_specificity_wildcard_only() {
+        assert_eq!(calculate_specificity("*"), 0);
+    }
+
+    #[test]
+    fn test_specificity_exact_segments() {
+        assert_eq!(calculate_specificity("foo.bar"), 4);
+    }
+
+    #[test]
+    fn test_specificity_partial_wildcard() {
+        assert_eq!(calculate_specificity("foo.*"), 2);
+    }
+
+    #[test]
+    fn test_specificity_partial_wildcard_in_segment() {
+        assert_eq!(calculate_specificity("foo.ba*"), 3);
+    }
+
+    #[test]
+    fn test_specificity_single_exact() {
+        assert_eq!(calculate_specificity("executor"), 2);
+    }
+
+    #[test]
+    fn test_specificity_all_wildcards() {
+        assert_eq!(calculate_specificity("*.*.*"), 0);
+    }
+
+    #[test]
+    fn test_specificity_mixed() {
+        assert_eq!(calculate_specificity("a.*.b.c*"), 5);
+    }
 }

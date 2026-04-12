@@ -85,12 +85,18 @@ impl RetryMiddleware {
     /// - Fixed: `base_delay_ms`.
     /// - With jitter: multiply by a factor in [0.5, 1.5).
     fn calculate_delay(&self, attempt: u32) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        // intentional: delay values are small (ms) and won't lose meaningful precision
         let delay = if self.config.strategy == "fixed" {
             self.config.base_delay_ms as f64
         } else {
             // Exponential backoff
+            #[allow(clippy::cast_possible_wrap)] // attempt won't exceed i32::MAX in practice
             let exp_delay = self.config.base_delay_ms as f64 * 2.0_f64.powi(attempt as i32);
-            exp_delay.min(self.config.max_delay_ms as f64)
+            #[allow(clippy::cast_precision_loss)]
+            // intentional: delay values are small (ms) and won't lose meaningful precision
+            let max = self.config.max_delay_ms as f64;
+            exp_delay.min(max)
         };
 
         if self.config.jitter {
@@ -100,7 +106,7 @@ impl RetryMiddleware {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos();
-            let factor = 0.5 + (nanos as f64 % 1_000_000.0) / 1_000_000.0;
+            let factor = 0.5 + (f64::from(nanos) % 1_000_000.0) / 1_000_000.0;
             delay * factor
         } else {
             delay
@@ -110,7 +116,7 @@ impl RetryMiddleware {
 
 #[async_trait]
 impl Middleware for RetryMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "retry"
     }
 
@@ -173,7 +179,10 @@ impl Middleware for RetryMiddleware {
         );
 
         // Sleep for the calculated delay.
-        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms as u64)).await;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // delay_ms is non-negative and won't exceed u64::MAX
+        let delay_ms_u64 = delay_ms as u64;
+        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms_u64)).await;
 
         // Increment the retry count.
         {
@@ -183,5 +192,161 @@ impl Middleware for RetryMiddleware {
 
         // Return the original inputs to signal retry.
         Ok(Some(inputs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::ErrorCode;
+    use serde_json::json;
+
+    #[test]
+    fn test_retry_config_default() {
+        let config = RetryConfig::default();
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.strategy, "exponential");
+        assert_eq!(config.base_delay_ms, 100);
+        assert_eq!(config.max_delay_ms, 5000);
+        assert!(config.jitter);
+    }
+
+    #[test]
+    fn test_retry_config_serde_defaults() {
+        let config: RetryConfig = serde_json::from_str(r#"{"max_retries": 5}"#).unwrap();
+        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.strategy, "exponential");
+        assert_eq!(config.base_delay_ms, 100);
+    }
+
+    #[test]
+    fn test_calculate_delay_fixed_no_jitter() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 3,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 200,
+            max_delay_ms: 5000,
+            jitter: false,
+        });
+        assert!((mw.calculate_delay(0) - 200.0).abs() < f64::EPSILON);
+        assert!((mw.calculate_delay(1) - 200.0).abs() < f64::EPSILON);
+        assert!((mw.calculate_delay(5) - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_delay_exponential_no_jitter() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 5,
+            strategy: "exponential".to_string(),
+            base_delay_ms: 100,
+            max_delay_ms: 5000,
+            jitter: false,
+        });
+        assert!((mw.calculate_delay(0) - 100.0).abs() < f64::EPSILON);
+        assert!((mw.calculate_delay(1) - 200.0).abs() < f64::EPSILON);
+        assert!((mw.calculate_delay(2) - 400.0).abs() < f64::EPSILON);
+        assert!((mw.calculate_delay(3) - 800.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_delay_exponential_capped() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 10,
+            strategy: "exponential".to_string(),
+            base_delay_ms: 100,
+            max_delay_ms: 500,
+            jitter: false,
+        });
+        assert!((mw.calculate_delay(4) - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_delay_with_jitter_in_range() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 3,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 1000,
+            max_delay_ms: 5000,
+            jitter: true,
+        });
+        for _ in 0..20 {
+            let delay = mw.calculate_delay(0);
+            assert!(delay >= 500.0, "delay {delay} should be >= 500");
+            assert!(delay < 1500.0, "delay {delay} should be < 1500");
+        }
+    }
+
+    #[test]
+    fn test_retry_middleware_name() {
+        let mw = RetryMiddleware::new(RetryConfig::default());
+        assert_eq!(mw.name(), "retry");
+    }
+
+    #[tokio::test]
+    async fn test_before_returns_none() {
+        let mw = RetryMiddleware::new(RetryConfig::default());
+        let ctx = Context::<serde_json::Value>::anonymous();
+        let result = mw.before("test.mod", json!({"a": 1}), &ctx).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_after_resets_retry_count() {
+        let mw = RetryMiddleware::new(RetryConfig::default());
+        mw.retry_counts.lock().insert("mod.a".to_string(), 2);
+        let ctx = Context::<serde_json::Value>::anonymous();
+        mw.after("mod.a", json!({}), json!({}), &ctx).await.unwrap();
+        assert!(mw.retry_counts.lock().get("mod.a").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_on_error_non_retryable_returns_none() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 3,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+        });
+        let ctx = Context::<serde_json::Value>::anonymous();
+        let err = ModuleError::new(ErrorCode::ModuleExecuteError, "fail");
+        let result = mw.on_error("mod.a", json!({}), &err, &ctx).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_on_error_retryable_returns_inputs() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 3,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+        });
+        let ctx = Context::<serde_json::Value>::anonymous();
+        let err = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
+        let inputs = json!({"key": "val"});
+        let result = mw
+            .on_error("mod.a", inputs.clone(), &err, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(inputs));
+        assert_eq!(*mw.retry_counts.lock().get("mod.a").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_on_error_exceeds_max_retries() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 2,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+        });
+        mw.retry_counts.lock().insert("mod.a".to_string(), 2);
+        let ctx = Context::<serde_json::Value>::anonymous();
+        let err = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
+        let result = mw.on_error("mod.a", json!({}), &err, &ctx).await.unwrap();
+        assert_eq!(result, None);
     }
 }

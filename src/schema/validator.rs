@@ -21,7 +21,7 @@ impl SchemaValidator {
         schema: &serde_json::Value,
     ) -> ValidationResult {
         let mut errors = Vec::new();
-        self.validate_inner(value, schema, "".to_string(), &mut errors);
+        self.validate_inner(value, schema, "", &mut errors);
         ValidationResult {
             valid: errors.is_empty(),
             errors,
@@ -60,27 +60,26 @@ impl SchemaValidator {
     }
 
     /// Recursively validate a value against a schema node, collecting errors.
-    #[allow(clippy::only_used_in_recursion)]
+    #[allow(clippy::self_only_used_in_recursion)] // `self` needed for recursive dispatch
+    #[allow(clippy::too_many_lines)] // single-pass recursive schema validator; splitting would hurt readability
     fn validate_inner(
         &self,
         value: &serde_json::Value,
         schema: &serde_json::Value,
-        path: String,
+        path: &str,
         errors: &mut Vec<String>,
     ) {
-        let schema_obj = match schema.as_object() {
-            Some(obj) => obj,
-            None => return, // non-object schema (e.g. `true`) – permissive
+        let Some(schema_obj) = schema.as_object() else {
+            return; // non-object schema (e.g. `true`) – permissive
         };
 
         // --- "enum" check ---
         if let Some(enum_values) = schema_obj.get("enum") {
             if let Some(arr) = enum_values.as_array() {
                 if !arr.contains(value) {
-                    let display_path = if path.is_empty() { "<root>" } else { &path };
+                    let display_path = if path.is_empty() { "<root>" } else { path };
                     errors.push(format!(
-                        "{}: value {:?} is not one of the allowed enum values",
-                        display_path, value
+                        "{display_path}: value {value:?} is not one of the allowed enum values"
                     ));
                     return;
                 }
@@ -111,10 +110,9 @@ impl SchemaValidator {
                 true
             };
             if !type_ok {
-                let display_path = if path.is_empty() { "<root>" } else { &path };
+                let display_path = if path.is_empty() { "<root>" } else { path };
                 errors.push(format!(
-                    "{}: expected type {:?}, got {:?}",
-                    display_path, type_val, value
+                    "{display_path}: expected type {type_val:?}, got {value:?}"
                 ));
                 return;
             }
@@ -127,10 +125,9 @@ impl SchemaValidator {
         ) {
             if let Ok(re) = regex::Regex::new(pattern_val) {
                 if !re.is_match(str_val) {
-                    let display_path = if path.is_empty() { "<root>" } else { &path };
+                    let display_path = if path.is_empty() { "<root>" } else { path };
                     errors.push(format!(
-                        "{}: value {:?} does not match pattern {:?}",
-                        display_path, str_val, pattern_val
+                        "{display_path}: value {str_val:?} does not match pattern {pattern_val:?}"
                     ));
                 }
             }
@@ -149,9 +146,9 @@ impl SchemaValidator {
                                 let field_path = if path.is_empty() {
                                     field_name.to_string()
                                 } else {
-                                    format!("{}.{}", path, field_name)
+                                    format!("{path}.{field_name}")
                                 };
-                                errors.push(format!("{}: missing required field", field_path));
+                                errors.push(format!("{field_path}: missing required field"));
                             }
                         }
                     }
@@ -166,9 +163,9 @@ impl SchemaValidator {
                             let child_path = if path.is_empty() {
                                 key.clone()
                             } else {
-                                format!("{}.{}", path, key)
+                                format!("{path}.{key}")
                             };
-                            self.validate_inner(prop_value, prop_schema, child_path, errors);
+                            self.validate_inner(prop_value, prop_schema, &child_path, errors);
                         }
                     }
                 }
@@ -182,9 +179,9 @@ impl SchemaValidator {
                             let field_path = if path.is_empty() {
                                 key.clone()
                             } else {
-                                format!("{}.{}", path, key)
+                                format!("{path}.{key}")
                             };
-                            errors.push(format!("{}: additional property not allowed", field_path));
+                            errors.push(format!("{field_path}: additional property not allowed"));
                         }
                     }
                 }
@@ -197,11 +194,11 @@ impl SchemaValidator {
                 let arr = value.as_array().unwrap();
                 for (i, item) in arr.iter().enumerate() {
                     let child_path = if path.is_empty() {
-                        format!("[{}]", i)
+                        format!("[{i}]")
                     } else {
-                        format!("{}[{}]", path, i)
+                        format!("{path}[{i}]")
                     };
-                    self.validate_inner(item, items_schema, child_path, errors);
+                    self.validate_inner(item, items_schema, &child_path, errors);
                 }
             }
         }

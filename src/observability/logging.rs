@@ -20,11 +20,10 @@ fn level_value(level: &str) -> u32 {
     match level.to_lowercase().as_str() {
         "trace" => 0,
         "debug" => 10,
-        "info" => 20,
         "warn" | "warning" => 30,
         "error" => 40,
         "fatal" => 50,
-        _ => 20,
+        _ => 20, // info and unknown levels default to 20
     }
 }
 
@@ -145,14 +144,14 @@ impl ContextLogger {
                 }
                 let json_str =
                     serde_json::to_string(&serde_json::Value::Object(record)).unwrap_or_default();
-                let _ = writeln!(std::io::stderr(), "{}", json_str);
+                let _ = writeln!(std::io::stderr(), "{json_str}");
             }
             LogFormat::Text => {
                 let ts = Utc::now().to_rfc3339();
                 let ctx_str = match (&self.trace_id, &self.module_id) {
-                    (Some(tid), Some(mid)) => format!(" [trace={} module={}]", tid, mid),
-                    (Some(tid), None) => format!(" [trace={}]", tid),
-                    (None, Some(mid)) => format!(" [module={}]", mid),
+                    (Some(tid), Some(mid)) => format!(" [trace={tid} module={mid}]"),
+                    (Some(tid), None) => format!(" [trace={tid}]"),
+                    (None, Some(mid)) => format!(" [module={mid}]"),
                     (None, None) => String::new(),
                 };
                 let _ = writeln!(
@@ -240,7 +239,7 @@ impl ObsLoggingMiddleware {
 
 #[async_trait]
 impl Middleware for ObsLoggingMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "logging"
     }
 
@@ -269,7 +268,7 @@ impl Middleware for ObsLoggingMiddleware {
             extra.insert("input".to_string(), inputs.clone());
         }
         self.logger
-            .emit("info", &format!("Starting {}", module_id), Some(&extra));
+            .emit("info", &format!("Starting {module_id}"), Some(&extra));
 
         Ok(None)
     }
@@ -286,8 +285,7 @@ impl Middleware for ObsLoggingMiddleware {
             let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
-                .map(|s| s.elapsed().as_secs_f64() * 1000.0)
-                .unwrap_or(0.0)
+                .map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)
         };
 
         let mut extra = HashMap::new();
@@ -305,7 +303,7 @@ impl Middleware for ObsLoggingMiddleware {
         }
         self.logger.emit(
             "info",
-            &format!("Completed {} in {:.2}ms", module_id, duration_ms),
+            &format!("Completed {module_id} in {duration_ms:.2}ms"),
             Some(&extra),
         );
 
@@ -324,8 +322,7 @@ impl Middleware for ObsLoggingMiddleware {
             let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
-                .map(|s| s.elapsed().as_secs_f64() * 1000.0)
-                .unwrap_or(0.0)
+                .map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)
         };
 
         let mut extra = HashMap::new();

@@ -90,7 +90,7 @@ impl ErrorHistory {
         }
 
         // Evict total entries if over limit
-        let mut total: usize = map.values().map(|v| v.len()).sum();
+        let mut total: usize = map.values().map(std::collections::VecDeque::len).sum();
         while total > self.max_total_entries {
             // Find the module with the oldest entry and remove it
             let mut oldest_module = None;
@@ -179,7 +179,7 @@ impl ErrorHistoryMiddleware {
 
 #[async_trait]
 impl Middleware for ErrorHistoryMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "error_history"
     }
 

@@ -46,7 +46,7 @@ impl std::fmt::Debug for FunctionModule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FunctionModule")
             .field("annotations", &self.annotations)
-            .finish()
+            .finish_non_exhaustive() // handler (fn pointer) and schemas are not Debug
     }
 }
 

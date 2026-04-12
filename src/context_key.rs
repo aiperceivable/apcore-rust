@@ -25,6 +25,7 @@ impl<T> ContextKey<T> {
     }
 
     /// Create a sub-key with `{name}.{suffix}`.
+    #[must_use]
     pub fn scoped(&self, suffix: &str) -> ContextKey<T> {
         ContextKey {
             name: Cow::Owned(format!("{}.{}", self.name, suffix)),

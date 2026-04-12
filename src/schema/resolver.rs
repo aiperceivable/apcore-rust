@@ -50,7 +50,7 @@ impl RefResolver {
                     if let Some(ref_str) = ref_val.as_str() {
                         if seen.contains(ref_str) {
                             return Err(SchemaCircularRefError::new(
-                                format!("Circular $ref detected: {}", ref_str),
+                                format!("Circular $ref detected: {ref_str}"),
                                 ref_str.to_string(),
                             )
                             .to_module_error());
@@ -97,7 +97,7 @@ impl RefResolver {
             root.pointer(pointer).cloned().ok_or_else(|| {
                 ModuleError::new(
                     ErrorCode::SchemaNotFound,
-                    format!("Local $ref not found: {}", ref_str),
+                    format!("Local $ref not found: {ref_str}"),
                 )
             })
         } else {
@@ -105,7 +105,7 @@ impl RefResolver {
             self.schemas.get(ref_str).cloned().ok_or_else(|| {
                 ModuleError::new(
                     ErrorCode::SchemaNotFound,
-                    format!("Referenced schema not found: {}", ref_str),
+                    format!("Referenced schema not found: {ref_str}"),
                 )
             })
         }

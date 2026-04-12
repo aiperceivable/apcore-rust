@@ -7,6 +7,7 @@ use apcore::module::Module;
 use apcore::APCore;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Test module
@@ -22,7 +23,7 @@ impl Module for AddModule {
     fn output_schema(&self) -> Value {
         json!({"type": "object", "properties": {"result": {"type": "integer"}}})
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Add two numbers"
     }
     async fn execute(&self, inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
@@ -41,7 +42,7 @@ struct PrefixMiddleware;
 
 #[async_trait]
 impl Middleware for PrefixMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "prefix"
     }
     async fn before(
@@ -81,7 +82,7 @@ struct TagMiddleware;
 
 #[async_trait]
 impl Middleware for TagMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "tag"
     }
     async fn before(
@@ -237,7 +238,7 @@ async fn test_apcore_disable_enable() {
 
     // Disable through the pipeline.
     let result = client.disable("math.add", Some("test")).await;
-    assert!(result.is_ok(), "disable should succeed: {:?}", result);
+    assert!(result.is_ok(), "disable should succeed: {result:?}");
 
     // Next call should fail with ModuleDisabled.
     let call_err = client
@@ -248,7 +249,7 @@ async fn test_apcore_disable_enable() {
 
     // Re-enable and call should succeed again.
     let result = client.enable("math.add", Some("test")).await;
-    assert!(result.is_ok(), "enable should succeed: {:?}", result);
+    assert!(result.is_ok(), "enable should succeed: {result:?}");
 
     let ok = client
         .call("math.add", json!({"a": 1, "b": 2}), None, None)
@@ -338,7 +339,7 @@ async fn test_validate_accepts_optional_context() {
         "test_caller".to_string(),
         "user".to_string(),
         vec!["tester".to_string()],
-        Default::default(),
+        HashMap::default(),
     );
     let ctx: Context<serde_json::Value> = Context::new(identity);
     let r2 = client

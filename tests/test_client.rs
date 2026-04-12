@@ -17,7 +17,7 @@ struct Echo;
 
 #[async_trait]
 impl Module for Echo {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "echo"
     }
     fn input_schema(&self) -> Value {

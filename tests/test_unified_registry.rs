@@ -28,7 +28,7 @@ struct Dummy;
 
 #[async_trait]
 impl Module for Dummy {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "dummy"
     }
     fn input_schema(&self) -> Value {

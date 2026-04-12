@@ -21,7 +21,7 @@ impl Module for EchoModule {
     fn output_schema(&self) -> Value {
         json!({ "type": "object", "properties": { "value": { "type": "string" } } })
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Echo the input value back"
     }
     async fn execute(&self, input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
@@ -39,7 +39,7 @@ impl Module for FailingModule {
     fn output_schema(&self) -> Value {
         json!({})
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Always returns an error"
     }
     async fn execute(&self, _input: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {

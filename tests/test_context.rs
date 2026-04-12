@@ -5,11 +5,11 @@ use apcore::context::{Context, Identity};
 use serde_json::Value;
 use std::collections::HashMap;
 
-fn make_identity(id: &str, identity_type: &str, roles: Vec<&str>) -> Identity {
+fn make_identity(id: &str, identity_type: &str, roles: &[&str]) -> Identity {
     Identity::new(
         id.to_string(),
         identity_type.to_string(),
-        roles.iter().map(|s| s.to_string()).collect(),
+        roles.iter().map(std::string::ToString::to_string).collect(),
         HashMap::new(),
     )
 }
@@ -20,7 +20,7 @@ fn make_identity(id: &str, identity_type: &str, roles: Vec<&str>) -> Identity {
 
 #[test]
 fn test_identity_basic_fields() {
-    let id = make_identity("user-1", "Alice", vec!["admin", "user"]);
+    let id = make_identity("user-1", "Alice", &["admin", "user"]);
     assert_eq!(id.id(), "user-1");
     assert_eq!(id.identity_type(), "Alice");
     assert_eq!(id.roles().len(), 2);
@@ -29,7 +29,7 @@ fn test_identity_basic_fields() {
 
 #[test]
 fn test_identity_empty_roles() {
-    let id = make_identity("svc-1", "Service", vec![]);
+    let id = make_identity("svc-1", "Service", &[]);
     assert!(id.roles().is_empty());
 }
 
@@ -43,7 +43,7 @@ fn test_identity_with_attrs() {
 
 #[test]
 fn test_identity_serialization() {
-    let id = make_identity("user-1", "Alice", vec!["admin"]);
+    let id = make_identity("user-1", "Alice", &["admin"]);
     let json = serde_json::to_string(&id).unwrap();
     let restored: Identity = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.id(), id.id());
@@ -57,7 +57,7 @@ fn test_identity_serialization() {
 
 #[test]
 fn test_context_new_has_unique_trace_id() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let ctx1: Context<Value> = Context::new(id.clone());
     let ctx2: Context<Value> = Context::new(id);
     assert_ne!(ctx1.trace_id, ctx2.trace_id);
@@ -65,28 +65,28 @@ fn test_context_new_has_unique_trace_id() {
 
 #[test]
 fn test_context_initial_call_chain_length_is_zero() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let ctx: Context<Value> = Context::new(id);
     assert_eq!(ctx.call_chain.len(), 0);
 }
 
 #[test]
 fn test_context_initial_call_chain_is_empty() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let ctx: Context<Value> = Context::new(id);
     assert!(ctx.call_chain.is_empty());
 }
 
 #[test]
 fn test_context_no_global_deadline_by_default() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let ctx: Context<Value> = Context::new(id);
     assert!(ctx.global_deadline.is_none());
 }
 
 #[test]
 fn test_context_identity_is_preserved() {
-    let id = make_identity("svc-42", "MyService", vec!["reader"]);
+    let id = make_identity("svc-42", "MyService", &["reader"]);
     let ctx: Context<Value> = Context::new(id);
     let identity = ctx.identity.as_ref().expect("identity should be Some");
     assert_eq!(identity.id(), "svc-42");
@@ -95,14 +95,14 @@ fn test_context_identity_is_preserved() {
 
 #[test]
 fn test_context_no_cancel_token_by_default() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let ctx: Context<Value> = Context::new(id);
     assert!(ctx.cancel_token.is_none());
 }
 
 #[test]
 fn test_context_with_cancel_token() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let mut ctx: Context<Value> = Context::new(id);
     let token = CancelToken::new();
     ctx.cancel_token = Some(token);
@@ -111,7 +111,7 @@ fn test_context_with_cancel_token() {
 
 #[test]
 fn test_context_data_starts_empty() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let ctx: Context<Value> = Context::new(id);
     assert!(ctx.data.read().is_empty());
 }
@@ -125,7 +125,7 @@ fn test_anonymous_context_has_none_identity() {
 
 #[test]
 fn test_shared_data_between_parent_and_child() {
-    let id = make_identity("user-1", "Alice", vec![]);
+    let id = make_identity("user-1", "Alice", &[]);
     let parent: Context<Value> = Context::new(id);
     let child = parent.child("child_mod");
 
@@ -145,7 +145,7 @@ fn test_shared_data_between_parent_and_child() {
 
 #[test]
 fn test_context_serde_roundtrip() {
-    let id = make_identity("user-1", "Alice", vec!["admin"]);
+    let id = make_identity("user-1", "Alice", &["admin"]);
     let ctx: Context<Value> = Context::new(id);
     ctx.data
         .write()

@@ -36,7 +36,7 @@ impl UpdateConfigModule {
 
 #[async_trait]
 impl Module for UpdateConfigModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Update a runtime configuration value by dot-path key"
     }
 
@@ -79,7 +79,7 @@ impl Module for UpdateConfigModule {
         if RESTRICTED_KEYS.contains(&key.as_str()) {
             return Err(ModuleError::new(
                 ErrorCode::ConfigInvalid,
-                format!("Configuration key '{}' cannot be changed at runtime", key),
+                format!("Configuration key '{key}' cannot be changed at runtime"),
             )
             .with_details([("key".to_string(), json!(key))].into_iter().collect()));
         }
@@ -153,7 +153,7 @@ impl ReloadModuleModule {
 
 #[async_trait]
 impl Module for ReloadModuleModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Hot-reload a module by safe unregister (re-registration must be done explicitly in Rust)"
     }
 
@@ -195,7 +195,7 @@ impl Module for ReloadModuleModule {
         if !self.registry.has(&module_id) {
             return Err(ModuleError::new(
                 ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", module_id),
+                format!("Module '{module_id}' not found"),
             ));
         }
         self.registry.safe_unregister(&module_id, 5000).await?;
@@ -263,7 +263,7 @@ impl ToggleFeatureModule {
 
 #[async_trait]
 impl Module for ToggleFeatureModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Disable or enable a module without unloading it"
     }
 
@@ -299,7 +299,7 @@ impl Module for ToggleFeatureModule {
         let reason = require_string(&inputs, "reason")?;
         let enabled = inputs
             .get("enabled")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .ok_or_else(|| {
                 ModuleError::new(
                     ErrorCode::GeneralInvalidInput,
@@ -310,7 +310,7 @@ impl Module for ToggleFeatureModule {
         if !self.registry.has(&module_id) {
             return Err(ModuleError::new(
                 ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", module_id),
+                format!("Module '{module_id}' not found"),
             ));
         }
 

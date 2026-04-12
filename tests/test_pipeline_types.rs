@@ -25,7 +25,7 @@ impl TestStep {
     fn new(name: &str, removable: bool, replaceable: bool) -> Self {
         Self {
             name: name.to_string(),
-            description: format!("Test step: {}", name),
+            description: format!("Test step: {name}"),
             removable,
             replaceable,
             result: StepResult::continue_step(),

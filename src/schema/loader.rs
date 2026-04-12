@@ -90,7 +90,10 @@ impl SchemaLoader {
 
     /// List all loaded schema names.
     pub fn list(&self) -> Vec<&str> {
-        self.schemas.keys().map(|k| k.as_str()).collect()
+        self.schemas
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 }
 

@@ -150,8 +150,7 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
         return Err(ModuleError::new(
             crate::errors::ErrorCode::GeneralInvalidInput,
             format!(
-                "Invalid module ID: '{}'. Must match pattern: ^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$ (lowercase, digits, underscores, dots only; no hyphens)",
-                name
+                "Invalid module ID: '{name}'. Must match pattern: ^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$ (lowercase, digits, underscores, dots only; no hyphens)"
             ),
         ));
     }
@@ -174,7 +173,7 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
             if RESERVED_WORDS.contains(&segment) {
                 return Err(ModuleError::new(
                     crate::errors::ErrorCode::GeneralInvalidInput,
-                    format!("Module ID contains reserved word: '{}'", segment),
+                    format!("Module ID contains reserved word: '{segment}'"),
                 ));
             }
         }
@@ -261,6 +260,14 @@ impl std::fmt::Debug for Registry {
                 "schema_cache_keys",
                 &core.schema_cache.keys().collect::<Vec<_>>(),
             )
+            .field(
+                "discoverer",
+                &self.discoverer.read().as_ref().map(|_| "<Discoverer>"),
+            )
+            .field(
+                "validator",
+                &self.validator.read().as_ref().map(|_| "<Validator>"),
+            )
             .finish()
     }
 }
@@ -326,7 +333,7 @@ impl Registry {
             if core.modules.contains_key(name) {
                 return Err(ModuleError::new(
                     crate::errors::ErrorCode::GeneralInvalidInput,
-                    format!("Module ID '{}' is already registered", name),
+                    format!("Module ID '{name}' is already registered"),
                 ));
             }
 
@@ -373,7 +380,7 @@ impl Registry {
                 None => {
                     return Err(ModuleError::new(
                         crate::errors::ErrorCode::ModuleNotFound,
-                        format!("Module '{}' not found", name),
+                        format!("Module '{name}' not found"),
                     ));
                 }
             }
@@ -458,6 +465,7 @@ impl Registry {
     }
 
     /// Discover and register modules from a discoverer.
+    #[allow(clippy::similar_names)] // `discoverer` (param) and `discovered` (result) are semantically distinct
     pub async fn discover(&self, discoverer: &dyn Discoverer) -> Result<Vec<String>, ModuleError> {
         let discovered = discoverer.discover().await?;
         let mut registered_names = Vec::new();
@@ -500,7 +508,7 @@ impl Registry {
             if core.modules.contains_key(name) {
                 return Err(ModuleError::new(
                     crate::errors::ErrorCode::GeneralInvalidInput,
-                    format!("Module ID '{}' is already registered", name),
+                    format!("Module ID '{name}' is already registered"),
                 ));
             }
 
@@ -529,7 +537,7 @@ impl Registry {
     /// MUST NOT recursively acquire any Registry lock.
     pub fn for_each_module(&self, mut f: impl FnMut(&str, &dyn Module)) {
         let core = self.core.read();
-        for (name, module) in core.modules.iter() {
+        for (name, module) in &core.modules {
             f(name.as_str(), module.as_ref());
         }
     }
@@ -550,7 +558,7 @@ impl Registry {
             if !core.modules.contains_key(name) {
                 return Err(ModuleError::new(
                     crate::errors::ErrorCode::ModuleNotFound,
-                    format!("Module '{}' not found", name),
+                    format!("Module '{name}' not found"),
                 ));
             }
             core.draining.insert(name.to_string());
@@ -578,17 +586,14 @@ impl Registry {
                 )
                 .await;
 
-                match result {
-                    Ok(_) => {
-                        self.unregister(name)?;
-                        Ok(true)
-                    }
-                    Err(_) => {
-                        // Timeout — remove draining flag but don't unregister.
-                        self.core.write().draining.remove(name);
-                        self.drain_events.write().remove(name);
-                        Ok(false)
-                    }
+                if let Ok(()) = result {
+                    self.unregister(name)?;
+                    Ok(true)
+                } else {
+                    // Timeout — remove draining flag but don't unregister.
+                    self.core.write().draining.remove(name);
+                    self.drain_events.write().remove(name);
+                    Ok(false)
                 }
             }
         }
@@ -604,13 +609,13 @@ impl Registry {
         if core.draining.contains(name) {
             return Err(ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' is draining", name),
+                format!("Module '{name}' is draining"),
             ));
         }
         let module = core.modules.get(name).cloned().ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", name),
+                format!("Module '{name}' not found"),
             )
         })?;
         *core.ref_counts.entry(name.to_string()).or_insert(0) += 1;
@@ -653,13 +658,13 @@ impl Registry {
         if core.draining.contains(name) {
             return Err(ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' is draining", name),
+                format!("Module '{name}' is draining"),
             ));
         }
         core.modules.get(name).cloned().ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", name),
+                format!("Module '{name}' not found"),
             )
         })
     }
@@ -679,6 +684,7 @@ impl Registry {
     }
 
     /// Filesystem watching (no-op — filesystem watching is platform-specific).
+    #[allow(clippy::unused_async)] // API stub for cross-language parity; real impl needs platform-specific deps
     pub async fn watch(&self) -> Result<(), ModuleError> {
         // No-op: filesystem watching requires platform-specific dependencies
         // (e.g. notify crate). Stubbed for API compatibility.
@@ -713,23 +719,20 @@ impl Registry {
         // discoverer write lock briefly, replace it with None, perform the
         // discovery, then put it back.
         let discoverer_opt = self.discoverer.write().take();
-        let discoverer = match discoverer_opt {
-            Some(d) => d,
-            None => {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::ModuleLoadError,
-                    "No discoverer configured".to_string(),
-                ));
-            }
+        let Some(active_discoverer) = discoverer_opt else {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::ModuleLoadError,
+                "No discoverer configured".to_string(),
+            ));
         };
 
-        let discover_result = discoverer.discover().await;
+        let discover_result = active_discoverer.discover().await;
         // Put the discoverer back, but only if no concurrent `set_discoverer`
         // swapped a new one in during the await. Otherwise the new one wins.
         {
             let mut slot = self.discoverer.write();
             if slot.is_none() {
-                *slot = Some(discoverer);
+                *slot = Some(active_discoverer);
             }
         }
 
@@ -786,7 +789,7 @@ impl Registry {
         let descriptor = core.descriptors.get_mut(name).ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", name),
+                format!("Module '{name}' not found"),
             )
         })?;
         descriptor.enabled = false;
@@ -801,7 +804,7 @@ impl Registry {
         let descriptor = core.descriptors.get_mut(name).ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", name),
+                format!("Module '{name}' not found"),
             )
         })?;
         descriptor.enabled = true;

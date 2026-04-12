@@ -39,7 +39,7 @@ impl SchemaExporter {
         serde_json::to_string_pretty(&exported).map_err(|e| {
             ModuleError::new(
                 ErrorCode::SchemaParseError,
-                format!("Failed to serialize exported schema: {}", e),
+                format!("Failed to serialize exported schema: {e}"),
             )
         })
     }
@@ -61,6 +61,8 @@ impl SchemaExporter {
     }
 
     /// MCP format: { name, inputSchema }
+    #[allow(clippy::unused_self)] // consistent method signature for dispatch through export()
+    #[allow(clippy::unnecessary_wraps)] // consistent Result return for dispatch through export()
     fn export_mcp(&self, schema: &serde_json::Value) -> Result<serde_json::Value, ModuleError> {
         let name = schema
             .get("name")
@@ -79,6 +81,8 @@ impl SchemaExporter {
     }
 
     /// OpenAI format: { type: "function", function: { name, description, parameters, strict } }
+    #[allow(clippy::unused_self)] // consistent method signature for dispatch through export()
+    #[allow(clippy::unnecessary_wraps)] // consistent Result return for dispatch through export()
     fn export_openai(&self, schema: &serde_json::Value) -> Result<serde_json::Value, ModuleError> {
         let name = schema
             .get("name")
@@ -107,6 +111,8 @@ impl SchemaExporter {
     }
 
     /// Anthropic format: { name, description, input_schema }
+    #[allow(clippy::unused_self)] // consistent method signature for dispatch through export()
+    #[allow(clippy::unnecessary_wraps)] // consistent Result return for dispatch through export()
     fn export_anthropic(
         &self,
         schema: &serde_json::Value,
@@ -133,6 +139,8 @@ impl SchemaExporter {
     }
 
     /// Generic format: return schema as-is.
+    #[allow(clippy::unused_self)] // consistent method signature for dispatch through export()
+    #[allow(clippy::unnecessary_wraps)] // consistent Result return for dispatch through export()
     fn export_generic(&self, schema: &serde_json::Value) -> Result<serde_json::Value, ModuleError> {
         Ok(schema.clone())
     }

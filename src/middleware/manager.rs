@@ -157,16 +157,13 @@ impl MiddlewareManager {
             guard.iter().map(Arc::clone).collect()
         };
         for mw in mws.iter().rev() {
-            match mw
+            if let Some(modified) = mw
                 .after(module_id, inputs.clone(), output.clone(), ctx)
                 .await?
             {
-                Some(modified) => {
-                    output = modified;
-                }
-                None => {
-                    // No modification — keep current output
-                }
+                output = modified;
+            } else {
+                // No modification — keep current output
             }
         }
         Ok(output)

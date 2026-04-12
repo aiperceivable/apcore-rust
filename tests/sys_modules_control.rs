@@ -1,5 +1,6 @@
 //! Integration tests for sys_modules control modules.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use apcore::config::Config;
@@ -36,7 +37,7 @@ fn dummy_ctx() -> Context<serde_json::Value> {
         "@test".to_string(),
         "test".to_string(),
         vec![],
-        Default::default(),
+        HashMap::default(),
     ))
 }
 
@@ -44,7 +45,7 @@ fn register_dummy(registry: &Arc<Registry>, id: &str) {
     struct DummyModule;
     #[async_trait::async_trait]
     impl Module for DummyModule {
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "dummy"
         }
         fn input_schema(&self) -> serde_json::Value {

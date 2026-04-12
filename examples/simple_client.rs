@@ -35,7 +35,7 @@ impl Module for AddModule {
         })
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Add two integers"
     }
 
@@ -74,7 +74,7 @@ impl Module for GreetModule {
         })
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Greet a user"
     }
 

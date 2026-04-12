@@ -26,8 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Boundary tests** in `tests/test_registry.rs`: `test_max_module_id_length_matches_spec`, `test_register_accepts_module_id_at_max_length`, `test_register_rejects_module_id_exceeding_max_length`, plus 6 `test_register_internal_*` parity tests.
 - **`tests/test_crate_root_exports.rs`** — 7 regression tests asserting that every spec-required and Python/TS-parity symbol is reachable from `apcore::*`.
 - **`test_validate_accepts_optional_context`** regression test in `tests/test_executor.rs`.
+- **`TraceContext::inject()` and `TraceContext::extract()`** — W3C trace context propagation utilities, aligned with apcore-python and apcore-typescript. `inject` serializes a `Context`'s trace ID into a `traceparent` header map; `extract` parses a `traceparent` header back into a `TraceParent`. Includes 8 unit tests.
+- **`Executor::register_strategy()` and `Executor::list_strategies()` associated functions** — Delegates to existing module-level functions. Spec places these on Executor; aligned with apcore-python (classmethod/instance method) and apcore-typescript (static methods).
 
 ### Changed
+
+- **`Executor::describe_pipeline()` now returns `StrategyInfo` instead of `String`** — Provides structured access to pipeline metadata (`name`, `step_count`, `step_names`, `description`). `StrategyInfo` implements `Display` for `.to_string()` backward compatibility. Aligned with apcore-typescript `describePipeline() -> StrategyInfo` and apcore-python `describe_pipeline() -> StrategyInfo`.
 
 - **`ACL::check()` and `ACL::async_check()` consolidated** via three shared private helpers (`finalize_no_rules`, `finalize_rule_match`, `finalize_default_effect`). Audit-entry construction, debug-logging, and default-effect mapping now live in exactly one place (was duplicated across sync and async paths). Added `check_conditions_async` helper so `matches_rule_async` no longer inlines conditions extraction. Aligned with apcore-python `_finalize_check` helper pattern.
 - **README documents annotation overlay cross-SDK difference** — New section explaining that Rust does not implement YAML annotation overlays, with rationale (spec §4.13 is conditional, Rust favors explicit code annotations) and a serde workaround for users who need it.
@@ -78,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **README `Identity` struct literal replaced with `Identity::new()` constructor.** The greet example used a struct literal `Identity { id: ..., ... }` but Identity fields are private — the correct constructor is `Identity::new(id, identity_type, roles, attrs)`.
 - **`Config` no longer silently ignores spec-conformant YAML.** A YAML file using the canonical `executor: { max_call_depth: 100 }` shape would previously be captured into the unused `settings` HashMap and the typed `max_call_depth` field would remain at default 32. Discovered during the v0.18.0 cross-language audit.
 
 - **`ModuleAnnotations.extra` wire format aligned with PROTOCOL_SPEC §4.4.1** — Removed `#[serde(flatten)]` on the `extra` field. The struct now serializes `extra` as a nested `"extra"` object, matching `apcore-python` and `apcore-typescript`. This fixes a silent cross-language data-loss bug where Python/TypeScript payloads carrying nested `extra` would deserialize on the Rust side as `extra["extra"] = {...}` (one level too deep). The custom `Deserialize` impl tolerates legacy flattened input from `apcore-rust ≤ 0.17.1` for one MINOR backward-compat cycle. When the same key appears in both forms, the nested value wins per spec rule 7.

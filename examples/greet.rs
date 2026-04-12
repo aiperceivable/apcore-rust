@@ -57,7 +57,7 @@ impl Module for GreetModule {
         })
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Greet a user by name"
     }
 

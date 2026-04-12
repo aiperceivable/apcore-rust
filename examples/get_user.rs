@@ -77,7 +77,7 @@ impl Module for GetUserModule {
         })
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Look up a user by ID (readonly, idempotent)"
     }
 

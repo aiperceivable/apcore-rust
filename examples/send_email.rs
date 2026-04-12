@@ -59,7 +59,7 @@ impl Module for SendEmailModule {
         })
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Send an email message via external API (destructive)"
     }
 
@@ -77,7 +77,7 @@ impl Module for SendEmailModule {
             ctx.trace_id, req.to, req.subject
         );
 
-        let message_id = format!("msg-{:05}", req.to.len() * 1000 % 100000);
+        let message_id = format!("msg-{:05}", req.to.len() * 1000 % 100_000);
 
         let output = SendEmailOutput {
             status: "sent".to_string(),

@@ -26,7 +26,7 @@ fn unique_adapter(base: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .subsec_nanos();
-    format!("{}_{}", base, nanos)
+    format!("{base}_{nanos}")
 }
 
 #[test]

@@ -43,8 +43,8 @@ fn test_schema_loader_load_from_value_and_get() {
     loader
         .load_from_value("test_schema", schema.clone())
         .unwrap();
-    let loaded = loader.get("test_schema").unwrap();
-    assert_eq!(loaded, &schema);
+    let result = loader.get("test_schema").unwrap();
+    assert_eq!(result, &schema);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn test_schema_loader_list_returns_all_names() {
     loader.load_from_value("a", json!({})).unwrap();
     loader.load_from_value("b", json!({})).unwrap();
     let mut names = loader.list();
-    names.sort();
+    names.sort_unstable();
     assert_eq!(names, vec!["a", "b"]);
 }
 
@@ -103,9 +103,9 @@ fn test_schema_loader_load_from_json_file() {
 
     let mut loader = SchemaLoader::new();
     loader.load_from_file("json_schema", &path).unwrap();
-    let loaded = loader.get("json_schema").unwrap();
-    assert_eq!(loaded["type"], "object");
-    assert!(loaded["properties"]["x"].is_object());
+    let schema = loader.get("json_schema").unwrap();
+    assert_eq!(schema["type"], "object");
+    assert!(schema["properties"]["x"].is_object());
 }
 
 // ---------------------------------------------------------------------------
@@ -126,9 +126,9 @@ fn test_schema_loader_load_from_yaml_file() {
 
     let mut loader = SchemaLoader::new();
     loader.load_from_file("yaml_schema", &path).unwrap();
-    let loaded = loader.get("yaml_schema").unwrap();
-    assert_eq!(loaded["type"], "object");
-    assert_eq!(loaded["properties"]["name"]["type"], "string");
+    let schema = loader.get("yaml_schema").unwrap();
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["properties"]["name"]["type"], "string");
 }
 
 #[test]

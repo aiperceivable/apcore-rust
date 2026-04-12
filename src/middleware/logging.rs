@@ -56,7 +56,7 @@ impl Default for LoggingMiddleware {
 
 #[async_trait]
 impl Middleware for LoggingMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "logging"
     }
 
@@ -80,11 +80,10 @@ impl Middleware for LoggingMiddleware {
 
         if self.log_inputs {
             // Use redacted_inputs if available; fall back to raw inputs.
-            let display_inputs = ctx
-                .redacted_inputs
-                .as_ref()
-                .map(|r| Value::Object(r.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
-                .unwrap_or_else(|| inputs.clone());
+            let display_inputs = ctx.redacted_inputs.as_ref().map_or_else(
+                || inputs.clone(),
+                |r| Value::Object(r.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            );
 
             tracing::info!(
                 trace_id = %ctx.trace_id,
@@ -111,8 +110,7 @@ impl Middleware for LoggingMiddleware {
             let mut times = self.start_times.lock();
             times
                 .remove(&key)
-                .map(|start| start.elapsed().as_secs_f64() * 1000.0)
-                .unwrap_or(0.0)
+                .map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0)
         };
 
         if self.log_outputs {

@@ -22,11 +22,13 @@ impl Module for SlowModule {
     fn output_schema(&self) -> Value {
         json!({ "type": "object", "properties": { "completed_steps": { "type": "integer" } } })
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "A slow module that checks for cancellation between steps"
     }
 
     async fn execute(&self, input: Value, ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // steps value is bounded and non-negative
         let steps = input["steps"].as_i64().unwrap_or(5) as usize;
 
         for i in 0..steps {

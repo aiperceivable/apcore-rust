@@ -6,6 +6,7 @@ use apcore::module::{Module, ModuleAnnotations};
 use apcore::registry::registry::{ModuleDescriptor, Registry};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -15,7 +16,7 @@ struct StubModule;
 
 #[async_trait]
 impl Module for StubModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "stub"
     }
     fn input_schema(&self) -> Value {
@@ -46,7 +47,7 @@ fn dummy_identity() -> Identity {
         "@test".to_string(),
         "test".to_string(),
         vec![],
-        Default::default(),
+        HashMap::default(),
     )
 }
 
@@ -215,11 +216,10 @@ fn test_register_rejects_reserved_first_segment() {
     );
     assert!(result.is_err(), "registering 'system.health' should fail");
     let err = result.unwrap_err();
-    let msg = format!("{}", err);
+    let msg = format!("{err}");
     assert!(
         msg.contains("reserved word"),
-        "error should mention reserved word, got: {}",
-        msg
+        "error should mention reserved word, got: {msg}"
     );
 }
 
@@ -241,8 +241,7 @@ fn test_register_rejects_reserved_word_in_any_segment() {
     let msg = format!("{}", result.unwrap_err());
     assert!(
         msg.contains("reserved word") && msg.contains("system"),
-        "error should mention reserved word 'system', got: {}",
-        msg
+        "error should mention reserved word 'system', got: {msg}"
     );
 }
 
@@ -262,7 +261,7 @@ fn test_register_rejects_all_reserved_words() {
     use apcore::registry::RESERVED_WORDS;
     for word in RESERVED_WORDS {
         let registry = Registry::new();
-        let module_id = format!("{}.something", word);
+        let module_id = format!("{word}.something");
         let result = registry.register(
             &module_id,
             Box::new(StubModule),
@@ -270,9 +269,7 @@ fn test_register_rejects_all_reserved_words() {
         );
         assert!(
             result.is_err(),
-            "registering '{}' should fail — '{}' is reserved",
-            module_id,
-            word
+            "registering '{module_id}' should fail — '{word}' is reserved"
         );
     }
 }
@@ -329,8 +326,7 @@ fn test_register_rejects_module_id_exceeding_max_length() {
     let msg = format!("{}", result.unwrap_err());
     assert!(
         msg.contains("maximum length"),
-        "error should mention maximum length, got: {}",
-        msg
+        "error should mention maximum length, got: {msg}"
     );
 }
 
@@ -347,8 +343,7 @@ fn test_register_rejects_empty_module_id() {
     let msg = format!("{}", result.unwrap_err());
     assert!(
         msg.contains("non-empty"),
-        "error should mention non-empty, got: {}",
-        msg
+        "error should mention non-empty, got: {msg}"
     );
 }
 
@@ -368,15 +363,12 @@ fn test_register_rejects_invalid_pattern() {
         let result = registry.register(bad_id, Box::new(StubModule), make_descriptor(bad_id));
         assert!(
             result.is_err(),
-            "registering pattern-invalid ID '{}' must fail",
-            bad_id
+            "registering pattern-invalid ID '{bad_id}' must fail"
         );
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("Invalid module ID") || msg.contains("Must match pattern"),
-            "error for '{}' should mention pattern, got: {}",
-            bad_id,
-            msg
+            "error for '{bad_id}' should mention pattern, got: {msg}"
         );
     }
 }

@@ -100,6 +100,8 @@ impl TracingMiddleware {
             SamplingStrategy::Always => true,
             SamplingStrategy::Never => false,
             SamplingStrategy::Probabilistic | SamplingStrategy::ErrorFirst => {
+                #[allow(clippy::cast_precision_loss)]
+                // intentional: sampling ratio; minor precision loss is acceptable
                 let random_val = uuid::Uuid::new_v4().as_u128() as f64 / u128::MAX as f64;
                 random_val < self.sampling_rate
             }
@@ -114,7 +116,7 @@ impl TracingMiddleware {
 
 #[async_trait]
 impl Middleware for TracingMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "tracing"
     }
 
@@ -160,7 +162,7 @@ impl Middleware for TracingMiddleware {
             let popped = state
                 .spans
                 .get_mut(&ctx.trace_id)
-                .and_then(|stack| stack.pop());
+                .and_then(std::vec::Vec::pop);
 
             let should_clean = if let Some(stack) = state.spans.get(&ctx.trace_id) {
                 if stack.is_empty() {
@@ -181,8 +183,7 @@ impl Middleware for TracingMiddleware {
             span.end();
             let duration_ms = span
                 .end_time
-                .map(|e| (e - span.start_time) * 1000.0)
-                .unwrap_or(0.0);
+                .map_or(0.0, |e| (e - span.start_time) * 1000.0);
             span.set_attribute("duration_ms".to_string(), serde_json::json!(duration_ms));
             span.set_attribute("success".to_string(), serde_json::json!(true));
 
@@ -214,7 +215,7 @@ impl Middleware for TracingMiddleware {
             let popped = state
                 .spans
                 .get_mut(&ctx.trace_id)
-                .and_then(|stack| stack.pop());
+                .and_then(std::vec::Vec::pop);
 
             let should_clean = if let Some(stack) = state.spans.get(&ctx.trace_id) {
                 if stack.is_empty() {
@@ -235,8 +236,7 @@ impl Middleware for TracingMiddleware {
             span.end();
             let duration_ms = span
                 .end_time
-                .map(|e| (e - span.start_time) * 1000.0)
-                .unwrap_or(0.0);
+                .map_or(0.0, |e| (e - span.start_time) * 1000.0);
             span.set_attribute("duration_ms".to_string(), serde_json::json!(duration_ms));
             span.set_attribute("success".to_string(), serde_json::json!(false));
             span.set_attribute(

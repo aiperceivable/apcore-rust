@@ -26,7 +26,7 @@ impl ManifestModuleModule {
 
 #[async_trait]
 impl Module for ManifestModuleModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Full manifest for a single registered module"
     }
 
@@ -59,14 +59,14 @@ impl Module for ManifestModuleModule {
         let descriptor = self.registry.get_definition(module_id).ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", module_id),
+                format!("Module '{module_id}' not found"),
             )
         })?;
 
         let source_root = {
             let cfg = self.config.lock().await;
             cfg.get("project.source_root")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .and_then(|v| v.as_str().map(std::string::ToString::to_string))
                 .unwrap_or_default()
         };
 
@@ -119,7 +119,7 @@ impl ManifestFullModule {
 
 #[async_trait]
 impl Module for ManifestFullModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Complete system manifest with filtering"
     }
 
@@ -146,11 +146,11 @@ impl Module for ManifestFullModule {
     ) -> Result<serde_json::Value, ModuleError> {
         let include_schemas = inputs
             .get("include_schemas")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         let include_source_paths = inputs
             .get("include_source_paths")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         let prefix = inputs.get("prefix").and_then(|v| v.as_str());
         let filter_tags: Option<Vec<&str>> = inputs
@@ -162,11 +162,11 @@ impl Module for ManifestFullModule {
             let cfg = self.config.lock().await;
             let name = cfg
                 .get("project.name")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .and_then(|v| v.as_str().map(std::string::ToString::to_string))
                 .unwrap_or_else(|| "apcore".to_string());
             let root = cfg
                 .get("project.source_root")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .and_then(|v| v.as_str().map(std::string::ToString::to_string))
                 .unwrap_or_default();
             (name, root)
         };
@@ -181,9 +181,8 @@ impl Module for ManifestFullModule {
                     continue;
                 }
             }
-            let descriptor = match self.registry.get_definition(mid) {
-                Some(d) => d,
-                None => continue,
+            let Some(descriptor) = self.registry.get_definition(mid) else {
+                continue;
             };
             // Tag filter (all tags must match).
             if let Some(ref tags) = filter_tags {

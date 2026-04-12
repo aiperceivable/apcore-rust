@@ -22,7 +22,7 @@ fn test_context() -> Context<Value> {
         "test-caller".into(),
         "test-caller".into(),
         vec![],
-        Default::default(),
+        HashMap::default(),
     ))
 }
 
@@ -97,7 +97,7 @@ fn test_error_history_get_nonexistent_module() {
 fn test_error_history_get_with_limit() {
     let history = ErrorHistory::new(50);
     for i in 0..10 {
-        history.record("mod.a", &make_error(&format!("error {}", i)));
+        history.record("mod.a", &make_error(&format!("error {i}")));
     }
 
     let entries = history.get("mod.a", Some(3));
@@ -108,7 +108,7 @@ fn test_error_history_get_with_limit() {
 fn test_error_history_get_all_with_limit() {
     let history = ErrorHistory::new(50);
     for i in 0..10 {
-        history.record("mod.a", &make_error(&format!("error {}", i)));
+        history.record("mod.a", &make_error(&format!("error {i}")));
     }
 
     let entries = history.get_all(Some(5));
@@ -119,7 +119,7 @@ fn test_error_history_get_all_with_limit() {
 fn test_error_history_per_module_eviction() {
     let history = ErrorHistory::new(3);
     for i in 0..5 {
-        history.record("mod.a", &make_error(&format!("error {}", i)));
+        history.record("mod.a", &make_error(&format!("error {i}")));
     }
 
     let entries = history.get("mod.a", None);
@@ -257,7 +257,7 @@ async fn test_in_memory_exporter_export_and_get() {
 async fn test_in_memory_exporter_capacity_eviction() {
     let exporter = InMemoryExporter::with_max_spans(3);
     for i in 0..5 {
-        let span = Span::new(format!("span-{}", i), "trace-1");
+        let span = Span::new(format!("span-{i}"), "trace-1");
         exporter.export(&span).await.unwrap();
     }
 
@@ -342,7 +342,7 @@ async fn test_otlp_exporter_sends_span_to_endpoint() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let endpoint = format!("http://127.0.0.1:{}", port);
+    let endpoint = format!("http://127.0.0.1:{port}");
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -381,7 +381,7 @@ async fn test_otlp_exporter_sends_span_to_endpoint() {
     let span = Span::new("otlp-capture-test", "trace-capture-1");
     let expected_name = span.name.clone();
     let result = exporter.export(&span).await;
-    assert!(result.is_ok(), "export failed: {:?}", result);
+    assert!(result.is_ok(), "export failed: {result:?}");
 
     let request = tokio::time::timeout(Duration::from_secs(2), server)
         .await
@@ -390,26 +390,21 @@ async fn test_otlp_exporter_sends_span_to_endpoint() {
 
     assert!(
         request.starts_with("POST "),
-        "expected POST request, got: {}",
-        request
+        "expected POST request, got: {request}"
     );
     assert!(
         request.contains("/v1/traces"),
-        "expected /v1/traces path, got: {}",
-        request
+        "expected /v1/traces path, got: {request}"
     );
     assert!(
         request
             .to_lowercase()
             .contains("content-type: application/json"),
-        "expected JSON content type, got: {}",
-        request
+        "expected JSON content type, got: {request}"
     );
     assert!(
         request.contains(&expected_name),
-        "expected body to contain span name '{}', got: {}",
-        expected_name,
-        request
+        "expected body to contain span name '{expected_name}', got: {request}"
     );
 }
 
@@ -503,9 +498,9 @@ fn test_metrics_collector_histogram_buckets() {
         let le = bucket["le"].as_f64().unwrap();
         let count = bucket["count"].as_u64().unwrap();
         if le >= 0.07 {
-            assert_eq!(count, 1, "Bucket le={} should contain the observation", le);
+            assert_eq!(count, 1, "Bucket le={le} should contain the observation");
         } else {
-            assert_eq!(count, 0, "Bucket le={} should be empty", le);
+            assert_eq!(count, 0, "Bucket le={le} should be empty");
         }
     }
 }
@@ -872,7 +867,7 @@ fn test_usage_collector_trend_default() {
 #[test]
 fn test_usage_collector_p99_latency_empty() {
     let collector = UsageCollector::new();
-    assert_eq!(collector.get_p99_latency_ms("mod.a"), 0.0);
+    assert!((collector.get_p99_latency_ms("mod.a") - 0.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -889,7 +884,7 @@ fn test_usage_collector_p99_latency_multiple_records() {
     let collector = UsageCollector::new();
     // Record 100 values: 1.0 through 100.0
     for i in 1..=100 {
-        collector.record("mod.a", None, i as f64, true);
+        collector.record("mod.a", None, f64::from(i), true);
     }
 
     let p99 = collector.get_p99_latency_ms("mod.a");
@@ -964,7 +959,7 @@ async fn test_usage_middleware_caller_id_from_context() {
             "test-caller".into(),
             "test-caller".into(),
             vec![],
-            Default::default(),
+            HashMap::default(),
         ),
         Value::Null,
         Some("explicit-caller".to_string()),

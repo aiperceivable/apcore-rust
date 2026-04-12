@@ -86,6 +86,72 @@ impl ApprovalHandler for AutoApproveHandler {
     }
 }
 
+/// An approval handler that delegates to a user-provided callback.
+///
+/// Wraps a closure `Fn(&ApprovalRequest) -> ApprovalResult` into a full
+/// [`ApprovalHandler`] implementation, matching the Python SDK's
+/// `CallbackApprovalHandler`. The `check_approval` method returns
+/// `"rejected"` by default since callback handlers typically do not
+/// support Phase B async resume.
+///
+/// # Example
+///
+/// ```ignore
+/// use apcore::{CallbackApprovalHandler, ApprovalResult};
+///
+/// let handler = CallbackApprovalHandler::new(|req| {
+///     ApprovalResult {
+///         status: "approved".to_string(),
+///         approved_by: Some("callback".to_string()),
+///         reason: None,
+///         approval_id: None,
+///         metadata: None,
+///     }
+/// });
+/// ```
+pub struct CallbackApprovalHandler {
+    callback: Box<dyn Fn(&ApprovalRequest) -> ApprovalResult + Send + Sync>,
+}
+
+impl CallbackApprovalHandler {
+    /// Create a new `CallbackApprovalHandler` from a closure.
+    pub fn new(
+        callback: impl Fn(&ApprovalRequest) -> ApprovalResult + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            callback: Box::new(callback),
+        }
+    }
+}
+
+impl std::fmt::Debug for CallbackApprovalHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallbackApprovalHandler")
+            .field("callback", &"<closure>")
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ApprovalHandler for CallbackApprovalHandler {
+    async fn request_approval(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalResult, ModuleError> {
+        Ok((self.callback)(request))
+    }
+
+    async fn check_approval(&self, _approval_id: &str) -> Result<ApprovalResult, ModuleError> {
+        Ok(ApprovalResult {
+            status: "rejected".to_string(),
+            approved_by: None,
+            reason: Some("Phase B not supported by callback handler".to_string()),
+            approval_id: None,
+            metadata: None,
+        })
+    }
+}
+
 /// An approval handler that automatically denies all requests.
 #[derive(Debug, Clone)]
 pub struct AlwaysDenyHandler;

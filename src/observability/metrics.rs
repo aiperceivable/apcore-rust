@@ -4,11 +4,17 @@
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
+
+/// Metric name for total module call count.
+pub const METRIC_CALLS_TOTAL: &str = "apcore_module_calls_total";
+/// Metric name for module execution duration in seconds.
+pub const METRIC_DURATION_SECONDS: &str = "apcore_module_duration_seconds";
 
 /// Default histogram bucket boundaries matching Python reference.
 pub(crate) const DEFAULT_BUCKETS: &[f64] = &[
@@ -71,6 +77,7 @@ impl MetricsCollector {
     }
 
     /// Increment a counter metric by `amount`.
+    #[allow(clippy::needless_pass_by_value)] // public API: HashMap passed by value is idiomatic for fire-and-forget metrics
     pub fn increment(&self, name: &str, labels: HashMap<String, String>, amount: f64) {
         let key = Self::make_key(name, &labels);
         let mut counters = self.counters.lock();
@@ -79,6 +86,7 @@ impl MetricsCollector {
     }
 
     /// Observe a value for a histogram metric.
+    #[allow(clippy::needless_pass_by_value)] // public API: HashMap passed by value is idiomatic for fire-and-forget metrics
     pub fn observe(&self, name: &str, labels: HashMap<String, String>, value: f64) {
         let key = Self::make_key(name, &labels);
         let mut histograms = self.histograms.lock();
@@ -97,7 +105,7 @@ impl MetricsCollector {
                 name.clone()
             } else {
                 let label_parts: Vec<String> =
-                    labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 format!("{}|{}", name, label_parts.join(","))
             };
             counters_map.insert(label_str, serde_json::json!(*value));
@@ -109,7 +117,7 @@ impl MetricsCollector {
                 name.clone()
             } else {
                 let label_parts: Vec<String> =
-                    labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 format!("{}|{}", name, label_parts.join(","))
             };
             histograms_map.insert(
@@ -147,11 +155,11 @@ impl MetricsCollector {
             std::collections::HashSet::new();
         for ((name, labels), value) in counters.iter() {
             if seen_counter_names.insert(name.clone()) {
-                output.push_str(&format!("# HELP {} Counter metric\n", name));
-                output.push_str(&format!("# TYPE {} counter\n", name));
+                let _ = writeln!(output, "# HELP {name} Counter metric");
+                let _ = writeln!(output, "# TYPE {name} counter");
             }
             let label_str = format_prometheus_labels(labels);
-            output.push_str(&format!("{}{} {}\n", name, label_str, value));
+            let _ = writeln!(output, "{name}{label_str} {value}");
         }
 
         // Export histograms
@@ -159,30 +167,30 @@ impl MetricsCollector {
             std::collections::HashSet::new();
         for ((name, labels), data) in histograms.iter() {
             if seen_hist_names.insert(name.clone()) {
-                output.push_str(&format!("# HELP {} Histogram metric\n", name));
-                output.push_str(&format!("# TYPE {} histogram\n", name));
+                let _ = writeln!(output, "# HELP {name} Histogram metric");
+                let _ = writeln!(output, "# TYPE {name} histogram");
             }
             let base_labels = format_prometheus_labels(labels);
             for (bound, count) in &data.buckets {
                 let le_label = if labels.is_empty() {
-                    format!("{{le=\"{}\"}}", bound)
+                    format!("{{le=\"{bound}\"}}")
                 } else {
                     // Insert le into existing labels
                     let inner = &base_labels[1..base_labels.len() - 1]; // strip { }
-                    format!("{{{},le=\"{}\"}}", inner, bound)
+                    format!("{{{inner},le=\"{bound}\"}}")
                 };
-                output.push_str(&format!("{}_bucket{} {}\n", name, le_label, count));
+                let _ = writeln!(output, "{name}_bucket{le_label} {count}");
             }
             // +Inf bucket
             let inf_label = if labels.is_empty() {
                 "{le=\"+Inf\"}".to_string()
             } else {
                 let inner = &base_labels[1..base_labels.len() - 1];
-                format!("{{{},le=\"+Inf\"}}", inner)
+                format!("{{{inner},le=\"+Inf\"}}")
             };
-            output.push_str(&format!("{}_bucket{} {}\n", name, inf_label, data.count));
-            output.push_str(&format!("{}_sum{} {}\n", name, base_labels, data.sum));
-            output.push_str(&format!("{}_count{} {}\n", name, base_labels, data.count));
+            let _ = writeln!(output, "{name}_bucket{inf_label} {}", data.count);
+            let _ = writeln!(output, "{name}_sum{base_labels} {}", data.sum);
+            let _ = writeln!(output, "{name}_count{base_labels} {}", data.count);
         }
 
         output
@@ -217,10 +225,7 @@ fn format_prometheus_labels(labels: &BTreeMap<String, String>) -> String {
     if labels.is_empty() {
         return String::new();
     }
-    let parts: Vec<String> = labels
-        .iter()
-        .map(|(k, v)| format!("{}=\"{}\"", k, v))
-        .collect();
+    let parts: Vec<String> = labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
     format!("{{{}}}", parts.join(","))
 }
 
@@ -236,13 +241,22 @@ pub(crate) fn estimate_p99_from_histogram(buckets: &[serde_json::Value], total_c
     if total_count == 0 || buckets.is_empty() {
         return 0.0;
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    // intentional: total_count fits in f64 for realistic metric counts; result is non-negative
     let target = (total_count as f64 * 0.99).ceil() as u64;
     for bucket in buckets {
         let le = bucket
             .get("le")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(f64::INFINITY);
-        let cnt = bucket.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cnt = bucket
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         if cnt >= target {
             return le * 1000.0; // seconds -> ms
         }
@@ -257,6 +271,12 @@ pub(crate) fn estimate_p99_from_sorted(sorted_latencies: &[f64]) -> f64 {
     if sorted_latencies.is_empty() {
         return 0.0;
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    // intentional: slice lengths fit in f64 for realistic inputs; result is non-negative
     let idx = ((sorted_latencies.len() as f64) * 0.99).ceil() as usize;
     sorted_latencies[idx.min(sorted_latencies.len()) - 1]
 }
@@ -294,7 +314,7 @@ impl MetricsMiddleware {
 
 #[async_trait]
 impl Middleware for MetricsMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "metrics"
     }
 
@@ -320,8 +340,7 @@ impl Middleware for MetricsMiddleware {
             let mut starts = self.starts.lock();
             starts
                 .remove(&_ctx.trace_id)
-                .map(|s| s.elapsed().as_secs_f64())
-                .unwrap_or(0.0)
+                .map_or(0.0, |s| s.elapsed().as_secs_f64())
         };
 
         self.collector.increment_calls(module_id, "success");
@@ -341,8 +360,7 @@ impl Middleware for MetricsMiddleware {
             let mut starts = self.starts.lock();
             starts
                 .remove(&_ctx.trace_id)
-                .map(|s| s.elapsed().as_secs_f64())
-                .unwrap_or(0.0)
+                .map_or(0.0, |s| s.elapsed().as_secs_f64())
         };
 
         let error_code = format!("{:?}", _error.code);

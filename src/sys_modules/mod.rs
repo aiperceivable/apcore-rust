@@ -84,7 +84,7 @@ pub fn check_module_disabled(module_id: &str) -> Result<(), ModuleError> {
     if is_module_disabled(module_id) {
         return Err(ModuleError::new(
             ErrorCode::ModuleDisabled,
-            format!("Module '{}' is disabled", module_id),
+            format!("Module '{module_id}' is disabled"),
         ));
     }
     Ok(())
@@ -129,11 +129,11 @@ pub(crate) fn require_string(
         .get(field)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::GeneralInvalidInput,
-                format!("'{}' is required and must be a non-empty string", field),
+                format!("'{field}' is required and must be a non-empty string"),
             )
         })
 }
@@ -141,7 +141,7 @@ pub(crate) fn require_string(
 pub(crate) fn missing_field_error(field: &str) -> ModuleError {
     ModuleError::new(
         ErrorCode::GeneralInvalidInput,
-        format!("'{}' is required", field),
+        format!("'{field}' is required"),
     )
 }
 
@@ -195,6 +195,8 @@ pub struct SysModulesContext {
 /// The registry is shared via `Arc<Registry>` — `Registry` provides interior
 /// mutability, so no external `Mutex` wrapper is needed and this function is
 /// fully synchronous and runtime-agnostic.
+#[allow(clippy::too_many_lines)] // complex orchestration function; extraction would obscure the registration flow
+#[allow(clippy::needless_pass_by_value)] // public API: Arc<Registry> and Option<MetricsCollector> consumed by sub-modules
 pub fn register_sys_modules(
     registry: Arc<Registry>,
     executor: &Executor,
@@ -210,10 +212,12 @@ pub fn register_sys_modules(
     }
 
     // --- Step 2: ErrorHistory + middleware ---
+    #[allow(clippy::cast_possible_truncation)] // config value won't exceed platform usize limits
     let max_per_module = config
         .get("sys_modules.error_history.max_entries_per_module")
         .and_then(|v| v.as_u64())
         .unwrap_or(50) as usize;
+    #[allow(clippy::cast_possible_truncation)] // config value won't exceed platform usize limits
     let max_total = config
         .get("sys_modules.error_history.max_total_entries")
         .and_then(|v| v.as_u64())

@@ -49,8 +49,10 @@ impl Span {
     pub fn new(name: impl Into<String>, trace_id: impl Into<String>) -> Self {
         let span_id = format!(
             "{:016x}",
-            uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFFFFFFFFFF
+            uuid::Uuid::new_v4().as_u128() & 0xFFFF_FFFF_FFFF_FFFF
         );
+        #[allow(clippy::cast_precision_loss)]
+        // intentional: millisecond timestamps fit in f64 for practical purposes
         let now = Utc::now().timestamp_millis() as f64 / 1000.0;
         Self {
             trace_id: trace_id.into(),
@@ -67,7 +69,10 @@ impl Span {
 
     /// End the span, recording the end time as epoch seconds.
     pub fn end(&mut self) {
-        self.end_time = Some(Utc::now().timestamp_millis() as f64 / 1000.0);
+        #[allow(clippy::cast_precision_loss)]
+        // intentional: millisecond timestamps fit in f64 for practical purposes
+        let end = Utc::now().timestamp_millis() as f64 / 1000.0;
+        self.end_time = Some(end);
     }
 
     /// Add an attribute to the span.

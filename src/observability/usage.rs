@@ -87,7 +87,7 @@ impl UsageCollector {
     pub fn record(&self, module_id: &str, caller_id: Option<&str>, latency_ms: f64, success: bool) {
         let record = UsageRecord {
             timestamp: Utc::now().to_rfc3339(),
-            caller_id: caller_id.map(|s| s.to_string()),
+            caller_id: caller_id.map(std::string::ToString::to_string),
             latency_ms,
             success,
         };
@@ -128,6 +128,8 @@ impl UsageCollector {
             }
         }
 
+        #[allow(clippy::cast_precision_loss)]
+        // intentional: call counts fit in f64 for realistic usage stats
         let avg_latency_ms = if call_count > 0 {
             total_latency / call_count as f64
         } else {
@@ -161,9 +163,8 @@ impl UsageCollector {
     /// Get per-caller breakdown for a module.
     pub(crate) fn get_caller_breakdown(&self, module_id: &str) -> Vec<CallerStats> {
         let data = self.data.lock();
-        let module_data = match data.get(module_id) {
-            Some(md) => md,
-            None => return Vec::new(),
+        let Some(module_data) = data.get(module_id) else {
+            return Vec::new();
         };
         let mut callers: HashMap<String, (u64, u64, f64)> = HashMap::new(); // (calls, errors, total_lat)
         for records in module_data.records.values() {
@@ -184,7 +185,9 @@ impl UsageCollector {
                 call_count: calls,
                 error_count: errs,
                 avg_latency_ms: if calls > 0 {
-                    total_lat / calls as f64
+                    #[allow(clippy::cast_precision_loss)] // metrics avg: precision loss acceptable
+                    let avg = total_lat / calls as f64;
+                    avg
                 } else {
                     0.0
                 },
@@ -195,9 +198,8 @@ impl UsageCollector {
     /// Get hourly distribution for a module (sorted by hour ascending).
     pub(crate) fn get_hourly_distribution(&self, module_id: &str) -> Vec<HourlyBucket> {
         let data = self.data.lock();
-        let module_data = match data.get(module_id) {
-            Some(md) => md,
-            None => return Vec::new(),
+        let Some(module_data) = data.get(module_id) else {
+            return Vec::new();
         };
         let mut buckets: Vec<HourlyBucket> = module_data
             .records
@@ -219,9 +221,8 @@ impl UsageCollector {
     /// Compute p99 latency (ms) for a module from stored records.
     pub fn get_p99_latency_ms(&self, module_id: &str) -> f64 {
         let data = self.data.lock();
-        let module_data = match data.get(module_id) {
-            Some(md) => md,
-            None => return 0.0,
+        let Some(module_data) = data.get(module_id) else {
+            return 0.0;
         };
         let mut latencies: Vec<f64> = module_data
             .records
@@ -291,7 +292,7 @@ impl UsageMiddleware {
 
 #[async_trait]
 impl Middleware for UsageMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "usage"
     }
 
@@ -317,8 +318,7 @@ impl Middleware for UsageMiddleware {
             let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
-                .map(|s| s.elapsed().as_secs_f64() * 1000.0)
-                .unwrap_or(0.0)
+                .map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)
         };
 
         self.collector
@@ -338,8 +338,7 @@ impl Middleware for UsageMiddleware {
             let mut starts = self.starts.lock();
             starts
                 .remove(&ctx.trace_id)
-                .map(|s| s.elapsed().as_secs_f64() * 1000.0)
-                .unwrap_or(0.0)
+                .map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)
         };
 
         self.collector

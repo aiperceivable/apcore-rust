@@ -289,6 +289,17 @@ pub struct StrategyInfo {
     pub description: String,
 }
 
+impl std::fmt::Display for StrategyInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}-step pipeline: {}",
+            self.step_count,
+            self.step_names.join(" \u{2192} ")
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ExecutionStrategy
 // ---------------------------------------------------------------------------
@@ -307,6 +318,7 @@ impl std::fmt::Debug for ExecutionStrategy {
         f.debug_struct("ExecutionStrategy")
             .field("name", &self.name)
             .field("step_names", &self.step_names())
+            .field("step_count", &self.steps.len())
             .finish()
     }
 }
@@ -401,7 +413,7 @@ impl ExecutionStrategy {
         if !self.steps[idx].removable() {
             return Err(ModuleError::new(
                 ErrorCode::GeneralInvalidInput,
-                format!("Step '{}' is not removable", step_name),
+                format!("Step '{step_name}' is not removable"),
             ));
         }
         self.steps.remove(idx);
@@ -414,7 +426,7 @@ impl ExecutionStrategy {
         if !self.steps[idx].replaceable() {
             return Err(ModuleError::new(
                 ErrorCode::GeneralInvalidInput,
-                format!("Step '{}' is not replaceable", step_name),
+                format!("Step '{step_name}' is not replaceable"),
             ));
         }
         self.steps[idx] = new_step;
@@ -477,6 +489,7 @@ pub struct PipelineEngine;
 impl PipelineEngine {
     /// Run every step in `strategy` against `ctx`, respecting flow-control
     /// actions (`continue`, `skip_to`, `abort`).
+    #[allow(clippy::too_many_lines)] // pipeline control loop is inherently stateful; splitting would reduce clarity
     pub async fn run(
         strategy: &ExecutionStrategy,
         ctx: &mut PipelineContext,
@@ -651,7 +664,7 @@ impl PipelineEngine {
                 other => {
                     return Err(ModuleError::new(
                         ErrorCode::GeneralInvalidInput,
-                        format!("Unknown step action: '{}'", other),
+                        format!("Unknown step action: '{other}'"),
                     ));
                 }
             }
@@ -683,7 +696,7 @@ mod tests {
         fn new(name: &str, removable: bool, replaceable: bool) -> Self {
             Self {
                 name: name.to_string(),
-                description: format!("Fake step: {}", name),
+                description: format!("Fake step: {name}"),
                 removable,
                 replaceable,
             }

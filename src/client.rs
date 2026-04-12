@@ -36,6 +36,7 @@ impl std::fmt::Debug for APCore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("APCore")
             .field("config", &self.config)
+            .field("executor", &"<Executor>")
             .field("registry", &self.registry)
             .field("event_emitter", &self.event_emitter)
             .field("metrics_collector", &self.metrics_collector)
@@ -225,6 +226,10 @@ impl APCore {
 
     /// Call (execute) a module by ID with the given inputs.
     ///
+    /// `inputs` accepts either a `serde_json::Value` directly or `None`.
+    /// When `None` is passed, an empty JSON object `{}` is used, matching
+    /// the Python and TypeScript SDKs where inputs can be `None`/`undefined`.
+    ///
     /// In Rust, `call()` is already async — there is no separate sync variant.
     /// This method is the equivalent of both `call()` and `call_async()` in the
     /// Python and TypeScript SDKs.
@@ -232,27 +237,37 @@ impl APCore {
     pub async fn call(
         &self,
         module_id: &str,
-        inputs: serde_json::Value,
+        inputs: impl Into<Option<serde_json::Value>>,
         ctx: Option<&Context<serde_json::Value>>,
         version_hint: Option<&str>,
     ) -> Result<serde_json::Value, ModuleError> {
+        let resolved_inputs = inputs.into().unwrap_or_else(|| serde_json::json!({}));
         self.executor
-            .call(module_id, inputs, ctx, version_hint)
+            .call(module_id, resolved_inputs, ctx, version_hint)
             .await
     }
 
     /// Validate module inputs without executing (spec §12.3).
     ///
+    /// `inputs` is optional -- pass `None` to validate with an empty `{}`
+    /// object, matching the Python and TypeScript SDKs where inputs can be
+    /// `None`/`undefined`. A `&serde_json::Value` reference is also accepted
+    /// directly for backward compatibility.
+    ///
     /// Returns a `PreflightResult` with per-check status. `ctx` enables
     /// call-chain checks against real caller state; pass `None` to validate
     /// from an anonymous external context.
-    pub async fn validate(
+    pub async fn validate<'v>(
         &self,
         module_id: &str,
-        inputs: &serde_json::Value,
+        inputs: impl Into<Option<&'v serde_json::Value>>,
         ctx: Option<&crate::context::Context<serde_json::Value>>,
     ) -> Result<crate::module::PreflightResult, ModuleError> {
-        self.executor.validate(module_id, inputs, ctx).await
+        let empty = serde_json::json!({});
+        let resolved_inputs = inputs.into().unwrap_or(&empty);
+        self.executor
+            .validate(module_id, resolved_inputs, ctx)
+            .await
     }
 
     /// Register a module with the given module_id.
@@ -396,6 +411,34 @@ impl APCore {
             .await
     }
 
+    /// Subscribe to an event type using a closure.
+    ///
+    /// Convenience wrapper around [`on()`](Self::on) that accepts a plain
+    /// function or closure instead of requiring a boxed [`EventSubscriber`].
+    /// The closure receives each matching [`ApCoreEvent`](crate::events::emitter::ApCoreEvent)
+    /// by reference.
+    ///
+    /// Returns the auto-generated subscriber ID (a UUID string).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let id = client.on_fn("apcore.*", |event| {
+    ///     println!("Got event: {}", event.event_type);
+    /// });
+    /// ```
+    pub fn on_fn(
+        &mut self,
+        event_type: &str,
+        callback: impl Fn(&crate::events::emitter::ApCoreEvent) + Send + Sync + 'static,
+    ) -> String {
+        let subscriber = Box::new(ClosureSubscriber {
+            id: uuid::Uuid::new_v4().to_string(),
+            callback: Box::new(callback),
+        });
+        self.on(event_type, subscriber)
+    }
+
     /// Subscribe to an event type. Returns the subscriber ID.
     ///
     /// The `event_type` is bound to the subscriber so it only receives matching
@@ -431,6 +474,7 @@ impl APCore {
     /// **Rust-specific:** This method is not available in Python or TypeScript
     /// SDKs. It reloads the `Config` object; module re-discovery will be added
     /// once the discoverer component is configured.
+    #[allow(clippy::unused_async)] // API stub for cross-language parity with Python/TypeScript SDKs
     pub async fn reload(&mut self) -> Result<(), ModuleError> {
         self.config.reload()?;
         Ok(())
@@ -438,27 +482,33 @@ impl APCore {
 
     /// Stream execution of a module.
     ///
+    /// `inputs` accepts either a `serde_json::Value` directly or `None`.
+    /// When `None` is passed, an empty JSON object `{}` is used, matching
+    /// the Python and TypeScript SDKs where inputs can be `None`/`undefined`.
+    ///
     /// Returns an async `Stream` of chunks. Each chunk is delivered to the
-    /// caller as soon as it is produced by the underlying module — true
+    /// caller as soon as it is produced by the underlying module -- true
     /// incremental streaming, no buffering. Phase 3 validation runs after
     /// the inner stream is exhausted; if it fails, the error is yielded as
     /// the final item.
     pub fn stream<'a>(
         &'a self,
         module_id: &str,
-        inputs: Value,
+        inputs: impl Into<Option<Value>>,
         ctx: Option<&Context<Value>>,
         version_hint: Option<&str>,
     ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<Value, ModuleError>> + Send + 'a>>
     {
-        self.executor.stream(module_id, inputs, ctx, version_hint)
+        let resolved_inputs = inputs.into().unwrap_or_else(|| serde_json::json!({}));
+        self.executor
+            .stream(module_id, resolved_inputs, ctx, version_hint)
     }
 
     /// Describe a module by ID.
     pub fn describe(&self, module_id: &str) -> String {
         match self.registry.get(module_id) {
             Some(module) => module.description().to_string(),
-            None => format!("Module '{}' not found", module_id),
+            None => format!("Module '{module_id}' not found"),
         }
     }
 
@@ -478,6 +528,40 @@ impl APCore {
     ) -> Result<&Self, crate::errors::ModuleError> {
         self.executor.use_after(middleware)?;
         Ok(self)
+    }
+}
+
+/// Internal subscriber that wraps a plain closure for [`APCore::on_fn()`].
+struct ClosureSubscriber {
+    id: String,
+    callback: Box<dyn Fn(&crate::events::emitter::ApCoreEvent) + Send + Sync>,
+}
+
+impl std::fmt::Debug for ClosureSubscriber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClosureSubscriber")
+            .field("id", &self.id)
+            .field("callback", &"<closure>")
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSubscriber for ClosureSubscriber {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+
+    fn event_pattern(&self) -> &'static str {
+        "*"
+    }
+
+    async fn on_event(
+        &self,
+        event: &crate::events::emitter::ApCoreEvent,
+    ) -> Result<(), ModuleError> {
+        (self.callback)(event);
+        Ok(())
     }
 }
 

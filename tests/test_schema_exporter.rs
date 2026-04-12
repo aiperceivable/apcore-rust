@@ -1,4 +1,5 @@
 //! Tests for SchemaExporter — exporting schemas to MCP, OpenAI, Anthropic, and Generic formats.
+#![allow(clippy::similar_names)] // `exporter`/`exported` and `schema`/`schemas` are intentionally distinct
 
 use apcore::schema::{ExportProfile, SchemaExporter, SchemaLoader};
 use serde_json::json;

@@ -40,13 +40,11 @@ pub struct IdentityTypesHandler;
 #[async_trait]
 impl ACLConditionHandler for IdentityTypesHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
-        let arr = match value.as_array() {
-            Some(a) => a,
-            None => return false,
+        let Some(arr) = value.as_array() else {
+            return false;
         };
-        let identity = match &ctx.identity {
-            Some(id) => id,
-            None => return false,
+        let Some(identity) = &ctx.identity else {
+            return false;
         };
         arr.iter()
             .any(|v| v.as_str().is_some_and(|s| s == identity.identity_type()))
@@ -59,13 +57,11 @@ pub struct RolesHandler;
 #[async_trait]
 impl ACLConditionHandler for RolesHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
-        let arr = match value.as_array() {
-            Some(a) => a,
-            None => return false,
+        let Some(arr) = value.as_array() else {
+            return false;
         };
-        let identity = match &ctx.identity {
-            Some(id) => id,
-            None => return false,
+        let Some(identity) = &ctx.identity else {
+            return false;
         };
         arr.iter().any(|v| {
             v.as_str()
@@ -105,9 +101,8 @@ impl OrHandler {
 #[async_trait]
 impl ACLConditionHandler for OrHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
-        let arr = match value.as_array() {
-            Some(a) => a,
-            None => return false,
+        let Some(arr) = value.as_array() else {
+            return false;
         };
         for sub in arr {
             if let Some(obj) = sub.as_object() {

@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
+use std::sync::LazyLock;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
@@ -115,6 +116,7 @@ pub trait Module: Send + Sync {
 /// accepts both the canonical nested form and the legacy flattened form
 /// (apcore-rust ≤ 0.17.1) for one MINOR backward-compat cycle.
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::struct_excessive_bools)] // spec-defined annotation flags; consolidating into bitflags would break the public API
 pub struct ModuleAnnotations {
     pub readonly: bool,
     pub destructive: bool,
@@ -230,6 +232,10 @@ impl Default for ModuleAnnotations {
         }
     }
 }
+
+/// Default annotations instance — all fields at their spec defaults.
+pub static DEFAULT_ANNOTATIONS: LazyLock<ModuleAnnotations> =
+    LazyLock::new(ModuleAnnotations::default);
 
 /// An example input/output pair for documentation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

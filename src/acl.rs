@@ -116,12 +116,11 @@ impl ACL {
         {
             let handlers = CONDITION_HANDLERS.read();
             for (key, value) in conditions {
-                let handler = match handlers.get(key.as_str()) {
-                    Some(h) => h.clone(),
-                    None => {
-                        tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
-                        return false;
-                    }
+                let handler = if let Some(h) = handlers.get(key.as_str()) {
+                    h.clone()
+                } else {
+                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                    return false;
                 };
                 to_evaluate.push((key, handler, value));
             }
@@ -164,12 +163,11 @@ impl ACL {
         {
             let handlers = CONDITION_HANDLERS.read();
             for (key, value) in conditions {
-                let handler = match handlers.get(key.as_str()) {
-                    Some(h) => h.clone(),
-                    None => {
-                        tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
-                        return false;
-                    }
+                let handler = if let Some(h) = handlers.get(key.as_str()) {
+                    h.clone()
+                } else {
+                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                    return false;
                 };
                 to_evaluate.push((handler, value));
             }
@@ -235,14 +233,14 @@ impl ACL {
         let content = std::fs::read_to_string(path).map_err(|e| {
             ModuleError::new(
                 ErrorCode::ConfigNotFound,
-                format!("Failed to read ACL file '{}': {}", path, e),
+                format!("Failed to read ACL file '{path}': {e}"),
             )
         })?;
 
         let raw: serde_json::Value = serde_yaml::from_str(&content).map_err(|e| {
             ModuleError::new(
                 ErrorCode::ConfigInvalid,
-                format!("Failed to parse ACL file '{}': {}", path, e),
+                format!("Failed to parse ACL file '{path}': {e}"),
             )
         })?;
 
@@ -250,14 +248,14 @@ impl ACL {
         let rules_val = raw.get("rules").ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ConfigInvalid,
-                format!("ACL file '{}' missing 'rules' key", path),
+                format!("ACL file '{path}' missing 'rules' key"),
             )
         })?;
 
         let rules: Vec<ACLRule> = serde_json::from_value(rules_val.clone()).map_err(|e| {
             ModuleError::new(
                 ErrorCode::ConfigInvalid,
-                format!("Invalid ACL rules in '{}': {}", path, e),
+                format!("Invalid ACL rules in '{path}': {e}"),
             )
         })?;
 
@@ -374,26 +372,24 @@ impl ACL {
         if pattern == "@system" {
             return ctx
                 .and_then(|c| c.identity.as_ref())
-                .map(|id| id.identity_type() == "system")
-                .unwrap_or(false);
+                .is_some_and(|id| id.identity_type() == "system");
         }
         Self::match_acl_pattern(pattern, value)
     }
 
     /// Evaluate conditions block against the context using registered handlers.
+    #[allow(clippy::unused_self)] // method must be on `&self` for trait-object dispatch consistency
     fn check_conditions(
         &self,
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
-        let ctx = match ctx {
-            Some(c) => c,
-            None => return false, // conditions require context
+        let Some(ctx) = ctx else {
+            return false; // conditions require context
         };
 
-        let obj = match conditions.as_object() {
-            Some(o) => o,
-            None => return false,
+        let Some(obj) = conditions.as_object() else {
+            return false;
         };
 
         let map: HashMap<String, serde_json::Value> =
@@ -405,19 +401,18 @@ impl ACL {
     /// Async counterpart to `check_conditions`. Drives async condition handlers
     /// via `evaluate_conditions_async` so handlers that genuinely suspend are
     /// awaited rather than treated as unsatisfied.
+    #[allow(clippy::unused_self)] // method must be on `&self` for trait-object dispatch consistency
     async fn check_conditions_async(
         &self,
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
-        let ctx = match ctx {
-            Some(c) => c,
-            None => return false,
+        let Some(ctx) = ctx else {
+            return false;
         };
 
-        let obj = match conditions.as_object() {
-            Some(o) => o,
-            None => return false,
+        let Some(obj) = conditions.as_object() else {
+            return false;
         };
 
         let map: HashMap<String, serde_json::Value> =
@@ -491,6 +486,7 @@ impl ACL {
 
     /// Build an audit entry from the check parameters and context.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::unused_self)] // method must be on `&self` for trait-object dispatch consistency
     fn build_audit_entry(
         &self,
         caller_id: &str,
@@ -507,7 +503,7 @@ impl ACL {
             target_id: target_id.to_string(),
             decision: decision.to_string(),
             reason: reason.to_string(),
-            matched_rule: matched_rule_desc.map(|s| s.to_string()),
+            matched_rule: matched_rule_desc.map(std::string::ToString::to_string),
             matched_rule_index,
             identity_type: ctx
                 .and_then(|c| c.identity.as_ref().map(|id| id.identity_type().to_string())),

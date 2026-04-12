@@ -38,6 +38,7 @@ impl From<IdentityRaw> for Identity {
 /// Fields are private to enforce immutability after construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "IdentityRaw")]
+#[allow(clippy::struct_field_names)] // `identity_type` intentionally prefixed for clarity with renamed JSON field
 pub struct Identity {
     id: String,
     #[serde(rename = "type")]
@@ -186,6 +187,7 @@ impl<T: Default> Context<T> {
     ///
     /// The child shares the same `data` map (via `Arc`) so writes in either
     /// parent or child are visible to both.
+    #[must_use]
     pub fn child(&self, target_module_id: &str) -> Context<T>
     where
         T: Clone,
@@ -288,6 +290,7 @@ impl<T: Default> Context<T> {
     /// global_deadline) are set to `None`/default after deserialization.
     /// If `_context_version` is greater than 1, a warning is logged
     /// but deserialization proceeds (forward compatibility).
+    #[allow(clippy::needless_pass_by_value)] // public API: callers pass owned Value; changing to &Value would be breaking
     pub fn deserialize(value: serde_json::Value) -> Result<Self, serde_json::Error>
     where
         T: Default,
@@ -298,7 +301,7 @@ impl<T: Default> Context<T> {
 
         let version = obj
             .get("_context_version")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .unwrap_or(1);
 
         if version > 1 {
@@ -340,7 +343,7 @@ impl<T: Default> Context<T> {
             caller_id: obj
                 .get("caller_id")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
             call_chain,
             identity,
             redacted_inputs,

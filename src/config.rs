@@ -179,6 +179,20 @@ const LEGACY_ROOT_FIELDS: &[(&str, &str)] = &[
     ("enable_metrics", "observability.metrics.enabled"),
 ];
 
+// Helper struct for two-pass deserialization of Config.
+// Defined outside the fn body to satisfy items_after_statements lint.
+#[derive(Deserialize)]
+struct ConfigHelper {
+    #[serde(default)]
+    modules_path: Option<PathBuf>,
+    #[serde(default)]
+    executor: ExecutorConfig,
+    #[serde(default)]
+    observability: ObservabilityConfig,
+    #[serde(flatten, default)]
+    user_namespaces: HashMap<String, serde_json::Value>,
+}
+
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // Two-pass: first parse the wire form into a generic JSON object,
@@ -214,18 +228,6 @@ impl<'de> Deserialize<'de> for Config {
                     core_data.insert(k.clone(), v.clone());
                 }
             }
-        }
-
-        #[derive(Deserialize)]
-        struct ConfigHelper {
-            #[serde(default)]
-            modules_path: Option<PathBuf>,
-            #[serde(default)]
-            executor: ExecutorConfig,
-            #[serde(default)]
-            observability: ObservabilityConfig,
-            #[serde(flatten, default)]
-            user_namespaces: HashMap<String, serde_json::Value>,
         }
 
         let helper: ConfigHelper = serde_json::from_value(serde_json::Value::Object(core_data))
@@ -292,7 +294,7 @@ impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self, ModuleError> {
         match path.extension().and_then(|e| e.to_str()) {
             Some("json") => Self::from_json_file(path),
-            Some("yaml") | Some("yml") => Self::from_yaml_file(path),
+            Some("yaml" | "yml") => Self::from_yaml_file(path),
             _ => {
                 // Default to YAML
                 Self::from_yaml_file(path)
@@ -645,8 +647,8 @@ impl Config {
         prefixed.sort_by(|a, b| {
             b.env_prefix
                 .as_ref()
-                .map_or(0, |p| p.len())
-                .cmp(&a.env_prefix.as_ref().map_or(0, |p| p.len()))
+                .map_or(0, std::string::String::len)
+                .cmp(&a.env_prefix.as_ref().map_or(0, std::string::String::len))
         });
 
         for (env_key, env_value) in std::env::vars() {
@@ -732,13 +734,21 @@ impl Config {
         match key {
             "executor.max_call_depth" => {
                 if let Some(n) = value.as_u64() {
-                    self.executor.max_call_depth = n as u32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    // config values are small and won't exceed u32::MAX
+                    {
+                        self.executor.max_call_depth = n as u32;
+                    }
                     return true;
                 }
             }
             "executor.max_module_repeat" => {
                 if let Some(n) = value.as_u64() {
-                    self.executor.max_module_repeat = n as u32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    // config values are small and won't exceed u32::MAX
+                    {
+                        self.executor.max_module_repeat = n as u32;
+                    }
                     return true;
                 }
             }

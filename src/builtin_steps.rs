@@ -1,6 +1,7 @@
 // APCore Protocol — Built-in execution pipeline steps
 // Spec reference: design-execution-pipeline.md (Section 3)
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -163,7 +164,7 @@ impl Step for BuiltinContextCreation {
                 "@external".to_string(),
                 "external".to_string(),
                 vec![],
-                Default::default(),
+                HashMap::new(),
             ));
         }
         Ok(StepResult::continue_step())
@@ -256,6 +257,7 @@ impl Step for BuiltinApprovalGate {
         &["context", "module"]
     }
 
+    #[allow(clippy::too_many_lines)] // approval gate logic is inherently multi-step; splitting would obscure the protocol flow
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         let handler = match ctx.approval_handler {
             Some(ref h) => h.clone(),
@@ -292,7 +294,7 @@ impl Step for BuiltinApprovalGate {
                                 serde_json::Value::Array(_) => "array",
                                 serde_json::Value::Object(_) => "object",
                                 serde_json::Value::Null => "null",
-                                _ => "unknown",
+                                serde_json::Value::String(_) => "string", // covered by as_str() above
                             }
                         ),
                     ));
@@ -308,7 +310,7 @@ impl Step for BuiltinApprovalGate {
                 module_id: ctx.module_id.clone(),
                 arguments: ctx.inputs.clone(),
                 context: Some(ctx.context.clone()),
-                annotations: Default::default(),
+                annotations: crate::module::ModuleAnnotations::default(),
                 description: None,
                 tags: vec![],
             };
@@ -469,6 +471,8 @@ impl Step for BuiltinExecute {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // intentional: remaining_ms is non-negative and fits in u64 for any reasonable deadline
             let remaining_ms = ((deadline - now) * 1000.0) as u64;
             if remaining_ms == 0 {
                 return Err(ModuleError::new(
@@ -549,9 +553,8 @@ impl Step for BuiltinOutputValidation {
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         // In dry_run mode, execute step is skipped so output may be absent.
-        let output = match ctx.output.as_ref() {
-            Some(o) => o,
-            None => return Ok(StepResult::continue_step()),
+        let Some(output) = ctx.output.as_ref() else {
+            return Ok(StepResult::continue_step());
         };
         let module = ctx
             .module
@@ -566,7 +569,7 @@ impl Step for BuiltinOutputValidation {
                 redact_sensitive(output, &output_schema),
             );
         }
-        ctx.validated_output = ctx.output.clone();
+        ctx.validated_output.clone_from(&ctx.output);
         Ok(StepResult::continue_step())
     }
 }

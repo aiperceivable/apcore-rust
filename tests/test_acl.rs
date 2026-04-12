@@ -3,6 +3,7 @@
 use apcore::acl::{ACLRule, ACL};
 use apcore::context::{Context, Identity};
 use serde_json::Value;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // ACL construction
@@ -101,7 +102,7 @@ fn make_ctx(id: &str, id_type: &str, roles: Vec<String>) -> Context<Value> {
         id.to_string(),
         id_type.to_string(),
         roles,
-        Default::default(),
+        HashMap::default(),
     ))
 }
 

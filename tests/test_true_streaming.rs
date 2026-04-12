@@ -36,7 +36,7 @@ impl Module for SlowStreamingModule {
     fn output_schema(&self) -> Value {
         json!({"type": "object"})
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "slow streaming test module"
     }
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
@@ -64,7 +64,7 @@ impl Module for NonStreamingModule {
     fn output_schema(&self) -> Value {
         json!({"type": "object"})
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "non-streaming module"
     }
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
@@ -92,7 +92,7 @@ impl Module for BadSchemaStreamingModule {
             "required": ["result"]
         })
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "streaming module with bad schema"
     }
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {

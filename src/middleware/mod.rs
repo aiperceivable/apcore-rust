@@ -85,29 +85,22 @@ impl PlatformNotifyMiddleware {
         let snap = collector.snapshot();
 
         // snapshot() returns {"counters": {...}, "histograms": {...}}
-        let counters = match snap.get("counters") {
-            Some(c) => c,
-            None => return 0.0,
+        let Some(counters) = snap.get("counters") else {
+            return 0.0;
         };
 
         // Look for counters matching apcore_module_calls_total with module label.
         // Keys are formatted as "name|key=value,key=value".
-        let total_key = format!(
-            "apcore_module_calls_total|module={},status=success",
-            module_id
-        );
-        let error_key = format!(
-            "apcore_module_calls_total|module={},status=error",
-            module_id
-        );
+        let total_key = format!("apcore_module_calls_total|module={module_id},status=success");
+        let error_key = format!("apcore_module_calls_total|module={module_id},status=error");
 
         let success = counters
             .get(&total_key)
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0);
         let errors = counters
             .get(&error_key)
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0);
         let total = success + errors;
 
@@ -211,7 +204,7 @@ impl PlatformNotifyMiddleware {
 
 #[async_trait]
 impl Middleware for PlatformNotifyMiddleware {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "platform_notify"
     }
 

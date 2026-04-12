@@ -59,14 +59,12 @@ fn test_standard_strategy_step_flags() {
         assert_eq!(
             step.removable(),
             *removable,
-            "removable mismatch for step '{}'",
-            name
+            "removable mismatch for step '{name}'"
         );
         assert_eq!(
             step.replaceable(),
             *replaceable,
-            "replaceable mismatch for step '{}'",
-            name
+            "replaceable mismatch for step '{name}'"
         );
     }
 }

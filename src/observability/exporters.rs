@@ -19,10 +19,10 @@ impl SpanExporter for StdoutExporter {
         let json = serde_json::to_string(span).map_err(|e| {
             ModuleError::new(
                 crate::errors::ErrorCode::GeneralInternalError,
-                format!("Failed to serialize span: {}", e),
+                format!("Failed to serialize span: {e}"),
             )
         })?;
-        println!("{}", json);
+        println!("{json}");
         Ok(())
     }
 
@@ -109,11 +109,14 @@ impl OTLPExporter {
 /// Convert a Span to OTLP JSON format.
 #[cfg(feature = "events")]
 fn span_to_otlp(span: &Span) -> serde_json::Value {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // intentional: nanosecond timestamps fit in u64 for dates post-1970
+    let start_ns = (span.start_time * 1_000_000_000.0) as u64;
     let mut otlp_span = serde_json::json!({
         "traceId": span.trace_id,
         "spanId": span.span_id,
         "name": span.name,
-        "startTimeUnixNano": (span.start_time * 1_000_000_000.0) as u64,
+        "startTimeUnixNano": start_ns,
         "status": match span.status {
             super::span::SpanStatus::Ok => serde_json::json!({"code": 1}),
             super::span::SpanStatus::Error => serde_json::json!({"code": 2}),
@@ -130,7 +133,10 @@ fn span_to_otlp(span: &Span) -> serde_json::Value {
         otlp_span["parentSpanId"] = serde_json::json!(parent_id);
     }
     if let Some(end_time) = span.end_time {
-        otlp_span["endTimeUnixNano"] = serde_json::json!((end_time * 1_000_000_000.0) as u64);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // intentional: nanosecond timestamps fit in u64 for dates post-1970
+        let end_ns = (end_time * 1_000_000_000.0) as u64;
+        otlp_span["endTimeUnixNano"] = serde_json::json!(end_ns);
     }
     otlp_span
 }
@@ -156,7 +162,7 @@ impl SpanExporter for OTLPExporter {
             .map_err(|e| {
                 ModuleError::new(
                     crate::errors::ErrorCode::GeneralInternalError,
-                    format!("OTLP export failed: {}", e),
+                    format!("OTLP export failed: {e}"),
                 )
             })?;
         Ok(())

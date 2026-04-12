@@ -54,8 +54,6 @@ fn init_handlers() {
 
 #[test]
 fn test_register_condition_adds_handler() {
-    init_handlers();
-
     struct TestHandler;
     #[async_trait]
     impl ACLConditionHandler for TestHandler {
@@ -64,6 +62,7 @@ fn test_register_condition_adds_handler() {
         }
     }
 
+    init_handlers();
     register_condition("_test_custom_rs", Arc::new(TestHandler));
     let handlers = CONDITION_HANDLERS.read();
     assert!(handlers.contains_key("_test_custom_rs"));
@@ -76,8 +75,7 @@ fn test_builtin_handlers_registered() {
     for key in &["identity_types", "roles", "max_call_depth", "$or", "$not"] {
         assert!(
             handlers.contains_key(*key),
-            "Missing built-in handler: {}",
-            key
+            "Missing built-in handler: {key}"
         );
     }
 }
@@ -263,7 +261,7 @@ fn test_empty_targets_matches_nothing() {
 fn test_audit_logger_via_constructor() {
     let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
     let logged_clone = logged.clone();
-    let logger = move |entry: &apcore::acl::AuditEntry| {
+    let audit_fn = move |entry: &apcore::acl::AuditEntry| {
         logged_clone.lock().unwrap().push(entry.decision.clone());
     };
     let acl = ACL::new(
@@ -275,7 +273,7 @@ fn test_audit_logger_via_constructor() {
             conditions: None,
         }],
         "deny",
-        Some(Arc::new(logger)),
+        Some(Arc::new(audit_fn)),
     );
     acl.check(Some("a"), "b", None).unwrap();
     let entries = logged.lock().unwrap();

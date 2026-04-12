@@ -24,7 +24,7 @@ impl UsageSummaryModule {
 
 #[async_trait]
 impl Module for UsageSummaryModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Usage overview with trend detection across all modules"
     }
 
@@ -98,7 +98,7 @@ impl UsageModuleModule {
 
 #[async_trait]
 impl Module for UsageModuleModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Detailed usage for a single module with caller breakdown"
     }
 
@@ -136,7 +136,7 @@ impl Module for UsageModuleModule {
         if !self.registry.has(module_id) {
             return Err(ModuleError::new(
                 ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", module_id),
+                format!("Module '{module_id}' not found"),
             ));
         }
 

@@ -462,7 +462,7 @@ impl Module for GreetModule {
 
 #[tokio::main]
 async fn main() {
-    let identity = Identity { id: "agent-1".to_string(), identity_type: "agent".to_string(), roles: vec![], attrs: HashMap::new() };
+    let identity = Identity::new("agent-1".to_string(), "agent".to_string(), vec![], HashMap::new());
     let ctx: Context<Value> = Context::new(identity);
     let module = GreetModule;
 

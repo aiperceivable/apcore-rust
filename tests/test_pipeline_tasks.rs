@@ -28,10 +28,10 @@ impl OutputStep {
 
 #[async_trait]
 impl Step for OutputStep {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "output_step"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Sets output on the pipeline context"
     }
     fn removable(&self) -> bool {

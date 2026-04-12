@@ -67,7 +67,7 @@ pub fn resolve_strategy_by_name(name: &str) -> Result<ExecutionStrategy, ModuleE
         "minimal" => Ok(build_minimal_strategy()),
         _ => Err(ModuleError::new(
             ErrorCode::GeneralInvalidInput,
-            format!("Unknown strategy name '{}'. Built-in presets: standard, internal, testing, performance, minimal", name),
+            format!("Unknown strategy name '{name}'. Built-in presets: standard, internal, testing, performance, minimal"),
         )),
     }
 }
@@ -95,15 +95,15 @@ fn trace_to_checks(trace: &PipelineTrace) -> Vec<PfCheck> {
         .map(|st| {
             let check_name = step_to_check_name(&st.name).to_string();
             let passed = st.result.action != "abort";
-            let error = if !passed {
+            let error = if passed {
+                None
+            } else {
                 st.result.explanation.as_ref().map(|msg| {
                     serde_json::json!({
                         "code": format!("STEP_{}_FAILED", st.name.to_uppercase()),
                         "message": msg,
                     })
                 })
-            } else {
-                None
             };
             PfCheck {
                 check: check_name,
@@ -144,10 +144,7 @@ struct StreamSetup {
 fn streaming_not_supported_error(module_id: &str) -> ModuleError {
     ModuleError::new(
         ErrorCode::GeneralNotImplemented,
-        format!(
-            "Module '{}' does not support streaming (Module::stream returned None)",
-            module_id
-        ),
+        format!("Module '{module_id}' does not support streaming (Module::stream returned None)"),
     )
 }
 
@@ -219,9 +216,8 @@ pub fn redact_sensitive(data: &Value, schema: &Value) -> Value {
 
 /// In-place redaction based on schema `x-sensitive` markers.
 fn redact_fields(data: &mut serde_json::Map<String, Value>, schema: &Value) {
-    let properties = match schema.get("properties").and_then(|p| p.as_object()) {
-        Some(p) => p,
-        None => return,
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return;
     };
 
     for (field_name, field_schema) in properties {
@@ -464,7 +460,7 @@ impl Executor {
         module_id: &str,
         inputs: serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
-        _version_hint: Option<&str>,
+        version_hint: Option<&str>,
     ) -> Result<serde_json::Value, ModuleError> {
         let context = match ctx {
             Some(c) => c.clone(),
@@ -472,11 +468,11 @@ impl Executor {
                 "@external".to_string(),
                 "external".to_string(),
                 vec![],
-                Default::default(),
+                HashMap::new(),
             )),
         };
         let mut pipe_ctx = PipelineContext::new(module_id, inputs, context, self.strategy.name());
-        if let Some(hint) = _version_hint {
+        if let Some(hint) = version_hint {
             pipe_ctx.version_hint = Some(hint.to_string());
         }
         self.inject_resources(&mut pipe_ctx);
@@ -509,7 +505,7 @@ impl Executor {
                 "@external".to_string(),
                 "external".to_string(),
                 vec![],
-                Default::default(),
+                HashMap::new(),
             ))
         });
         let mut pipe_ctx =
@@ -612,13 +608,10 @@ impl Executor {
                 .await?;
 
             // Phase 2: invoke module.stream() and forward chunks as they arrive.
-            let mut inner = match setup.module.stream(setup.inputs.clone(), &setup.context) {
-                Some(s) => s,
-                None => {
-                    Err(streaming_not_supported_error(&module_id_owned))?;
-                    // Unreachable: the `?` above always returns from the block.
-                    return;
-                }
+            let Some(mut inner) = setup.module.stream(setup.inputs.clone(), &setup.context) else {
+                Err(streaming_not_supported_error(&module_id_owned))?;
+                // Unreachable: the `?` above always returns from the block.
+                return;
             };
 
             let mut accumulated: Vec<Value> = Vec::new();
@@ -658,7 +651,7 @@ impl Executor {
                 "@external".to_string(),
                 "external".to_string(),
                 vec![],
-                Default::default(),
+                HashMap::new(),
             ))
         });
 
@@ -723,7 +716,7 @@ impl Executor {
                 other => {
                     return Err(ModuleError::new(
                         ErrorCode::GeneralInvalidInput,
-                        format!("Unknown step action: '{}'", other),
+                        format!("Unknown step action: '{other}'"),
                     ));
                 }
             }
@@ -732,10 +725,7 @@ impl Executor {
         let module = pipe_ctx.module.clone().ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ModuleNotFound,
-                format!(
-                    "Module '{}' was not resolved during pre-stream setup",
-                    module_id
-                ),
+                format!("Module '{module_id}' was not resolved during pre-stream setup"),
             )
         })?;
         let output_schema = module.output_schema();
@@ -754,13 +744,15 @@ impl Executor {
         &self.strategy
     }
 
-    /// Return a human-readable description of the configured pipeline.
-    pub fn describe_pipeline(&self) -> String {
-        format!(
-            "{}-step pipeline: {}",
-            self.strategy.steps().len(),
-            self.strategy.step_names().join(" \u{2192} ")
-        )
+    /// Return structured info about the configured pipeline.
+    ///
+    /// Returns a [`StrategyInfo`] describing the strategy name, step count,
+    /// step names, and auto-generated description. This matches the spec and
+    /// aligns with the Python and TypeScript SDK return types.
+    ///
+    /// Use `.to_string()` on the result for a human-readable summary.
+    pub fn describe_pipeline(&self) -> StrategyInfo {
+        self.strategy.info()
     }
 
     /// Execute a module through the pipeline engine, returning both the output
@@ -782,7 +774,7 @@ impl Executor {
                 "@external".to_string(),
                 "external".to_string(),
                 vec![],
-                Default::default(),
+                HashMap::new(),
             )),
         };
 
@@ -815,6 +807,21 @@ impl Executor {
     pub fn use_after(&self, middleware: Box<dyn AfterMiddleware>) -> Result<(), ModuleError> {
         self.middleware_manager
             .add(Box::new(BoxedAfterMiddlewareAdapter(middleware)))
+    }
+
+    /// Register a strategy's info in the global registry for introspection.
+    ///
+    /// Delegates to the module-level [`register_strategy`] function.
+    /// Replaces any existing entry with the same name.
+    pub fn register_strategy(info: StrategyInfo) {
+        register_strategy(info);
+    }
+
+    /// List all registered strategy summaries from the global registry.
+    ///
+    /// Delegates to the module-level [`list_strategies`] function.
+    pub fn list_strategies() -> Vec<StrategyInfo> {
+        list_strategies()
     }
 }
 
@@ -960,7 +967,7 @@ mod tests {
         fn output_schema(&self) -> Value {
             self.output_schema.clone()
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "mock module"
         }
         async fn execute(

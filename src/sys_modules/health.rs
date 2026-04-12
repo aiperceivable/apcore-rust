@@ -56,7 +56,7 @@ impl HealthSummaryModule {
 
 #[async_trait]
 impl Module for HealthSummaryModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Aggregated health overview of all registered modules"
     }
 
@@ -81,11 +81,11 @@ impl Module for HealthSummaryModule {
     ) -> Result<serde_json::Value, ModuleError> {
         let threshold = inputs
             .get("error_rate_threshold")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.01);
         let include_healthy = inputs
             .get("include_healthy")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
 
         let module_ids = self.registry.list(None, None);
@@ -93,11 +93,14 @@ impl Module for HealthSummaryModule {
         let project_name = {
             let cfg = self.config.lock().await;
             cfg.get("project.name")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .and_then(|v| v.as_str().map(std::string::ToString::to_string))
                 .unwrap_or_else(|| "apcore".to_string())
         };
 
-        let snapshot = self.metrics.as_ref().map(|m| m.snapshot());
+        let snapshot = self
+            .metrics
+            .as_ref()
+            .map(super::super::observability::metrics::MetricsCollector::snapshot);
 
         let mut modules = Vec::new();
         let (mut healthy, mut degraded, mut error_count, mut unknown) = (0u32, 0u32, 0u32, 0u32);
@@ -105,8 +108,8 @@ impl Module for HealthSummaryModule {
         for mid in &module_ids {
             let (total_calls, errors) = snapshot
                 .as_ref()
-                .map(|s| extract_call_counts(s, mid.as_str()))
-                .unwrap_or((0, 0));
+                .map_or((0, 0), |s| extract_call_counts(s, mid.as_str()));
+            #[allow(clippy::cast_precision_loss)] // metrics ratio: precision loss acceptable
             let error_rate = if total_calls > 0 {
                 errors as f64 / total_calls as f64
             } else {
@@ -183,7 +186,7 @@ impl HealthModuleModule {
 
 #[async_trait]
 impl Module for HealthModuleModule {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Detailed health information for a single module"
     }
 
@@ -213,23 +216,28 @@ impl Module for HealthModuleModule {
             .ok_or_else(|| {
                 ModuleError::new(ErrorCode::GeneralInvalidInput, "'module_id' is required")
             })?;
+        #[allow(clippy::cast_possible_truncation)]
+        // config value won't exceed platform usize limits
         let error_limit = inputs
             .get("error_limit")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(10) as usize;
 
         if !self.registry.has(module_id) {
             return Err(ModuleError::new(
                 ErrorCode::ModuleNotFound,
-                format!("Module '{}' not found", module_id),
+                format!("Module '{module_id}' not found"),
             ));
         }
 
-        let snapshot = self.metrics.as_ref().map(|m| m.snapshot());
+        let snapshot = self
+            .metrics
+            .as_ref()
+            .map(super::super::observability::metrics::MetricsCollector::snapshot);
         let (total_calls, errors) = snapshot
             .as_ref()
-            .map(|s| extract_call_counts(s, module_id))
-            .unwrap_or((0, 0));
+            .map_or((0, 0), |s| extract_call_counts(s, module_id));
+        #[allow(clippy::cast_precision_loss)] // metrics ratio: precision loss acceptable
         let error_rate = if total_calls > 0 {
             errors as f64 / total_calls as f64
         } else {
@@ -255,8 +263,7 @@ impl Module for HealthModuleModule {
 
         let (avg_latency_ms, p99_latency_ms) = snapshot
             .as_ref()
-            .map(|s| extract_latency_stats(s, module_id))
-            .unwrap_or((0.0, 0.0));
+            .map_or((0.0, 0.0), |s| extract_latency_stats(s, module_id));
 
         Ok(json!({
             "module_id": module_id,
@@ -273,18 +280,20 @@ impl Module for HealthModuleModule {
 
 /// Extract call counts from a MetricsCollector snapshot.
 fn extract_call_counts(snapshot: &serde_json::Value, module_id: &str) -> (u64, u64) {
-    let counters = match snapshot.get("counters").and_then(|c| c.as_object()) {
-        Some(c) => c,
-        None => return (0, 0),
+    let Some(counters) = snapshot.get("counters").and_then(|c| c.as_object()) else {
+        return (0, 0);
     };
     let mut total: u64 = 0;
     let mut errors: u64 = 0;
     let success_key = format!("apcore_module_calls_total|module_id={module_id},status=success");
     let error_key = format!("apcore_module_calls_total|module_id={module_id},status=error");
-    if let Some(v) = counters.get(&success_key).and_then(|v| v.as_u64()) {
+    if let Some(v) = counters
+        .get(&success_key)
+        .and_then(serde_json::Value::as_u64)
+    {
         total += v;
     }
-    if let Some(v) = counters.get(&error_key).and_then(|v| v.as_u64()) {
+    if let Some(v) = counters.get(&error_key).and_then(serde_json::Value::as_u64) {
         total += v;
         errors = v;
     }
@@ -296,17 +305,22 @@ fn extract_call_counts(snapshot: &serde_json::Value, module_id: &str) -> (u64, u
 /// Reads the histogram key `apcore_module_duration_seconds|module_id=<id>`.
 /// Returns (avg_latency_ms, p99_latency_ms).
 fn extract_latency_stats(snapshot: &serde_json::Value, module_id: &str) -> (f64, f64) {
-    let histograms = match snapshot.get("histograms").and_then(|h| h.as_object()) {
-        Some(h) => h,
-        None => return (0.0, 0.0),
+    let Some(histograms) = snapshot.get("histograms").and_then(|h| h.as_object()) else {
+        return (0.0, 0.0);
     };
     let hist_key = format!("apcore_module_duration_seconds|module_id={module_id}");
-    let data = match histograms.get(&hist_key) {
-        Some(d) => d,
-        None => return (0.0, 0.0),
+    let Some(data) = histograms.get(&hist_key) else {
+        return (0.0, 0.0);
     };
-    let sum = data.get("sum").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let sum = data
+        .get("sum")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let count = data
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    #[allow(clippy::cast_precision_loss)] // latency avg: precision loss acceptable
     let avg_ms = if count > 0 {
         (sum / count as f64) * 1000.0
     } else {

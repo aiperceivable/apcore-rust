@@ -124,14 +124,17 @@ impl BindingLoader {
         self.bindings.get(name).ok_or_else(|| {
             ModuleError::new(
                 crate::errors::ErrorCode::BindingModuleNotFound,
-                format!("Binding '{}' not found", name),
+                format!("Binding '{name}' not found"),
             )
         })
     }
 
     /// List all loaded binding names.
     pub fn list_bindings(&self) -> Vec<&str> {
-        self.bindings.keys().map(|k| k.as_str()).collect()
+        self.bindings
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Register every loaded binding as a [`FunctionModule`] in `registry`,
@@ -144,6 +147,7 @@ impl BindingLoader {
     ///
     /// Returns an error if any binding is missing a handler or if the
     /// underlying [`Registry::register_module`] call fails.
+    #[allow(clippy::needless_pass_by_value)] // public API: HashMap consumed to prevent reuse after registration
     pub fn register_into_with_handlers(
         &self,
         registry: &Registry,
@@ -154,7 +158,7 @@ impl BindingLoader {
             let handler = handlers.get(name).cloned().ok_or_else(|| {
                 ModuleError::new(
                     crate::errors::ErrorCode::BindingModuleNotFound,
-                    format!("No handler provided for binding '{}'", name),
+                    format!("No handler provided for binding '{name}'"),
                 )
             })?;
 
@@ -191,5 +195,190 @@ impl BindingLoader {
 impl Default for BindingLoader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_binding_loader_new_is_empty() {
+        let loader = BindingLoader::new();
+        assert!(loader.list_bindings().is_empty());
+    }
+
+    #[test]
+    fn test_binding_loader_default() {
+        let loader = BindingLoader::default();
+        assert!(loader.list_bindings().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_missing_binding() {
+        let loader = BindingLoader::new();
+        let result = loader.resolve("nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, crate::errors::ErrorCode::BindingModuleNotFound);
+        assert!(err.message.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_load_from_file_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("bindings.json");
+
+        let bindings = json!([
+            {
+                "name": "send_email",
+                "target": {
+                    "module_name": "executor.email.send",
+                    "callable": "send_handler"
+                },
+                "metadata": {"description": "Send an email"}
+            },
+            {
+                "name": "fetch_data",
+                "target": {
+                    "module_name": "executor.data.fetch",
+                    "callable": "fetch_handler"
+                },
+                "metadata": {}
+            }
+        ]);
+        std::fs::write(&file_path, serde_json::to_string(&bindings).unwrap()).unwrap();
+
+        let mut loader = BindingLoader::new();
+        loader.load_from_file(&file_path).unwrap();
+
+        assert_eq!(loader.list_bindings().len(), 2);
+
+        let def = loader.resolve("send_email").unwrap();
+        assert_eq!(def.target.module_name, "executor.email.send");
+        assert_eq!(def.target.callable, "send_handler");
+    }
+
+    #[test]
+    fn test_load_from_file_invalid_path() {
+        let mut loader = BindingLoader::new();
+        let result = loader.load_from_file(Path::new("/nonexistent/bindings.json"));
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().code,
+            crate::errors::ErrorCode::BindingFileInvalid
+        );
+    }
+
+    #[test]
+    fn test_load_from_file_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("bad.json");
+        std::fs::write(&file_path, "not json at all").unwrap();
+
+        let mut loader = BindingLoader::new();
+        let result = loader.load_from_file(&file_path);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().code,
+            crate::errors::ErrorCode::BindingFileInvalid
+        );
+    }
+
+    #[test]
+    fn test_load_from_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("bindings.yaml");
+
+        let yaml_content = r"
+- name: greet
+  target:
+    module_name: executor.greet
+    callable: greet_fn
+  metadata: {}
+";
+        std::fs::write(&file_path, yaml_content).unwrap();
+
+        let mut loader = BindingLoader::new();
+        loader.load_from_yaml(&file_path).unwrap();
+
+        assert_eq!(loader.list_bindings().len(), 1);
+        let def = loader.resolve("greet").unwrap();
+        assert_eq!(def.target.module_name, "executor.greet");
+    }
+
+    #[test]
+    fn test_load_from_yaml_invalid_path() {
+        let mut loader = BindingLoader::new();
+        let result = loader.load_from_yaml(Path::new("/no/such/file.yaml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_from_yaml_invalid_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("bad.yaml");
+        std::fs::write(&file_path, "- [invalid structure").unwrap();
+
+        let mut loader = BindingLoader::new();
+        let result = loader.load_from_yaml(&file_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_binding_target_serde() {
+        let target = BindingTarget {
+            module_name: "executor.foo".to_string(),
+            callable: "bar".to_string(),
+            schema_path: Some("schemas/foo.json".to_string()),
+        };
+        let json = serde_json::to_value(&target).unwrap();
+        assert_eq!(json["module_name"], "executor.foo");
+        assert_eq!(json["schema_path"], "schemas/foo.json");
+
+        let deserialized: BindingTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.module_name, "executor.foo");
+        assert_eq!(
+            deserialized.schema_path.as_deref(),
+            Some("schemas/foo.json")
+        );
+    }
+
+    #[test]
+    fn test_binding_target_schema_path_none_omitted() {
+        let target = BindingTarget {
+            module_name: "m".to_string(),
+            callable: "c".to_string(),
+            schema_path: None,
+        };
+        let json = serde_json::to_value(&target).unwrap();
+        assert!(json.get("schema_path").is_none());
+    }
+
+    #[test]
+    fn test_load_overwrites_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("bindings.json");
+
+        let bindings = json!([
+            {
+                "name": "dup",
+                "target": {"module_name": "first", "callable": "a"},
+                "metadata": {}
+            },
+            {
+                "name": "dup",
+                "target": {"module_name": "second", "callable": "b"},
+                "metadata": {}
+            }
+        ]);
+        std::fs::write(&file_path, serde_json::to_string(&bindings).unwrap()).unwrap();
+
+        let mut loader = BindingLoader::new();
+        loader.load_from_file(&file_path).unwrap();
+
+        let def = loader.resolve("dup").unwrap();
+        assert_eq!(def.target.module_name, "second");
     }
 }

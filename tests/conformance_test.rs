@@ -30,10 +30,7 @@ fn find_fixtures_root() -> PathBuf {
         if p.is_dir() {
             return p;
         }
-        panic!(
-            "APCORE_SPEC_REPO={} does not contain conformance/fixtures/",
-            spec_repo
-        );
+        panic!("APCORE_SPEC_REPO={spec_repo} does not contain conformance/fixtures/");
     }
 
     // 2. Sibling ../apcore/ directory
@@ -58,10 +55,10 @@ fn find_fixtures_root() -> PathBuf {
 }
 
 fn load_fixture(name: &str) -> Value {
-    let path = find_fixtures_root().join(format!("{}.json", name));
+    let path = find_fixtures_root().join(format!("{name}.json"));
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("Failed to read fixture: {}", path.display()));
-    serde_json::from_str(&content).unwrap_or_else(|e| panic!("Invalid JSON in {}: {}", name, e))
+    serde_json::from_str(&content).unwrap_or_else(|e| panic!("Invalid JSON in {name}: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -80,11 +77,7 @@ fn conformance_pattern_matching() {
         assert_eq!(
             match_pattern(pattern, value),
             expected,
-            "FAIL [{}]: match_pattern({:?}, {:?}) expected {}",
-            id,
-            pattern,
-            value,
-            expected
+            "FAIL [{id}]: match_pattern({pattern:?}, {value:?}) expected {expected}"
         );
     }
 }
@@ -99,15 +92,13 @@ fn conformance_specificity() {
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
         let pattern = tc["pattern"].as_str().unwrap();
+        #[allow(clippy::cast_possible_truncation)] // specificity scores are small integers
         let expected = tc["expected_score"].as_u64().unwrap() as u32;
 
         assert_eq!(
             calculate_specificity(pattern),
             expected,
-            "FAIL [{}]: calculate_specificity({:?}) expected {}",
-            id,
-            pattern,
-            expected
+            "FAIL [{id}]: calculate_specificity({pattern:?}) expected {expected}"
         );
     }
 }
@@ -128,8 +119,7 @@ fn conformance_normalize_id() {
         let result = normalize_to_canonical_id(local_id, language);
         assert_eq!(
             result, expected,
-            "FAIL [{}]: normalize({:?}, {:?}) = {:?}, expected {:?}",
-            id, local_id, language, result, expected
+            "FAIL [{id}]: normalize({local_id:?}, {language:?}) = {result:?}, expected {expected:?}"
         );
     }
 }
@@ -149,27 +139,19 @@ fn conformance_version_negotiation() {
         if tc.get("expected_error").is_some() {
             assert!(
                 negotiate_version(declared, sdk).is_err(),
-                "FAIL [{}]: expected error but got Ok",
-                id
+                "FAIL [{id}]: expected error but got Ok"
             );
         } else {
             let expected = tc["expected"].as_str().unwrap();
             let result = negotiate_version(declared, sdk);
             assert!(
                 result.is_ok(),
-                "FAIL [{}]: expected Ok({}) but got {:?}",
-                id,
-                expected,
-                result
+                "FAIL [{id}]: expected Ok({expected}) but got {result:?}"
             );
             assert_eq!(
                 result.unwrap(),
                 expected,
-                "FAIL [{}]: negotiate({:?}, {:?}) expected {:?}",
-                id,
-                declared,
-                sdk,
-                expected
+                "FAIL [{id}]: negotiate({declared:?}, {sdk:?}) expected {expected:?}"
             );
         }
     }
@@ -191,13 +173,17 @@ fn conformance_call_chain() {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
+        #[allow(clippy::cast_possible_truncation)]
+        // max_call_depth from fixtures is a small integer
         let max_depth = tc
             .get("max_call_depth")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(32) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        // max_module_repeat from fixtures is a small integer
         let max_repeat = tc
             .get("max_module_repeat")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(3) as usize;
 
         let identity = Identity::new(
@@ -214,31 +200,23 @@ fn conformance_call_chain() {
         if let Some(expected_error) = tc.get("expected_error").and_then(|v| v.as_str()) {
             assert!(
                 result.is_err(),
-                "FAIL [{}]: expected error {} but got Ok",
-                id,
-                expected_error
+                "FAIL [{id}]: expected error {expected_error} but got Ok"
             );
             let err_lower = format!("{}", result.unwrap_err()).to_lowercase();
             match expected_error {
                 "CALL_DEPTH_EXCEEDED" => assert!(
                     err_lower.contains("depth"),
-                    "FAIL [{}]: expected depth error, got: {}",
-                    id,
-                    err_lower
+                    "FAIL [{id}]: expected depth error, got: {err_lower}"
                 ),
                 "CIRCULAR_CALL" => assert!(
                     err_lower.contains("circular"),
-                    "FAIL [{}]: expected circular error, got: {}",
-                    id,
-                    err_lower
+                    "FAIL [{id}]: expected circular error, got: {err_lower}"
                 ),
                 "CALL_FREQUENCY_EXCEEDED" => assert!(
                     err_lower.contains("frequency"),
-                    "FAIL [{}]: expected frequency error, got: {}",
-                    id,
-                    err_lower
+                    "FAIL [{id}]: expected frequency error, got: {err_lower}"
                 ),
-                _ => panic!("Unknown expected_error: {}", expected_error),
+                _ => panic!("Unknown expected_error: {expected_error}"),
             }
         } else {
             assert!(
@@ -270,13 +248,11 @@ fn conformance_error_codes() {
                 let codes: HashSet<String> = [code.to_string()].into_iter().collect();
                 let result = registry.register(module_id, &codes);
                 if tc.get("expected_error").is_some() {
-                    assert!(result.is_err(), "FAIL [{}]: expected error but got Ok", id);
+                    assert!(result.is_err(), "FAIL [{id}]: expected error but got Ok");
                 } else {
                     assert!(
                         result.is_ok(),
-                        "FAIL [{}]: expected Ok but got {:?}",
-                        id,
-                        result
+                        "FAIL [{id}]: expected Ok but got {result:?}"
                     );
                 }
             }
@@ -290,13 +266,9 @@ fn conformance_error_codes() {
                     let result = registry.register(mid, &codes);
                     let is_last = idx == steps.len() - 1;
                     if is_last && has_error {
-                        assert!(
-                            result.is_err(),
-                            "FAIL [{}]: expected error on last step",
-                            id
-                        );
+                        assert!(result.is_err(), "FAIL [{id}]: expected error on last step");
                     } else {
-                        assert!(result.is_ok(), "FAIL [{}] step {}: {:?}", id, idx, result);
+                        assert!(result.is_ok(), "FAIL [{id}] step {idx}: {result:?}");
                     }
                 }
             }
@@ -310,17 +282,17 @@ fn conformance_error_codes() {
                             let codes: HashSet<String> = [code.to_string()].into_iter().collect();
                             registry
                                 .register(mid, &codes)
-                                .unwrap_or_else(|e| panic!("FAIL [{}]: {}", id, e));
+                                .unwrap_or_else(|e| panic!("FAIL [{id}]: {e}"));
                         }
                         "unregister" => {
                             let mid = step["module_id"].as_str().unwrap();
                             registry.unregister(mid);
                         }
-                        _ => panic!("Unknown step action: {}", step_action),
+                        _ => panic!("Unknown step action: {step_action}"),
                     }
                 }
             }
-            _ => panic!("Unknown action: {}", action),
+            _ => panic!("Unknown action: {action}"),
         }
     }
 }
@@ -369,7 +341,11 @@ fn conformance_acl_evaluation() {
         let acl = ACL::new(rules, default_effect, None);
 
         let needs_context = tc.get("caller_identity").is_some()
-            || tc.get("call_depth").and_then(|v| v.as_u64()).unwrap_or(0) > 0
+            || tc
+                .get("call_depth")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
             || tc["rules"]
                 .as_array()
                 .unwrap()
@@ -407,9 +383,12 @@ fn conformance_acl_evaluation() {
 
             let mut ctx: Context<Value> = Context::create(identity, Value::Null, None, None);
 
-            let call_depth = tc.get("call_depth").and_then(|v| v.as_u64()).unwrap_or(0);
+            let call_depth = tc
+                .get("call_depth")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
             for i in 0..call_depth {
-                ctx.call_chain.push(format!("_depth_{}", i));
+                ctx.call_chain.push(format!("_depth_{i}"));
             }
 
             Some(ctx)
@@ -429,8 +408,7 @@ fn conformance_acl_evaluation() {
 
         assert_eq!(
             result, expected,
-            "FAIL [{}]: ACL check(caller={:?}, target={:?}) returned {}, expected {}",
-            id, caller_id, target_id, result, expected
+            "FAIL [{id}]: ACL check(caller={caller_id:?}, target={target_id:?}) returned {result}, expected {expected}"
         );
     }
 }
@@ -515,23 +493,20 @@ fn conformance_context_serialization() {
             assert_eq!(
                 ctx.trace_id,
                 expected["trace_id"].as_str().unwrap(),
-                "FAIL [{}]",
-                id
+                "FAIL [{id}]"
             );
             assert_eq!(
                 ctx.caller_id.as_deref(),
                 expected["caller_id"].as_str(),
-                "FAIL [{}]",
-                id
+                "FAIL [{id}]"
             );
             if let Some(expected_id) = expected.get("identity_id").and_then(|v| v.as_str()) {
                 let identity = ctx.identity.as_ref().unwrap();
-                assert_eq!(identity.id(), expected_id, "FAIL [{}]", id);
+                assert_eq!(identity.id(), expected_id, "FAIL [{id}]");
                 assert_eq!(
                     identity.identity_type(),
                     expected["identity_type"].as_str().unwrap(),
-                    "FAIL [{}]",
-                    id
+                    "FAIL [{id}]"
                 );
             }
             continue;
@@ -542,8 +517,7 @@ fn conformance_context_serialization() {
             assert_eq!(
                 ctx.trace_id,
                 expected["trace_id"].as_str().unwrap(),
-                "FAIL [{}]",
-                id
+                "FAIL [{id}]"
             );
             continue;
         }
@@ -556,43 +530,36 @@ fn conformance_context_serialization() {
             assert_eq!(
                 serialized["trace_id"].as_str().unwrap(),
                 expected["trace_id"].as_str().unwrap(),
-                "FAIL [{}]",
-                id
+                "FAIL [{id}]"
             );
             assert_eq!(
                 serialized["redacted_inputs"], expected["redacted_inputs"],
-                "FAIL [{}]",
-                id
+                "FAIL [{id}]"
             );
             continue;
         }
 
         assert_eq!(
             serialized["_context_version"], expected["_context_version"],
-            "FAIL [{}] _context_version",
-            id
+            "FAIL [{id}] _context_version"
         );
         assert_eq!(
             serialized["trace_id"], expected["trace_id"],
-            "FAIL [{}] trace_id",
-            id
+            "FAIL [{id}] trace_id"
         );
         assert_eq!(
             serialized["caller_id"], expected["caller_id"],
-            "FAIL [{}] caller_id",
-            id
+            "FAIL [{id}] caller_id"
         );
         assert_eq!(
             serialized["call_chain"], expected["call_chain"],
-            "FAIL [{}] call_chain",
-            id
+            "FAIL [{id}] call_chain"
         );
         assert_eq!(
             serialized["identity"], expected["identity"],
-            "FAIL [{}] identity",
-            id
+            "FAIL [{id}] identity"
         );
-        assert_eq!(serialized["data"], expected["data"], "FAIL [{}] data", id);
+        assert_eq!(serialized["data"], expected["data"], "FAIL [{id}] data");
     }
 }
 
@@ -621,16 +588,14 @@ fn conformance_context_identity_types() {
                 assert_eq!(
                     serialized["identity"]["type"].as_str().unwrap(),
                     expected_type,
-                    "FAIL identity type {}",
-                    expected_type
+                    "FAIL identity type {expected_type}"
                 );
 
                 let restored: Context<Value> = Context::deserialize(serialized).unwrap();
                 assert_eq!(
                     restored.identity.as_ref().unwrap().identity_type(),
                     expected_type,
-                    "FAIL roundtrip identity type {}",
-                    expected_type
+                    "FAIL roundtrip identity type {expected_type}"
                 );
             }
         }
@@ -709,7 +674,11 @@ fn conformance_config_env() {
             .get("env_prefix")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let max_depth = ns.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        #[allow(clippy::cast_possible_truncation)] // max_depth from fixtures is a small integer
+        let max_depth = ns
+            .get("max_depth")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(5) as usize;
 
         let env_map_obj = ns.get("env_map").and_then(|v| v.as_object()).map(|obj| {
             obj.iter()
@@ -779,11 +748,7 @@ fn conformance_config_env() {
             let actual = config.get(path);
             assert!(
                 actual.is_some(),
-                "FAIL [{}]: expected path {:?} to have a value, got None. env_var={}, env_value={}",
-                id,
-                path,
-                env_var,
-                env_value
+                "FAIL [{id}]: expected path {path:?} to have a value, got None. env_var={env_var}, env_value={env_value}"
             );
             let actual_str = match actual.unwrap() {
                 Value::String(s) => s,
@@ -793,8 +758,7 @@ fn conformance_config_env() {
             };
             assert_eq!(
                 actual_str, value,
-                "FAIL [{}]: path {:?} expected {:?}, got {:?}",
-                id, path, value, actual_str
+                "FAIL [{id}]: path {path:?} expected {value:?}, got {actual_str:?}"
             );
         } else {
             // expected_path is null — env var should be ignored.

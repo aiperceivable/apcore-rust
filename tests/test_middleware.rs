@@ -7,6 +7,7 @@ use apcore::middleware::{RetryConfig, RetryMiddleware};
 use apcore::module::Module;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 // -- Test module that fails N times then succeeds --
 
@@ -35,7 +36,7 @@ impl Module for FailNTimesModule {
     fn output_schema(&self) -> Value {
         json!({})
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Fails N times then succeeds"
     }
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
@@ -128,7 +129,7 @@ async fn test_retry_middleware_skips_non_retryable() {
         "test".into(),
         "test".into(),
         vec![],
-        Default::default(),
+        HashMap::default(),
     ));
     let error = ModuleError::new(ErrorCode::ModuleExecuteError, "fail");
     // error.retryable is None (not explicitly retryable)
@@ -152,7 +153,7 @@ async fn test_retry_middleware_retries_retryable_error() {
         "test".into(),
         "test".into(),
         vec![],
-        Default::default(),
+        HashMap::default(),
     ));
     let error = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
 
@@ -191,7 +192,7 @@ async fn test_retry_middleware_resets_on_success() {
         "test".into(),
         "test".into(),
         vec![],
-        Default::default(),
+        HashMap::default(),
     ));
     let error = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
 

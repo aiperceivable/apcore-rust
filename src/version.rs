@@ -87,14 +87,14 @@ pub fn negotiate_version(declared_version: &str, sdk_version: &str) -> Result<St
     let declared = parse_semver(declared_version).ok_or_else(|| {
         ModuleError::new(
             ErrorCode::VersionIncompatible,
-            format!("Invalid declared version: {}", declared_version),
+            format!("Invalid declared version: {declared_version}"),
         )
     })?;
 
     let sdk = parse_semver(sdk_version).ok_or_else(|| {
         ModuleError::new(
             ErrorCode::VersionIncompatible,
-            format!("Invalid SDK version: {}", sdk_version),
+            format!("Invalid SDK version: {sdk_version}"),
         )
     })?;
 
@@ -102,8 +102,7 @@ pub fn negotiate_version(declared_version: &str, sdk_version: &str) -> Result<St
     if declared.major != sdk.major {
         let err = VersionIncompatibleError {
             message: format!(
-                "Major version mismatch: declared {} vs SDK {}",
-                declared_version, sdk_version
+                "Major version mismatch: declared {declared_version} vs SDK {sdk_version}"
             ),
         };
         return Err(err.to_module_error());
@@ -128,4 +127,147 @@ pub fn negotiate_version(declared_version: &str, sdk_version: &str) -> Result<St
     // Same minor -> return max(declared, sdk)
     let effective = std::cmp::max(&declared, &sdk);
     Ok(effective.to_string_repr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_semver_basic() {
+        let v = parse_semver("1.2.3").unwrap();
+        assert_eq!(v.major, 1);
+        assert_eq!(v.minor, 2);
+        assert_eq!(v.patch, 3);
+        assert_eq!(v.prerelease, None);
+    }
+
+    #[test]
+    fn test_parse_semver_with_prerelease() {
+        let v = parse_semver("1.0.0-alpha").unwrap();
+        assert_eq!(v.major, 1);
+        assert_eq!(v.minor, 0);
+        assert_eq!(v.patch, 0);
+        assert_eq!(v.prerelease, Some("alpha".to_string()));
+    }
+
+    #[test]
+    fn test_parse_semver_invalid_too_few_parts() {
+        assert!(parse_semver("1.2").is_none());
+    }
+
+    #[test]
+    fn test_parse_semver_invalid_too_many_parts() {
+        assert!(parse_semver("1.2.3.4").is_none());
+    }
+
+    #[test]
+    fn test_parse_semver_invalid_non_numeric() {
+        assert!(parse_semver("a.b.c").is_none());
+    }
+
+    #[test]
+    fn test_parse_semver_empty_prerelease_rejected() {
+        assert!(parse_semver("1.0.0-").is_none());
+    }
+
+    #[test]
+    fn test_semver_ordering_major() {
+        let v1 = parse_semver("1.0.0").unwrap();
+        let v2 = parse_semver("2.0.0").unwrap();
+        assert!(v1 < v2);
+    }
+
+    #[test]
+    fn test_semver_ordering_minor() {
+        let v1 = parse_semver("1.1.0").unwrap();
+        let v2 = parse_semver("1.2.0").unwrap();
+        assert!(v1 < v2);
+    }
+
+    #[test]
+    fn test_semver_ordering_patch() {
+        let v1 = parse_semver("1.0.1").unwrap();
+        let v2 = parse_semver("1.0.2").unwrap();
+        assert!(v1 < v2);
+    }
+
+    #[test]
+    fn test_semver_prerelease_less_than_release() {
+        let pre = parse_semver("1.0.0-alpha").unwrap();
+        let rel = parse_semver("1.0.0").unwrap();
+        assert!(pre < rel);
+    }
+
+    #[test]
+    fn test_semver_prerelease_lexicographic() {
+        let alpha = parse_semver("1.0.0-alpha").unwrap();
+        let beta = parse_semver("1.0.0-beta").unwrap();
+        assert!(alpha < beta);
+    }
+
+    #[test]
+    fn test_semver_to_string_repr() {
+        let v = parse_semver("1.2.3").unwrap();
+        assert_eq!(v.to_string_repr(), "1.2.3");
+
+        let v_pre = parse_semver("1.2.3-rc1").unwrap();
+        assert_eq!(v_pre.to_string_repr(), "1.2.3-rc1");
+    }
+
+    #[test]
+    fn test_negotiate_same_version() {
+        let result = negotiate_version("1.2.3", "1.2.3").unwrap();
+        assert_eq!(result, "1.2.3");
+    }
+
+    #[test]
+    fn test_negotiate_declared_older_minor() {
+        let result = negotiate_version("1.1.0", "1.3.0").unwrap();
+        assert_eq!(result, "1.1.0");
+    }
+
+    #[test]
+    fn test_negotiate_declared_newer_minor_fails() {
+        let result = negotiate_version("1.5.0", "1.3.0");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::VersionIncompatible);
+    }
+
+    #[test]
+    fn test_negotiate_major_mismatch_fails() {
+        let result = negotiate_version("2.0.0", "1.0.0");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::VersionIncompatible);
+    }
+
+    #[test]
+    fn test_negotiate_same_minor_higher_sdk_patch() {
+        let result = negotiate_version("1.2.0", "1.2.5").unwrap();
+        assert_eq!(result, "1.2.5");
+    }
+
+    #[test]
+    fn test_negotiate_same_minor_higher_declared_patch() {
+        let result = negotiate_version("1.2.5", "1.2.0").unwrap();
+        assert_eq!(result, "1.2.5");
+    }
+
+    #[test]
+    fn test_negotiate_prerelease_vs_release_same_version() {
+        let result = negotiate_version("1.2.0-alpha", "1.2.0").unwrap();
+        assert_eq!(result, "1.2.0");
+    }
+
+    #[test]
+    fn test_negotiate_invalid_declared_version() {
+        let result = negotiate_version("not.a.version", "1.0.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_negotiate_invalid_sdk_version() {
+        let result = negotiate_version("1.0.0", "bad");
+        assert!(result.is_err());
+    }
 }
