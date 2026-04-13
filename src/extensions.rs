@@ -10,48 +10,8 @@ use crate::approval::ApprovalHandler;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::executor::Executor;
 use crate::middleware::base::Middleware;
-use crate::observability::span::{Span, SpanExporter};
+use crate::observability::span::SpanExporter;
 use crate::registry::registry::{Discoverer, ModuleValidator, Registry};
-
-// ---------------------------------------------------------------------------
-// CompositeExporter — delegates span export to multiple underlying exporters
-// ---------------------------------------------------------------------------
-
-/// Delegates span export to multiple underlying exporters.
-///
-/// Kept for parity with Python/TypeScript SDKs. Will be used when
-/// `TracingMiddleware` gains a `set_exporter` method.
-#[allow(dead_code)]
-#[derive(Debug)]
-struct CompositeExporter {
-    exporters: Vec<Box<dyn SpanExporter>>,
-}
-
-impl CompositeExporter {
-    #[allow(dead_code)]
-    fn new(exporters: Vec<Box<dyn SpanExporter>>) -> Self {
-        Self { exporters }
-    }
-}
-
-#[async_trait::async_trait]
-impl SpanExporter for CompositeExporter {
-    async fn export(&self, span: &Span) -> Result<(), ModuleError> {
-        for exp in &self.exporters {
-            if let Err(e) = exp.export(span).await {
-                tracing::warn!("Span exporter {:?} failed: {}", exp, e);
-            }
-        }
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), ModuleError> {
-        for exp in &self.exporters {
-            let _ = exp.shutdown().await;
-        }
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ExtensionPoint — describes a named slot where extensions can be registered
