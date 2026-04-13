@@ -368,6 +368,11 @@ impl APCore {
     /// This calls `system.control.toggle_feature` through the executor,
     /// matching the Python and TypeScript SDK behavior (events, ACL, and
     /// middleware are applied).
+    ///
+    /// **Cross-language note:** Python and TypeScript SDKs accept a `reason`
+    /// string with a default value (e.g. `reason=""` or `reason=None`). In Rust,
+    /// `reason` is `Option<&str>` — pass `None` to use the default message, or
+    /// `Some("my reason")` to provide a custom one.
     pub async fn disable(
         &self,
         module_id: &str,
@@ -392,6 +397,11 @@ impl APCore {
     /// This calls `system.control.toggle_feature` through the executor,
     /// matching the Python and TypeScript SDK behavior (events, ACL, and
     /// middleware are applied).
+    ///
+    /// **Cross-language note:** Python and TypeScript SDKs accept a `reason`
+    /// string with a default value (e.g. `reason=""` or `reason=None`). In Rust,
+    /// `reason` is `Option<&str>` — pass `None` to use the default message, or
+    /// `Some("my reason")` to provide a custom one.
     pub async fn enable(
         &self,
         module_id: &str,
@@ -411,7 +421,7 @@ impl APCore {
             .await
     }
 
-    /// Subscribe to an event type using a closure.
+    /// **Preferred API:** Subscribe to an event type using a closure.
     ///
     /// Convenience wrapper around [`on()`](Self::on) that accepts a plain
     /// function or closure instead of requiring a boxed [`EventSubscriber`].
@@ -420,12 +430,19 @@ impl APCore {
     ///
     /// Returns the auto-generated subscriber ID (a UUID string).
     ///
+    /// **Cross-language note:** Python and TypeScript SDKs register event
+    /// listeners with a plain callback closure and return the subscriber object.
+    /// `on_fn()` is the idiomatic Rust equivalent — it wraps the closure in an
+    /// internal `ClosureSubscriber` and returns the subscriber ID string,
+    /// which can be passed to [`off()`](Self::off) to unsubscribe.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// let id = client.on_fn("apcore.*", |event| {
     ///     println!("Got event: {}", event.event_type);
     /// });
+    /// client.off(&id); // unsubscribe by ID
     /// ```
     pub fn on_fn(
         &mut self,
@@ -439,11 +456,16 @@ impl APCore {
         self.on(event_type, subscriber)
     }
 
-    /// Subscribe to an event type. Returns the subscriber ID.
+    /// Subscribe to an event type using a boxed [`EventSubscriber`]. Returns the subscriber ID.
     ///
     /// The `event_type` is bound to the subscriber so it only receives matching
     /// events (glob patterns like `"apcore.*"` are supported).
     /// Lazily initializes the event emitter on first use.
+    ///
+    /// **Cross-language note:** Python and TypeScript SDKs accept a plain
+    /// callback closure here. In Rust, prefer [`on_fn()`](Self::on_fn) for
+    /// closure-based subscriptions; use `on()` only when you need a custom
+    /// [`EventSubscriber`] implementation.
     pub fn on(&mut self, event_type: &str, subscriber: Box<dyn EventSubscriber>) -> String {
         let wrapped = Box::new(EventTypeSubscriber {
             event_type: event_type.to_string(),
