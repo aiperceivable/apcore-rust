@@ -229,6 +229,35 @@ fn format_prometheus_labels(labels: &BTreeMap<String, String>) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
+/// Compute the minimum number of observations that must be accumulated to
+/// reach the 99th-percentile threshold for a population of `total` items.
+///
+/// This is the shared core used by both [`estimate_p99_from_histogram`] and
+/// [`estimate_p99_from_sorted`].
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+// intentional: realistic metric counts fit in f64; result is non-negative
+fn p99_target_count(total: u64) -> u64 {
+    (total as f64 * 0.99).ceil() as u64
+}
+
+/// Compute the 0-based index into a sorted slice that corresponds to the
+/// 99th-percentile position for a slice of `len` items.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+// intentional: realistic slice lengths fit in f64; result is non-negative
+fn p99_sorted_index(len: usize) -> usize {
+    // ceil(len * 0.99) gives us the 1-based rank; clamp then convert to 0-based
+    let rank = (len as f64 * 0.99).ceil() as usize;
+    rank.min(len).saturating_sub(1)
+}
+
 /// Estimate p99 latency from histogram buckets in a metrics snapshot.
 ///
 /// Expects `buckets` to be a JSON array of `{"le": <f64>, "count": <u64>}` objects
@@ -241,13 +270,7 @@ pub(crate) fn estimate_p99_from_histogram(buckets: &[serde_json::Value], total_c
     if total_count == 0 || buckets.is_empty() {
         return 0.0;
     }
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    // intentional: total_count fits in f64 for realistic metric counts; result is non-negative
-    let target = (total_count as f64 * 0.99).ceil() as u64;
+    let target = p99_target_count(total_count);
     for bucket in buckets {
         let le = bucket
             .get("le")
@@ -271,14 +294,8 @@ pub(crate) fn estimate_p99_from_sorted(sorted_latencies: &[f64]) -> f64 {
     if sorted_latencies.is_empty() {
         return 0.0;
     }
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    // intentional: slice lengths fit in f64 for realistic inputs; result is non-negative
-    let idx = ((sorted_latencies.len() as f64) * 0.99).ceil() as usize;
-    sorted_latencies[idx.min(sorted_latencies.len()) - 1]
+    let idx = p99_sorted_index(sorted_latencies.len());
+    sorted_latencies[idx]
 }
 
 impl Default for MetricsCollector {
@@ -369,5 +386,138 @@ impl Middleware for MetricsMiddleware {
         self.collector.observe_duration(module_id, duration_secs);
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // p99 helper — correctness regression tests for Issue 23 refactor
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn estimate_p99_from_sorted_empty_returns_zero() {
+        assert_eq!(estimate_p99_from_sorted(&[]), 0.0);
+    }
+
+    #[test]
+    fn estimate_p99_from_sorted_single_element() {
+        assert_eq!(estimate_p99_from_sorted(&[42.0]), 42.0);
+    }
+
+    #[test]
+    fn estimate_p99_from_sorted_100_elements() {
+        // 100 elements [1.0, 2.0, ..., 100.0]
+        let data: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let p99 = estimate_p99_from_sorted(&data);
+        // ceil(100 * 0.99) = ceil(99) = 99 → index 98 (0-based) → value 99.0
+        assert_eq!(p99, 99.0);
+    }
+
+    #[test]
+    fn estimate_p99_from_sorted_two_elements() {
+        // ceil(2 * 0.99) = ceil(1.98) = 2 → index 1 → second element
+        let data = vec![10.0, 200.0];
+        let p99 = estimate_p99_from_sorted(&data);
+        assert_eq!(p99, 200.0);
+    }
+
+    #[test]
+    fn estimate_p99_from_histogram_empty_buckets_returns_zero() {
+        assert_eq!(estimate_p99_from_histogram(&[], 100), 0.0);
+    }
+
+    #[test]
+    fn estimate_p99_from_histogram_zero_count_returns_zero() {
+        let buckets = vec![serde_json::json!({"le": 0.1, "count": 50u64})];
+        assert_eq!(estimate_p99_from_histogram(&buckets, 0), 0.0);
+    }
+
+    #[test]
+    fn estimate_p99_from_histogram_finds_correct_bucket() {
+        // 100 total, p99 threshold = ceil(99) = 99.
+        // Bucket le=0.1 has cumulative count 90 (not enough).
+        // Bucket le=0.5 has cumulative count 99 (exactly meets threshold).
+        let buckets = vec![
+            serde_json::json!({"le": 0.1, "count": 90u64}),
+            serde_json::json!({"le": 0.5, "count": 99u64}),
+            serde_json::json!({"le": 1.0, "count": 100u64}),
+        ];
+        // le=0.5 seconds → 500ms
+        assert_eq!(estimate_p99_from_histogram(&buckets, 100), 500.0);
+    }
+
+    #[test]
+    fn estimate_p99_from_histogram_no_bucket_exceeds_threshold_returns_zero() {
+        // If no bucket has enough count (e.g. only partial data), returns 0.0
+        let buckets = vec![
+            serde_json::json!({"le": 0.1, "count": 50u64}),
+        ];
+        // total=100, threshold=99, but bucket only has 50 → no match
+        assert_eq!(estimate_p99_from_histogram(&buckets, 100), 0.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // MetricsCollector — basic construction and increment
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn metrics_collector_new_produces_empty_snapshot() {
+        let collector = MetricsCollector::new();
+        let snapshot = collector.snapshot();
+        let counters = snapshot.get("counters").unwrap();
+        assert!(counters.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn metrics_collector_records_calls_and_snapshot_contains_counter() {
+        let collector = MetricsCollector::new();
+        collector.increment_calls("math.add", "success");
+        collector.increment_calls("math.add", "success");
+        let snapshot = collector.snapshot();
+        let counters = snapshot.get("counters").unwrap().as_object().unwrap();
+        // At least one key should contain "math.add"
+        let found = counters.keys().any(|k| k.contains("math.add"));
+        assert!(found, "snapshot should contain a counter for math.add");
+    }
+
+    #[test]
+    fn metrics_collector_increment_by_known_amount() {
+        let collector = MetricsCollector::new();
+        let mut labels = HashMap::new();
+        labels.insert("module".to_string(), "test".to_string());
+        collector.increment("my_counter", labels.clone(), 3.0);
+        collector.increment("my_counter", labels, 7.0);
+        let snapshot = collector.snapshot();
+        let counters = snapshot.get("counters").unwrap().as_object().unwrap();
+        // Find the counter
+        let val = counters
+            .iter()
+            .find(|(k, _)| k.contains("my_counter"))
+            .map(|(_, v)| v.as_f64().unwrap())
+            .expect("counter should exist");
+        assert!((val - 10.0).abs() < f64::EPSILON, "counter should be 10.0, got {val}");
+    }
+
+    #[test]
+    fn metrics_collector_reset_clears_all_metrics() {
+        let collector = MetricsCollector::new();
+        collector.increment_calls("m", "success");
+        collector.reset();
+        let snapshot = collector.snapshot();
+        assert!(snapshot.get("counters").unwrap().as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn metrics_collector_observe_duration_populates_histogram() {
+        let collector = MetricsCollector::new();
+        collector.observe_duration("m", 0.05); // 50ms — falls in 0.05s bucket
+        collector.observe_duration("m", 0.2);  // 200ms
+        let snapshot = collector.snapshot();
+        let histograms = snapshot.get("histograms").unwrap().as_object().unwrap();
+        let found = histograms.keys().any(|k| k.contains("duration"));
+        assert!(found, "duration histogram should be present");
     }
 }
