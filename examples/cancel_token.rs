@@ -60,7 +60,7 @@ impl Module for SlowModule {
 async fn main() {
     let identity = Identity::new(
         "user-1".to_string(),
-        "Alice".to_string(),
+        "user".to_string(),
         vec![],
         HashMap::new(),
     );

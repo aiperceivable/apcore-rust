@@ -129,7 +129,7 @@ fn get_user_annotations() -> ModuleAnnotations {
 async fn main() {
     let identity = Identity::new(
         "service-account".to_string(),
-        "Data Service".to_string(),
+        "service".to_string(),
         vec!["reader".to_string()],
         HashMap::new(),
     );

@@ -109,7 +109,7 @@ fn send_email_annotations() -> ModuleAnnotations {
 async fn main() {
     let identity = Identity::new(
         "admin-1".to_string(),
-        "Admin".to_string(),
+        "user".to_string(),
         vec!["admin".to_string()],
         HashMap::new(),
     );

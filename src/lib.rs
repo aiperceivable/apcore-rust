@@ -107,8 +107,8 @@ pub use registry::registry::{
     MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
 pub use schema::{
-    ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader, SchemaStrategy,
-    SchemaValidator,
+    to_strict_schema, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader,
+    SchemaStrategy, SchemaValidator,
 };
 pub use sys_modules::control::{ReloadModuleModule, ToggleFeatureModule, UpdateConfigModule};
 pub use sys_modules::health::{HealthModuleModule, HealthSummaryModule};

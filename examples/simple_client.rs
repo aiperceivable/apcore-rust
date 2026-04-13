@@ -94,7 +94,7 @@ async fn main() {
     // Build a caller identity
     let identity = Identity::new(
         "user-1".to_string(),
-        "Alice".to_string(),
+        "user".to_string(),
         vec!["user".to_string()],
         HashMap::new(),
     );

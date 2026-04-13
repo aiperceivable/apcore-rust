@@ -85,7 +85,7 @@ impl Module for GreetModule {
 async fn main() {
     let identity = Identity::new(
         "agent-1".to_string(),
-        "AI Agent".to_string(),
+        "service".to_string(),
         vec!["assistant".to_string()],
         HashMap::new(),
     );

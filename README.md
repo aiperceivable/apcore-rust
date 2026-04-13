@@ -275,7 +275,7 @@ use apcore::acl::{ACL, ACLRule};
 let acl = ACL::new(vec![
     ACLRule { callers: vec!["admin.*".into()], targets: vec!["*".into()], effect: "allow".into(), description: Some("Admins can call anything".into()), conditions: None },
     ACLRule { callers: vec!["*".into()], targets: vec!["admin.*".into()], effect: "deny".into(), description: Some("Others cannot call admin modules".into()), conditions: None },
-], "deny");
+], "deny", None);
 ```
 
 ### YAML bindings
@@ -334,7 +334,7 @@ If you need runtime-configurable annotations (e.g., ops teams toggling `readonly
 construct `ModuleAnnotations` via `serde`:
 
 ```rust
-let yaml: serde_json::Value = serde_yaml::from_reader(file)?;
+let yaml: serde_json::Value = serde_yaml_ng::from_reader(file)?;
 let annotations: ModuleAnnotations = serde_json::from_value(yaml)?;
 let descriptor = ModuleDescriptor { annotations, ..default_descriptor };
 registry.register("my.module", module, descriptor)?;
@@ -550,7 +550,7 @@ fn send_email_examples() -> Vec<ModuleExample> {
         title: "Send a welcome email".to_string(),
         inputs: json!({ "to": "user@example.com", "subject": "Welcome!", "body": "...", "api_key": "sk-xxx" }),
         output: json!({ "status": "sent", "message_id": "msg-12345" }),
-        ..Default::default()
+        description: None,
     }]
 }
 ```

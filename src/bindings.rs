@@ -119,6 +119,58 @@ impl BindingLoader {
         Ok(())
     }
 
+    /// Load all YAML binding files matching a glob pattern from a directory.
+    ///
+    /// Scans `dir` for files whose names match `pattern` (default
+    /// `"*.binding.yaml"`), calls [`load_from_yaml`](Self::load_from_yaml) on
+    /// each match, and returns the total number of bindings loaded.
+    pub fn load_binding_dir(
+        &mut self,
+        dir: &Path,
+        pattern: Option<&str>,
+    ) -> Result<usize, ModuleError> {
+        let pattern = pattern.unwrap_or("*.binding.yaml");
+
+        if !dir.is_dir() {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::BindingFileInvalid,
+                format!(
+                    "Binding directory '{}' does not exist or is not a directory",
+                    dir.display()
+                ),
+            ));
+        }
+
+        // Convert the glob pattern to a simple suffix match.
+        // Patterns like "*.binding.yaml" become a suffix check on ".binding.yaml".
+        let suffix = pattern.strip_prefix('*').unwrap_or(pattern);
+
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| {
+                ModuleError::new(
+                    crate::errors::ErrorCode::BindingFileInvalid,
+                    format!("Failed to read directory '{}': {}", dir.display(), e),
+                )
+            })?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(suffix))
+            })
+            .collect();
+
+        // Sort for deterministic load order (matches Python's sorted(p.glob(…))).
+        entries.sort_by_key(|e| e.file_name());
+
+        let before = self.bindings.len();
+        for entry in entries {
+            self.load_from_yaml(&entry.path())?;
+        }
+        Ok(self.bindings.len() - before)
+    }
+
     /// Resolve a binding by name.
     pub fn resolve(&self, name: &str) -> Result<&BindingDefinition, ModuleError> {
         self.bindings.get(name).ok_or_else(|| {
@@ -354,6 +406,80 @@ mod tests {
         };
         let json = serde_json::to_value(&target).unwrap();
         assert!(json.get("schema_path").is_none());
+    }
+
+    #[test]
+    fn test_load_binding_dir_default_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Matching files
+        let yaml_a = r"
+- name: alpha
+  target:
+    module_name: executor.alpha
+    callable: alpha_fn
+  metadata: {}
+";
+        let yaml_b = r"
+- name: beta
+  target:
+    module_name: executor.beta
+    callable: beta_fn
+  metadata: {}
+";
+        std::fs::write(dir.path().join("a.binding.yaml"), yaml_a).unwrap();
+        std::fs::write(dir.path().join("b.binding.yaml"), yaml_b).unwrap();
+
+        // Non-matching file — should be ignored
+        std::fs::write(dir.path().join("ignored.yaml"), yaml_a).unwrap();
+
+        let mut loader = BindingLoader::new();
+        let count = loader.load_binding_dir(dir.path(), None).unwrap();
+        assert_eq!(count, 2);
+        assert!(loader.resolve("alpha").is_ok());
+        assert!(loader.resolve("beta").is_ok());
+    }
+
+    #[test]
+    fn test_load_binding_dir_custom_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let yaml = r"
+- name: gamma
+  target:
+    module_name: executor.gamma
+    callable: gamma_fn
+  metadata: {}
+";
+        std::fs::write(dir.path().join("gamma.custom.yml"), yaml).unwrap();
+        std::fs::write(dir.path().join("gamma.binding.yaml"), yaml).unwrap();
+
+        let mut loader = BindingLoader::new();
+        let count = loader
+            .load_binding_dir(dir.path(), Some("*.custom.yml"))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(loader.resolve("gamma").is_ok());
+    }
+
+    #[test]
+    fn test_load_binding_dir_nonexistent() {
+        let mut loader = BindingLoader::new();
+        let result = loader.load_binding_dir(Path::new("/no/such/dir"), None);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().code,
+            crate::errors::ErrorCode::BindingFileInvalid
+        );
+    }
+
+    #[test]
+    fn test_load_binding_dir_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loader = BindingLoader::new();
+        let count = loader.load_binding_dir(dir.path(), None).unwrap();
+        assert_eq!(count, 0);
+        assert!(loader.list_bindings().is_empty());
     }
 
     #[test]
