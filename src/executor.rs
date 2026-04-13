@@ -809,20 +809,6 @@ impl Executor {
             .add(Box::new(BoxedAfterMiddlewareAdapter(middleware)))
     }
 
-    /// Register a strategy's info in the global registry for introspection.
-    ///
-    /// Delegates to the module-level [`register_strategy`] function.
-    /// Replaces any existing entry with the same name.
-    pub fn register_strategy(info: StrategyInfo) {
-        register_strategy(info);
-    }
-
-    /// List all registered strategy summaries from the global registry.
-    ///
-    /// Delegates to the module-level [`list_strategies`] function.
-    pub fn list_strategies() -> Vec<StrategyInfo> {
-        list_strategies()
-    }
 }
 
 // These boxed adapters wrap `Box<dyn BeforeMiddleware>` / `Box<dyn AfterMiddleware>`
