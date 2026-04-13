@@ -3,7 +3,7 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::errors::ModuleError;
 
@@ -16,10 +16,10 @@ pub trait ErrorFormatter: Send + Sync {
         -> serde_json::Value;
 }
 
-static FORMATTER_REGISTRY: OnceLock<RwLock<HashMap<String, Box<dyn ErrorFormatter>>>> =
+static FORMATTER_REGISTRY: OnceLock<RwLock<HashMap<String, Arc<dyn ErrorFormatter>>>> =
     OnceLock::new();
 
-fn global_formatters() -> &'static RwLock<HashMap<String, Box<dyn ErrorFormatter>>> {
+fn global_formatters() -> &'static RwLock<HashMap<String, Arc<dyn ErrorFormatter>>> {
     FORMATTER_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -40,8 +40,13 @@ impl ErrorFormatterRegistry {
         if map.contains_key(adapter_name) {
             return Err(ModuleError::error_formatter_duplicate(adapter_name));
         }
-        map.insert(adapter_name.to_string(), formatter);
+        map.insert(adapter_name.to_string(), Arc::from(formatter));
         Ok(())
+    }
+
+    /// Return the formatter registered for `adapter_name`, if any.
+    pub fn get(adapter_name: &str) -> Option<Arc<dyn ErrorFormatter>> {
+        global_formatters().read().get(adapter_name).cloned()
     }
 
     /// Format an error using the formatter registered for `adapter_name`.
@@ -62,6 +67,11 @@ impl ErrorFormatterRegistry {
     /// Returns true if a formatter is registered for `adapter_name`.
     pub fn is_registered(adapter_name: &str) -> bool {
         global_formatters().read().contains_key(adapter_name)
+    }
+
+    /// Returns the list of registered adapter names.
+    pub fn registered_adapters() -> Vec<String> {
+        global_formatters().read().keys().cloned().collect()
     }
 }
 

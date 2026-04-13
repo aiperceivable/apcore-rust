@@ -227,8 +227,10 @@ fn test_schema_loader_with_config_explicit_schemas_dir() {
 #[test]
 fn test_schema_loader_with_config_uses_modules_path_fallback() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.modules_path = Some(dir.path().to_path_buf());
+    let config = Config {
+        modules_path: Some(dir.path().to_path_buf()),
+        ..Default::default()
+    };
     let loader = SchemaLoader::with_config(&config, None);
     assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
 }

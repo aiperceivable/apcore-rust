@@ -346,12 +346,27 @@ mod tests {
         let result_shallow = scan_extensions(tmp.path(), 1, false, None).unwrap();
         let result_deep = scan_extensions(tmp.path(), 2, false, None).unwrap();
 
-        let shallow_ids: Vec<&str> = result_shallow.iter().map(|f| f.canonical_id.as_str()).collect();
-        let deep_ids: Vec<&str> = result_deep.iter().map(|f| f.canonical_id.as_str()).collect();
+        let shallow_ids: Vec<&str> = result_shallow
+            .iter()
+            .map(|f| f.canonical_id.as_str())
+            .collect();
+        let deep_ids: Vec<&str> = result_deep
+            .iter()
+            .map(|f| f.canonical_id.as_str())
+            .collect();
 
-        assert!(shallow_ids.contains(&"shallow"), "shallow.rs should always be found");
-        assert!(!shallow_ids.contains(&"deep.nested"), "deep/nested.rs too deep for max_depth=1");
-        assert!(deep_ids.contains(&"deep.nested"), "deep/nested.rs included when max_depth=2");
+        assert!(
+            shallow_ids.contains(&"shallow"),
+            "shallow.rs should always be found"
+        );
+        assert!(
+            !shallow_ids.contains(&"deep.nested"),
+            "deep/nested.rs too deep for max_depth=1"
+        );
+        assert!(
+            deep_ids.contains(&"deep.nested"),
+            "deep/nested.rs included when max_depth=2"
+        );
     }
 
     #[test]
@@ -361,7 +376,10 @@ mod tests {
         let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
         let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
         assert!(ids.contains(&"visible"), "visible.rs should be found");
-        assert!(!ids.iter().any(|id| id.contains("hidden")), "hidden dir should be skipped");
+        assert!(
+            !ids.iter().any(|id| id.contains("hidden")),
+            "hidden dir should be skipped"
+        );
     }
 
     #[test]
@@ -394,13 +412,19 @@ mod tests {
 
         let roots: Vec<HashMap<String, String>> = vec![
             [
-                ("root".to_string(), tmp1.path().to_string_lossy().into_owned()),
+                (
+                    "root".to_string(),
+                    tmp1.path().to_string_lossy().into_owned(),
+                ),
                 ("namespace".to_string(), "math".to_string()),
             ]
             .into_iter()
             .collect(),
             [
-                ("root".to_string(), tmp2.path().to_string_lossy().into_owned()),
+                (
+                    "root".to_string(),
+                    tmp2.path().to_string_lossy().into_owned(),
+                ),
                 ("namespace".to_string(), "email".to_string()),
             ]
             .into_iter()
@@ -419,13 +443,19 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let roots: Vec<HashMap<String, String>> = vec![
             [
-                ("root".to_string(), tmp.path().to_string_lossy().into_owned()),
+                (
+                    "root".to_string(),
+                    tmp.path().to_string_lossy().into_owned(),
+                ),
                 ("namespace".to_string(), "same".to_string()),
             ]
             .into_iter()
             .collect(),
             [
-                ("root".to_string(), tmp.path().to_string_lossy().into_owned()),
+                (
+                    "root".to_string(),
+                    tmp.path().to_string_lossy().into_owned(),
+                ),
                 ("namespace".to_string(), "same".to_string()),
             ]
             .into_iter()
@@ -437,11 +467,10 @@ mod tests {
 
     #[test]
     fn scan_multi_root_requires_root_key() {
-        let roots: Vec<HashMap<String, String>> = vec![
-            [("namespace".to_string(), "ns".to_string())]
+        let roots: Vec<HashMap<String, String>> =
+            vec![[("namespace".to_string(), "ns".to_string())]
                 .into_iter()
-                .collect(),
-        ];
+                .collect()];
         let result = scan_multi_root(&roots, 5, false, None);
         assert!(result.is_err(), "missing root key should fail");
     }

@@ -73,3 +73,29 @@ fn test_error_formatter_registry_is_registered() {
     ErrorFormatterRegistry::register(adapter.as_str(), Box::new(JsonWrapFormatter)).unwrap();
     assert!(ErrorFormatterRegistry::is_registered(adapter.as_str()));
 }
+
+#[test]
+fn test_error_formatter_registry_get_returns_none_for_unknown() {
+    let result = ErrorFormatterRegistry::get("totally_unknown_adapter_xyz");
+    assert!(
+        result.is_none(),
+        "get() should return None for unregistered adapter"
+    );
+}
+
+#[test]
+fn test_error_formatter_registry_get_returns_formatter() {
+    let adapter = unique_adapter("get_fmt");
+    ErrorFormatterRegistry::register(adapter.as_str(), Box::new(JsonWrapFormatter)).unwrap();
+
+    let formatter = ErrorFormatterRegistry::get(adapter.as_str());
+    assert!(
+        formatter.is_some(),
+        "get() should return Some for registered adapter"
+    );
+
+    let error = ModuleError::new(ErrorCode::GeneralInternalError, "get test");
+    let result = formatter.unwrap().format(&error, None);
+    assert_eq!(result["wrapped"], serde_json::json!(true));
+    assert_eq!(result["message"], serde_json::json!("get test"));
+}

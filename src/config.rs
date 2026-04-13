@@ -1046,7 +1046,9 @@ mod tests {
     #[test]
     fn get_canonical_executor_key() {
         let cfg = Config::default();
-        let depth = cfg.get("executor.max_call_depth").expect("key should exist");
+        let depth = cfg
+            .get("executor.max_call_depth")
+            .expect("key should exist");
         assert_eq!(depth, serde_json::json!(32u64));
     }
 
@@ -1080,7 +1082,10 @@ mod tests {
     #[test]
     fn set_and_get_user_namespace_key() {
         let mut cfg = Config::default();
-        cfg.set("myapp.db.url", serde_json::json!("postgres://localhost/test"));
+        cfg.set(
+            "myapp.db.url",
+            serde_json::json!("postgres://localhost/test"),
+        );
         let val = cfg.get("myapp.db.url").expect("should exist");
         assert_eq!(val.as_str().unwrap(), "postgres://localhost/test");
     }
@@ -1173,7 +1178,10 @@ mod tests {
     #[test]
     fn reload_without_path_returns_error() {
         let mut cfg = Config::default();
-        assert!(cfg.reload().is_err(), "reload without yaml_path should fail");
+        assert!(
+            cfg.reload().is_err(),
+            "reload without yaml_path should fail"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1194,7 +1202,10 @@ mod tests {
         let mut cfg = Config::default();
         let data = serde_json::json!({"key": "value"});
         let result = cfg.mount("_config", MountSource::Dict(data));
-        assert!(result.is_err(), "should reject reserved namespace '_config'");
+        assert!(
+            result.is_err(),
+            "should reject reserved namespace '_config'"
+        );
     }
 
     #[test]

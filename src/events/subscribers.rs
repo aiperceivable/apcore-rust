@@ -19,6 +19,9 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
     ///
     /// Defaults to `"default"`. Override this when multiple subscribers must be
     /// distinguishable by `EventEmitter::unsubscribe_by_id`.
+    // The default returns a literal, but implementors may return non-static strings
+    // (e.g. `&self.id`), so the trait signature must remain `&str`.
+    #[allow(clippy::unnecessary_literal_bound)]
     fn subscriber_id(&self) -> &str {
         "default"
     }
@@ -27,6 +30,7 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
     ///
     /// Defaults to `"*"` (matches all events). Override to filter by prefix or
     /// exact event type (e.g. `"module.*"` or `"module.loaded"`).
+    #[allow(clippy::unnecessary_literal_bound)]
     fn event_pattern(&self) -> &str {
         "*"
     }

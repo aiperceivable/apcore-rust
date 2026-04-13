@@ -399,21 +399,21 @@ mod tests {
 
     #[test]
     fn estimate_p99_from_sorted_empty_returns_zero() {
-        assert_eq!(estimate_p99_from_sorted(&[]), 0.0);
+        assert!((estimate_p99_from_sorted(&[]) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn estimate_p99_from_sorted_single_element() {
-        assert_eq!(estimate_p99_from_sorted(&[42.0]), 42.0);
+        assert!((estimate_p99_from_sorted(&[42.0]) - 42.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn estimate_p99_from_sorted_100_elements() {
         // 100 elements [1.0, 2.0, ..., 100.0]
-        let data: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let data: Vec<f64> = (1..=100).map(f64::from).collect();
         let p99 = estimate_p99_from_sorted(&data);
         // ceil(100 * 0.99) = ceil(99) = 99 → index 98 (0-based) → value 99.0
-        assert_eq!(p99, 99.0);
+        assert!((p99 - 99.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -421,18 +421,18 @@ mod tests {
         // ceil(2 * 0.99) = ceil(1.98) = 2 → index 1 → second element
         let data = vec![10.0, 200.0];
         let p99 = estimate_p99_from_sorted(&data);
-        assert_eq!(p99, 200.0);
+        assert!((p99 - 200.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn estimate_p99_from_histogram_empty_buckets_returns_zero() {
-        assert_eq!(estimate_p99_from_histogram(&[], 100), 0.0);
+        assert!((estimate_p99_from_histogram(&[], 100) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn estimate_p99_from_histogram_zero_count_returns_zero() {
         let buckets = vec![serde_json::json!({"le": 0.1, "count": 50u64})];
-        assert_eq!(estimate_p99_from_histogram(&buckets, 0), 0.0);
+        assert!((estimate_p99_from_histogram(&buckets, 0) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -446,17 +446,15 @@ mod tests {
             serde_json::json!({"le": 1.0, "count": 100u64}),
         ];
         // le=0.5 seconds → 500ms
-        assert_eq!(estimate_p99_from_histogram(&buckets, 100), 500.0);
+        assert!((estimate_p99_from_histogram(&buckets, 100) - 500.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn estimate_p99_from_histogram_no_bucket_exceeds_threshold_returns_zero() {
         // If no bucket has enough count (e.g. only partial data), returns 0.0
-        let buckets = vec![
-            serde_json::json!({"le": 0.1, "count": 50u64}),
-        ];
+        let buckets = vec![serde_json::json!({"le": 0.1, "count": 50u64})];
         // total=100, threshold=99, but bucket only has 50 → no match
-        assert_eq!(estimate_p99_from_histogram(&buckets, 100), 0.0);
+        assert!((estimate_p99_from_histogram(&buckets, 100) - 0.0).abs() < f64::EPSILON);
     }
 
     // -------------------------------------------------------------------------
@@ -498,7 +496,10 @@ mod tests {
             .find(|(k, _)| k.contains("my_counter"))
             .map(|(_, v)| v.as_f64().unwrap())
             .expect("counter should exist");
-        assert!((val - 10.0).abs() < f64::EPSILON, "counter should be 10.0, got {val}");
+        assert!(
+            (val - 10.0).abs() < f64::EPSILON,
+            "counter should be 10.0, got {val}"
+        );
     }
 
     #[test]
@@ -507,14 +508,19 @@ mod tests {
         collector.increment_calls("m", "success");
         collector.reset();
         let snapshot = collector.snapshot();
-        assert!(snapshot.get("counters").unwrap().as_object().unwrap().is_empty());
+        assert!(snapshot
+            .get("counters")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn metrics_collector_observe_duration_populates_histogram() {
         let collector = MetricsCollector::new();
         collector.observe_duration("m", 0.05); // 50ms — falls in 0.05s bucket
-        collector.observe_duration("m", 0.2);  // 200ms
+        collector.observe_duration("m", 0.2); // 200ms
         let snapshot = collector.snapshot();
         let histograms = snapshot.get("histograms").unwrap().as_object().unwrap();
         let found = histograms.keys().any(|k| k.contains("duration"));

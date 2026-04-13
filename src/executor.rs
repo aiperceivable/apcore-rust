@@ -808,7 +808,6 @@ impl Executor {
         self.middleware_manager
             .add(Box::new(BoxedAfterMiddlewareAdapter(middleware)))
     }
-
 }
 
 // These boxed adapters wrap `Box<dyn BeforeMiddleware>` / `Box<dyn AfterMiddleware>`

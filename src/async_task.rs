@@ -396,7 +396,7 @@ mod tests {
     async fn submit_rejected_when_at_capacity() {
         let exec = make_executor();
         let mgr = AsyncTaskManager::new(exec, 4, 2); // max 2 tasks
-        // Spawn 2 tasks to fill the limit
+                                                     // Spawn 2 tasks to fill the limit
         let _ = mgr.submit("a.module", serde_json::json!({}), None);
         let _ = mgr.submit("b.module", serde_json::json!({}), None);
         // Third submit should fail
@@ -408,7 +408,7 @@ mod tests {
     async fn list_tasks_filtered_by_status() {
         let exec = make_executor();
         let mgr = AsyncTaskManager::new(exec, 0, 100); // max_concurrent=0 keeps tasks pending
-        // Submit a task; with 0 concurrency slots it stays Pending until the semaphore opens
+                                                       // Submit a task; with 0 concurrency slots it stays Pending until the semaphore opens
         let _ = mgr.submit("some.module", serde_json::json!({}), None);
         // list_tasks(Some(Pending)) should contain it; other statuses should be empty
         let completed = mgr.list_tasks(Some(TaskStatus::Completed));
@@ -454,7 +454,10 @@ mod tests {
         // Cleanup with very large max_age — nothing should be removed
         let removed = mgr.cleanup(9_999_999.0);
         assert_eq!(removed, 0, "task within max_age should not be removed");
-        assert!(mgr.get_status(&task_id).is_some(), "task should still exist");
+        assert!(
+            mgr.get_status(&task_id).is_some(),
+            "task should still exist"
+        );
     }
 
     #[tokio::test]
@@ -483,7 +486,8 @@ mod tests {
             error: None,
         };
         let json = serde_json::to_string(&info).expect("serialization should succeed");
-        let restored: TaskInfo = serde_json::from_str(&json).expect("deserialization should succeed");
+        let restored: TaskInfo =
+            serde_json::from_str(&json).expect("deserialization should succeed");
         assert_eq!(restored.task_id, "abc");
         assert_eq!(restored.status, TaskStatus::Completed);
         assert_eq!(restored.result, Some(serde_json::json!({"x": 1})));

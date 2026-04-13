@@ -280,7 +280,10 @@ mod tests {
 
     fn simple_eval(conditions: &HashMap<String, Value>, _ctx: &Context<Value>) -> bool {
         // Evaluates "pass: true" condition for testing purposes
-        conditions.get("pass").and_then(Value::as_bool).unwrap_or(false)
+        conditions
+            .get("pass")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     #[tokio::test]

@@ -152,7 +152,7 @@ impl BindingLoader {
                     format!("Failed to read directory '{}': {}", dir.display(), e),
                 )
             })?
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|entry| {
                 entry
                     .file_name()
@@ -162,7 +162,7 @@ impl BindingLoader {
             .collect();
 
         // Sort for deterministic load order (matches Python's sorted(p.glob(…))).
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
 
         let before = self.bindings.len();
         for entry in entries {

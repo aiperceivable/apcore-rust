@@ -469,3 +469,61 @@ fn test_register_internal_rejects_duplicate() {
 fn _use_identity() -> Identity {
     dummy_identity()
 }
+
+#[test]
+fn test_on_returns_unique_handles() {
+    let registry = Registry::new();
+
+    let h1 = registry.on(
+        "register",
+        Box::new(|_: &str, _: &dyn apcore::module::Module| {}),
+    );
+    let h2 = registry.on(
+        "register",
+        Box::new(|_: &str, _: &dyn apcore::module::Module| {}),
+    );
+
+    assert_ne!(h1, h2, "each on() call must return a distinct handle");
+}
+
+#[test]
+fn test_off_removes_callback_by_handle() {
+    use std::sync::{Arc, Mutex};
+    let registry = Registry::new();
+    let counter = Arc::new(Mutex::new(0u32));
+
+    let c = counter.clone();
+    let handle = registry.on(
+        "register",
+        Box::new(move |_: &str, _: &dyn apcore::module::Module| {
+            *c.lock().unwrap() += 1;
+        }),
+    );
+
+    // Register a module to trigger the callback once
+    registry
+        .register_module("math.add", Box::new(StubModule))
+        .unwrap();
+    assert_eq!(*counter.lock().unwrap(), 1, "callback should fire once");
+
+    // Remove the callback
+    let removed = registry.off(handle);
+    assert!(removed, "off() should return true when callback exists");
+
+    // Register another module — callback should NOT fire again
+    registry
+        .register_module("math.sub", Box::new(StubModule))
+        .unwrap();
+    assert_eq!(
+        *counter.lock().unwrap(),
+        1,
+        "callback should not fire after off()"
+    );
+}
+
+#[test]
+fn test_off_returns_false_for_unknown_handle() {
+    let registry = Registry::new();
+    let removed = registry.off(99999);
+    assert!(!removed, "off() with unknown handle should return false");
+}

@@ -6,7 +6,10 @@ use parking_lot::RwLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations, ValidationResult};
@@ -78,6 +81,7 @@ pub trait ModuleValidator: Send + Sync {
 
 /// Type alias for the event callback closure.
 pub type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
+type CallbackMap = HashMap<String, Vec<(u64, Arc<ModuleCallbackFn>)>>;
 
 /// Reserved words that cannot be used as the first segment of a module ID.
 ///
@@ -247,10 +251,12 @@ pub struct Registry {
     core: RwLock<RegistryCore>,
     /// Event callbacks keyed by event name (e.g. "register", "unregister").
     ///
-    /// Callbacks are stored as `Arc` so they can be cloned out of the lock
+    /// Callbacks are stored as `(id, Arc)` so they can be cloned out of the lock
     /// before invocation — holding this lock while calling a callback would
     /// deadlock if the callback tried to register or unregister a module.
-    callbacks: RwLock<HashMap<String, Vec<Arc<ModuleCallbackFn>>>>,
+    callbacks: RwLock<CallbackMap>,
+    /// Monotonically increasing counter for callback handle IDs.
+    callback_counter: AtomicU64,
     /// Drain completion notification — signaled when a draining module reaches zero refs.
     drain_events: RwLock<HashMap<String, Arc<tokio::sync::Notify>>>,
     /// Optional discoverer for module discovery.
@@ -288,7 +294,7 @@ impl std::fmt::Debug for Registry {
                 "validator",
                 &self.validator.read().as_ref().map(|_| "<Validator>"),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -298,6 +304,7 @@ impl Registry {
         Self {
             core: RwLock::new(RegistryCore::new()),
             callbacks: RwLock::new(HashMap::new()),
+            callback_counter: AtomicU64::new(1),
             drain_events: RwLock::new(HashMap::new()),
             discoverer: RwLock::new(None),
             validator: RwLock::new(None),
@@ -310,7 +317,7 @@ impl Registry {
         self.callbacks
             .read()
             .get(event)
-            .cloned()
+            .map(|v| v.iter().map(|(_, cb)| cb.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -712,12 +719,40 @@ impl Registry {
     }
 
     /// Event subscription.
-    pub fn on(&self, event: &str, callback: Box<ModuleCallbackFn>) {
+    /// Register an event callback and return a handle ID for later removal.
+    ///
+    /// Returns a `u64` handle that can be passed to [`off`](Self::off) to
+    /// remove the callback.
+    pub fn on(&self, event: &str, callback: Box<ModuleCallbackFn>) -> u64 {
+        let id = self.callback_counter.fetch_add(1, Ordering::Relaxed);
         self.callbacks
             .write()
             .entry(event.to_string())
             .or_default()
-            .push(Arc::from(callback));
+            .push((id, Arc::from(callback)));
+        id
+    }
+
+    /// Remove a previously registered event callback by handle ID.
+    ///
+    /// Returns `true` if the callback was found and removed, `false` otherwise.
+    pub fn off(&self, handle_id: u64) -> bool {
+        let mut callbacks = self.callbacks.write();
+        for entries in callbacks.values_mut() {
+            if let Some(pos) = entries.iter().position(|(id, _)| *id == handle_id) {
+                entries.remove(pos);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Re-run module discovery and update the registry.
+    ///
+    /// Equivalent to calling [`discover_internal`](Self::discover_internal).
+    /// Returns the number of newly registered modules.
+    pub async fn reload(&self) -> Result<Vec<String>, ModuleError> {
+        self.discover_internal().await
     }
 
     /// Filesystem watching (no-op — filesystem watching is platform-specific).

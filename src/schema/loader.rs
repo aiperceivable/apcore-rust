@@ -55,7 +55,7 @@ impl SchemaLoader {
     /// finally to the current working directory.
     pub fn with_config(config: &Config, schemas_dir: Option<&Path>) -> Self {
         let resolved_dir = schemas_dir
-            .map(|p| p.to_path_buf())
+            .map(std::path::Path::to_path_buf)
             .or_else(|| config.modules_path.clone());
         Self {
             schemas: HashMap::new(),
@@ -98,16 +98,15 @@ impl SchemaLoader {
                 self.load_from_file(module_id, path)?;
                 let value = self.get(module_id).expect("just loaded").clone();
                 return Self::value_to_schema_def(module_id, value);
-            } else {
-                last_err = Some(ModuleError::new(
-                    ErrorCode::SchemaNotFound,
-                    format!(
-                        "Schema file not found for module '{}' (tried {})",
-                        module_id,
-                        path.display()
-                    ),
-                ));
             }
+            last_err = Some(ModuleError::new(
+                ErrorCode::SchemaNotFound,
+                format!(
+                    "Schema file not found for module '{}' (tried {})",
+                    module_id,
+                    path.display()
+                ),
+            ));
         }
 
         Err(last_err.unwrap_or_else(|| {
