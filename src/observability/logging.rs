@@ -10,10 +10,8 @@ use parking_lot::Mutex;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
+use crate::executor::REDACTED_VALUE;
 use crate::middleware::base::Middleware;
-
-/// Redacted placeholder for sensitive values.
-pub const REDACTED: &str = "***REDACTED***";
 
 /// Log level numeric values matching Python reference.
 fn level_value(level: &str) -> u32 {
@@ -136,7 +134,7 @@ impl ContextLogger {
                     for (k, v) in extra_map {
                         if k.starts_with("_secret_") {
                             record
-                                .insert(k.clone(), serde_json::Value::String(REDACTED.to_string()));
+                                .insert(k.clone(), serde_json::Value::String(REDACTED_VALUE.to_string()));
                         } else {
                             record.insert(k.clone(), v.clone());
                         }
