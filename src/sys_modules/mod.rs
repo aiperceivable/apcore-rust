@@ -26,7 +26,7 @@ use crate::observability::metrics::MetricsCollector;
 use crate::observability::usage::{UsageCollector, UsageMiddleware};
 use crate::registry::registry::{ModuleDescriptor, Registry};
 
-pub use control::{ReloadModuleModule, ToggleFeatureModule, UpdateConfigModule};
+pub use control::{ReloadModule, ToggleFeatureModule, UpdateConfigModule};
 
 // ---------------------------------------------------------------------------
 // ToggleState — thread-safe enable/disable tracking
@@ -277,7 +277,7 @@ pub fn register_sys_modules(
         ),
         (
             "system.health.module",
-            Box::new(health::HealthModuleModule::new(
+            Box::new(health::HealthModule::new(
                 Arc::clone(&registry),
                 metrics_collector.clone(),
                 error_history.clone(),
@@ -286,7 +286,7 @@ pub fn register_sys_modules(
         ),
         (
             "system.manifest.module",
-            Box::new(manifest::ManifestModuleModule::new(
+            Box::new(manifest::ManifestModule::new(
                 Arc::clone(&registry),
                 Arc::clone(&config_arc),
             )),
@@ -307,7 +307,7 @@ pub fn register_sys_modules(
         ),
         (
             "system.usage.module",
-            Box::new(usage::UsageModuleModule::new(
+            Box::new(usage::UsageModule::new(
                 Arc::clone(&registry),
                 usage_collector.clone(),
             )),
@@ -345,7 +345,7 @@ pub fn register_sys_modules(
         ));
         modules.push((
             "system.control.reload_module",
-            Box::new(ReloadModuleModule::new(
+            Box::new(ReloadModule::new(
                 Arc::clone(&registry),
                 Arc::clone(&emitter_arc),
             )),

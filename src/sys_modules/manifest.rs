@@ -13,19 +13,19 @@ use crate::module::Module;
 use crate::registry::registry::Registry;
 
 /// system.manifest.module — Full manifest for a single registered module.
-pub struct ManifestModuleModule {
+pub struct ManifestModule {
     registry: Arc<Registry>,
     config: Arc<Mutex<Config>>,
 }
 
-impl ManifestModuleModule {
+impl ManifestModule {
     pub fn new(registry: Arc<Registry>, config: Arc<Mutex<Config>>) -> Self {
         Self { registry, config }
     }
 }
 
 #[async_trait]
-impl Module for ManifestModuleModule {
+impl Module for ManifestModule {
     fn description(&self) -> &'static str {
         "Full manifest for a single registered module"
     }

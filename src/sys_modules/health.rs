@@ -164,13 +164,13 @@ impl Module for HealthSummaryModule {
 }
 
 /// system.health.module — Detailed health for a single module.
-pub struct HealthModuleModule {
+pub struct HealthModule {
     registry: Arc<Registry>,
     metrics: Option<MetricsCollector>,
     error_history: ErrorHistory,
 }
 
-impl HealthModuleModule {
+impl HealthModule {
     pub fn new(
         registry: Arc<Registry>,
         metrics: Option<MetricsCollector>,
@@ -185,7 +185,7 @@ impl HealthModuleModule {
 }
 
 #[async_trait]
-impl Module for HealthModuleModule {
+impl Module for HealthModule {
     fn description(&self) -> &'static str {
         "Detailed health information for a single module"
     }

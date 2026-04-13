@@ -132,7 +132,7 @@ impl Module for UpdateConfigModule {
 }
 
 // ---------------------------------------------------------------------------
-// ReloadModuleModule (F10)
+// ReloadModule (F10)
 // ---------------------------------------------------------------------------
 
 /// Hot-reload a module via safe unregister (F10).
@@ -140,19 +140,19 @@ impl Module for UpdateConfigModule {
 /// Full re-discovery is not supported in Rust (no dynamic loading). The module
 /// is unregistered and callers must re-register manually. The event is always
 /// emitted with new_version == previous_version.
-pub struct ReloadModuleModule {
+pub struct ReloadModule {
     registry: Arc<Registry>,
     emitter: Arc<Mutex<EventEmitter>>,
 }
 
-impl ReloadModuleModule {
+impl ReloadModule {
     pub fn new(registry: Arc<Registry>, emitter: Arc<Mutex<EventEmitter>>) -> Self {
         Self { registry, emitter }
     }
 }
 
 #[async_trait]
-impl Module for ReloadModuleModule {
+impl Module for ReloadModule {
     fn description(&self) -> &'static str {
         "Hot-reload a module by safe unregister (re-registration must be done explicitly in Rust)"
     }

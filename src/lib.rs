@@ -107,13 +107,13 @@ pub use registry::registry::{
     MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
 pub use schema::{
-    to_strict_schema, ExportOptions, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter,
-    SchemaLoader, SchemaStrategy, SchemaValidator,
+    to_strict_schema, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader,
+    SchemaStrategy, SchemaValidator,
 };
-pub use sys_modules::control::{ReloadModuleModule, ToggleFeatureModule, UpdateConfigModule};
-pub use sys_modules::health::{HealthModuleModule, HealthSummaryModule};
-pub use sys_modules::manifest::{ManifestFullModule, ManifestModuleModule};
-pub use sys_modules::usage::{UsageModuleModule, UsageSummaryModule};
+pub use sys_modules::control::{ReloadModule, ToggleFeatureModule, UpdateConfigModule};
+pub use sys_modules::health::{HealthModule, HealthSummaryModule};
+pub use sys_modules::manifest::{ManifestFullModule, ManifestModule};
+pub use sys_modules::usage::{UsageModule, UsageSummaryModule};
 pub use sys_modules::{
     check_module_disabled, is_module_disabled, register_sys_modules, SysModulesContext, ToggleState,
 };

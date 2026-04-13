@@ -82,12 +82,12 @@ impl Module for UsageSummaryModule {
 }
 
 /// system.usage.module — Detailed usage for a single module.
-pub struct UsageModuleModule {
+pub struct UsageModule {
     registry: Arc<Registry>,
     collector: UsageCollector,
 }
 
-impl UsageModuleModule {
+impl UsageModule {
     pub fn new(registry: Arc<Registry>, collector: UsageCollector) -> Self {
         Self {
             registry,
@@ -97,7 +97,7 @@ impl UsageModuleModule {
 }
 
 #[async_trait]
-impl Module for UsageModuleModule {
+impl Module for UsageModule {
     fn description(&self) -> &'static str {
         "Detailed usage for a single module with caller breakdown"
     }
