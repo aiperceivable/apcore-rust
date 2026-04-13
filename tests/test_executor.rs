@@ -314,6 +314,74 @@ async fn test_apcore_list_modules_with_tags() {
     assert!(modules.is_empty());
 }
 
+// Tests for A-001 / A-002 — call_with_trace() and describe_pipeline() on Executor.
+
+#[tokio::test]
+async fn test_call_with_trace_returns_output_and_trace() {
+    use apcore::pipeline::PipelineTrace;
+
+    let client = APCore::new();
+    client.register("math.add", Box::new(AddModule)).unwrap();
+
+    let (output, trace): (serde_json::Value, PipelineTrace) = client
+        .executor()
+        .call_with_trace("math.add", json!({"a": 3, "b": 4}), None, None)
+        .await
+        .unwrap();
+
+    // Output should contain the correct result.
+    assert_eq!(output["result"], 7);
+
+    // Trace must contain at least one recorded step.
+    assert!(
+        !trace.steps.is_empty(),
+        "PipelineTrace should have at least one step; got zero"
+    );
+
+    // Trace should reference the correct module.
+    assert_eq!(trace.module_id, "math.add");
+
+    // Pipeline must have completed successfully.
+    assert!(
+        trace.success,
+        "PipelineTrace.success should be true after a successful call"
+    );
+}
+
+#[tokio::test]
+async fn test_describe_pipeline_returns_strategy_info() {
+    use apcore::pipeline::StrategyInfo;
+
+    let client = APCore::new();
+    let info: StrategyInfo = client.executor().describe_pipeline();
+
+    // The default strategy has a non-empty name.
+    assert!(
+        !info.name.is_empty(),
+        "StrategyInfo.name should not be empty"
+    );
+
+    // There must be at least one step in a non-trivial strategy.
+    assert!(
+        info.step_count > 0,
+        "StrategyInfo.step_count should be > 0; got {}",
+        info.step_count
+    );
+
+    // step_names length must match step_count.
+    assert_eq!(
+        info.step_names.len(),
+        info.step_count,
+        "step_names.len() should equal step_count"
+    );
+
+    // Description should be non-empty.
+    assert!(
+        !info.description.is_empty(),
+        "StrategyInfo.description should not be empty"
+    );
+}
+
 // Regression for sync finding A-002 — Executor.validate() must accept an
 // optional context parameter per PROTOCOL_SPEC §12.2 line 6405. Aligns Rust
 // signature with apcore-python and apcore-typescript.

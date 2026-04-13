@@ -7,7 +7,7 @@ pub mod resolver;
 pub mod strict;
 pub mod validator;
 
-pub use exporter::{ExportProfile, SchemaExporter};
+pub use exporter::{ExportOptions, ExportProfile, SchemaExporter};
 pub use loader::{SchemaLoader, SchemaStrategy};
 pub use resolver::RefResolver;
 pub use strict::to_strict_schema;

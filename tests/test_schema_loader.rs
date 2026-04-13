@@ -1,6 +1,7 @@
 //! Tests for SchemaLoader — loading schemas from files and inline values.
 
 use apcore::schema::{SchemaLoader, SchemaStrategy};
+use apcore::Config;
 use serde_json::json;
 use std::io::Write;
 
@@ -201,4 +202,102 @@ fn test_schema_strategy_equality() {
     assert_eq!(SchemaStrategy::YamlFirst, SchemaStrategy::YamlFirst);
     assert_ne!(SchemaStrategy::YamlFirst, SchemaStrategy::NativeFirst);
     assert_ne!(SchemaStrategy::NativeFirst, SchemaStrategy::YamlOnly);
+}
+
+// ---------------------------------------------------------------------------
+// with_config (spec-compatible constructor)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_with_config_defaults_yaml_first() {
+    let config = Config::default();
+    let loader = SchemaLoader::with_config(&config, None);
+    assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
+    assert!(loader.list().is_empty());
+}
+
+#[test]
+fn test_schema_loader_with_config_explicit_schemas_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
+}
+
+#[test]
+fn test_schema_loader_with_config_uses_modules_path_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.modules_path = Some(dir.path().to_path_buf());
+    let loader = SchemaLoader::with_config(&config, None);
+    assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
+}
+
+// ---------------------------------------------------------------------------
+// load() — spec-compatible method
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_loader_load_from_json_file_via_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("my_module.json");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        r#"{{"module_id":"my_module","description":"A module","input_schema":{{"type":"object"}},"output_schema":{{"type":"object"}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    let config = Config::default();
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let def = loader.load("my_module").unwrap();
+    assert_eq!(def.module_id, "my_module");
+    assert_eq!(def.description, "A module");
+    assert_eq!(def.input_schema["type"], "object");
+}
+
+#[test]
+fn test_schema_loader_load_from_value_via_load() {
+    let mut loader = SchemaLoader::new();
+    let schema = json!({
+        "module_id": "my_mod",
+        "description": "desc",
+        "input_schema": { "type": "string" },
+        "output_schema": { "type": "string" }
+    });
+    loader.load_from_value("my_mod", schema).unwrap();
+    let def = loader.load("my_mod").unwrap();
+    assert_eq!(def.module_id, "my_mod");
+    assert_eq!(def.input_schema["type"], "string");
+}
+
+#[test]
+fn test_schema_loader_load_missing_module_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let result = loader.load("nonexistent_module");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaNotFound);
+}
+
+#[test]
+fn test_schema_loader_load_yaml_file_via_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("email_module.yaml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        "module_id: email_module\ndescription: Send email\ninput_schema:\n  type: object\noutput_schema:\n  type: object\n"
+    )
+    .unwrap();
+    drop(file);
+
+    let config = Config::default();
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let def = loader.load("email_module").unwrap();
+    assert_eq!(def.module_id, "email_module");
+    assert_eq!(def.description, "Send email");
 }

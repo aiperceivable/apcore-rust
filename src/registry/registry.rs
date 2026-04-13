@@ -47,13 +47,33 @@ pub struct DiscoveredModule {
 #[async_trait]
 pub trait Discoverer: Send + Sync {
     /// Discover available modules.
-    async fn discover(&self) -> Result<Vec<DiscoveredModule>, ModuleError>;
+    ///
+    /// `roots` is a list of filesystem paths (or logical namespaces) to search.
+    /// Implementations that perform filesystem discovery SHOULD restrict their
+    /// search to the provided roots. Passing an empty slice means "use the
+    /// implementation's default search paths."
+    ///
+    /// Aligned with `apcore-python.Discoverer.discover(roots)` and
+    /// `apcore-typescript.Discoverer.discover(roots)`.
+    async fn discover(&self, roots: &[String]) -> Result<Vec<DiscoveredModule>, ModuleError>;
 }
 
 /// Trait for validating module implementations.
 pub trait ModuleValidator: Send + Sync {
     /// Validate a module against the protocol contract.
-    fn validate(&self, module: &dyn Module, descriptor: &ModuleDescriptor) -> ValidationResult;
+    ///
+    /// `descriptor` is optional — pass `Some(&descriptor)` when a full
+    /// `ModuleDescriptor` is available, or `None` for schema-free validation.
+    /// Returning a non-empty `ValidationResult.errors` causes `register()` to
+    /// reject the module.
+    ///
+    /// Aligned with `apcore-python.ModuleValidator.validate(module)` and
+    /// `apcore-typescript.ModuleValidator.validate(module)`.
+    fn validate(
+        &self,
+        module: &dyn Module,
+        descriptor: Option<&ModuleDescriptor>,
+    ) -> ValidationResult;
 }
 
 /// Type alias for the event callback closure.
@@ -294,7 +314,14 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Register a module with the given name.
+    /// Register a module with an explicit `ModuleDescriptor`.
+    ///
+    /// This is the **extended** registration form. Use it when you need to
+    /// supply a pre-built descriptor (e.g. loaded from a config file or
+    /// discovered from an external source). For the **spec-compliant** form
+    /// (`register(module_id, module)` — two arguments, descriptor
+    /// auto-generated from the module's schema methods), use
+    /// [`register_module`](Self::register_module) instead.
     ///
     /// Validation order (PROTOCOL_SPEC §2.7, aligned with apcore-python /
     /// apcore-typescript): empty → pattern → length → reserved (per-segment)
@@ -310,7 +337,7 @@ impl Registry {
         // Run validation callbacks if a validator is set (do NOT hold the
         // core lock while calling user-supplied code).
         if let Some(validator) = self.validator.read().as_ref() {
-            let result = validator.validate(module.as_ref(), &descriptor);
+            let result = validator.validate(module.as_ref(), Some(&descriptor));
             if !result.valid {
                 return Err(ModuleError::new(
                     crate::errors::ErrorCode::ModuleLoadError,
@@ -356,7 +383,17 @@ impl Registry {
         Ok(())
     }
 
-    /// Register a module with auto-generated descriptor.
+    /// Register a module — **spec-compliant two-argument form**.
+    ///
+    /// Equivalent to `register(module_id, module)` in the Python and
+    /// TypeScript SDKs. The `ModuleDescriptor` is auto-generated from the
+    /// module's `input_schema()` / `output_schema()` / annotations.
+    ///
+    /// Aligned with `apcore-python.Registry.register(module_id, module)` and
+    /// `apcore-typescript.Registry.register(moduleId, module)`.
+    ///
+    /// When you need a custom descriptor, use
+    /// [`register`](Self::register) (the three-argument extended form).
     pub fn register_module(&self, name: &str, module: Box<dyn Module>) -> Result<(), ModuleError> {
         let descriptor = ModuleDescriptor {
             name: name.to_string(),
@@ -467,7 +504,7 @@ impl Registry {
     /// Discover and register modules from a discoverer.
     #[allow(clippy::similar_names)] // `discoverer` (param) and `discovered` (result) are semantically distinct
     pub async fn discover(&self, discoverer: &dyn Discoverer) -> Result<Vec<String>, ModuleError> {
-        let discovered = discoverer.discover().await?;
+        let discovered = discoverer.discover(&[]).await?;
         let mut registered_names = Vec::new();
 
         {
@@ -726,7 +763,7 @@ impl Registry {
             ));
         };
 
-        let discover_result = active_discoverer.discover().await;
+        let discover_result = active_discoverer.discover(&[] as &[String]).await;
         // Put the discoverer back, but only if no concurrent `set_discoverer`
         // swapped a new one in during the await. Otherwise the new one wins.
         {

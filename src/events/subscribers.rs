@@ -16,10 +16,20 @@ use crate::errors::{ErrorCode, ModuleError};
 #[async_trait]
 pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
     /// Unique ID for this subscriber (used by unsubscribe).
-    fn subscriber_id(&self) -> &str;
+    ///
+    /// Defaults to `"default"`. Override this when multiple subscribers must be
+    /// distinguishable by `EventEmitter::unsubscribe_by_id`.
+    fn subscriber_id(&self) -> &str {
+        "default"
+    }
 
     /// The event type pattern this subscriber is interested in.
-    fn event_pattern(&self) -> &str;
+    ///
+    /// Defaults to `"*"` (matches all events). Override to filter by prefix or
+    /// exact event type (e.g. `"module.*"` or `"module.loaded"`).
+    fn event_pattern(&self) -> &str {
+        "*"
+    }
 
     /// Handle an incoming event.
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError>;

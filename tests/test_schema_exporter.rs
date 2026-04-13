@@ -1,7 +1,7 @@
 //! Tests for SchemaExporter — exporting schemas to MCP, OpenAI, Anthropic, and Generic formats.
 #![allow(clippy::similar_names)] // `exporter`/`exported` and `schema`/`schemas` are intentionally distinct
 
-use apcore::schema::{ExportProfile, SchemaExporter, SchemaLoader};
+use apcore::schema::{ExportOptions, ExportProfile, SchemaExporter, SchemaLoader};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -29,10 +29,9 @@ fn sample_schema() -> serde_json::Value {
 #[test]
 fn test_schema_exporter_mcp_format() {
     let exporter = SchemaExporter::new();
-    let exported = exporter
-        .export(&sample_schema(), ExportProfile::Mcp)
+    let parsed = exporter
+        .export(&sample_schema(), ExportProfile::Mcp, None)
         .unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(parsed["name"], "get_weather");
     assert!(parsed["inputSchema"].is_object());
     assert_eq!(parsed["inputSchema"]["required"][0], "location");
@@ -44,8 +43,7 @@ fn test_schema_exporter_mcp_format() {
 fn test_schema_exporter_mcp_missing_name() {
     let exporter = SchemaExporter::new();
     let schema = json!({ "input_schema": { "type": "object" } });
-    let exported = exporter.export(&schema, ExportProfile::Mcp).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter.export(&schema, ExportProfile::Mcp, None).unwrap();
     assert!(parsed["name"].is_null());
 }
 
@@ -56,8 +54,7 @@ fn test_schema_exporter_mcp_fallback_input_schema_key() {
         "name": "tool",
         "inputSchema": { "type": "string" }
     });
-    let exported = exporter.export(&schema, ExportProfile::Mcp).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter.export(&schema, ExportProfile::Mcp, None).unwrap();
     assert_eq!(parsed["inputSchema"]["type"], "string");
 }
 
@@ -65,8 +62,7 @@ fn test_schema_exporter_mcp_fallback_input_schema_key() {
 fn test_schema_exporter_mcp_no_input_schema_defaults_empty_object() {
     let exporter = SchemaExporter::new();
     let schema = json!({ "name": "tool" });
-    let exported = exporter.export(&schema, ExportProfile::Mcp).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter.export(&schema, ExportProfile::Mcp, None).unwrap();
     assert_eq!(parsed["inputSchema"], json!({}));
 }
 
@@ -77,10 +73,9 @@ fn test_schema_exporter_mcp_no_input_schema_defaults_empty_object() {
 #[test]
 fn test_schema_exporter_openai_format() {
     let exporter = SchemaExporter::new();
-    let exported = exporter
-        .export(&sample_schema(), ExportProfile::OpenAi)
+    let parsed = exporter
+        .export(&sample_schema(), ExportProfile::OpenAi, None)
         .unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(parsed["type"], "function");
     assert_eq!(parsed["function"]["name"], "get_weather");
     assert_eq!(
@@ -95,8 +90,9 @@ fn test_schema_exporter_openai_format() {
 fn test_schema_exporter_openai_missing_description_defaults_empty() {
     let exporter = SchemaExporter::new();
     let schema = json!({ "name": "tool", "input_schema": {} });
-    let exported = exporter.export(&schema, ExportProfile::OpenAi).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter
+        .export(&schema, ExportProfile::OpenAi, None)
+        .unwrap();
     assert_eq!(parsed["function"]["description"], "");
 }
 
@@ -107,8 +103,9 @@ fn test_schema_exporter_openai_uses_parameters_key_fallback() {
         "name": "tool",
         "parameters": { "type": "object", "properties": { "x": { "type": "integer" } } }
     });
-    let exported = exporter.export(&schema, ExportProfile::OpenAi).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter
+        .export(&schema, ExportProfile::OpenAi, None)
+        .unwrap();
     assert_eq!(
         parsed["function"]["parameters"]["properties"]["x"]["type"],
         "integer"
@@ -122,10 +119,9 @@ fn test_schema_exporter_openai_uses_parameters_key_fallback() {
 #[test]
 fn test_schema_exporter_anthropic_format() {
     let exporter = SchemaExporter::new();
-    let exported = exporter
-        .export(&sample_schema(), ExportProfile::Anthropic)
+    let parsed = exporter
+        .export(&sample_schema(), ExportProfile::Anthropic, None)
         .unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(parsed["name"], "get_weather");
     assert_eq!(
         parsed["description"],
@@ -141,8 +137,9 @@ fn test_schema_exporter_anthropic_format() {
 fn test_schema_exporter_anthropic_missing_fields_use_defaults() {
     let exporter = SchemaExporter::new();
     let schema = json!({});
-    let exported = exporter.export(&schema, ExportProfile::Anthropic).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter
+        .export(&schema, ExportProfile::Anthropic, None)
+        .unwrap();
     assert!(parsed["name"].is_null());
     assert_eq!(parsed["description"], "");
     assert_eq!(parsed["input_schema"], json!({}));
@@ -156,8 +153,9 @@ fn test_schema_exporter_anthropic_missing_fields_use_defaults() {
 fn test_schema_exporter_generic_returns_schema_as_is() {
     let exporter = SchemaExporter::new();
     let schema = sample_schema();
-    let exported = exporter.export(&schema, ExportProfile::Generic).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter
+        .export(&schema, ExportProfile::Generic, None)
+        .unwrap();
     assert_eq!(parsed, schema);
 }
 
@@ -165,14 +163,15 @@ fn test_schema_exporter_generic_returns_schema_as_is() {
 fn test_schema_exporter_generic_preserves_arbitrary_fields() {
     let exporter = SchemaExporter::new();
     let schema = json!({ "custom_field": 42, "nested": { "a": true } });
-    let exported = exporter.export(&schema, ExportProfile::Generic).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    let parsed = exporter
+        .export(&schema, ExportProfile::Generic, None)
+        .unwrap();
     assert_eq!(parsed["custom_field"], 42);
     assert_eq!(parsed["nested"]["a"], true);
 }
 
 // ---------------------------------------------------------------------------
-// export_all
+// export_all — now returns HashMap<String, Value>
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -209,10 +208,9 @@ fn test_schema_exporter_export_all_multiple_schemas() {
     assert!(result.contains_key("tool_a"));
     assert!(result.contains_key("tool_b"));
 
-    // Verify each exported schema is valid JSON
-    for exported_str in result.values() {
-        let parsed: serde_json::Value = serde_json::from_str(exported_str).unwrap();
-        assert!(parsed.get("name").is_some());
+    // Verify each exported schema is a JSON object with a name field
+    for exported_value in result.values() {
+        assert!(exported_value.get("name").is_some());
     }
 }
 
@@ -235,23 +233,68 @@ fn test_export_profile_equality() {
 #[test]
 fn test_schema_exporter_default() {
     let exporter = SchemaExporter;
-    let exported = exporter
-        .export(&json!({"name": "x"}), ExportProfile::Generic)
+    let parsed = exporter
+        .export(&json!({"name": "x"}), ExportProfile::Generic, None)
         .unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(parsed["name"], "x");
 }
 
 // ---------------------------------------------------------------------------
-// Output is pretty-printed JSON
+// export_serialized — pretty-printed JSON string (legacy behaviour)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_schema_exporter_output_is_pretty_printed() {
     let exporter = SchemaExporter::new();
     let exported = exporter
-        .export(&json!({"name": "test"}), ExportProfile::Generic)
+        .export_serialized(&json!({"name": "test"}), ExportProfile::Generic, None)
         .unwrap();
     // Pretty-printed JSON contains newlines
     assert!(exported.contains('\n'));
+}
+
+// ---------------------------------------------------------------------------
+// ExportOptions — optional parameters (spec-compatible)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_exporter_export_with_name_override() {
+    let exporter = SchemaExporter::new();
+    let schema = json!({ "name": "original", "input_schema": {} });
+    let opts = ExportOptions {
+        name: Some("overridden".to_string()),
+        ..Default::default()
+    };
+    let parsed = exporter
+        .export(&schema, ExportProfile::Generic, Some(&opts))
+        .unwrap();
+    assert_eq!(parsed["name"], "overridden");
+}
+
+#[test]
+fn test_schema_exporter_export_with_examples() {
+    let exporter = SchemaExporter::new();
+    let schema = json!({ "name": "tool", "input_schema": {} });
+    let opts = ExportOptions {
+        examples: Some(json!([{"location": "London"}])),
+        ..Default::default()
+    };
+    let parsed = exporter
+        .export(&schema, ExportProfile::Generic, Some(&opts))
+        .unwrap();
+    assert_eq!(parsed["examples"][0]["location"], "London");
+}
+
+#[test]
+fn test_schema_exporter_export_with_annotations() {
+    let exporter = SchemaExporter::new();
+    let schema = json!({ "name": "tool", "input_schema": {} });
+    let opts = ExportOptions {
+        annotations: Some(json!({ "x-custom": "value" })),
+        ..Default::default()
+    };
+    let parsed = exporter
+        .export(&schema, ExportProfile::Generic, Some(&opts))
+        .unwrap();
+    assert_eq!(parsed["x-custom"], "value");
 }
