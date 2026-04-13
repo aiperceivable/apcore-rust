@@ -288,3 +288,161 @@ pub fn scan_multi_root<S: std::hash::BuildHasher>(
 
     Ok(all_results)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Create a temporary directory tree for scanning tests.
+    fn make_test_dir(base: &std::path::Path, files: &[&str]) {
+        for file in files {
+            let path = base.join(file);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, b"// test module").unwrap();
+        }
+    }
+
+    #[test]
+    fn scan_nonexistent_root_returns_error() {
+        let path = std::path::Path::new("/tmp/apcore_test_nonexistent_xyz_abc");
+        let result = scan_extensions(path, 5, false, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("not found") || msg.contains("No such file"));
+    }
+
+    #[test]
+    fn scan_empty_directory_returns_no_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_returns_rs_files_with_canonical_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        make_test_dir(tmp.path(), &["email/send.rs", "math/add.rs"]);
+
+        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
+
+        assert!(ids.contains(&"email.send"), "email/send.rs → email.send");
+        assert!(ids.contains(&"math.add"), "math/add.rs → math.add");
+    }
+
+    #[test]
+    fn scan_respects_max_depth() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // depth-1 file
+        make_test_dir(tmp.path(), &["shallow.rs"]);
+        // depth-2 file (nested)
+        make_test_dir(tmp.path(), &["deep/nested.rs"]);
+
+        // max_depth=1 — only the top level file; subdirectory is allowed at depth 1
+        // but files inside it are at depth 2 and should be included when max_depth=2
+        let result_shallow = scan_extensions(tmp.path(), 1, false, None).unwrap();
+        let result_deep = scan_extensions(tmp.path(), 2, false, None).unwrap();
+
+        let shallow_ids: Vec<&str> = result_shallow.iter().map(|f| f.canonical_id.as_str()).collect();
+        let deep_ids: Vec<&str> = result_deep.iter().map(|f| f.canonical_id.as_str()).collect();
+
+        assert!(shallow_ids.contains(&"shallow"), "shallow.rs should always be found");
+        assert!(!shallow_ids.contains(&"deep.nested"), "deep/nested.rs too deep for max_depth=1");
+        assert!(deep_ids.contains(&"deep.nested"), "deep/nested.rs included when max_depth=2");
+    }
+
+    #[test]
+    fn scan_skips_hidden_files_and_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        make_test_dir(tmp.path(), &[".hidden/module.rs", "visible.rs"]);
+        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
+        assert!(ids.contains(&"visible"), "visible.rs should be found");
+        assert!(!ids.iter().any(|id| id.contains("hidden")), "hidden dir should be skipped");
+    }
+
+    #[test]
+    fn scan_skips_underscore_prefixed_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        make_test_dir(tmp.path(), &["_private.rs", "public.rs"]);
+        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
+        assert!(ids.contains(&"public"), "public.rs should be found");
+        assert!(!ids.contains(&"_private"), "_private.rs should be skipped");
+    }
+
+    #[test]
+    fn scan_custom_extension_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        make_test_dir(tmp.path(), &["module.py", "module.rs"]);
+        let result = scan_extensions(tmp.path(), 5, false, Some(&[".py"])).unwrap();
+        let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
+        assert!(ids.contains(&"module"), "module.py should match .py filter");
+        // When filtering for .py, .rs files should NOT appear
+        assert_eq!(result.len(), 1, "only one file should match");
+    }
+
+    #[test]
+    fn scan_multi_root_prefixes_with_namespace() {
+        let tmp1 = tempfile::tempdir().expect("tempdir 1");
+        let tmp2 = tempfile::tempdir().expect("tempdir 2");
+        make_test_dir(tmp1.path(), &["add.rs"]);
+        make_test_dir(tmp2.path(), &["send.rs"]);
+
+        let roots: Vec<HashMap<String, String>> = vec![
+            [
+                ("root".to_string(), tmp1.path().to_string_lossy().into_owned()),
+                ("namespace".to_string(), "math".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            [
+                ("root".to_string(), tmp2.path().to_string_lossy().into_owned()),
+                ("namespace".to_string(), "email".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ];
+
+        let result = scan_multi_root(&roots, 5, false, None).unwrap();
+        let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
+
+        assert!(ids.contains(&"math.add"), "math namespace should prefix");
+        assert!(ids.contains(&"email.send"), "email namespace should prefix");
+    }
+
+    #[test]
+    fn scan_multi_root_rejects_duplicate_namespaces() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let roots: Vec<HashMap<String, String>> = vec![
+            [
+                ("root".to_string(), tmp.path().to_string_lossy().into_owned()),
+                ("namespace".to_string(), "same".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            [
+                ("root".to_string(), tmp.path().to_string_lossy().into_owned()),
+                ("namespace".to_string(), "same".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ];
+        let result = scan_multi_root(&roots, 5, false, None);
+        assert!(result.is_err(), "duplicate namespace should fail");
+    }
+
+    #[test]
+    fn scan_multi_root_requires_root_key() {
+        let roots: Vec<HashMap<String, String>> = vec![
+            [("namespace".to_string(), "ns".to_string())]
+                .into_iter()
+                .collect(),
+        ];
+        let result = scan_multi_root(&roots, 5, false, None);
+        assert!(result.is_err(), "missing root key should fail");
+    }
+}

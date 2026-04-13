@@ -269,6 +269,11 @@ impl AsyncTaskManager {
         count
     }
 
+    /// Maximum number of currently tracked tasks (all states).
+    pub fn task_count(&self) -> usize {
+        self.tasks.lock().len()
+    }
+
     /// Internal coroutine that executes a module under the concurrency semaphore.
     async fn run_task(
         task_id: String,
@@ -330,5 +335,157 @@ impl AsyncTaskManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::Executor;
+    use crate::registry::registry::Registry;
+    use std::sync::Arc;
+
+    fn make_executor() -> Arc<Executor> {
+        let registry = Arc::new(Registry::default());
+        let config = Arc::new(crate::config::Config::default());
+        Arc::new(Executor::new(registry, config))
+    }
+
+    #[test]
+    fn new_creates_empty_task_list() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 4, 100);
+        assert_eq!(mgr.task_count(), 0);
+        assert!(mgr.list_tasks(None).is_empty());
+    }
+
+    #[test]
+    fn get_status_returns_none_for_unknown_task() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 4, 100);
+        assert!(mgr.get_status("nonexistent-task-id").is_none());
+    }
+
+    #[test]
+    fn get_result_errors_for_unknown_task() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 4, 100);
+        assert!(mgr.get_result("nonexistent-task-id").is_err());
+    }
+
+    #[test]
+    fn cancel_returns_false_for_unknown_task() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 4, 100);
+        assert!(!mgr.cancel("nonexistent-task-id"));
+    }
+
+    #[tokio::test]
+    async fn submit_returns_task_id_and_records_pending() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 4, 100);
+        let task_id = mgr
+            .submit("some.module", serde_json::json!({}), None)
+            .expect("submit should succeed");
+        assert!(!task_id.is_empty());
+        // Task should be tracked (may have transitioned to Running/Failed by now)
+        assert!(mgr.get_status(&task_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_rejected_when_at_capacity() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 4, 2); // max 2 tasks
+        // Spawn 2 tasks to fill the limit
+        let _ = mgr.submit("a.module", serde_json::json!({}), None);
+        let _ = mgr.submit("b.module", serde_json::json!({}), None);
+        // Third submit should fail
+        let result = mgr.submit("c.module", serde_json::json!({}), None);
+        assert!(result.is_err(), "Should reject when task limit is reached");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filtered_by_status() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 0, 100); // max_concurrent=0 keeps tasks pending
+        // Submit a task; with 0 concurrency slots it stays Pending until the semaphore opens
+        let _ = mgr.submit("some.module", serde_json::json!({}), None);
+        // list_tasks(Some(Pending)) should contain it; other statuses should be empty
+        let completed = mgr.list_tasks(Some(TaskStatus::Completed));
+        let cancelled = mgr.list_tasks(Some(TaskStatus::Cancelled));
+        // The task was submitted; it may be Pending or Running depending on scheduling,
+        // but it should NOT be Completed or Cancelled yet
+        assert!(completed.is_empty(), "no completed tasks yet");
+        assert!(cancelled.is_empty(), "no cancelled tasks yet");
+    }
+
+    #[tokio::test]
+    async fn cancel_changes_status_to_cancelled() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(Arc::clone(&exec), 0, 100); // 0 concurrency — tasks stay Pending
+        let task_id = mgr
+            .submit("some.module", serde_json::json!({}), None)
+            .unwrap();
+        let cancelled = mgr.cancel(&task_id);
+        assert!(cancelled, "cancel should return true for a Pending task");
+        let info = mgr.get_status(&task_id).expect("task should still exist");
+        assert_eq!(info.status, TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_terminal_tasks_past_max_age() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 0, 100);
+        let task_id = mgr.submit("m", serde_json::json!({}), None).unwrap();
+        // Cancel it so it reaches a terminal state
+        mgr.cancel(&task_id);
+        // Cleanup with max_age = -1 (everything is "old enough")
+        let removed = mgr.cleanup(-1.0);
+        assert_eq!(removed, 1, "one terminal task should be removed");
+        assert!(mgr.get_status(&task_id).is_none(), "task should be gone");
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_tasks_within_max_age() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 0, 100);
+        let task_id = mgr.submit("m", serde_json::json!({}), None).unwrap();
+        mgr.cancel(&task_id);
+        // Cleanup with very large max_age — nothing should be removed
+        let removed = mgr.cleanup(9_999_999.0);
+        assert_eq!(removed, 0, "task within max_age should not be removed");
+        assert!(mgr.get_status(&task_id).is_some(), "task should still exist");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_all_pending_tasks() {
+        let exec = make_executor();
+        let mgr = AsyncTaskManager::new(exec, 0, 100); // 0 concurrency keeps tasks Pending
+        let id1 = mgr.submit("m1", serde_json::json!({}), None).unwrap();
+        let id2 = mgr.submit("m2", serde_json::json!({}), None).unwrap();
+        mgr.shutdown();
+        let s1 = mgr.get_status(&id1).unwrap().status;
+        let s2 = mgr.get_status(&id2).unwrap().status;
+        assert_eq!(s1, TaskStatus::Cancelled);
+        assert_eq!(s2, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn task_info_serializes_and_deserializes() {
+        let info = TaskInfo {
+            task_id: "abc".to_string(),
+            module_id: "m.foo".to_string(),
+            status: TaskStatus::Completed,
+            submitted_at: 1_000_000.0,
+            started_at: Some(1_000_001.0),
+            completed_at: Some(1_000_002.0),
+            result: Some(serde_json::json!({"x": 1})),
+            error: None,
+        };
+        let json = serde_json::to_string(&info).expect("serialization should succeed");
+        let restored: TaskInfo = serde_json::from_str(&json).expect("deserialization should succeed");
+        assert_eq!(restored.task_id, "abc");
+        assert_eq!(restored.status, TaskStatus::Completed);
+        assert_eq!(restored.result, Some(serde_json::json!({"x": 1})));
     }
 }

@@ -150,3 +150,207 @@ pub fn register_builtin_handlers(evaluate_fn: EvalFn) {
     register_condition("$or", Arc::new(OrHandler::new(evaluate_fn)));
     register_condition("$not", Arc::new(NotHandler::new(evaluate_fn)));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{Context, Identity};
+
+    fn make_ctx(identity_type: &str, roles: Vec<&str>, call_depth: usize) -> Context<Value> {
+        let identity = Identity::new(
+            "test-id".to_string(),
+            identity_type.to_string(),
+            roles.into_iter().map(String::from).collect(),
+            HashMap::new(),
+        );
+        let mut ctx = Context::new(identity);
+        for i in 0..call_depth {
+            ctx.call_chain.push(format!("module.{i}"));
+        }
+        ctx
+    }
+
+    fn anon_ctx() -> Context<Value> {
+        Context::<Value>::anonymous()
+    }
+
+    // -------------------------------------------------------------------------
+    // IdentityTypesHandler
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn identity_types_matches_correct_type() {
+        let handler = IdentityTypesHandler;
+        let ctx = make_ctx("user", vec![], 0);
+        let value = serde_json::json!(["user", "service"]);
+        assert!(handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn identity_types_rejects_wrong_type() {
+        let handler = IdentityTypesHandler;
+        let ctx = make_ctx("agent", vec![], 0);
+        let value = serde_json::json!(["user", "service"]);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn identity_types_rejects_non_array_value() {
+        let handler = IdentityTypesHandler;
+        let ctx = make_ctx("user", vec![], 0);
+        let value = serde_json::json!("user"); // not an array
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn identity_types_rejects_no_identity() {
+        let handler = IdentityTypesHandler;
+        let ctx = anon_ctx();
+        let value = serde_json::json!(["user"]);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    // -------------------------------------------------------------------------
+    // RolesHandler
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn roles_matches_overlapping_role() {
+        let handler = RolesHandler;
+        let ctx = make_ctx("user", vec!["admin", "viewer"], 0);
+        let value = serde_json::json!(["admin"]);
+        assert!(handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn roles_rejects_no_overlap() {
+        let handler = RolesHandler;
+        let ctx = make_ctx("user", vec!["viewer"], 0);
+        let value = serde_json::json!(["admin"]);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn roles_rejects_no_identity() {
+        let handler = RolesHandler;
+        let ctx = anon_ctx();
+        let value = serde_json::json!(["admin"]);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    // -------------------------------------------------------------------------
+    // MaxCallDepthHandler
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn max_call_depth_allows_under_limit() {
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 3);
+        let value = serde_json::json!(5u64);
+        assert!(handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn max_call_depth_allows_at_limit() {
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 5);
+        let value = serde_json::json!(5u64);
+        assert!(handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn max_call_depth_rejects_over_limit() {
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 6);
+        let value = serde_json::json!(5u64);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn max_call_depth_rejects_non_numeric_value() {
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 0);
+        let value = serde_json::json!("five"); // not a number
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    // -------------------------------------------------------------------------
+    // OrHandler
+    // -------------------------------------------------------------------------
+
+    fn simple_eval(conditions: &HashMap<String, Value>, _ctx: &Context<Value>) -> bool {
+        // Evaluates "pass: true" condition for testing purposes
+        conditions.get("pass").and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn or_handler_true_if_any_sub_passes() {
+        let handler = OrHandler::new(simple_eval);
+        let ctx = anon_ctx();
+        let value = serde_json::json!([
+            {"pass": false},
+            {"pass": true},
+        ]);
+        assert!(handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn or_handler_false_if_none_pass() {
+        let handler = OrHandler::new(simple_eval);
+        let ctx = anon_ctx();
+        let value = serde_json::json!([
+            {"pass": false},
+            {"pass": false},
+        ]);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn or_handler_rejects_non_array_value() {
+        let handler = OrHandler::new(simple_eval);
+        let ctx = anon_ctx();
+        let value = serde_json::json!({"pass": true}); // not an array
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    // -------------------------------------------------------------------------
+    // NotHandler
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn not_handler_inverts_passing_condition() {
+        let handler = NotHandler::new(simple_eval);
+        let ctx = anon_ctx();
+        let value = serde_json::json!({"pass": true});
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn not_handler_inverts_failing_condition() {
+        let handler = NotHandler::new(simple_eval);
+        let ctx = anon_ctx();
+        let value = serde_json::json!({"pass": false});
+        assert!(handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn not_handler_rejects_non_object_value() {
+        let handler = NotHandler::new(simple_eval);
+        let ctx = anon_ctx();
+        let value = serde_json::json!([{"pass": true}]); // not an object
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    // -------------------------------------------------------------------------
+    // register_condition
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn register_condition_stores_and_overwrites() {
+        register_condition("_test_handler", Arc::new(MaxCallDepthHandler));
+        // Overwrite — should not panic
+        register_condition("_test_handler", Arc::new(MaxCallDepthHandler));
+        let map = CONDITION_HANDLERS.read();
+        assert!(map.contains_key("_test_handler"));
+    }
+}
