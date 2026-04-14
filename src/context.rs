@@ -36,7 +36,7 @@ impl From<IdentityRaw> for Identity {
 
 /// Frozen/immutable identity representing the caller.
 /// Fields are private to enforce immutability after construction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "IdentityRaw")]
 #[allow(clippy::struct_field_names)] // `identity_type` intentionally prefixed for clarity with renamed JSON field
 pub struct Identity {
@@ -81,6 +81,25 @@ impl Identity {
     /// Additional attributes associated with this identity.
     pub fn attrs(&self) -> &HashMap<String, serde_json::Value> {
         &self.attrs
+    }
+}
+
+// Manual Hash impl: serde_json::Value doesn't implement Hash, so we sort
+// attrs by key and hash each value's canonical JSON string representation.
+// This is consistent with the derived PartialEq/Eq (order-independent HashMap
+// equality), because sorting by key always produces the same ordered sequence
+// for any two maps that compare equal.
+impl std::hash::Hash for Identity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.identity_type.hash(state);
+        self.roles.hash(state);
+        let mut pairs: Vec<_> = self.attrs.iter().collect();
+        pairs.sort_by_key(|(k, _)| k.as_str());
+        for (k, v) in pairs {
+            k.hash(state);
+            v.to_string().hash(state);
+        }
     }
 }
 
