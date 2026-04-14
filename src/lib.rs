@@ -55,7 +55,7 @@ pub use builtin_steps::{
     BuiltinMiddlewareAfter, BuiltinMiddlewareBefore, BuiltinModuleLookup, BuiltinOutputValidation,
     BuiltinReturnResult,
 };
-pub use cancel::CancelToken;
+pub use cancel::{CancelToken, ExecutionCancelledError};
 pub use client::APCore;
 pub use config::{
     Config, ConfigMode, EnvStyle, ExecutorConfig, MetricsConfig, MountSource, NamespaceInfo,

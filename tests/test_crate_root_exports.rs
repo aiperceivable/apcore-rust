@@ -160,6 +160,21 @@ fn test_other_required_exports_at_crate_root() {
 }
 
 #[test]
+fn test_execution_cancelled_error_at_crate_root() {
+    // D1-003: ExecutionCancelledError must be accessible from the crate root,
+    // matching apcore-python's ExecutionCancelledError(Exception) class.
+    use apcore::ExecutionCancelledError;
+    let err = ExecutionCancelledError {
+        module_id: "executor.email.send_email".to_string(),
+        message: "Cancelled by user request".to_string(),
+    };
+    assert_eq!(err.module_id, "executor.email.send_email");
+    // Verify Display (thiserror) is implemented.
+    let display = format!("{err}");
+    assert!(!display.is_empty());
+}
+
+#[test]
 fn test_event_subscriber_types_at_crate_root() {
     // D1-001/D1-002: EventSubscriber trait and concrete subscriber types must be
     // accessible from the crate root without navigating internal module paths.

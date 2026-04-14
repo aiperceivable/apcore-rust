@@ -4,6 +4,20 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Error raised when an execution is cancelled mid-flight.
+///
+/// Mirrors `apcore-python.ExecutionCancelledError(Exception)` and carries the
+/// same two fields: `module_id` (the module that was running) and `message`
+/// (a human-readable cancellation reason).
+#[derive(Debug, thiserror::Error)]
+#[error("ExecutionCancelledError: module '{module_id}' — {message}")]
+pub struct ExecutionCancelledError {
+    /// ID of the module whose execution was cancelled.
+    pub module_id: String,
+    /// Human-readable reason or description for the cancellation.
+    pub message: String,
+}
+
 /// Token used to signal cancellation to a running execution.
 #[derive(Debug, Clone)]
 pub struct CancelToken {
