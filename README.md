@@ -483,29 +483,22 @@ async fn main() {
 
 ---
 
-### `get_user` — Readonly module with `ModuleAnnotations` and `ModuleExample`
+### `get_user` — Readonly module with `ModuleAnnotations`
 
-Demonstrates behavioral annotations (`readonly`, `idempotent`), `ModuleExample` for AI-perceivable documentation, and looking up records by ID.
+Demonstrates behavioral annotations (`readonly`, `idempotent`, `cacheable`), typed input/output schemas, and looking up records by ID.
 
 ```rust
-use apcore::module::{Module, ModuleAnnotations, ModuleExample};
+use apcore::module::{Module, ModuleAnnotations};
 // ...
 
 fn get_user_annotations() -> ModuleAnnotations {
     ModuleAnnotations {
         readonly: true,
         idempotent: true,
+        cacheable: true,
+        cache_ttl: 60,
         ..Default::default()
     }
-}
-
-fn get_user_examples() -> Vec<ModuleExample> {
-    vec![ModuleExample {
-        title: "Look up Alice".to_string(),
-        description: Some("Returns Alice's profile".to_string()),
-        inputs: json!({"user_id": "user-1"}),
-        output: json!({"id": "user-1", "name": "Alice", "email": "alice@example.com"}),
-    }]
 }
 ```
 
