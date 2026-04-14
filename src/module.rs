@@ -20,18 +20,6 @@ use crate::errors::ModuleError;
 /// executor can drive it across `.await` points without lifetime issues.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<serde_json::Value, ModuleError>> + Send>>;
 
-/// Convert a pre-computed vector of chunks into a `ChunkStream`.
-///
-/// Useful when a module produces all of its chunks up-front but still wants to
-/// conform to the streaming trait shape.
-pub fn chunks_to_stream(chunks: Vec<Result<serde_json::Value, ModuleError>>) -> ChunkStream {
-    Box::pin(async_stream::stream! {
-        for chunk in chunks {
-            yield chunk;
-        }
-    })
-}
-
 /// Core trait that all APCore modules must implement.
 #[async_trait]
 pub trait Module: Send + Sync {

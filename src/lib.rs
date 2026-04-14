@@ -87,8 +87,8 @@ pub use middleware::{
     PlatformNotifyMiddleware, RetryConfig, RetryMiddleware,
 };
 pub use module::{
-    chunks_to_stream, ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult,
-    PreflightResult, ValidationResult, DEFAULT_ANNOTATIONS,
+    ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult, PreflightResult,
+    ValidationResult, DEFAULT_ANNOTATIONS,
 };
 pub use observability::error_history::{ErrorEntry, ErrorHistory, ErrorHistoryMiddleware};
 pub use observability::exporters::{InMemoryExporter, OTLPExporter, StdoutExporter};
