@@ -110,6 +110,7 @@ pub use registry::registry::{
     module_id_pattern, registry_events, Registry, RegistryEvents, MAX_MODULE_ID_LENGTH,
     MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
+pub use registry::{detect_id_conflicts, ConflictResult, ConflictSeverity, ConflictType};
 pub use schema::{
     to_strict_schema, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader,
     SchemaStrategy, SchemaValidator,

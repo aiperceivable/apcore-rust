@@ -3,13 +3,37 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// Category of a detected module ID conflict.
+///
+/// Mirrors `apcore-python.ConflictType` and `apcore-typescript.ConflictType`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictType {
+    /// The exact ID is already registered.
+    DuplicateId,
+    /// One or more ID segments match a reserved word.
+    ReservedWord,
+    /// The ID differs only in case from an existing ID.
+    CaseCollision,
+}
+
+/// Severity level of a detected module ID conflict.
+///
+/// Mirrors `apcore-python.ConflictSeverity` and `apcore-typescript.ConflictSeverity`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictSeverity {
+    /// The conflict is a hard error — registration must be rejected.
+    Error,
+    /// The conflict is a warning — registration is allowed but discouraged.
+    Warning,
+}
+
 /// Result of an ID conflict check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictResult {
-    /// One of: "duplicate_id", "reserved_word", "case_collision".
-    pub conflict_type: String,
-    /// "error" or "warning".
-    pub severity: String,
+    /// The category of conflict that was detected.
+    pub conflict_type: ConflictType,
+    /// How severe the conflict is.
+    pub severity: ConflictSeverity,
     /// Human-readable conflict description.
     pub message: String,
 }
@@ -38,8 +62,8 @@ pub fn detect_id_conflicts(
     // Step 1: Exact duplicate
     if existing_ids.contains(new_id) {
         return Some(ConflictResult {
-            conflict_type: "duplicate_id".to_string(),
-            severity: "error".to_string(),
+            conflict_type: ConflictType::DuplicateId,
+            severity: ConflictSeverity::Error,
             message: format!("Module ID '{new_id}' is already registered"),
         });
     }
@@ -48,8 +72,8 @@ pub fn detect_id_conflicts(
     for segment in new_id.split('.') {
         if reserved_words.contains(&segment) {
             return Some(ConflictResult {
-                conflict_type: "reserved_word".to_string(),
-                severity: "error".to_string(),
+                conflict_type: ConflictType::ReservedWord,
+                severity: ConflictSeverity::Error,
                 message: format!("Module ID '{new_id}' contains reserved word '{segment}'"),
             });
         }
@@ -61,8 +85,8 @@ pub fn detect_id_conflicts(
         if let Some(existing) = lc_map.get(&normalized_new) {
             if existing != new_id {
                 return Some(ConflictResult {
-                    conflict_type: "case_collision".to_string(),
-                    severity: "warning".to_string(),
+                    conflict_type: ConflictType::CaseCollision,
+                    severity: ConflictSeverity::Warning,
                     message: format!(
                         "Module ID '{new_id}' has a case collision with existing '{existing}'"
                     ),
@@ -73,8 +97,8 @@ pub fn detect_id_conflicts(
         for existing_id in existing_ids {
             if existing_id.to_lowercase() == normalized_new && existing_id != new_id {
                 return Some(ConflictResult {
-                    conflict_type: "case_collision".to_string(),
-                    severity: "warning".to_string(),
+                    conflict_type: ConflictType::CaseCollision,
+                    severity: ConflictSeverity::Warning,
                     message: format!(
                         "Module ID '{new_id}' has a case collision with existing '{existing_id}'"
                     ),
@@ -101,8 +125,8 @@ mod tests {
     fn test_duplicate_id() {
         let existing: HashSet<String> = ["foo.bar".to_string()].into_iter().collect();
         let result = detect_id_conflicts("foo.bar", &existing, &[], None).unwrap();
-        assert_eq!(result.conflict_type, "duplicate_id");
-        assert_eq!(result.severity, "error");
+        assert_eq!(result.conflict_type, ConflictType::DuplicateId);
+        assert_eq!(result.severity, ConflictSeverity::Error);
     }
 
     #[test]
@@ -110,16 +134,16 @@ mod tests {
         let existing: HashSet<String> = HashSet::new();
         let reserved = &["system", "internal"];
         let result = detect_id_conflicts("system.foo", &existing, reserved, None).unwrap();
-        assert_eq!(result.conflict_type, "reserved_word");
-        assert_eq!(result.severity, "error");
+        assert_eq!(result.conflict_type, ConflictType::ReservedWord);
+        assert_eq!(result.severity, ConflictSeverity::Error);
     }
 
     #[test]
     fn test_case_collision_without_map() {
         let existing: HashSet<String> = ["Foo.Bar".to_string()].into_iter().collect();
         let result = detect_id_conflicts("foo.bar", &existing, &[], None).unwrap();
-        assert_eq!(result.conflict_type, "case_collision");
-        assert_eq!(result.severity, "warning");
+        assert_eq!(result.conflict_type, ConflictType::CaseCollision);
+        assert_eq!(result.severity, ConflictSeverity::Warning);
     }
 
     #[test]
@@ -128,6 +152,6 @@ mod tests {
         let mut lc_map = HashMap::new();
         lc_map.insert("foo.bar".to_string(), "Foo.Bar".to_string());
         let result = detect_id_conflicts("foo.bar", &existing, &[], Some(&lc_map)).unwrap();
-        assert_eq!(result.conflict_type, "case_collision");
+        assert_eq!(result.conflict_type, ConflictType::CaseCollision);
     }
 }

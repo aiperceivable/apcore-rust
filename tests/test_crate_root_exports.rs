@@ -160,6 +160,28 @@ fn test_other_required_exports_at_crate_root() {
 }
 
 #[test]
+fn test_detect_id_conflicts_at_crate_root() {
+    // D1-004: detect_id_conflicts, ConflictResult, ConflictType, ConflictSeverity
+    // must be accessible from the crate root, matching apcore-python's
+    // detect_id_conflicts function and ConflictResult/ConflictType/ConflictSeverity.
+    use apcore::{detect_id_conflicts, ConflictResult, ConflictSeverity, ConflictType};
+    use std::collections::HashSet;
+
+    let existing: HashSet<String> = ["foo.bar".to_string()].into_iter().collect();
+
+    // Duplicate ID -> Some(ConflictResult)
+    let result: Option<ConflictResult> = detect_id_conflicts("foo.bar", &existing, &[], None);
+    assert!(result.is_some());
+    let conflict = result.unwrap();
+    // ConflictType and ConflictSeverity should be usable as enum values.
+    let _: ConflictType = conflict.conflict_type;
+    let _: ConflictSeverity = conflict.severity;
+
+    // No conflict
+    assert!(detect_id_conflicts("baz.qux", &existing, &[], None).is_none());
+}
+
+#[test]
 fn test_execution_cancelled_error_at_crate_root() {
     // D1-003: ExecutionCancelledError must be accessible from the crate root,
     // matching apcore-python's ExecutionCancelledError(Exception) class.

@@ -13,7 +13,7 @@ pub mod types;
 pub mod validation;
 pub mod version;
 
-pub use conflicts::detect_id_conflicts;
+pub use conflicts::{detect_id_conflicts, ConflictResult, ConflictSeverity, ConflictType};
 pub use dependencies::resolve_dependencies;
 pub use entry_point::{infer_struct_name, resolve_entry_point_name, snake_to_pascal};
 pub use metadata::{load_id_map, load_metadata, merge_module_metadata, parse_dependencies};
