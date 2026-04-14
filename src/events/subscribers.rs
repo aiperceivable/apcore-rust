@@ -258,6 +258,9 @@ type SubscriberFactory =
     Box<dyn Fn(&serde_json::Value) -> Result<Box<dyn EventSubscriber>, ModuleError> + Send + Sync>;
 
 /// Register the webhook + a2a factories with the full config-honoring logic.
+// ModuleError is a protocol-level domain type whose rich field set is spec-required;
+// boxing individual fields would break ergonomics across the entire codebase.
+#[allow(clippy::result_large_err)]
 fn register_builtin_factories(map: &mut HashMap<String, SubscriberFactory>) {
     // Built-in: webhook
     map.insert(

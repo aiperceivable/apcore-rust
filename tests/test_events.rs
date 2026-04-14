@@ -393,6 +393,9 @@ fn test_a2a_subscriber_defaults() {
 // Subscriber factory tests — single sequential test to avoid global state races
 // ---------------------------------------------------------------------------
 
+// ModuleError is a protocol-level domain type whose rich field set is spec-required;
+// boxing individual fields would break ergonomics across the entire codebase.
+#[allow(clippy::result_large_err)]
 #[test]
 fn test_subscriber_factory_operations() {
     reset_subscriber_registry();
