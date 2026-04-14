@@ -848,6 +848,16 @@ impl Registry {
         ids
     }
 
+    /// Return a snapshot of all registered (module_id, module) pairs.
+    pub fn entries(&self) -> Vec<(String, Arc<dyn Module>)> {
+        self.core
+            .read()
+            .modules
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect()
+    }
+
     /// Export the combined input/output schema for a module.
     ///
     /// Returns a cloned schema JSON, or `None` if the module is not registered.

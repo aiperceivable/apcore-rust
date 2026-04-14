@@ -755,6 +755,20 @@ impl Executor {
         self.strategy.info()
     }
 
+    /// Register a strategy's info in the global registry for introspection.
+    ///
+    /// Delegates to the module-level [`register_strategy`] function.
+    pub fn register_strategy(info: StrategyInfo) {
+        register_strategy(info);
+    }
+
+    /// List all registered strategy summaries.
+    ///
+    /// Delegates to the module-level [`list_strategies`] function.
+    pub fn list_strategies() -> Vec<StrategyInfo> {
+        list_strategies()
+    }
+
     /// Execute a module through the pipeline engine, returning both the output
     /// and a full execution trace.
     ///
