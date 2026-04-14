@@ -177,10 +177,9 @@ impl SpanExporter for OTLPExporter {
 #[async_trait]
 impl SpanExporter for OTLPExporter {
     async fn export(&self, _span: &Span) -> Result<(), ModuleError> {
-        Err(ModuleError::new(
-            crate::errors::ErrorCode::GeneralInternalError,
-            "OTLPExporter requires the 'events' feature",
-        ))
+        // Without the `events` feature, export is a silent no-op.
+        // No network call is made; spans are discarded.
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), ModuleError> {
