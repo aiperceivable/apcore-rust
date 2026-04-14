@@ -294,7 +294,7 @@ impl APCore {
     /// is configured on the registry.
     pub async fn discover(&self) -> Result<usize, ModuleError> {
         match self.registry.discover_internal().await {
-            Ok(names) => Ok(names.len()),
+            Ok(count) => Ok(count),
             Err(e) if e.code == crate::errors::ErrorCode::ModuleLoadError => {
                 // No discoverer configured — not an error, just nothing to discover.
                 Ok(0)

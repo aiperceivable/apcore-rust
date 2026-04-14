@@ -509,10 +509,13 @@ impl Registry {
     }
 
     /// Discover and register modules from a discoverer.
+    ///
+    /// Returns the number of newly registered modules, matching the
+    /// protocol spec's `Registry.discover() -> int` contract.
     #[allow(clippy::similar_names)] // `discoverer` (param) and `discovered` (result) are semantically distinct
-    pub async fn discover(&self, discoverer: &dyn Discoverer) -> Result<Vec<String>, ModuleError> {
+    pub async fn discover(&self, discoverer: &dyn Discoverer) -> Result<usize, ModuleError> {
         let discovered = discoverer.discover(&[]).await?;
-        let mut registered_names = Vec::new();
+        let count = discovered.len();
 
         {
             let mut core = self.core.write();
@@ -520,11 +523,10 @@ impl Registry {
                 core.descriptors.insert(dm.name.clone(), dm.descriptor);
                 core.lowercase_map
                     .insert(dm.name.to_lowercase(), dm.name.clone());
-                registered_names.push(dm.name);
             }
         }
 
-        Ok(registered_names)
+        Ok(count)
     }
 
     /// Register a sys/internal module that bypasses **only** the reserved
@@ -751,7 +753,7 @@ impl Registry {
     ///
     /// Equivalent to calling [`discover_internal`](Self::discover_internal).
     /// Returns the number of newly registered modules.
-    pub async fn reload(&self) -> Result<Vec<String>, ModuleError> {
+    pub async fn reload(&self) -> Result<usize, ModuleError> {
         self.discover_internal().await
     }
 
@@ -769,7 +771,9 @@ impl Registry {
     }
 
     /// Discover modules using the internally-set discoverer.
-    pub async fn discover_internal(&self) -> Result<Vec<String>, ModuleError> {
+    ///
+    /// Returns the number of newly registered modules.
+    pub async fn discover_internal(&self) -> Result<usize, ModuleError> {
         // Run discovery outside of any lock, but we need to briefly check
         // that a discoverer is set. We can't hold the discoverer lock across
         // `.await`, so we invoke it through a short-lived critical section
@@ -809,18 +813,17 @@ impl Registry {
         }
 
         let discovered = discover_result?;
-        let mut registered_names = Vec::new();
+        let count = discovered.len();
         {
             let mut core = self.core.write();
             for dm in discovered {
                 core.descriptors.insert(dm.name.clone(), dm.descriptor);
                 core.lowercase_map
                     .insert(dm.name.to_lowercase(), dm.name.clone());
-                registered_names.push(dm.name);
             }
         }
 
-        Ok(registered_names)
+        Ok(count)
     }
 
     /// Set the discoverer.
