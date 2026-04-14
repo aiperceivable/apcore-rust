@@ -1,12 +1,14 @@
 // APCore Protocol — ID conflict detection (Algorithm A03)
 // Spec reference: Module ID conflict checks — duplicate, reserved, case collision
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Category of a detected module ID conflict.
 ///
 /// Mirrors `apcore-python.ConflictType` and `apcore-typescript.ConflictType`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConflictType {
     /// The exact ID is already registered.
     DuplicateId,
@@ -19,7 +21,8 @@ pub enum ConflictType {
 /// Severity level of a detected module ID conflict.
 ///
 /// Mirrors `apcore-python.ConflictSeverity` and `apcore-typescript.ConflictSeverity`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConflictSeverity {
     /// The conflict is a hard error — registration must be rejected.
     Error,
@@ -28,7 +31,7 @@ pub enum ConflictSeverity {
 }
 
 /// Result of an ID conflict check.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictResult {
     /// The category of conflict that was detected.
     pub conflict_type: ConflictType,

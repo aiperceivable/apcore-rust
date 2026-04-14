@@ -13,6 +13,7 @@ use crate::errors::{ErrorCode, ModuleError};
 
 /// Configuration mode detected from YAML content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum ConfigMode {
     #[default]
     Legacy,

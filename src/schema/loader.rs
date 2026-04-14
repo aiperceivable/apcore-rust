@@ -1,6 +1,7 @@
 // APCore Protocol — Schema loader
 // Spec reference: Loading schemas from files and inline definitions
 
+use serde::{Deserialize, Serialize};
 use serde_yaml_ng as serde_yaml;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +11,8 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::schema::SchemaDefinition;
 
 /// Strategy for loading schemas when both YAML and native definitions exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SchemaStrategy {
     /// Prefer YAML schema files over native code definitions.
     YamlFirst,
