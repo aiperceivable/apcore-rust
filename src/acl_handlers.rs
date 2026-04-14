@@ -22,6 +22,9 @@ pub static CONDITION_HANDLERS: LazyLock<RwLock<HashMap<String, Arc<dyn ACLCondit
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Register a condition handler globally. Replaces any existing handler for the same key.
+///
+/// See also [`ACL::register_condition`](crate::ACL::register_condition) for the convenience
+/// static method on the ACL type, which delegates here.
 pub fn register_condition(key: impl Into<String>, handler: Arc<dyn ACLConditionHandler>) {
     let mut map = CONDITION_HANDLERS.write();
     map.insert(key.into(), handler);

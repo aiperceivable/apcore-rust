@@ -270,6 +270,14 @@ impl ACL {
         Ok(acl)
     }
 
+    /// Register a custom condition handler. Delegates to `acl_handlers::register_condition`.
+    pub fn register_condition(
+        key: impl Into<String>,
+        handler: std::sync::Arc<dyn crate::acl_handlers::ACLConditionHandler>,
+    ) {
+        crate::acl_handlers::register_condition(key, handler);
+    }
+
     /// Reload rules from the stored YAML path.
     pub fn reload(&mut self) -> Result<(), ModuleError> {
         let path = self.yaml_path.clone().ok_or_else(|| {
