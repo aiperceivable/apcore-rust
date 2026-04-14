@@ -3,13 +3,13 @@
 
 pub mod exporter;
 pub mod loader;
-pub mod resolver;
+pub mod ref_resolver;
 pub mod strict;
 pub mod validator;
 
 pub use exporter::{ExportOptions, ExportProfile, SchemaExporter};
 pub use loader::{SchemaLoader, SchemaStrategy};
-pub use resolver::RefResolver;
+pub use ref_resolver::RefResolver;
 pub use strict::to_strict_schema;
 pub use validator::SchemaValidator;
 
