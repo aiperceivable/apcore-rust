@@ -74,6 +74,10 @@ pub use errors::{
     FRAMEWORK_ERROR_CODE_PREFIXES,
 };
 pub use events::emitter::{ApCoreEvent, EventEmitter};
+pub use events::subscribers::{
+    register_subscriber_type, reset_subscriber_registry, unregister_subscriber_type, A2ASubscriber,
+    EventSubscriber, WebhookSubscriber,
+};
 pub use executor::{
     list_strategies, redact_sensitive, register_strategy, Executor, REDACTED_VALUE,
 };

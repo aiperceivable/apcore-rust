@@ -158,3 +158,27 @@ fn test_other_required_exports_at_crate_root() {
     // Compile-time references — if any of these aren't at the crate root, this test fails to compile.
     let _: Option<CancelToken> = None;
 }
+
+#[test]
+fn test_event_subscriber_types_at_crate_root() {
+    // D1-001/D1-002: EventSubscriber trait and concrete subscriber types must be
+    // accessible from the crate root without navigating internal module paths.
+    use apcore::{A2ASubscriber, EventSubscriber, WebhookSubscriber};
+    // Compile-time — constructing a concrete subscriber confirms the types resolve.
+    let sub = WebhookSubscriber::new("wh1", "https://example.com/hook", "*");
+    let _sub2 = A2ASubscriber::new("a2a1", "https://platform.example.com", "module.*");
+    // Verify trait object coercion works from crate root type path.
+    let _: &dyn EventSubscriber = &sub;
+}
+
+#[test]
+fn test_subscriber_registry_functions_at_crate_root() {
+    // D1-002: register_subscriber_type, unregister_subscriber_type,
+    // reset_subscriber_registry must be accessible from the crate root.
+    use apcore::{register_subscriber_type, reset_subscriber_registry, unregister_subscriber_type};
+    // reset_subscriber_registry restores built-ins — safe to call in tests.
+    reset_subscriber_registry();
+    // Confirm the function signatures are callable with expected argument types.
+    let result = unregister_subscriber_type("nonexistent_type_xyz");
+    assert!(result.is_err());
+}
