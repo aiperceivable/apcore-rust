@@ -26,7 +26,8 @@ use crate::observability::metrics::MetricsCollector;
 use crate::observability::usage::{UsageCollector, UsageMiddleware};
 use crate::registry::registry::{ModuleDescriptor, Registry};
 
-pub use control::{ReloadModule, ToggleFeatureModule, UpdateConfigModule};
+pub use control::UpdateConfigModule;
+pub(crate) use control::{ReloadModule, ToggleFeatureModule};
 
 // ---------------------------------------------------------------------------
 // ToggleState — thread-safe enable/disable tracking

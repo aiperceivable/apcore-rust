@@ -10,10 +10,11 @@ use apcore::events::emitter::EventEmitter;
 use apcore::executor::Executor;
 use apcore::module::{Module, ModuleAnnotations};
 use apcore::registry::registry::{ModuleDescriptor, Registry};
+use apcore::sys_modules::control::ToggleFeatureModule;
 use apcore::sys_modules::{
-    check_module_disabled, is_module_disabled, register_sys_modules, ToggleFeatureModule,
-    ToggleState, UpdateConfigModule,
+    check_module_disabled, is_module_disabled, register_sys_modules, ToggleState,
 };
+use apcore::UpdateConfigModule;
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
