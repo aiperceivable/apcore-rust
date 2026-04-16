@@ -12,6 +12,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.1] - 2026-04-16
+
+### Changed
+
+- **`ModuleDescriptor` unified with the cross-language protocol shape.** The slim Rust-only descriptor and the auxiliary `FullModuleDescriptor` (previously in `src/registry/types.rs`) have been merged into a single `ModuleDescriptor` in `apcore::registry` that matches `apcore-python.ModuleDescriptor` and `apcore-typescript.ModuleDescriptor` field-for-field. Changes relative to v0.18.0:
+  - `name: String` (previously the canonical module ID) is now `name: Option<String>` (human-readable display name).
+  - New required field `module_id: String` carries the canonical identifier that used to live in `name`.
+  - New optional fields: `description`, `documentation`, `version` (default `"1.0.0"`), `examples`, `metadata`, `sunset_date`.
+  - `annotations: ModuleAnnotations` is now `annotations: Option<ModuleAnnotations>` (matches Python `None` / TS `null`).
+  - `enabled: bool` (Rust-only runtime toggle) is kept but marked `#[serde(skip_serializing)]` so it never leaks into cross-language wire payloads; it still deserializes with a default of `true`.
+  - `FullModuleDescriptor` is removed from the public API. All callers should use `ModuleDescriptor`.
+
+  **Migration**: callers constructing `ModuleDescriptor` literals must rename `name` to `module_id`, wrap `annotations` in `Some(...)`, and supply the new fields (all have sensible defaults — `description: String::new()`, `documentation: None`, `version: "1.0.0".into()`, `examples: vec![]`, `metadata: HashMap::new()`, `sunset_date: None`).
+
+### Fixed
+
+- Clippy `unnecessary_map_or` warnings in `builtin_steps.rs`, `executor.rs`, and `sys_modules/manifest.rs` (11 sites) — replaced `.map_or(false, |a| a.field)` with `.is_some_and(|a| a.field)`.
+
+---
+
 ## [0.18.0] - 2026-04-15
 
 ### Added

@@ -336,7 +336,7 @@ construct `ModuleAnnotations` via `serde`:
 ```rust
 let yaml: serde_json::Value = serde_yaml_ng::from_reader(file)?;
 let annotations: ModuleAnnotations = serde_json::from_value(yaml)?;
-let descriptor = ModuleDescriptor { annotations, ..default_descriptor };
+let descriptor = ModuleDescriptor { annotations: Some(annotations), ..default_descriptor };
 registry.register("my.module", module, descriptor)?;
 ```
 

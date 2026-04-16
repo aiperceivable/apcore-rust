@@ -369,18 +369,25 @@ pub fn register_sys_modules(
     for (id, module, tags) in modules {
         let is_control = tags.contains(&"control".to_string());
         let descriptor = ModuleDescriptor {
-            name: id.to_string(),
-            annotations: crate::module::ModuleAnnotations {
+            module_id: id.to_string(),
+            name: None,
+            description: module.description().to_string(),
+            documentation: None,
+            input_schema: module.input_schema(),
+            output_schema: module.output_schema(),
+            version: "1.0.0".to_string(),
+            tags,
+            annotations: Some(crate::module::ModuleAnnotations {
                 requires_approval: is_control,
                 readonly: !is_control,
                 idempotent: !is_control,
                 ..Default::default()
-            },
-            input_schema: module.input_schema(),
-            output_schema: module.output_schema(),
-            enabled: true,
-            tags,
+            }),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            sunset_date: None,
             dependencies: vec![],
+            enabled: true,
         };
         let info = json!({
             "name": id,

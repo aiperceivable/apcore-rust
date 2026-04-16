@@ -544,7 +544,11 @@ impl Executor {
         // Detect requires_approval from module annotations.
         let mut requires_approval = false;
         if let Some(desc) = self.registry.get_definition(module_id) {
-            if desc.annotations.requires_approval {
+            if desc
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.requires_approval)
+            {
                 requires_approval = true;
             }
         }
@@ -1029,13 +1033,20 @@ mod tests {
     fn build_executor_with_module(module: MockModule, annotations: ModuleAnnotations) -> Executor {
         let registry = Registry::new();
         let descriptor = ModuleDescriptor {
-            name: "test_mod".to_string(),
-            annotations,
+            module_id: "test_mod".to_string(),
+            name: None,
+            description: module.description().to_string(),
+            documentation: None,
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
-            enabled: true,
+            version: "1.0.0".to_string(),
             tags: vec![],
+            annotations: Some(annotations),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            sunset_date: None,
             dependencies: vec![],
+            enabled: true,
         };
         registry
             .register("test_mod", Box::new(module), descriptor)

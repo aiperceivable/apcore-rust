@@ -270,7 +270,7 @@ impl Step for BuiltinApprovalGate {
             .expect("registry must be injected into PipelineContext");
 
         let desc = match registry.get_definition(&ctx.module_id) {
-            Some(d) if d.annotations.requires_approval => d,
+            Some(d) if d.annotations.as_ref().is_some_and(|a| a.requires_approval) => d,
             _ => return Ok(StepResult::continue_step()),
         };
         let _ = desc; // used only for the requires_approval check above

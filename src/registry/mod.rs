@@ -23,6 +23,6 @@ pub use registry::{
     MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
 pub use scanner::{scan_extensions, scan_multi_root};
-pub use types::{DepInfo, DiscoveredFile, FullModuleDescriptor};
+pub use types::{DepInfo, DiscoveredFile};
 pub use validation::validate_descriptor;
 pub use version::{matches_version_hint, parse_semver, select_best_version, VersionedStore};

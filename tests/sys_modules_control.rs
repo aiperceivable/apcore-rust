@@ -65,13 +65,20 @@ fn register_dummy(registry: &Arc<Registry>, id: &str) {
     }
 
     let descriptor = ModuleDescriptor {
-        name: id.to_string(),
-        annotations: ModuleAnnotations::default(),
+        module_id: id.to_string(),
+        name: None,
+        description: String::new(),
+        documentation: None,
         input_schema: serde_json::json!({}),
         output_schema: serde_json::json!({}),
-        enabled: true,
+        version: "1.0.0".to_string(),
         tags: vec![],
+        annotations: Some(ModuleAnnotations::default()),
+        examples: vec![],
+        metadata: std::collections::HashMap::new(),
+        sunset_date: None,
         dependencies: vec![],
+        enabled: true,
     };
     registry
         .register_internal(id, Box::new(DummyModule), descriptor)

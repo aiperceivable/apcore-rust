@@ -198,27 +198,34 @@ impl APCore {
     {
         let resolved_version = version.unwrap_or("0.1.0").to_string();
         let resolved_metadata = metadata.unwrap_or_default();
+        let descriptor = ModuleDescriptor {
+            module_id: module_id.to_string(),
+            name: None,
+            description: description.to_string(),
+            documentation: documentation.clone(),
+            input_schema: input_schema.clone(),
+            output_schema: output_schema.clone(),
+            version: resolved_version.clone(),
+            tags: tags.clone(),
+            annotations: Some(ModuleAnnotations::default()),
+            examples: examples.clone(),
+            metadata: resolved_metadata.clone(),
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
         let func_module = FunctionModule::with_description(
             ModuleAnnotations::default(),
-            input_schema.clone(),
-            output_schema.clone(),
+            input_schema,
+            output_schema,
             description,
             documentation,
-            tags.clone(),
+            tags,
             &resolved_version,
             resolved_metadata,
             examples,
             handler,
         );
-        let descriptor = ModuleDescriptor {
-            name: module_id.to_string(),
-            annotations: ModuleAnnotations::default(),
-            input_schema,
-            output_schema,
-            enabled: true,
-            tags,
-            dependencies: vec![],
-        };
         self.registry
             .register(module_id, Box::new(func_module), descriptor)?;
         Ok(self)
@@ -277,13 +284,20 @@ impl APCore {
         module: Box<dyn crate::module::Module>,
     ) -> Result<(), ModuleError> {
         let descriptor = ModuleDescriptor {
-            name: module_id.to_string(),
-            annotations: ModuleAnnotations::default(),
+            module_id: module_id.to_string(),
+            name: None,
+            description: module.description().to_string(),
+            documentation: None,
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
-            enabled: true,
+            version: "1.0.0".to_string(),
             tags: vec![],
+            annotations: Some(ModuleAnnotations::default()),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            sunset_date: None,
             dependencies: vec![],
+            enabled: true,
         };
         self.registry.register(module_id, module, descriptor)
     }

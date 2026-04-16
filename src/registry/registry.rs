@@ -12,21 +12,63 @@ use std::sync::{
 };
 
 use crate::errors::ModuleError;
-use crate::module::{Module, ModuleAnnotations, ValidationResult};
+use crate::module::{Module, ModuleAnnotations, ModuleExample, ValidationResult};
 
-/// Metadata descriptor for a registered module.
+/// Cross-language compatible module descriptor.
+///
+/// Aligned with `apcore-python.ModuleDescriptor` and
+/// `apcore-typescript.ModuleDescriptor`.  All fields match PROTOCOL_SPEC
+/// section 5.2.  The `enabled` field is a Rust-specific runtime addition
+/// used by `Registry::disable()` / `Registry::enable()` for module toggling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleDescriptor {
-    pub name: String,
-    pub annotations: ModuleAnnotations,
-    pub input_schema: serde_json::Value,
-    pub output_schema: serde_json::Value,
+    /// Canonical module identifier (e.g. "math.add").
+    pub module_id: String,
+    /// Human-readable display name (optional).
     #[serde(default)]
-    pub enabled: bool,
+    pub name: Option<String>,
+    /// One-line description of what the module does.
+    #[serde(default)]
+    pub description: String,
+    /// Long-form documentation (Markdown).
+    #[serde(default)]
+    pub documentation: Option<String>,
+    /// JSON Schema for the module's input.
+    pub input_schema: serde_json::Value,
+    /// JSON Schema for the module's output.
+    pub output_schema: serde_json::Value,
+    /// Semantic version string.
+    #[serde(default = "default_version")]
+    pub version: String,
+    /// Categorisation tags.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Behavioural annotations (readonly, destructive, etc.).
+    #[serde(default)]
+    pub annotations: Option<ModuleAnnotations>,
+    /// Example invocations.
+    #[serde(default)]
+    pub examples: Vec<ModuleExample>,
+    /// Arbitrary metadata for display overlays, AI intent hints, and version hints.
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
+    /// ISO 8601 date string (YYYY-MM-DD) after which this module is removed.
+    #[serde(default)]
+    pub sunset_date: Option<String>,
+    /// Module dependencies.
     #[serde(default)]
     pub dependencies: Vec<DependencyInfo>,
+    /// Runtime-only: whether the module is enabled (not in PROTOCOL_SPEC).
+    #[serde(default = "default_enabled", skip_serializing)]
+    pub enabled: bool,
+}
+
+fn default_version() -> String {
+    "1.0.0".to_string()
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 /// Dependency information for a module.
@@ -403,13 +445,20 @@ impl Registry {
     /// [`register`](Self::register) (the three-argument extended form).
     pub fn register_module(&self, name: &str, module: Box<dyn Module>) -> Result<(), ModuleError> {
         let descriptor = ModuleDescriptor {
-            name: name.to_string(),
-            annotations: ModuleAnnotations::default(),
+            module_id: name.to_string(),
+            name: None,
+            description: module.description().to_string(),
+            documentation: None,
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
-            enabled: true,
+            version: "1.0.0".to_string(),
             tags: vec![],
+            annotations: Some(ModuleAnnotations::default()),
+            examples: vec![],
+            metadata: HashMap::new(),
+            sunset_date: None,
             dependencies: vec![],
+            enabled: true,
         };
         self.register(name, module, descriptor)
     }

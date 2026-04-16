@@ -1,42 +1,8 @@
 // APCore Protocol — Registry types
-// Spec reference: ModuleDescriptor, DiscoveredModule, DependencyInfo
+// Spec reference: DiscoveredFile, DepInfo
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
-
-use crate::module::{ModuleAnnotations, ModuleExample};
-
-/// Cross-language compatible module descriptor.
-///
-/// Aligned with `apcore-python.ModuleDescriptor` and
-/// `apcore-typescript.ModuleDescriptor`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FullModuleDescriptor {
-    pub module_id: String,
-    pub name: Option<String>,
-    pub description: String,
-    pub documentation: Option<String>,
-    pub input_schema: serde_json::Value,
-    pub output_schema: serde_json::Value,
-    #[serde(default = "default_version")]
-    pub version: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub annotations: Option<ModuleAnnotations>,
-    #[serde(default)]
-    pub examples: Vec<ModuleExample>,
-    #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
-    /// ISO 8601 date string (YYYY-MM-DD) after which this module is removed.
-    #[serde(default)]
-    pub sunset_date: Option<String>,
-}
-
-fn default_version() -> String {
-    "1.0.0".to_string()
-}
 
 /// Intermediate representation of a discovered module file.
 ///
@@ -68,15 +34,16 @@ pub struct DepInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::ModuleDescriptor;
     use std::path::PathBuf;
 
     // -------------------------------------------------------------------------
-    // FullModuleDescriptor
+    // ModuleDescriptor
     // -------------------------------------------------------------------------
 
     #[test]
-    fn full_module_descriptor_serializes_and_deserializes() {
-        let desc = FullModuleDescriptor {
+    fn module_descriptor_serializes_and_deserializes() {
+        let desc = ModuleDescriptor {
             module_id: "math.add".to_string(),
             name: Some("Add".to_string()),
             description: "Adds two numbers".to_string(),
@@ -89,11 +56,12 @@ mod tests {
             examples: vec![],
             metadata: std::collections::HashMap::new(),
             sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
         };
 
         let json = serde_json::to_string(&desc).expect("should serialize");
-        let restored: FullModuleDescriptor =
-            serde_json::from_str(&json).expect("should deserialize");
+        let restored: ModuleDescriptor = serde_json::from_str(&json).expect("should deserialize");
 
         assert_eq!(restored.module_id, "math.add");
         assert_eq!(restored.version, "1.2.3");
@@ -101,29 +69,26 @@ mod tests {
     }
 
     #[test]
-    fn full_module_descriptor_default_version_is_1_0_0() {
-        // When `version` is absent from JSON, it should default to "1.0.0"
+    fn module_descriptor_default_version_is_1_0_0() {
         let json_str = r#"{
             "module_id": "test.module",
             "description": "A test module",
             "input_schema": {},
             "output_schema": {}
         }"#;
-        let desc: FullModuleDescriptor =
-            serde_json::from_str(json_str).expect("should deserialize");
+        let desc: ModuleDescriptor = serde_json::from_str(json_str).expect("should deserialize");
         assert_eq!(desc.version, "1.0.0");
     }
 
     #[test]
-    fn full_module_descriptor_optional_fields_default_to_none_or_empty() {
+    fn module_descriptor_optional_fields_default_to_none_or_empty() {
         let json_str = r#"{
             "module_id": "test.module",
             "description": "A test",
             "input_schema": {},
             "output_schema": {}
         }"#;
-        let desc: FullModuleDescriptor =
-            serde_json::from_str(json_str).expect("should deserialize");
+        let desc: ModuleDescriptor = serde_json::from_str(json_str).expect("should deserialize");
         assert!(desc.name.is_none());
         assert!(desc.documentation.is_none());
         assert!(desc.annotations.is_none());
@@ -155,7 +120,6 @@ mod tests {
 
     #[test]
     fn discovered_file_optional_fields_default_correctly() {
-        // meta_path and namespace default to None when absent
         let json_str = r#"{
             "file_path": "/modules/add.rs",
             "canonical_id": "add"
