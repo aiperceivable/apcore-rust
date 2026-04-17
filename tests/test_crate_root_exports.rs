@@ -222,3 +222,30 @@ fn test_subscriber_registry_functions_at_crate_root() {
     let result = unregister_subscriber_type("nonexistent_type_xyz");
     assert!(result.is_err());
 }
+
+#[test]
+fn test_async_task_manager_at_crate_root() {
+    // sync B-020 / v0.19.0: AsyncTaskManager is re-exported from the crate root
+    // after being reintroduced in 0.19.0 with full Executor integration. Parity with
+    // apcore-python AsyncTaskManager and apcore-typescript AsyncTaskManager exports.
+    use apcore::{AsyncTaskManager, TaskInfo, TaskStatus};
+    // Compile-time — referencing the types ensures they resolve at the crate root.
+    let _: Option<TaskInfo> = None;
+    let _: Option<TaskStatus> = None;
+    // AsyncTaskManager takes an Executor + concurrency knobs; verifying the
+    // type path is enough here.
+    let _: Option<AsyncTaskManager> = None;
+}
+
+#[test]
+fn test_extension_manager_at_crate_root() {
+    // sync B-020 / v0.19.0: ExtensionManager and ExtensionPoint are re-exported
+    // from the crate root after being reintroduced in 0.19.0. Parity with
+    // apcore-python ExtensionManager/ExtensionPoint and apcore-typescript exports.
+    use apcore::{ExtensionKind, ExtensionManager, ExtensionPoint};
+    let manager = ExtensionManager::new();
+    // Compile-time references confirm the types resolve at the crate root.
+    let _: &ExtensionManager = &manager;
+    let _: Option<ExtensionPoint> = None;
+    let _: Option<ExtensionKind> = None;
+}

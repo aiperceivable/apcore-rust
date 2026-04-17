@@ -31,17 +31,18 @@ A schema-enforced module standard for the AI-Perceivable era.
 
 ## Cross-Language Feature Parity
 
-The Rust SDK tracks the apcore protocol spec but currently omits two
-language-specific extensions that ship in the Python and TypeScript SDKs:
+The Rust SDK tracks the apcore protocol spec and ships full feature parity
+with the Python and TypeScript SDKs:
 
 | Feature | Python | TypeScript | Rust |
 |---------|:------:|:----------:|:----:|
-| `AsyncTaskManager` (background task execution) | Yes | Yes | Not yet |
-| `ExtensionManager` / `ExtensionPoint` (plugin registry) | Yes | Yes | Not yet |
+| `AsyncTaskManager` (background task execution) | Yes | Yes | Yes |
+| `ExtensionManager` / `ExtensionPoint` (plugin registry) | Yes | Yes | Yes |
 
-Both will be reintroduced when their Rust implementations are wired into
-`Executor` with real concurrency and plugin loading. For now, code that
-needs these features should stay in Python or TypeScript.
+Both were reintroduced in 0.19.0 with full `Executor` integration. See the
+[`AsyncTaskManager`](./src/async_task.rs) and [`ExtensionManager`](./src/extensions.rs)
+source, plus the corresponding tests at `tests/test_async_task.rs` and
+`tests/test_extensions.rs`.
 
 ## API Overview
 
@@ -104,9 +105,8 @@ needs these features should stay in Python or TypeScript.
 | `CancelToken` | Cooperative cancellation token |
 | `BindingLoader` | Load modules from YAML binding files |
 
-> See [Cross-Language Feature Parity](#cross-language-feature-parity) for a note on
-> `ExtensionManager` and `AsyncTaskManager`, which exist in Python/TypeScript but
-> are not yet available in the Rust SDK.
+> See [Cross-Language Feature Parity](#cross-language-feature-parity) — as of 0.19.0,
+> `ExtensionManager` and `AsyncTaskManager` are available in all three SDKs.
 
 ## Documentation
 
@@ -124,7 +124,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-apcore = "0.18"
+apcore = "0.19"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -307,8 +307,8 @@ Load it at runtime:
 ```rust
 use apcore::bindings::BindingLoader;
 
-let loader = BindingLoader::new();
-loader.load_from_file(std::path::Path::new("binding.yaml")).unwrap();
+let mut loader = BindingLoader::new();
+loader.load_from_yaml(std::path::Path::new("binding.yaml")).unwrap();
 ```
 
 ### Annotation overlay (cross-SDK difference)
