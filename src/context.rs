@@ -10,6 +10,39 @@ use std::sync::Arc;
 
 use crate::cancel::CancelToken;
 use crate::observability::logging::ContextLogger;
+use crate::trace_context::TraceParent;
+
+const TRACE_ID_ZEROS: &str = "00000000000000000000000000000000";
+const TRACE_ID_FFFF: &str = "ffffffffffffffffffffffffffffffff";
+
+/// Generate a fresh 32-char lowercase hex trace_id aligned with W3C Trace Context.
+#[must_use]
+fn generate_trace_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Accept a trace_parent's trace_id if it is well-formed (32 lowercase hex,
+/// not W3C-invalid); otherwise log WARN and return a fresh trace_id.
+///
+/// PROTOCOL_SPEC §10.5 `external_trace_parent_handling`: no dashed-UUID
+/// stripping, no case folding — such normalization is the caller's
+/// responsibility, not Context::create's.
+fn accept_or_regenerate_trace_id(incoming: &str) -> String {
+    let is_valid_hex = incoming.len() == 32
+        && incoming
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let is_w3c_valid = incoming != TRACE_ID_ZEROS && incoming != TRACE_ID_FFFF;
+    if is_valid_hex && is_w3c_valid {
+        incoming.to_string()
+    } else {
+        tracing::warn!(
+            "Invalid trace_id format in trace_parent: {:?}. Restarting trace.",
+            incoming
+        );
+        generate_trace_id()
+    }
+}
 
 /// Raw intermediate struct for deserializing Identity with private fields.
 #[derive(Deserialize)]
@@ -181,7 +214,7 @@ impl<T: Default> Context<T> {
     #[must_use]
     pub fn new(identity: Identity) -> Self {
         Self {
-            trace_id: uuid::Uuid::new_v4().to_string(),
+            trace_id: generate_trace_id(),
             identity: Some(identity),
             services: T::default(),
             caller_id: None,
@@ -199,7 +232,7 @@ impl<T: Default> Context<T> {
     #[must_use]
     pub fn anonymous() -> Self {
         Self {
-            trace_id: uuid::Uuid::new_v4().to_string(),
+            trace_id: generate_trace_id(),
             identity: None,
             services: T::default(),
             caller_id: None,
@@ -416,11 +449,118 @@ impl<T: Default> Context<T> {
         data: Option<HashMap<String, serde_json::Value>>,
     ) -> Self {
         Self {
-            trace_id: uuid::Uuid::new_v4().to_string(),
+            trace_id: generate_trace_id(),
             identity: Some(identity),
             services,
             caller_id,
             data: Arc::new(RwLock::new(data.unwrap_or_default())),
+            call_chain: vec![],
+            redacted_inputs: None,
+            redacted_output: None,
+            cancel_token: None,
+            global_deadline: None,
+            executor: None,
+        }
+    }
+
+    /// Start building a context with optional W3C trace_parent inheritance.
+    ///
+    /// Use this when integrating with web frameworks that parse incoming
+    /// `traceparent` headers — the builder accepts an `Option<TraceParent>`
+    /// and inherits its trace_id when well-formed, or regenerates on invalid
+    /// input. See PROTOCOL_SPEC §10.5 `external_trace_parent_handling`.
+    #[must_use]
+    pub fn builder() -> ContextBuilder<T> {
+        ContextBuilder::new()
+    }
+}
+
+/// Builder for [`Context`] that supports W3C Trace Context propagation.
+///
+/// Created via [`Context::builder`]. Accepts an optional `TraceParent` whose
+/// trace_id is inherited when it matches `^[0-9a-f]{32}$` and is not the
+/// W3C-reserved all-zero or all-f value. Otherwise the builder generates a
+/// fresh trace_id and emits a `tracing::warn!` log.
+pub struct ContextBuilder<T> {
+    trace_parent: Option<TraceParent>,
+    identity: Option<Identity>,
+    services: Option<T>,
+    caller_id: Option<String>,
+    data: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl<T> Default for ContextBuilder<T> {
+    fn default() -> Self {
+        Self {
+            trace_parent: None,
+            identity: None,
+            services: None,
+            caller_id: None,
+            data: None,
+        }
+    }
+}
+
+impl<T> ContextBuilder<T> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the W3C trace_parent to inherit from (when well-formed).
+    #[must_use]
+    pub fn trace_parent(mut self, trace_parent: Option<TraceParent>) -> Self {
+        self.trace_parent = trace_parent;
+        self
+    }
+
+    /// Set the caller identity. `None` is the anonymous/unauthenticated case.
+    #[must_use]
+    pub fn identity(mut self, identity: Option<Identity>) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// Set the services container for dependency injection.
+    #[must_use]
+    pub fn services(mut self, services: T) -> Self {
+        self.services = Some(services);
+        self
+    }
+
+    /// Set the caller_id. Top-level calls leave this as `None`.
+    #[must_use]
+    pub fn caller_id(mut self, caller_id: Option<String>) -> Self {
+        self.caller_id = caller_id;
+        self
+    }
+
+    /// Seed the shared data map with initial entries.
+    #[must_use]
+    pub fn data(mut self, data: HashMap<String, serde_json::Value>) -> Self {
+        self.data = Some(data);
+        self
+    }
+}
+
+impl<T: Default> ContextBuilder<T> {
+    /// Finalize the builder into a [`Context`].
+    ///
+    /// If a `trace_parent` was set, its trace_id is validated per
+    /// PROTOCOL_SPEC §10.5 and either accepted verbatim or replaced with a
+    /// freshly generated 32-char hex trace_id (with a WARN log on regen).
+    #[must_use]
+    pub fn build(self) -> Context<T> {
+        let trace_id = match self.trace_parent.as_ref() {
+            Some(tp) => accept_or_regenerate_trace_id(&tp.trace_id),
+            None => generate_trace_id(),
+        };
+        Context {
+            trace_id,
+            identity: self.identity,
+            services: self.services.unwrap_or_default(),
+            caller_id: self.caller_id,
+            data: Arc::new(RwLock::new(self.data.unwrap_or_default())),
             call_chain: vec![],
             redacted_inputs: None,
             redacted_output: None,

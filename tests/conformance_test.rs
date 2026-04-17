@@ -767,3 +767,67 @@ fn conformance_config_env() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Context.create trace_parent handling (PROTOCOL_SPEC §10.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conformance_context_trace_parent() {
+    use apcore::trace_context::TraceParent;
+
+    let fixture = load_fixture("context_trace_parent");
+    let hex_re = regex::Regex::new(r"^[0-9a-f]{32}$").unwrap();
+
+    for tc in fixture["test_cases"].as_array().unwrap() {
+        let id = tc["id"].as_str().unwrap();
+        let incoming = tc["input"]["trace_parent_trace_id"].as_str();
+        let expected = &tc["expected"];
+        let expected_regen = expected["regenerated"].as_bool().unwrap();
+
+        // Construct a TraceParent directly from the raw trace_id string,
+        // bypassing TraceParent::parse so we can exercise the builder's
+        // defensive validation with every fixture input — including those
+        // that a well-behaved parser would never emit.
+        let trace_parent = incoming.map(|trace_id| TraceParent {
+            version: 0,
+            trace_id: trace_id.to_string(),
+            parent_id: "0000000000000001".to_string(),
+            trace_flags: 1,
+        });
+
+        let ctx: Context<serde_json::Value> = Context::builder().trace_parent(trace_parent).build();
+
+        assert!(
+            hex_re.is_match(&ctx.trace_id),
+            "FAIL [{id}]: trace_id {:?} is not 32-char lowercase hex",
+            ctx.trace_id
+        );
+        assert_ne!(
+            ctx.trace_id,
+            "0".repeat(32),
+            "FAIL [{id}]: trace_id is W3C-invalid all-zero"
+        );
+        assert_ne!(
+            ctx.trace_id,
+            "f".repeat(32),
+            "FAIL [{id}]: trace_id is W3C-invalid all-f"
+        );
+
+        if expected_regen {
+            if let Some(src) = incoming {
+                assert_ne!(
+                    ctx.trace_id, src,
+                    "FAIL [{id}]: expected regeneration but inherited {src:?}"
+                );
+            }
+        } else {
+            let want = expected["trace_id"].as_str().unwrap();
+            assert_eq!(
+                ctx.trace_id, want,
+                "FAIL [{id}]: expected inheritance of {want:?}, got {:?}",
+                ctx.trace_id
+            );
+        }
+    }
+}
