@@ -12,7 +12,7 @@ use serde_json::json;
 use super::emitter::ApCoreEvent;
 use crate::errors::{ErrorCode, ModuleError};
 
-/// Trait for receiving events from the EventEmitter.
+/// Trait for receiving events from the `EventEmitter`.
 #[async_trait]
 pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
     /// Unique ID for this subscriber (used by unsubscribe).

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::context::Context;
 use crate::errors::ModuleError;
 
-/// Core middleware trait with before/after/on_error hooks.
+/// Core middleware trait with `before/after/on_error` hooks.
 ///
 /// All hooks return `Option<Value>`:
 /// - `Some(value)` means the middleware modified the input/output/recovery value.
@@ -21,7 +21,7 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
 
     /// Priority of this middleware (higher runs first). Default is 100.
-    /// Valid range: 0-1000 (enforced by MiddlewareManager::add).
+    /// Valid range: 0-1000 (enforced by `MiddlewareManager::add`).
     /// When two middlewares have the same priority, registration order is preserved.
     fn priority(&self) -> u16 {
         100

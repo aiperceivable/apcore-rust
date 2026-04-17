@@ -13,10 +13,11 @@ use std::path::Path;
 
 use crate::errors::{ErrorCode, ModuleError};
 
-/// Convert a snake_case string to PascalCase.
+/// Convert a `snake_case` string to `PascalCase`.
 ///
 /// Aligned with `apcore-python.snake_to_pascal` and
 /// `apcore-typescript.snakeToPascal`.
+#[must_use]
 pub fn snake_to_pascal(name: &str) -> String {
     if name.is_empty() {
         return String::new();
@@ -68,11 +69,12 @@ pub fn resolve_entry_point_name(
     Ok(None)
 }
 
-/// Derive a PascalCase struct name from a file stem.
+/// Derive a `PascalCase` struct name from a file stem.
 ///
 /// E.g., `"send_email"` -> `"SendEmail"`, `"my_module"` -> `"MyModule"`.
 /// Useful for code generators that need a conventional struct name from a
 /// discovered file path.
+#[must_use]
 pub fn infer_struct_name(file_path: &Path) -> String {
     let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     snake_to_pascal(stem)

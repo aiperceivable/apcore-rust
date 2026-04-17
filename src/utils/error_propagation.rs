@@ -7,7 +7,7 @@ use crate::errors::{ErrorCode, ModuleError};
 /// Wrap a raw error into a standardized `ModuleError` (Algorithm A11).
 ///
 /// If the error is already a `ModuleError`, enriches it with trace context
-/// (trace_id, module_id, call_chain) where missing. Otherwise wraps it as a
+/// (`trace_id`, `module_id`, `call_chain`) where missing. Otherwise wraps it as a
 /// `ModuleExecuteError`.
 ///
 /// # Arguments

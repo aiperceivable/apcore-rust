@@ -147,7 +147,7 @@ fn built_in_points() -> HashMap<String, ExtensionPoint> {
 /// Manages extension points and their registered implementations.
 ///
 /// Pre-registers six built-in extension points: discoverer, middleware,
-/// acl, span_exporter, module_validator, and approval_handler.
+/// acl, `span_exporter`, `module_validator`, and `approval_handler`.
 ///
 /// Extensions are registered as [`ExtensionKind`] variants, ensuring type
 /// safety at compile time rather than relying on runtime `isinstance` checks
@@ -181,6 +181,7 @@ impl Default for ExtensionManager {
 
 impl ExtensionManager {
     /// Create a new extension manager with the built-in extension points.
+    #[must_use]
     pub fn new() -> Self {
         let points = built_in_points();
         let extensions: HashMap<String, Vec<ExtensionKind>> =
@@ -265,6 +266,7 @@ impl ExtensionManager {
     }
 
     /// Return all registered extension points.
+    #[must_use]
     pub fn list_points(&self) -> Vec<ExtensionPoint> {
         self.points.values().cloned().collect()
     }
@@ -298,12 +300,12 @@ impl ExtensionManager {
     ///
     /// Connections:
     /// - discoverer -> `registry.set_discoverer()`
-    /// - module_validator -> `registry.set_validator()`
+    /// - `module_validator` -> `registry.set_validator()`
     /// - acl -> `executor.set_acl()`
-    /// - approval_handler -> `executor.set_approval_handler()`
+    /// - `approval_handler` -> `executor.set_approval_handler()`
     /// - middleware -> `executor.use_middleware()` for each
     ///
-    /// Note: span_exporter wiring is logged as a warning if no
+    /// Note: `span_exporter` wiring is logged as a warning if no
     /// `TracingMiddleware` is found; the Rust `TracingMiddleware` does not
     /// currently expose a `set_exporter` method, so exporters must be provided
     /// at construction time.

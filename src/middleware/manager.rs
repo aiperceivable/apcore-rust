@@ -21,6 +21,7 @@ pub struct MiddlewareManager {
 
 impl MiddlewareManager {
     /// Create a new empty middleware manager.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             middlewares: Mutex::new(vec![]),
@@ -99,9 +100,9 @@ impl MiddlewareManager {
     /// middlewares that were successfully executed (used by `execute_on_error`
     /// for onion-model unwinding).
     ///
-    /// If a middleware's before() fails, wraps the error as a
-    /// MiddlewareChainError and returns it. The `executed` list allows
-    /// callers to run on_error only on middlewares that actually ran.
+    /// If a middleware's `before()` fails, wraps the error as a
+    /// `MiddlewareChainError` and returns it. The `executed` list allows
+    /// callers to run `on_error` only on middlewares that actually ran.
     pub async fn execute_before(
         &self,
         module_id: &str,
@@ -169,7 +170,7 @@ impl MiddlewareManager {
         Ok(output)
     }
 
-    /// Run the on_error hooks in reverse order over the middlewares that
+    /// Run the `on_error` hooks in reverse order over the middlewares that
     /// were executed during `execute_before`.
     ///
     /// Returns `Ok(Some(recovery))` if any middleware provides a recovery

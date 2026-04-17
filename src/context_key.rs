@@ -17,6 +17,7 @@ pub struct ContextKey<T> {
 
 impl<T> ContextKey<T> {
     /// Create a new key from a static string (zero-allocation).
+    #[must_use]
     pub const fn new(name: &'static str) -> Self {
         Self {
             name: Cow::Borrowed(name),

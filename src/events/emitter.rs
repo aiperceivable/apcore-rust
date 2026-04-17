@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::subscribers::EventSubscriber;
 use crate::errors::ModuleError;
 
-/// An event emitted by the APCore system.
+/// An event emitted by the `APCore` system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApCoreEvent {
     pub event_type: String,
@@ -30,7 +30,7 @@ impl ApCoreEvent {
         }
     }
 
-    /// Create a new event with explicit module_id and severity.
+    /// Create a new event with explicit `module_id` and severity.
     pub fn with_module(
         event_type: impl Into<String>,
         data: serde_json::Value,
@@ -56,6 +56,7 @@ pub struct EventEmitter {
 
 impl EventEmitter {
     /// Create a new event emitter.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             subscribers: vec![],
@@ -105,7 +106,7 @@ impl EventEmitter {
     }
 
     /// Emit an event to subscribers matching both the caller's filter pattern
-    /// AND the subscriber's own event_pattern.
+    /// AND the subscriber's own `event_pattern`.
     pub async fn emit_filtered(
         &self,
         event: &ApCoreEvent,
@@ -123,7 +124,7 @@ impl EventEmitter {
         Ok(())
     }
 
-    /// Flush all pending events, waiting up to timeout_ms milliseconds.
+    /// Flush all pending events, waiting up to `timeout_ms` milliseconds.
     #[allow(clippy::unused_async)] // API stub for cross-language parity; future batched dispatch will await
     pub async fn flush(&self, _timeout_ms: u64) -> Result<(), ModuleError> {
         // Synchronous dispatch model — nothing to flush.

@@ -20,7 +20,7 @@ use crate::errors::ModuleError;
 /// executor can drive it across `.await` points without lifetime issues.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<serde_json::Value, ModuleError>> + Send>>;
 
-/// Core trait that all APCore modules must implement.
+/// Core trait that all `APCore` modules must implement.
 #[async_trait]
 pub trait Module: Send + Sync {
     /// Returns the JSON Schema describing this module's input.
@@ -60,7 +60,7 @@ pub trait Module: Send + Sync {
     }
 
     /// Return a structured description of this module for AI/LLM consumption (spec §5.6).
-    /// Default: builds description from input_schema, output_schema, and description.
+    /// Default: builds description from `input_schema`, `output_schema`, and description.
     fn describe(&self) -> serde_json::Value {
         serde_json::json!({
             "description": self.description(),
@@ -84,13 +84,13 @@ pub trait Module: Send + Sync {
     /// Called before the module is unregistered. Default: no-op.
     fn on_unload(&self) {}
 
-    /// Called before hot-reload to capture state. Returns state dict for on_resume().
+    /// Called before hot-reload to capture state. Returns state dict for `on_resume()`.
     /// Default: returns None (no state to preserve).
     fn on_suspend(&self) -> Option<serde_json::Value> {
         None
     }
 
-    /// Called after hot-reload to restore state from on_suspend().
+    /// Called after hot-reload to restore state from `on_suspend()`.
     /// Default: no-op.
     fn on_resume(&self, _state: serde_json::Value) {}
 }
@@ -98,7 +98,7 @@ pub trait Module: Send + Sync {
 /// Metadata annotations attached to a module.
 /// Describes behavioral characteristics of the module.
 ///
-/// **Wire format (PROTOCOL_SPEC §4.4.1):** the `extra` field is serialized as a
+/// **Wire format (`PROTOCOL_SPEC` §4.4.1):** the `extra` field is serialized as a
 /// nested JSON object under the key `"extra"`. Extension keys MUST NOT be
 /// flattened to the annotations root. The custom `Deserialize` impl below
 /// accepts both the canonical nested form and the legacy flattened form
@@ -235,7 +235,7 @@ pub struct ModuleExample {
     pub output: serde_json::Value,
 }
 
-/// Result of validating a single aspect (used by SchemaValidator and ModuleValidator).
+/// Result of validating a single aspect (used by `SchemaValidator` and `ModuleValidator`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
     pub valid: bool,
@@ -248,7 +248,7 @@ pub struct ValidationResult {
 /// Result of a single preflight check (spec §12.8.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreflightCheckResult {
-    /// Check name (e.g., "module_id", "module_lookup", "call_chain", "acl", "schema", "module_preflight").
+    /// Check name (e.g., "`module_id`", "`module_lookup`", "`call_chain`", "acl", "schema", "`module_preflight`").
     pub check: String,
     /// Whether the check passed.
     pub passed: bool,
@@ -274,6 +274,7 @@ pub struct PreflightResult {
 
 impl PreflightResult {
     /// Computed view: only checks where `passed` is false (duck-type ValidationResult.errors).
+    #[must_use]
     pub fn errors(&self) -> Vec<&PreflightCheckResult> {
         self.checks.iter().filter(|c| !c.passed).collect()
     }

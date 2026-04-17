@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub enum ConflictType {
     /// The exact ID is already registered.
     DuplicateId,
-    /// One or more ID segments match a reserved word.
+    /// The first ID segment matches a reserved word.
     ReservedWord,
     /// The ID differs only in case from an existing ID.
     CaseCollision,
@@ -45,7 +45,7 @@ pub struct ConflictResult {
 ///
 /// Steps:
 ///   1. Exact duplicate detection.
-///   2. Reserved word detection (per segment).
+///   2. Reserved word detection (first segment).
 ///   3. Case collision detection.
 ///
 /// Returns `Some(ConflictResult)` if a conflict is found, `None` if the ID is safe.
@@ -56,6 +56,7 @@ pub struct ConflictResult {
 /// Aligned with `apcore-python.detect_id_conflicts` and
 /// `apcore-typescript.detectIdConflicts`.
 #[allow(clippy::implicit_hasher)] // public API: callers always use the default hasher
+#[must_use]
 pub fn detect_id_conflicts(
     new_id: &str,
     existing_ids: &HashSet<String>,
@@ -71,13 +72,13 @@ pub fn detect_id_conflicts(
         });
     }
 
-    // Step 2: Reserved word check (per segment)
-    for segment in new_id.split('.') {
-        if reserved_words.contains(&segment) {
+    // Step 2: Reserved word check (first segment only)
+    if let Some(first_segment) = new_id.split('.').next() {
+        if reserved_words.contains(&first_segment) {
             return Some(ConflictResult {
                 conflict_type: ConflictType::ReservedWord,
                 severity: ConflictSeverity::Error,
-                message: format!("Module ID '{new_id}' contains reserved word '{segment}'"),
+                message: format!("Module ID '{new_id}' contains reserved word '{first_segment}'"),
             });
         }
     }
@@ -139,6 +140,14 @@ mod tests {
         let result = detect_id_conflicts("system.foo", &existing, reserved, None).unwrap();
         assert_eq!(result.conflict_type, ConflictType::ReservedWord);
         assert_eq!(result.severity, ConflictSeverity::Error);
+    }
+
+    #[test]
+    fn test_reserved_word_allowed_in_middle_segment() {
+        let existing: HashSet<String> = HashSet::new();
+        let reserved = &["system", "internal"];
+        assert!(detect_id_conflicts("email.system", &existing, reserved, None).is_none());
+        assert!(detect_id_conflicts("foo.internal.bar", &existing, reserved, None).is_none());
     }
 
     #[test]

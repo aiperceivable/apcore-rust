@@ -40,7 +40,7 @@ pub struct PlatformNotifyMiddleware {
     error_rate_threshold: f64,
     latency_p99_threshold_ms: f64,
     /// Tracks which alert types are active per module to implement hysteresis.
-    /// Key: module_id, Value: set of alert type strings ("error_rate", "latency").
+    /// Key: `module_id`, Value: set of alert type strings ("`error_rate`", "latency").
     alerted: Mutex<HashMap<String, HashSet<String>>>,
 }
 
@@ -48,11 +48,12 @@ impl PlatformNotifyMiddleware {
     /// Create a new platform notify middleware.
     ///
     /// # Arguments
-    /// * `emitter` — EventEmitter to emit threshold events to.
-    /// * `metrics_collector` — Optional MetricsCollector to read error rates
+    /// * `emitter` — `EventEmitter` to emit threshold events to.
+    /// * `metrics_collector` — Optional `MetricsCollector` to read error rates
     ///   and latency from. If None, all checks return 0.
     /// * `error_rate_threshold` — Error rate (0.0-1.0) above which to alert.
     /// * `latency_p99_threshold_ms` — p99 latency in ms above which to alert.
+    #[must_use]
     pub fn new(
         emitter: EventEmitter,
         metrics_collector: Option<MetricsCollector>,
@@ -69,6 +70,7 @@ impl PlatformNotifyMiddleware {
     }
 
     /// Create with default thresholds (10% error rate, 5000ms p99 latency).
+    #[must_use]
     pub fn with_defaults(
         emitter: EventEmitter,
         metrics_collector: Option<MetricsCollector>,
@@ -76,7 +78,7 @@ impl PlatformNotifyMiddleware {
         Self::new(emitter, metrics_collector, 0.1, 5000.0)
     }
 
-    /// Compute error rate for a module from MetricsCollector snapshot.
+    /// Compute error rate for a module from `MetricsCollector` snapshot.
     fn compute_error_rate(&self, module_id: &str) -> f64 {
         if self.metrics_collector.is_none() {
             return 0.0;

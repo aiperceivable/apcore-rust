@@ -31,7 +31,7 @@ impl SpanExporter for StdoutExporter {
     }
 }
 
-/// Default maximum spans for InMemoryExporter.
+/// Default maximum spans for `InMemoryExporter`.
 const DEFAULT_MAX_SPANS: usize = 1000;
 
 /// Exports spans to an in-memory buffer for testing.
@@ -43,6 +43,7 @@ pub struct InMemoryExporter {
 
 impl InMemoryExporter {
     /// Create a new in-memory exporter with default capacity.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             spans: Arc::new(Mutex::new(VecDeque::new())),
@@ -51,6 +52,7 @@ impl InMemoryExporter {
     }
 
     /// Create with explicit max spans capacity.
+    #[must_use]
     pub fn with_max_spans(max_spans: usize) -> Self {
         Self {
             spans: Arc::new(Mutex::new(VecDeque::new())),
@@ -59,6 +61,7 @@ impl InMemoryExporter {
     }
 
     /// Get all exported spans.
+    #[must_use]
     pub fn get_spans(&self) -> Vec<Span> {
         self.spans.lock().iter().cloned().collect()
     }

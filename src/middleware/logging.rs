@@ -22,12 +22,13 @@ pub struct LoggingMiddleware {
     log_outputs: bool,
     log_errors: bool,
     /// Per-call start times indexed by a nonce stored in context.data.
-    /// Using a concurrent map keyed by trace_id + module_id to stay thread-safe.
+    /// Using a concurrent map keyed by `trace_id` + `module_id` to stay thread-safe.
     start_times: parking_lot::Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 impl LoggingMiddleware {
     /// Create a new logging middleware with the given configuration flags.
+    #[must_use]
     pub fn new(log_inputs: bool, log_outputs: bool, log_errors: bool) -> Self {
         Self {
             log_inputs,
@@ -38,11 +39,12 @@ impl LoggingMiddleware {
     }
 
     /// Create with all logging flags enabled (default).
+    #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(true, true, true)
     }
 
-    /// Build a key for the start-time map from context and module_id.
+    /// Build a key for the start-time map from context and `module_id`.
     fn timing_key(module_id: &str, ctx: &Context<Value>) -> String {
         format!("{}:{}", ctx.trace_id, module_id)
     }

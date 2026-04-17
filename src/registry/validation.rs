@@ -12,6 +12,7 @@
 ///
 /// Aligned with `apcore-python.validate_module` and
 /// `apcore-typescript.validateModule`.
+#[must_use]
 pub fn validate_descriptor(descriptor: &serde_json::Value) -> Vec<String> {
     let mut errors = Vec::new();
 

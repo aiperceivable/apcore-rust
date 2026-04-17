@@ -36,6 +36,7 @@ pub struct ErrorHistory {
 
 impl ErrorHistory {
     /// Create a new error history with the given capacity per module.
+    #[must_use]
     pub fn new(max_entries_per_module: usize) -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
@@ -45,6 +46,7 @@ impl ErrorHistory {
     }
 
     /// Create with explicit per-module and total limits.
+    #[must_use]
     pub fn with_limits(max_entries_per_module: usize, max_total_entries: usize) -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
@@ -53,7 +55,7 @@ impl ErrorHistory {
         }
     }
 
-    /// Record an error for a module. Deduplicates by (error_code, message).
+    /// Record an error for a module. Deduplicates by (`error_code`, message).
     pub fn record(&self, module_id: &str, error: &ModuleError) {
         let mut map = self.entries.lock();
         let error_code = format!("{:?}", error.code);
@@ -118,6 +120,7 @@ impl ErrorHistory {
     }
 
     /// Get errors for a specific module, newest first.
+    #[must_use]
     pub fn get(&self, module_id: &str, limit: Option<usize>) -> Vec<ErrorEntry> {
         let map = self.entries.lock();
         match map.get(module_id) {
@@ -133,7 +136,8 @@ impl ErrorHistory {
         }
     }
 
-    /// Get all recorded errors across all modules, sorted by last_occurred desc.
+    /// Get all recorded errors across all modules, sorted by `last_occurred` desc.
+    #[must_use]
     pub fn get_all(&self, limit: Option<usize>) -> Vec<ErrorEntry> {
         let map = self.entries.lock();
         let mut all: Vec<ErrorEntry> = map
@@ -147,7 +151,7 @@ impl ErrorHistory {
         all
     }
 
-    /// Clear errors. If module_id is Some, clear only that module; otherwise clear all.
+    /// Clear errors. If `module_id` is Some, clear only that module; otherwise clear all.
     pub fn clear(&self, module_id: Option<&str>) {
         let mut map = self.entries.lock();
         match module_id {
@@ -159,7 +163,7 @@ impl ErrorHistory {
     }
 }
 
-/// Middleware that records errors into an ErrorHistory.
+/// Middleware that records errors into an `ErrorHistory`.
 #[derive(Debug)]
 pub struct ErrorHistoryMiddleware {
     history: ErrorHistory,
@@ -167,11 +171,13 @@ pub struct ErrorHistoryMiddleware {
 
 impl ErrorHistoryMiddleware {
     /// Create a new error history middleware.
+    #[must_use]
     pub fn new(history: ErrorHistory) -> Self {
         Self { history }
     }
 
     /// Get a reference to the underlying error history.
+    #[must_use]
     pub fn history(&self) -> &ErrorHistory {
         &self.history
     }

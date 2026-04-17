@@ -55,7 +55,7 @@ type AuditLoggerFn = dyn Fn(&AuditEntry) + Send + Sync;
 /// Access control list manager.
 ///
 /// Thread safety: Rust's borrow checker enforces exclusive access for mutation
-/// (&mut self for add_rule/remove_rule/reload). The check() method takes &self
+/// (&mut self for `add_rule/remove_rule/reload`). The `check()` method takes &self
 /// and is safe for concurrent reads. No internal lock is needed.
 pub struct ACL {
     rules: Vec<ACLRule>,
@@ -153,7 +153,7 @@ impl ACL {
     /// Async evaluate all conditions with AND logic using the handler registry.
     ///
     /// Handlers are cloned out of the registry (as `Arc<dyn ACLConditionHandler>`)
-    /// before the read guard is dropped, so no parking_lot lock guard is held
+    /// before the read guard is dropped, so no `parking_lot` lock guard is held
     /// across `.await`.
     pub async fn evaluate_conditions_async(
         conditions: &HashMap<String, serde_json::Value>,
@@ -297,6 +297,7 @@ impl ACL {
     /// Return a reference to the current rules.
     ///
     /// Returns a snapshot of the current rules.
+    #[must_use]
     pub fn rules(&self) -> &[ACLRule] {
         &self.rules
     }
@@ -550,7 +551,7 @@ impl ACL {
         Ok(self.finalize_default_effect(caller, target_id, ctx))
     }
 
-    /// Async version of matches_rule that awaits async condition handlers.
+    /// Async version of `matches_rule` that awaits async condition handlers.
     /// Mirrors the sync `matches_rule` exactly except it routes condition
     /// evaluation through `check_conditions_async` so async handlers are awaited
     /// rather than polled-once.

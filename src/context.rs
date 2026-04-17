@@ -49,6 +49,7 @@ pub struct Identity {
 
 impl Identity {
     /// Create a new identity with the given fields.
+    #[must_use]
     pub fn new(
         id: String,
         identity_type: String,
@@ -64,21 +65,25 @@ impl Identity {
     }
 
     /// The unique identifier of the caller.
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
     /// The type of the identity (e.g. "user", "service", "agent").
+    #[must_use]
     pub fn identity_type(&self) -> &str {
         &self.identity_type
     }
 
     /// The roles assigned to this identity.
+    #[must_use]
     pub fn roles(&self) -> &[String] {
         &self.roles
     }
 
     /// Additional attributes associated with this identity.
+    #[must_use]
     pub fn attrs(&self) -> &HashMap<String, serde_json::Value> {
         &self.attrs
     }
@@ -139,6 +144,8 @@ pub struct Context<T> {
     pub call_chain: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_inputs: Option<HashMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_output: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip)]
     pub cancel_token: Option<CancelToken>,
     /// Global deadline for dual-timeout enforcement (not serialized).
@@ -171,6 +178,7 @@ where
 }
 
 impl<T: Default> Context<T> {
+    #[must_use]
     pub fn new(identity: Identity) -> Self {
         Self {
             trace_id: uuid::Uuid::new_v4().to_string(),
@@ -180,6 +188,7 @@ impl<T: Default> Context<T> {
             data: default_shared_data(),
             call_chain: vec![],
             redacted_inputs: None,
+            redacted_output: None,
             cancel_token: None,
             global_deadline: None,
             executor: None,
@@ -187,6 +196,7 @@ impl<T: Default> Context<T> {
     }
 
     /// Create a context with no identity (anonymous/unauthenticated).
+    #[must_use]
     pub fn anonymous() -> Self {
         Self {
             trace_id: uuid::Uuid::new_v4().to_string(),
@@ -196,6 +206,7 @@ impl<T: Default> Context<T> {
             data: default_shared_data(),
             call_chain: vec![],
             redacted_inputs: None,
+            redacted_output: None,
             cancel_token: None,
             global_deadline: None,
             executor: None,
@@ -224,6 +235,7 @@ impl<T: Default> Context<T> {
             data: Arc::clone(&self.data),
             call_chain,
             redacted_inputs: None,
+            redacted_output: None,
             cancel_token: self.cancel_token.clone(),
             global_deadline: self.global_deadline,
             executor: self.executor.clone(),
@@ -265,7 +277,7 @@ impl<T: Default> Context<T> {
     /// Serialize context to a cross-language JSON representation.
     ///
     /// Includes `_context_version: 1` at top level.
-    /// Excludes: executor, services, cancel_token, global_deadline.
+    /// Excludes: executor, services, `cancel_token`, `global_deadline`.
     /// Filters `_`-prefixed keys from data.
     pub fn serialize(&self) -> serde_json::Value {
         let mut result = serde_json::json!({
@@ -289,6 +301,9 @@ impl<T: Default> Context<T> {
         if let Some(ref redacted) = self.redacted_inputs {
             result["redacted_inputs"] = serde_json::to_value(redacted).unwrap_or_default();
         }
+        if let Some(ref redacted) = self.redacted_output {
+            result["redacted_output"] = serde_json::to_value(redacted).unwrap_or_default();
+        }
 
         // Filter _-prefixed keys from data
         let filtered: HashMap<String, serde_json::Value> = self
@@ -305,8 +320,8 @@ impl<T: Default> Context<T> {
 
     /// Deserialize a cross-language JSON representation into a Context.
     ///
-    /// Non-serializable fields (executor, services, cancel_token,
-    /// global_deadline) are set to `None`/default after deserialization.
+    /// Non-serializable fields (executor, services, `cancel_token`,
+    /// `global_deadline`) are set to `None`/default after deserialization.
     /// If `_context_version` is greater than 1, a warning is logged
     /// but deserialization proceeds (forward compatibility).
     #[allow(clippy::needless_pass_by_value)] // public API: callers pass owned Value; changing to &Value would be breaking
@@ -353,6 +368,10 @@ impl<T: Default> Context<T> {
             .get("redacted_inputs")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+        let redacted_output: Option<HashMap<String, serde_json::Value>> = obj
+            .get("redacted_output")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
         Ok(Context {
             trace_id: obj
                 .get("trace_id")
@@ -366,6 +385,7 @@ impl<T: Default> Context<T> {
             call_chain,
             identity,
             redacted_inputs,
+            redacted_output,
             data: Arc::new(RwLock::new(data_map)),
             services: T::default(),
             cancel_token: None,
@@ -403,6 +423,7 @@ impl<T: Default> Context<T> {
             data: Arc::new(RwLock::new(data.unwrap_or_default())),
             call_chain: vec![],
             redacted_inputs: None,
+            redacted_output: None,
             cancel_token: None,
             global_deadline: None,
             executor: None,

@@ -26,6 +26,7 @@ pub struct CancelToken {
 
 impl CancelToken {
     /// Create a new cancel token in the non-cancelled state.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -38,6 +39,7 @@ impl CancelToken {
     }
 
     /// Check whether cancellation has been requested.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }

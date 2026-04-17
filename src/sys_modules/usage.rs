@@ -17,6 +17,7 @@ pub struct UsageSummaryModule {
 }
 
 impl UsageSummaryModule {
+    #[must_use]
     pub fn new(collector: UsageCollector) -> Self {
         Self { collector }
     }

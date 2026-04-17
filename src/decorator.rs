@@ -13,7 +13,7 @@ use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations, ModuleExample};
 
-/// Boxed async handler type for FunctionModule.
+/// Boxed async handler type for `FunctionModule`.
 type HandlerFn = Box<
     dyn for<'a> Fn(
             serde_json::Value,
@@ -51,7 +51,7 @@ impl std::fmt::Debug for FunctionModule {
 }
 
 impl FunctionModule {
-    /// Create a new FunctionModule wrapping an async handler.
+    /// Create a new `FunctionModule` wrapping an async handler.
     pub fn new<F, Fut>(
         annotations: ModuleAnnotations,
         input_schema: serde_json::Value,
@@ -86,7 +86,7 @@ impl FunctionModule {
         }
     }
 
-    /// Create a new FunctionModule with an explicit description and optional metadata.
+    /// Create a new `FunctionModule` with an explicit description and optional metadata.
     ///
     /// This is used by [`APCore::module()`](crate::client::APCore::module) to
     /// propagate the caller-supplied description and metadata into the module.

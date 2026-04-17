@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 /// Deep-clones the input, strips extension keys (`x-*`) and `default` keys,
 /// then enforces strict mode rules: `additionalProperties: false`, all
 /// properties required, and previously-optional fields become nullable.
+#[must_use]
 pub fn to_strict_schema(schema: &Value) -> Value {
     let mut result = schema.clone();
     strip_extensions(&mut result);

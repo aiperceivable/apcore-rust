@@ -10,11 +10,13 @@ pub struct SchemaValidator;
 
 impl SchemaValidator {
     /// Create a new schema validator.
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
 
     /// Validate a value against a JSON schema.
+    #[must_use]
     pub fn validate(
         &self,
         value: &serde_json::Value,
@@ -29,7 +31,7 @@ impl SchemaValidator {
         }
     }
 
-    /// Validate and return a ModuleError on failure.
+    /// Validate and return a `ModuleError` on failure.
     pub fn validate_or_error(
         &self,
         value: &serde_json::Value,

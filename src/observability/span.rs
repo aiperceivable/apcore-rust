@@ -45,7 +45,7 @@ pub enum SpanStatus {
 }
 
 impl Span {
-    /// Create a new span with a random hex span_id.
+    /// Create a new span with a random hex `span_id`.
     pub fn new(name: impl Into<String>, trace_id: impl Into<String>) -> Self {
         let span_id = format!(
             "{:016x}",

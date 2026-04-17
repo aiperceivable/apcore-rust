@@ -217,6 +217,7 @@ pub struct ObsLoggingMiddleware {
 
 impl ObsLoggingMiddleware {
     /// Create a new logging middleware.
+    #[must_use]
     pub fn new(logger: ContextLogger) -> Self {
         Self {
             logger,
@@ -227,6 +228,7 @@ impl ObsLoggingMiddleware {
     }
 
     /// Create with explicit input/output logging flags.
+    #[must_use]
     pub fn with_options(logger: ContextLogger, log_inputs: bool, log_outputs: bool) -> Self {
         Self {
             logger,

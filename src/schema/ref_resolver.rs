@@ -13,6 +13,7 @@ pub struct RefResolver {
 
 impl RefResolver {
     /// Create a new ref resolver.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             schemas: HashMap::new(),
@@ -31,6 +32,7 @@ impl RefResolver {
     }
 
     /// Check if a schema contains circular references.
+    #[must_use]
     pub fn has_circular_refs(&self, schema: &serde_json::Value) -> bool {
         let mut seen = HashSet::new();
         self.check_circular(schema, schema, &mut seen)

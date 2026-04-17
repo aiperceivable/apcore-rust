@@ -55,7 +55,7 @@ impl Default for RetryConfig {
     }
 }
 
-/// Middleware that retries failed executions according to RetryConfig.
+/// Middleware that retries failed executions according to `RetryConfig`.
 ///
 /// When `on_error` is called with a retryable error (`error.retryable == Some(true)`),
 /// this middleware sleeps for a calculated delay and returns `Some(inputs)` to signal
@@ -72,6 +72,7 @@ pub struct RetryMiddleware {
 
 impl RetryMiddleware {
     /// Create a new retry middleware with the given config.
+    #[must_use]
     pub fn new(config: RetryConfig) -> Self {
         Self {
             config,

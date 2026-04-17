@@ -139,7 +139,7 @@ impl Module for UpdateConfigModule {
 ///
 /// Full re-discovery is not supported in Rust (no dynamic loading). The module
 /// is unregistered and callers must re-register manually. The event is always
-/// emitted with new_version == previous_version.
+/// emitted with `new_version` == `previous_version`.
 pub struct ReloadModule {
     registry: Arc<Registry>,
     emitter: Arc<Mutex<EventEmitter>>,

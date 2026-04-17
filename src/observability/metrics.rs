@@ -62,6 +62,7 @@ pub struct MetricsCollector {
 
 impl MetricsCollector {
     /// Create a new metrics collector.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             counters: Arc::new(Mutex::new(HashMap::new())),
@@ -95,6 +96,7 @@ impl MetricsCollector {
     }
 
     /// Return a snapshot of all current metric values as JSON.
+    #[must_use]
     pub fn snapshot(&self) -> serde_json::Value {
         let counters = self.counters.lock();
         let histograms = self.histograms.lock();
@@ -145,6 +147,7 @@ impl MetricsCollector {
     }
 
     /// Export metrics in Prometheus text format.
+    #[must_use]
     pub fn export_prometheus(&self) -> String {
         let mut output = String::new();
         let counters = self.counters.lock();
@@ -316,6 +319,7 @@ pub struct MetricsMiddleware {
 
 impl MetricsMiddleware {
     /// Create a new metrics middleware.
+    #[must_use]
     pub fn new(collector: MetricsCollector) -> Self {
         Self {
             collector,

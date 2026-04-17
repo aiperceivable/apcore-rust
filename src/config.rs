@@ -84,7 +84,7 @@ fn env_map_claimed() -> &'static RwLock<HashMap<String, String>> {
 
 const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
 
-/// Executor namespace configuration (PROTOCOL_SPEC §9.1).
+/// Executor namespace configuration (`PROTOCOL_SPEC` §9.1).
 ///
 /// All timeouts are in milliseconds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +111,7 @@ impl Default for ExecutorConfig {
     }
 }
 
-/// Observability namespace configuration (PROTOCOL_SPEC §9.1).
+/// Observability namespace configuration (`PROTOCOL_SPEC` §9.1).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ObservabilityConfig {
@@ -131,7 +131,7 @@ pub struct MetricsConfig {
     pub enabled: bool,
 }
 
-/// Top-level apcore configuration (PROTOCOL_SPEC §9.1).
+/// Top-level apcore configuration (`PROTOCOL_SPEC` §9.1).
 ///
 /// Canonical wire format is a nested JSON/YAML object with `executor`,
 /// `observability`, and any user-defined namespaces as siblings:
@@ -333,6 +333,7 @@ impl Config {
     }
 
     /// Build config from defaults, applying env var overrides.
+    #[must_use]
     pub fn from_defaults() -> Self {
         let mut config = Self::default();
         config.detect_mode();
@@ -358,6 +359,7 @@ impl Config {
     /// namespaces. Per spec §9.1, all keys MUST use the canonical
     /// `<namespace>.<field>` form. Legacy v0.17.x short-form aliases
     /// (e.g. bare `max_call_depth`) are NOT accepted.
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<serde_json::Value> {
         // Check canonical typed fields first.
         if let Some(val) = self.get_typed_field(key) {
@@ -423,7 +425,7 @@ impl Config {
             .insert(parts[parts.len() - 1].to_string(), value);
     }
 
-    /// Reload config from the stored yaml_path. Returns error if no path stored.
+    /// Reload config from the stored `yaml_path`. Returns error if no path stored.
     pub fn reload(&mut self) -> Result<(), ModuleError> {
         let path = self.yaml_path.clone().ok_or_else(|| {
             ModuleError::new(
@@ -440,7 +442,8 @@ impl Config {
     }
 
     /// Return a `serde_json::Value` representing the full config as the
-    /// canonical nested JSON object (PROTOCOL_SPEC §9.1 wire format).
+    /// canonical nested JSON object (`PROTOCOL_SPEC` §9.1 wire format).
+    #[must_use]
     pub fn data(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
@@ -503,6 +506,7 @@ impl Config {
         Ok(())
     }
 
+    #[must_use]
     pub fn registered_namespaces() -> Vec<NamespaceInfo> {
         global_ns_registry()
             .read()
@@ -517,6 +521,7 @@ impl Config {
 
     // --- Namespace instance methods ---
 
+    #[must_use]
     pub fn namespace(&self, name: &str) -> Option<serde_json::Value> {
         self.user_namespaces.get(name).cloned()
     }
@@ -862,7 +867,7 @@ impl Config {
         None
     }
 
-    /// Resolve an env var suffix based on the registration's env_style.
+    /// Resolve an env var suffix based on the registration's `env_style`.
     fn resolve_env_suffix(suffix: &str, reg: &NamespaceRegistration) -> String {
         match reg.env_style {
             EnvStyle::Flat => suffix.to_lowercase(),

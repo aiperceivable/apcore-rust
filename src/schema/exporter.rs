@@ -35,6 +35,7 @@ pub struct SchemaExporter;
 
 impl SchemaExporter {
     /// Create a new schema exporter.
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -148,7 +149,7 @@ impl SchemaExporter {
         }))
     }
 
-    /// OpenAI format: { type: "function", function: { name, description, parameters, strict } }
+    /// `OpenAI` format: { type: "function", function: { name, description, parameters, strict } }
     #[allow(clippy::unused_self)] // consistent method signature for dispatch through export()
     #[allow(clippy::unnecessary_wraps)] // consistent Result return for dispatch through export()
     fn export_openai(&self, schema: &serde_json::Value) -> Result<serde_json::Value, ModuleError> {
@@ -178,7 +179,7 @@ impl SchemaExporter {
         }))
     }
 
-    /// Anthropic format: { name, description, input_schema }
+    /// Anthropic format: { name, description, `input_schema` }
     #[allow(clippy::unused_self)] // consistent method signature for dispatch through export()
     #[allow(clippy::unnecessary_wraps)] // consistent Result return for dispatch through export()
     fn export_anthropic(

@@ -231,10 +231,10 @@ fn test_register_rejects_reserved_first_segment() {
 }
 
 #[test]
-fn test_register_rejects_reserved_word_in_any_segment() {
-    // PROTOCOL_SPEC §2.7: reserved words MUST NOT appear as ANY segment of a
-    // module ID (not just the first). Aligned with apcore-python and
-    // apcore-typescript, both of which reject 'email.system' for this reason.
+fn test_register_allows_reserved_word_in_middle_segment() {
+    // PROTOCOL_SPEC §2.7: reserved words are only checked against the first
+    // segment. Middle/last segments may contain reserved words.
+    // Aligned with apcore-python and apcore-typescript.
     let registry = Registry::new();
     let result = registry.register(
         "email.system",
@@ -242,13 +242,8 @@ fn test_register_rejects_reserved_word_in_any_segment() {
         make_descriptor("email.system"),
     );
     assert!(
-        result.is_err(),
-        "registering 'email.system' must fail — 'system' is reserved in any segment"
-    );
-    let msg = format!("{}", result.unwrap_err());
-    assert!(
-        msg.contains("reserved word") && msg.contains("system"),
-        "error should mention reserved word 'system', got: {msg}"
+        result.is_ok(),
+        "registering 'email.system' should succeed — 'system' is not the first segment"
     );
 }
 

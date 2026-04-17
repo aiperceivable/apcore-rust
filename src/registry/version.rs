@@ -85,6 +85,7 @@ fn check_single_constraint(version_tuple: (u64, u64, u64), constraint: &str) -> 
 ///
 /// Aligned with `apcore-python.matches_version_hint` and
 /// `apcore-typescript.matchesVersionHint`.
+#[must_use]
 pub fn matches_version_hint(version: &str, hint: &str) -> bool {
     let version_tuple = parse_semver(version);
     hint.split(',')
@@ -99,6 +100,7 @@ pub fn matches_version_hint(version: &str, hint: &str) -> bool {
 ///
 /// Aligned with `apcore-python.select_best_version` and
 /// `apcore-typescript.selectBestVersion`.
+#[must_use]
 pub fn select_best_version(versions: &[String], version_hint: Option<&str>) -> Option<String> {
     if versions.is_empty() {
         return None;
@@ -131,13 +133,14 @@ pub struct VersionedStore<T> {
 
 impl<T: Clone> VersionedStore<T> {
     /// Create a new empty versioned store.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             data: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Add an item for a given module_id and version.
+    /// Add an item for a given `module_id` and version.
     pub fn add(&self, module_id: &str, version: &str, item: T) {
         let mut data = self.data.write();
         data.entry(module_id.to_string())
@@ -171,7 +174,7 @@ impl<T: Clone> VersionedStore<T> {
         versions.get(&best).cloned()
     }
 
-    /// List all registered versions for a module_id, sorted by semver.
+    /// List all registered versions for a `module_id`, sorted by semver.
     pub fn list_versions(&self, module_id: &str) -> Vec<String> {
         let data = self.data.read();
         match data.get(module_id) {
@@ -201,13 +204,13 @@ impl<T: Clone> VersionedStore<T> {
         item
     }
 
-    /// Remove all versions for a module_id. Returns removed versions.
+    /// Remove all versions for a `module_id`. Returns removed versions.
     pub fn remove_all(&self, module_id: &str) -> HashMap<String, T> {
         let mut data = self.data.write();
         data.remove(module_id).unwrap_or_default()
     }
 
-    /// Check if any version of a module_id is registered.
+    /// Check if any version of a `module_id` is registered.
     pub fn has(&self, module_id: &str) -> bool {
         let data = self.data.read();
         data.get(module_id).is_some_and(|v| !v.is_empty())

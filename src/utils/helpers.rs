@@ -12,6 +12,7 @@ pub const DEFAULT_MAX_MODULE_REPEAT: usize = 3;
 /// Match a string against a glob-like pattern (supports `*` wildcards).
 ///
 /// Ported from apcore-python `utils/pattern.py::match_pattern`.
+#[must_use]
 pub fn match_pattern(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -130,12 +131,12 @@ pub fn guard_call_chain_with_repeat(
     Ok(())
 }
 
-/// Convert a single segment to snake_case by detecting case boundaries.
+/// Convert a single segment to `snake_case` by detecting case boundaries.
 ///
 /// Matches Algorithm A02 from the apcore protocol spec:
 /// - Inserts `_` before an uppercase letter preceded by a lowercase/digit.
 /// - Inserts `_` between consecutive uppercase letters when followed by a lowercase letter
-///   (e.g., "HTTPClient" -> "http_client", "HTMLParser" -> "html_parser").
+///   (e.g., "`HTTPClient`" -> "`http_client`", "`HTMLParser`" -> "`html_parser`").
 /// - Collapses any resulting double underscores.
 fn to_snake_case(segment: &str) -> String {
     let chars: Vec<char> = segment.chars().collect();
@@ -171,11 +172,11 @@ fn separator_for_language(language: &str) -> &'static str {
     }
 }
 
-/// Normalize a local module identifier to its canonical dotted snake_case form.
+/// Normalize a local module identifier to its canonical dotted `snake_case` form.
 ///
 /// Implements Algorithm A02 from the apcore protocol spec.
 /// Splits `local_id` by the language-specific separator, converts each segment
-/// to snake_case, and joins with `"."`.
+/// to `snake_case`, and joins with `"."`.
 pub fn normalize_to_canonical_id(local_id: &str, language: &str) -> String {
     let separator = separator_for_language(language);
     local_id
@@ -190,6 +191,7 @@ pub fn normalize_to_canonical_id(local_id: &str, language: &str) -> String {
 /// Ported from apcore-python `utils/pattern.py::calculate_specificity`.
 /// - Wildcard-only `"*"` returns 0.
 /// - Each dot-separated segment scores: exact literal = 2, partial wildcard = 1, pure `"*"` = 0.
+#[must_use]
 pub fn calculate_specificity(pattern: &str) -> u32 {
     if pattern == "*" {
         return 0;

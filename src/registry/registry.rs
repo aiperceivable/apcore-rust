@@ -17,7 +17,7 @@ use crate::module::{Module, ModuleAnnotations, ModuleExample, ValidationResult};
 /// Cross-language compatible module descriptor.
 ///
 /// Aligned with `apcore-python.ModuleDescriptor` and
-/// `apcore-typescript.ModuleDescriptor`.  All fields match PROTOCOL_SPEC
+/// `apcore-typescript.ModuleDescriptor`.  All fields match `PROTOCOL_SPEC`
 /// section 5.2.  The `enabled` field is a Rust-specific runtime addition
 /// used by `Registry::disable()` / `Registry::enable()` for module toggling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ pub struct ModuleDescriptor {
     /// Module dependencies.
     #[serde(default)]
     pub dependencies: Vec<DependencyInfo>,
-    /// Runtime-only: whether the module is enabled (not in PROTOCOL_SPEC).
+    /// Runtime-only: whether the module is enabled (not in `PROTOCOL_SPEC`).
     #[serde(default = "default_enabled", skip_serializing)]
     pub enabled: bool,
 }
@@ -134,7 +134,7 @@ pub const RESERVED_WORDS: &[&str] = &[
 
 /// Maximum allowed length for a module ID.
 ///
-/// Per PROTOCOL_SPEC §2.7 EBNF constraint #1. 192 is filesystem-safe
+/// Per `PROTOCOL_SPEC` §2.7 EBNF constraint #1. 192 is filesystem-safe
 /// (`192 + ".binding.yaml".len() = 205 < 255`-byte filename limit on
 /// ext4/xfs/NTFS/APFS/btrfs) and accommodates Java/.NET deep-namespace
 /// FQN-derived IDs. Bumped from 128 in spec 1.6.0-draft (2026-04-08).
@@ -142,7 +142,7 @@ pub const RESERVED_WORDS: &[&str] = &[
 /// Aligned with `apcore-python` and `apcore-typescript` `MAX_MODULE_ID_LENGTH`.
 pub const MAX_MODULE_ID_LENGTH: usize = 192;
 
-/// Standard registry event names per PROTOCOL_SPEC §12.2.
+/// Standard registry event names per `PROTOCOL_SPEC` §12.2.
 ///
 /// All SDKs **MUST** export these event names as named constants so that
 /// consumers do not hardcode the underlying string literals. Aligned with
@@ -173,14 +173,14 @@ impl RegistryEvents {
 /// access pattern matching the Python and TypeScript SDKs.
 pub const REGISTRY_EVENTS: RegistryEvents = RegistryEvents;
 
-/// Canonical regex source for the module ID pattern (PROTOCOL_SPEC §2.7).
+/// Canonical regex source for the module ID pattern (`PROTOCOL_SPEC` §2.7).
 ///
 /// Raw string form, matching `apcore-python` / `apcore-typescript`
 /// `MODULE_ID_PATTERN`. Consumers needing a compiled pattern should call
 /// [`module_id_pattern`] instead.
 pub const MODULE_ID_PATTERN: &str = r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$";
 
-/// Canonical EBNF pattern for module IDs per PROTOCOL_SPEC §2.7.
+/// Canonical EBNF pattern for module IDs per `PROTOCOL_SPEC` §2.7.
 ///
 /// Equivalent regex of: `canonical_id = segment ("." segment)*` where
 /// `segment = [a-z][a-z0-9_]*`. Aligned with `apcore-python` and
@@ -190,15 +190,15 @@ pub fn module_id_pattern() -> &'static Regex {
     PATTERN.get_or_init(|| Regex::new(MODULE_ID_PATTERN).unwrap())
 }
 
-/// Validate a module ID against PROTOCOL_SPEC §2.7 in canonical order:
+/// Validate a module ID against `PROTOCOL_SPEC` §2.7 in canonical order:
 /// 1. non-empty
 /// 2. matches EBNF pattern
-/// 3. length ≤ MAX_MODULE_ID_LENGTH
-/// 4. (if `allow_reserved == false`) no segment is a reserved word
+/// 3. length ≤ `MAX_MODULE_ID_LENGTH`
+/// 4. (if `allow_reserved == false`) first segment is not a reserved word
 ///
 /// Duplicate detection is the caller's responsibility (it requires registry
 /// state). `register_internal` calls this with `allow_reserved=true` so sys
-/// modules can use the `system.*` prefix; everything else still validates.
+/// modules can use the `system.*` prefix; all other validations still apply.
 ///
 /// Aligned with `apcore-python._validate_module_id` and
 /// `apcore-typescript._validateModuleId`.
@@ -233,15 +233,15 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
         ));
     }
 
-    // 4. reserved word per-segment check (skipped for register_internal)
+    // 4. reserved word first-segment check (skipped for register_internal)
     if !allow_reserved {
-        for segment in name.split('.') {
-            if RESERVED_WORDS.contains(&segment) {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::GeneralInvalidInput,
-                    format!("Module ID contains reserved word: '{segment}'"),
-                ));
-            }
+        // INVARIANT: pattern check (step 2) guarantees at least one segment.
+        let first_segment = name.split('.').next().unwrap();
+        if RESERVED_WORDS.contains(&first_segment) {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::GeneralInvalidInput,
+                format!("Module ID contains reserved word: '{first_segment}'"),
+            ));
         }
     }
 
@@ -342,6 +342,7 @@ impl std::fmt::Debug for Registry {
 
 impl Registry {
     /// Create a new empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             core: RwLock::new(RegistryCore::new()),
@@ -372,7 +373,7 @@ impl Registry {
     /// auto-generated from the module's schema methods), use
     /// [`register_module`](Self::register_module) instead.
     ///
-    /// Validation order (PROTOCOL_SPEC §2.7, aligned with apcore-python /
+    /// Validation order (`PROTOCOL_SPEC` §2.7, aligned with apcore-python /
     /// apcore-typescript): empty → pattern → length → reserved (per-segment)
     /// → duplicate.
     pub fn register(
@@ -579,7 +580,7 @@ impl Registry {
     }
 
     /// Register a sys/internal module that bypasses **only** the reserved
-    /// word check. All other PROTOCOL_SPEC §2.7 validations (empty, EBNF
+    /// word check. All other `PROTOCOL_SPEC` §2.7 validations (empty, EBNF
     /// pattern, length, duplicate) still apply.
     ///
     /// The intended use case is registering modules under reserved prefixes
@@ -897,7 +898,7 @@ impl Registry {
         ids
     }
 
-    /// Return a snapshot of all registered (module_id, module) pairs.
+    /// Return a snapshot of all registered (`module_id`, module) pairs.
     pub fn entries(&self) -> Vec<(String, Arc<dyn Module>)> {
         self.core
             .read()

@@ -19,7 +19,7 @@ use crate::observability::metrics::MetricsCollector;
 use crate::registry::registry::{ModuleDescriptor, Registry};
 use crate::sys_modules::SysModulesContext;
 
-/// Main entry point for interacting with the APCore system.
+/// Main entry point for interacting with the `APCore` system.
 pub struct APCore {
     pub config: Config,
     executor: Executor,
@@ -55,16 +55,16 @@ impl Default for APCore {
 }
 
 impl APCore {
-    /// Create a new APCore client with default configuration.
+    /// Create a new `APCore` client with default configuration.
     pub fn new() -> Self {
         Self::with_options(None, None, None, None)
     }
 
-    /// Create a new APCore client with all optional parameters.
+    /// Create a new `APCore` client with all optional parameters.
     ///
     /// A single `Arc<Registry>` is shared between the executor, the pipeline,
     /// and every built-in sys module — there is exactly one registry
-    /// instance per APCore client.
+    /// instance per `APCore` client.
     ///
     /// When `sys_modules.enabled` is true in the config (the default), built-in
     /// system modules are automatically registered into the executor pipeline.
@@ -115,7 +115,7 @@ impl APCore {
         }
     }
 
-    /// Return whether the sys_modules auto-registration is enabled
+    /// Return whether the `sys_modules` auto-registration is enabled
     /// according to the given config. Defaults to `true` when the key
     /// is absent.
     fn sys_modules_enabled(config: &Config) -> bool {
@@ -125,12 +125,12 @@ impl APCore {
             .unwrap_or(true)
     }
 
-    /// Create a new APCore client with the given configuration.
+    /// Create a new `APCore` client with the given configuration.
     pub fn with_config(config: Config) -> Self {
         Self::with_options(None, None, Some(config), None)
     }
 
-    /// Create a new APCore client from a pre-built Registry and Executor.
+    /// Create a new `APCore` client from a pre-built Registry and Executor.
     ///
     /// Builds an `Executor` from the given `registry` and a default `Config`.
     /// To supply a custom config, use [`with_options`] instead.
@@ -138,7 +138,7 @@ impl APCore {
         Self::with_options(Some(registry), None, Some(config), None)
     }
 
-    /// Create a new APCore client from a configuration file path.
+    /// Create a new `APCore` client from a configuration file path.
     pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self, ModuleError> {
         let config = Config::load(path.as_ref())?;
         Ok(Self::with_config(config))
@@ -277,7 +277,7 @@ impl APCore {
             .await
     }
 
-    /// Register a module with the given module_id.
+    /// Register a module with the given `module_id`.
     pub fn register(
         &self,
         module_id: &str,

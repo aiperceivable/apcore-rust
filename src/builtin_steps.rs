@@ -220,7 +220,32 @@ impl Step for BuiltinModuleLookup {
                 format!("Module '{}' is disabled", ctx.module_id),
             ));
         }
-        ctx.module = Some(module);
+        ctx.module = Some(module.clone());
+
+        // Early input redaction: set context.redacted_inputs BEFORE
+        // middleware runs (step 6), so logging sees redacted data.
+        let input_schema = module.input_schema().clone();
+        if has_schema(&input_schema) {
+            let redacted = redact_sensitive(&ctx.inputs, &input_schema);
+            ctx.context.redacted_inputs = Some(
+                redacted
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            );
+        } else {
+            ctx.context.redacted_inputs = Some(
+                ctx.inputs
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            );
+        }
+
         Ok(StepResult::continue_step())
     }
 }
@@ -563,10 +588,18 @@ impl Step for BuiltinOutputValidation {
         let output_schema = module.output_schema();
         validate_against_schema(output, &output_schema, "Output")?;
 
+        // Store redacted output as first-class Context field (symmetric with
+        // redacted_inputs). Previously stored under data["_apcore.executor.
+        // redacted_output"] which was filtered out by serialize().
         if has_schema(&output_schema) {
-            ctx.context.data.write().insert(
-                "_apcore.executor.redacted_output".to_string(),
-                redact_sensitive(output, &output_schema),
+            let redacted = redact_sensitive(output, &output_schema);
+            ctx.context.redacted_output = Some(
+                redacted
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
             );
         }
         ctx.validated_output.clone_from(&ctx.output);
@@ -636,6 +669,7 @@ impl Step for BuiltinReturnResult {
 // ---------------------------------------------------------------------------
 
 /// Build the standard 11-step execution strategy.
+#[must_use]
 pub fn build_standard_strategy() -> ExecutionStrategy {
     // INVARIANT: all step names are unique literals, so `new()` cannot fail.
     ExecutionStrategy::new(
@@ -657,7 +691,8 @@ pub fn build_standard_strategy() -> ExecutionStrategy {
     .expect("standard strategy should have unique step names")
 }
 
-/// Build the internal strategy (standard minus acl_check and approval_gate).
+/// Build the internal strategy (standard minus `acl_check` and `approval_gate`).
+#[must_use]
 pub fn build_internal_strategy() -> ExecutionStrategy {
     let mut s = build_standard_strategy();
     s.set_name("internal");
@@ -666,7 +701,8 @@ pub fn build_internal_strategy() -> ExecutionStrategy {
     s
 }
 
-/// Build the testing strategy (standard minus acl_check, approval_gate, and call_chain_guard).
+/// Build the testing strategy (standard minus `acl_check`, `approval_gate`, and `call_chain_guard`).
+#[must_use]
 pub fn build_testing_strategy() -> ExecutionStrategy {
     let mut s = build_standard_strategy();
     s.set_name("testing");
@@ -676,7 +712,8 @@ pub fn build_testing_strategy() -> ExecutionStrategy {
     s
 }
 
-/// Build the performance strategy (standard minus middleware_before and middleware_after).
+/// Build the performance strategy (standard minus `middleware_before` and `middleware_after`).
+#[must_use]
 pub fn build_performance_strategy() -> ExecutionStrategy {
     let mut s = build_standard_strategy();
     s.set_name("performance");
@@ -689,6 +726,7 @@ pub fn build_performance_strategy() -> ExecutionStrategy {
 ///
 /// No safety checks, no ACL, no approval, no validation, no middleware.
 /// Suitable for pre-validated internal hot paths. Use with caution.
+#[must_use]
 pub fn build_minimal_strategy() -> ExecutionStrategy {
     let mut s = build_standard_strategy();
     s.set_name("minimal");

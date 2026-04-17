@@ -45,6 +45,7 @@ impl ErrorFormatterRegistry {
     }
 
     /// Return the formatter registered for `adapter_name`, if any.
+    #[must_use]
     pub fn get(adapter_name: &str) -> Option<Arc<dyn ErrorFormatter>> {
         global_formatters().read().get(adapter_name).cloned()
     }
@@ -52,6 +53,7 @@ impl ErrorFormatterRegistry {
     /// Format an error using the formatter registered for `adapter_name`.
     ///
     /// Falls back to `error.to_dict()` if no formatter is registered for the adapter.
+    #[must_use]
     pub fn format(
         adapter_name: &str,
         error: &ModuleError,
@@ -65,11 +67,13 @@ impl ErrorFormatterRegistry {
     }
 
     /// Returns true if a formatter is registered for `adapter_name`.
+    #[must_use]
     pub fn is_registered(adapter_name: &str) -> bool {
         global_formatters().read().contains_key(adapter_name)
     }
 
     /// Returns the list of registered adapter names.
+    #[must_use]
     pub fn registered_adapters() -> Vec<String> {
         global_formatters().read().keys().cloned().collect()
     }

@@ -33,6 +33,7 @@ pub struct SchemaLoader {
 
 impl SchemaLoader {
     /// Create a new schema loader with the default strategy.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             schemas: HashMap::new(),
@@ -42,6 +43,7 @@ impl SchemaLoader {
     }
 
     /// Create a schema loader with a specific strategy.
+    #[must_use]
     pub fn with_strategy(strategy: SchemaStrategy) -> Self {
         Self {
             schemas: HashMap::new(),
@@ -200,6 +202,7 @@ impl SchemaLoader {
     }
 
     /// Get a loaded schema by name.
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&serde_json::Value> {
         self.schemas.get(name)
     }

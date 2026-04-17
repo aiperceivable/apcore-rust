@@ -39,6 +39,7 @@ pub struct ToggleState {
 }
 
 impl ToggleState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             disabled: RwLock::new(HashSet::new()),
@@ -76,6 +77,7 @@ fn global_toggle_state() -> &'static ToggleState {
 }
 
 /// Check if a module is disabled using the default global toggle state.
+#[must_use]
 pub fn is_module_disabled(module_id: &str) -> bool {
     global_toggle_state().is_disabled(module_id)
 }
@@ -191,7 +193,7 @@ pub struct SysModulesContext {
 /// 2. Create `ErrorHistory` + `ErrorHistoryMiddleware`, register on executor.
 /// 3. Create `UsageCollector` + `UsageMiddleware`, register on executor.
 /// 4. Register health, manifest, and usage modules (always).
-/// 5. If `sys_modules.events.enabled`: register control modules + EventEmitter.
+/// 5. If `sys_modules.events.enabled`: register control modules + `EventEmitter`.
 ///
 /// The registry is shared via `Arc<Registry>` — `Registry` provides interior
 /// mutability, so no external `Mutex` wrapper is needed and this function is

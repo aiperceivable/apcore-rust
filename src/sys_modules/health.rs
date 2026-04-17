@@ -278,7 +278,7 @@ impl Module for HealthModule {
     }
 }
 
-/// Extract call counts from a MetricsCollector snapshot.
+/// Extract call counts from a `MetricsCollector` snapshot.
 fn extract_call_counts(snapshot: &serde_json::Value, module_id: &str) -> (u64, u64) {
     let Some(counters) = snapshot.get("counters").and_then(|c| c.as_object()) else {
         return (0, 0);
@@ -300,10 +300,10 @@ fn extract_call_counts(snapshot: &serde_json::Value, module_id: &str) -> (u64, u
     (total, errors)
 }
 
-/// Extract latency statistics (avg_ms, p99_ms) from a MetricsCollector snapshot.
+/// Extract latency statistics (`avg_ms`, `p99_ms`) from a `MetricsCollector` snapshot.
 ///
 /// Reads the histogram key `apcore_module_duration_seconds|module_id=<id>`.
-/// Returns (avg_latency_ms, p99_latency_ms).
+/// Returns (`avg_latency_ms`, `p99_latency_ms`).
 fn extract_latency_stats(snapshot: &serde_json::Value, module_id: &str) -> (f64, f64) {
     let Some(histograms) = snapshot.get("histograms").and_then(|h| h.as_object()) else {
         return (0.0, 0.0);

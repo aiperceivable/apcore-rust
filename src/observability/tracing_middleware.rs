@@ -21,7 +21,7 @@ pub enum SamplingStrategy {
     /// Sample spans at the configured rate (serializes as "proportional").
     #[serde(rename = "proportional")]
     Probabilistic,
-    /// Sample errors always, success at rate (serializes as "error_first").
+    /// Sample errors always, success at rate (serializes as "`error_first`").
     #[serde(rename = "error_first")]
     ErrorFirst,
     /// Never sample spans (serializes as "off").
@@ -39,7 +39,7 @@ struct TraceState {
 
 /// Middleware that creates tracing spans around module execution.
 ///
-/// Uses a stack-based approach (Vec of Spans per trace_id) to correctly
+/// Uses a stack-based approach (Vec of Spans per `trace_id`) to correctly
 /// handle nested module-to-module calls with proper parent-child span
 /// relationships.
 ///
@@ -56,6 +56,7 @@ pub struct TracingMiddleware {
 
 impl TracingMiddleware {
     /// Create a new tracing middleware with the given exporter (Always sampling).
+    #[must_use]
     pub fn new(exporter: Box<dyn SpanExporter>) -> Self {
         Self {
             exporter,
@@ -66,6 +67,7 @@ impl TracingMiddleware {
     }
 
     /// Create with explicit sampling configuration.
+    #[must_use]
     pub fn with_sampling(
         exporter: Box<dyn SpanExporter>,
         strategy: SamplingStrategy,

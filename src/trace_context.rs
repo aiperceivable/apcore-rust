@@ -71,6 +71,7 @@ impl TraceParent {
     }
 
     /// Serialize to a traceparent header string.
+    #[must_use]
     pub fn to_header(&self) -> String {
         format!(
             "{:02x}-{}-{}-{:02x}",
@@ -91,6 +92,7 @@ pub struct TraceContext {
 
 impl TraceContext {
     /// Create a new trace context from a traceparent.
+    #[must_use]
     pub fn new(traceparent: TraceParent) -> Self {
         Self {
             traceparent,
@@ -100,6 +102,7 @@ impl TraceContext {
     }
 
     /// Generate a new root trace context with random IDs.
+    #[must_use]
     pub fn new_root() -> Self {
         let trace_id = uuid::Uuid::new_v4().simple().to_string();
         let parent_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();

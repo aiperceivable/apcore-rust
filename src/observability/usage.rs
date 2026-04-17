@@ -72,6 +72,7 @@ pub struct UsageCollector {
 
 impl UsageCollector {
     /// Create a new usage collector.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             data: Arc::new(Mutex::new(HashMap::new())),
@@ -108,7 +109,7 @@ impl UsageCollector {
         module.evict_old_buckets();
     }
 
-    /// Aggregate records for a single module into a UsageStats.
+    /// Aggregate records for a single module into a `UsageStats`.
     fn aggregate(module_id: &str, module_data: &ModuleData) -> UsageStats {
         let mut call_count: u64 = 0;
         let mut error_count: u64 = 0;
@@ -147,12 +148,14 @@ impl UsageCollector {
     }
 
     /// Get usage summary for a specific module.
+    #[must_use]
     pub fn get_module_summary(&self, module_id: &str) -> Option<UsageStats> {
         let data = self.data.lock();
         data.get(module_id).map(|md| Self::aggregate(module_id, md))
     }
 
     /// Get all usage summaries.
+    #[must_use]
     pub fn get_all_summaries(&self) -> Vec<UsageStats> {
         let data = self.data.lock();
         data.iter()
@@ -219,6 +222,7 @@ impl UsageCollector {
     }
 
     /// Compute p99 latency (ms) for a module from stored records.
+    #[must_use]
     pub fn get_p99_latency_ms(&self, module_id: &str) -> f64 {
         let data = self.data.lock();
         let Some(module_data) = data.get(module_id) else {
@@ -277,6 +281,7 @@ pub struct UsageMiddleware {
 
 impl UsageMiddleware {
     /// Create a new usage middleware.
+    #[must_use]
     pub fn new(collector: UsageCollector) -> Self {
         Self {
             collector,

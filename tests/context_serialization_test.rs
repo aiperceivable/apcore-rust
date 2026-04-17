@@ -26,6 +26,7 @@ fn make_ctx() -> Context<()> {
         data: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         call_chain: vec!["api.users.get".to_string()],
         redacted_inputs: None,
+        redacted_output: None,
         cancel_token: None,
         global_deadline: None,
         executor: None,
