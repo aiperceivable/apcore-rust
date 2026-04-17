@@ -128,9 +128,11 @@ fn test_other_required_exports_at_crate_root() {
     // should also be reachable from `apcore::*`.
     use apcore::{
         // Bindings
-        BindingDefinition,
+        AutoSchemaValue,
+        BindingEntry,
+        BindingHandler,
         BindingLoader,
-        BindingTarget,
+        BindingsFile,
         // Cancel
         CancelToken,
         // Observability extras
@@ -152,6 +154,7 @@ fn test_other_required_exports_at_crate_root() {
         // Tracing
         TraceContext,
         TraceParent,
+        TypedBindingHandler,
         UsageCollector,
         UsageStats,
     };

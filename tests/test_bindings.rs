@@ -1,8 +1,9 @@
-//! Integration tests for BindingLoader with Registry and FunctionModule.
+//! Integration tests for BindingLoader with Registry and FunctionModule
+//! using the canonical YAML format defined in DECLARATIVE_CONFIG_SPEC.md §3.
 
-use apcore::bindings::{BindingDefinition, BindingHandler, BindingLoader, BindingTarget};
+use apcore::bindings::{BindingHandler, BindingLoader};
 use apcore::context::Context;
-use apcore::errors::ModuleError;
+use apcore::errors::{ErrorCode, ModuleError};
 use apcore::registry::registry::Registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -20,54 +21,39 @@ fn make_error_handler() -> BindingHandler {
     Arc::new(|_inputs: Value, _ctx: &Context<Value>| {
         Box::pin(async move {
             Err(ModuleError::new(
-                apcore::errors::ErrorCode::GeneralInternalError,
+                ErrorCode::GeneralInternalError,
                 "handler intentionally failed".to_string(),
             ))
         })
     })
 }
 
-fn binding_def(name: &str, module_name: &str) -> BindingDefinition {
-    BindingDefinition {
-        name: name.to_string(),
-        target: BindingTarget {
-            module_name: module_name.to_string(),
-            callable: "handler".to_string(),
-            schema_path: None,
-        },
-        metadata: HashMap::new(),
-    }
-}
-
 // ---------------------------------------------------------------------------
-// register_into_with_handlers
+// register_into_with_handlers (canonical YAML format)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn register_single_binding_into_registry() {
     let registry = Registry::new();
-    let mut loader = BindingLoader::new();
-
-    // Manually insert a definition (bypasses file I/O)
-    let def = binding_def("echo_binding", "test.echo");
-    let mut inner = HashMap::new();
-    inner.insert("echo_binding".to_string(), def);
-
-    // Load via a temp JSON file so we exercise the public API.
     let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("bindings.json");
+    let file_path = dir.path().join("e.binding.yaml");
     std::fs::write(
         &file_path,
-        serde_json::to_string(&json!([
-            {"name": "echo_binding", "target": {"module_name": "test.echo", "callable": "h"}, "metadata": {}}
-        ]))
-        .unwrap(),
+        r#"
+spec_version: "1.0"
+bindings:
+  - module_id: test.echo
+    target: "test.echo:handler"
+    auto_schema: true
+"#,
     )
     .unwrap();
-    loader.load_from_file(&file_path).unwrap();
+
+    let mut loader = BindingLoader::new();
+    loader.load_from_yaml(&file_path).unwrap();
 
     let mut handlers: HashMap<String, BindingHandler> = HashMap::new();
-    handlers.insert("echo_binding".to_string(), make_echo_handler());
+    handlers.insert("test.echo:handler".to_string(), make_echo_handler());
 
     let count = loader
         .register_into_with_handlers(&registry, handlers)
@@ -81,24 +67,28 @@ fn register_single_binding_into_registry() {
 fn register_multiple_bindings_into_registry() {
     let registry = Registry::new();
     let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("bindings.json");
+    let file_path = dir.path().join("multi.binding.yaml");
     std::fs::write(
         &file_path,
-        serde_json::to_string(&json!([
-            {"name": "b1", "target": {"module_name": "test.b1", "callable": "h"}, "metadata": {}},
-            {"name": "b2", "target": {"module_name": "test.b2", "callable": "h"}, "metadata": {}},
-            {"name": "b3", "target": {"module_name": "test.b3", "callable": "h"}, "metadata": {}}
-        ]))
-        .unwrap(),
+        r#"
+spec_version: "1.0"
+bindings:
+  - module_id: test.b1
+    target: "test.b1:handler"
+  - module_id: test.b2
+    target: "test.b2:handler"
+  - module_id: test.b3
+    target: "test.b3:handler"
+"#,
     )
     .unwrap();
 
     let mut loader = BindingLoader::new();
-    loader.load_from_file(&file_path).unwrap();
+    loader.load_from_yaml(&file_path).unwrap();
 
     let mut handlers: HashMap<String, BindingHandler> = HashMap::new();
-    for name in ["b1", "b2", "b3"] {
-        handlers.insert(name.to_string(), make_echo_handler());
+    for tgt in ["test.b1:handler", "test.b2:handler", "test.b3:handler"] {
+        handlers.insert(tgt.to_string(), make_echo_handler());
     }
 
     let count = loader
@@ -111,28 +101,28 @@ fn register_multiple_bindings_into_registry() {
 }
 
 #[test]
-fn register_binding_with_description_in_metadata() {
+fn register_binding_with_top_level_description() {
     let registry = Registry::new();
     let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("bindings.json");
+    let file_path = dir.path().join("d.binding.yaml");
     std::fs::write(
         &file_path,
-        serde_json::to_string(&json!([
-            {
-                "name": "described",
-                "target": {"module_name": "test.described", "callable": "h"},
-                "metadata": {"description": "A well-described module"}
-            }
-        ]))
-        .unwrap(),
+        r#"
+spec_version: "1.0"
+bindings:
+  - module_id: test.described
+    target: "test.described:handler"
+    description: "A well-described module"
+    documentation: "Long-form details about this module."
+"#,
     )
     .unwrap();
 
     let mut loader = BindingLoader::new();
-    loader.load_from_file(&file_path).unwrap();
+    loader.load_from_yaml(&file_path).unwrap();
 
     let mut handlers: HashMap<String, BindingHandler> = HashMap::new();
-    handlers.insert("described".to_string(), make_echo_handler());
+    handlers.insert("test.described:handler".to_string(), make_echo_handler());
 
     let count = loader
         .register_into_with_handlers(&registry, handlers)
@@ -142,27 +132,28 @@ fn register_binding_with_description_in_metadata() {
 }
 
 #[test]
-fn register_fails_when_handler_missing_for_binding() {
+fn register_fails_when_handler_missing_for_target() {
     let registry = Registry::new();
     let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("bindings.json");
+    let file_path = dir.path().join("nh.binding.yaml");
     std::fs::write(
         &file_path,
-        serde_json::to_string(&json!([
-            {"name": "needs_handler", "target": {"module_name": "test.x", "callable": "h"}, "metadata": {}}
-        ]))
-        .unwrap(),
+        r#"
+spec_version: "1.0"
+bindings:
+  - module_id: test.x
+    target: "test.x:needs_handler"
+"#,
     )
     .unwrap();
 
     let mut loader = BindingLoader::new();
-    loader.load_from_file(&file_path).unwrap();
+    loader.load_from_yaml(&file_path).unwrap();
 
-    // Provide an empty handler map — should fail.
     let result = loader.register_into_with_handlers(&registry, HashMap::new());
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert_eq!(err.code, apcore::errors::ErrorCode::BindingModuleNotFound);
+    assert_eq!(err.code, ErrorCode::BindingModuleNotFound);
     assert!(err.message.contains("needs_handler"));
 }
 
@@ -176,21 +167,47 @@ fn register_empty_loader_succeeds_with_zero_count() {
     assert_eq!(count, 0);
 }
 
+#[test]
+fn json_load_canonical_format() {
+    let registry = Registry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("bindings.json");
+    let body = json!({
+        "spec_version": "1.0",
+        "bindings": [
+            {"module_id": "test.j", "target": "test.j:handler"}
+        ]
+    });
+    std::fs::write(&file_path, serde_json::to_string(&body).unwrap()).unwrap();
+
+    let mut loader = BindingLoader::new();
+    loader.load_from_file(&file_path).unwrap();
+
+    let mut handlers: HashMap<String, BindingHandler> = HashMap::new();
+    handlers.insert("test.j:handler".to_string(), make_echo_handler());
+
+    let count = loader
+        .register_into_with_handlers(&registry, handlers)
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(registry.get("test.j").is_some());
+}
+
 // ---------------------------------------------------------------------------
-// End-to-end: load from YAML dir, register, execute via Registry
+// End-to-end: load YAML dir, register, execute
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn end_to_end_yaml_load_and_registry_execution() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = r"
-- name: yaml_echo
-  target:
-    module_name: test.yaml_echo
-    callable: echo_fn
-  metadata:
+    let yaml = r#"
+spec_version: "1.0"
+bindings:
+  - module_id: test.yaml_echo
+    target: "test.yaml_echo:echo_fn"
     description: Echo inputs back as output
-";
+    auto_schema: true
+"#;
     std::fs::write(dir.path().join("echo.binding.yaml"), yaml).unwrap();
 
     let mut loader = BindingLoader::new();
@@ -199,14 +216,13 @@ async fn end_to_end_yaml_load_and_registry_execution() {
 
     let registry = Registry::new();
     let mut handlers: HashMap<String, BindingHandler> = HashMap::new();
-    handlers.insert("yaml_echo".to_string(), make_echo_handler());
+    handlers.insert("test.yaml_echo:echo_fn".to_string(), make_echo_handler());
 
     let registered = loader
         .register_into_with_handlers(&registry, handlers)
         .unwrap();
     assert_eq!(registered, 1);
 
-    // Call the registered module through the Registry.
     let module = registry
         .get("test.yaml_echo")
         .expect("module should be registered");
@@ -225,13 +241,13 @@ async fn end_to_end_yaml_load_and_registry_execution() {
 #[tokio::test]
 async fn registered_handler_propagates_error() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = r"
-- name: failing_binding
-  target:
-    module_name: test.failing
-    callable: fail_fn
-  metadata: {}
-";
+    let yaml = r#"
+spec_version: "1.0"
+bindings:
+  - module_id: test.failing
+    target: "test.failing:fail_fn"
+    auto_schema: true
+"#;
     std::fs::write(dir.path().join("fail.binding.yaml"), yaml).unwrap();
 
     let mut loader = BindingLoader::new();
@@ -239,7 +255,7 @@ async fn registered_handler_propagates_error() {
 
     let registry = Registry::new();
     let mut handlers: HashMap<String, BindingHandler> = HashMap::new();
-    handlers.insert("failing_binding".to_string(), make_error_handler());
+    handlers.insert("test.failing:fail_fn".to_string(), make_error_handler());
 
     loader
         .register_into_with_handlers(&registry, handlers)

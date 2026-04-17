@@ -39,6 +39,7 @@ futures-core = "0.3"
 futures-util = "0.3"
 async-stream = "0.3"
 parking_lot = "0.12"
+schemars = "0.8"
 
 [features]
 default = []

@@ -12,6 +12,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.19.0] - 2026-04-17
+
+### Added
+
+- **`TypedBindingHandler`** and **`typed_handler<I, O>()`** — Generic function that bundles an async handler with auto-derived JSON Schemas from `schemars::JsonSchema` trait bounds. When used with `register_into_with_typed_handlers()`, schemas from `schemars` are used for `auto_schema` bindings instead of the permissive `{"type":"object"}` fallback. No proc-macro crate needed. See DECLARATIVE_CONFIG_SPEC.md §6.5.
+- **`auto_schema: true | permissive | strict`** — `AutoSchemaValue` enum accepts boolean or mode string. Strict mode reserved for OpenAI/Anthropic schema compliance (enforcement via `schemars` + post-processing tracked for 0.20.0).
+- **New `ErrorCode` variants**: `BindingSchemaInferenceFailed`, `BindingSchemaModeConflict`, `BindingStrictSchemaIncompatible`, `BindingPolicyViolation`, `PipelineConfigInvalid`, `PipelineHandlerNotSupported`, `PipelineStepInsertionAmbiguous`, `EntryPointNotFound`, `EntryPointAmbiguous`, `EntryPointRuntimeUnsupported` (reserved). See DECLARATIVE_CONFIG_SPEC.md §7.1.
+- **Pipeline `handler:` parse-time rejection** — `PipelineHandlerNotSupportedError` with remediation message pointing to `register_step_type()`. See DECLARATIVE_CONFIG_SPEC.md §4.4.
+- **Pipeline metadata fields honored**: `match_modules`, `ignore_errors`, `pure`, `timeout_ms` now applied to resolved steps via `ConfiguredStep` wrapper. Previously silently dropped.
+- **Pipeline `configure:` section** — Overlay metadata fields on existing built-in steps via `ExecutionStrategy::replace_with()`.
+- **`ExecutionStrategy::replace_with(name, wrapper_fn)`** — Replace a step in-place by applying a wrapper function.
+- **`schema_ref` loading implemented** — External YAML schema files referenced by `schema_ref` field now actually loaded and parsed (previously the field was stored but never processed).
+- **`spec_version`** handling in binding YAML with deprecation warning when absent.
+- **`schemars` dependency** (`0.8`) for JSON Schema generation from Rust types.
+- **Cross-SDK conformance fixtures** in `apcore/conformance/fixtures/`.
+
+### Changed (BREAKING)
+
+- **Binding YAML format migrated to canonical** — Top-level `bindings:` list with `module_id` and string `target: "module:callable"`. Old format (`- name:` flat list, `target: {module_name, callable}`, `metadata:` wrapper) removed. See DECLARATIVE_CONFIG_SPEC.md §8.1 for migration guide.
+- **`BindingDefinition` and `BindingTarget` removed** — Replaced by `BindingEntry` and `BindingsFile`. Public re-exports updated.
+- **Handler-map key changed** from binding `name` to full `target` string (e.g., `"format_date:format_date_string"`).
+- **`BindingSchemaMissing` ErrorCode variant deprecated** — Superseded by `BindingSchemaInferenceFailed`. Kept for backward-compatible deserialization.
+- **`description`, `documentation`, `tags`, `version`, `annotations`, `display`, `metadata`** now parsed from top-level binding entry fields (previously some were nested under `metadata`).
+
 ## [0.18.1] - 2026-04-16
 
 ### Changed

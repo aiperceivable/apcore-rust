@@ -28,7 +28,7 @@ pub const FRAMEWORK_ERROR_CODE_PREFIXES: &[&str] = &[
     "STRATEGY_",
 ];
 
-/// All error codes defined by the APCore protocol.
+/// All error codes defined by the `APCore` protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
@@ -61,7 +61,13 @@ pub enum ErrorCode {
     BindingModuleNotFound,
     BindingCallableNotFound,
     BindingNotCallable,
+    /// Deprecated since 0.19.0; superseded by `BindingSchemaInferenceFailed`.
+    /// Kept for backward-compatibility deserialization. See `DECLARATIVE_CONFIG_SPEC.md` §7.1.
     BindingSchemaMissing,
+    BindingSchemaInferenceFailed,
+    BindingSchemaModeConflict,
+    BindingStrictSchemaIncompatible,
+    BindingPolicyViolation,
     BindingFileInvalid,
     CircularDependency,
     MiddlewareChainError,
@@ -79,11 +85,20 @@ pub enum ErrorCode {
     ConfigEnvMapConflict,
     ErrorFormatterDuplicate,
     PipelineAbort,
+    PipelineConfigInvalid,
+    PipelineHandlerNotSupported,
+    PipelineStepInsertionAmbiguous,
     StepNotFound,
     StepNotRemovable,
     StepNotReplaceable,
     StepNameDuplicate,
     StrategyNotFound,
+    EntryPointNotFound,
+    EntryPointAmbiguous,
+    /// Reserved for future opt-in runtime entry-point loading APIs (e.g.,
+    /// `libloading`-based plugin discovery). No current API path raises this
+    /// error. See `DECLARATIVE_CONFIG_SPEC.md` §5.2.
+    EntryPointRuntimeUnsupported,
 }
 
 /// Structured error returned by module execution.
@@ -163,10 +178,12 @@ impl ModuleError {
     }
 
     /// Convert to a sparse JSON dictionary (omitting None fields).
+    #[must_use]
     pub fn to_dict(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    #[must_use]
     pub fn config_namespace_duplicate(name: &str) -> Self {
         let mut details = HashMap::new();
         details.insert("name".to_string(), serde_json::json!(name));
@@ -177,6 +194,7 @@ impl ModuleError {
         .with_details(details)
     }
 
+    #[must_use]
     pub fn config_namespace_reserved(name: &str) -> Self {
         let mut details = HashMap::new();
         details.insert("name".to_string(), serde_json::json!(name));
@@ -187,6 +205,7 @@ impl ModuleError {
         .with_details(details)
     }
 
+    #[must_use]
     pub fn config_env_prefix_conflict(prefix: &str) -> Self {
         let mut details = HashMap::new();
         details.insert("env_prefix".to_string(), serde_json::json!(prefix));
@@ -197,6 +216,7 @@ impl ModuleError {
         .with_details(details)
     }
 
+    #[must_use]
     pub fn config_env_map_conflict(env_var: &str, owner: &str) -> Self {
         let mut details = HashMap::new();
         details.insert("env_var".to_string(), serde_json::json!(env_var));
@@ -208,6 +228,7 @@ impl ModuleError {
         .with_details(details)
     }
 
+    #[must_use]
     pub fn config_mount_error(namespace: &str, reason: &str) -> Self {
         let mut details = HashMap::new();
         details.insert("namespace".to_string(), serde_json::json!(namespace));
@@ -218,6 +239,7 @@ impl ModuleError {
         .with_details(details)
     }
 
+    #[must_use]
     pub fn config_bind_error(namespace: &str, reason: &str) -> Self {
         let mut details = HashMap::new();
         details.insert("namespace".to_string(), serde_json::json!(namespace));
@@ -228,6 +250,7 @@ impl ModuleError {
         .with_details(details)
     }
 
+    #[must_use]
     pub fn error_formatter_duplicate(adapter_name: &str) -> Self {
         let mut details = HashMap::new();
         details.insert("adapter_name".to_string(), serde_json::json!(adapter_name));
@@ -238,6 +261,7 @@ impl ModuleError {
         .with_details(details)
     }
 
+    #[must_use]
     pub fn pipeline_abort(step: &str, explanation: Option<&str>) -> Self {
         let mut details = HashMap::new();
         details.insert("step".to_string(), serde_json::json!(step));
@@ -306,6 +330,7 @@ impl SchemaValidationError {
         }
     }
 
+    #[must_use]
     pub fn to_module_error(&self) -> ModuleError {
         let mut details = HashMap::new();
         let errors_json: Vec<serde_json::Value> = self
@@ -338,6 +363,7 @@ impl SchemaCircularRefError {
         }
     }
 
+    #[must_use]
     pub fn to_module_error(&self) -> ModuleError {
         let mut details = HashMap::new();
         details.insert(
@@ -355,6 +381,7 @@ pub struct VersionIncompatibleError {
 }
 
 impl VersionIncompatibleError {
+    #[must_use]
     pub fn to_module_error(&self) -> ModuleError {
         ModuleError::new(ErrorCode::VersionIncompatible, &self.message)
     }
@@ -384,6 +411,7 @@ impl ErrorCodeCollisionError {
         }
     }
 
+    #[must_use]
     pub fn to_module_error(&self) -> ModuleError {
         let mut details = HashMap::new();
         details.insert(
@@ -416,6 +444,7 @@ pub struct ErrorCodeRegistry {
 }
 
 impl ErrorCodeRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             module_codes: HashMap::new(),
@@ -494,11 +523,13 @@ impl ErrorCodeRegistry {
     }
 
     /// Returns a reference to the set of all currently registered codes.
+    #[must_use]
     pub fn all_codes(&self) -> &HashSet<String> {
         &self.all_codes
     }
 
     /// Returns the codes registered for a specific module, if any.
+    #[must_use]
     pub fn codes_for_module(&self, module_id: &str) -> Option<&HashSet<String>> {
         self.module_codes.get(module_id)
     }

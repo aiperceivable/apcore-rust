@@ -47,7 +47,10 @@ pub use approval::{
     CallbackApprovalHandler,
 };
 pub use async_task::{AsyncTaskManager, TaskInfo, TaskStatus};
-pub use bindings::{BindingDefinition, BindingLoader, BindingTarget};
+pub use bindings::{
+    typed_handler, AutoSchemaValue, BindingEntry, BindingHandler, BindingLoader, BindingsFile,
+    TypedBindingHandler,
+};
 pub use builtin_steps::{
     build_internal_strategy, build_minimal_strategy, build_performance_strategy,
     build_standard_strategy, build_testing_strategy, BuiltinACLCheck, BuiltinApprovalGate,

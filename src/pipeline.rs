@@ -25,7 +25,7 @@ use crate::utils::helpers::match_pattern;
 /// only defines the `execute()` contract and metadata accessors.
 #[async_trait]
 pub trait Step: Send + Sync {
-    /// Unique identifier within a strategy (e.g. "acl_check").
+    /// Unique identifier within a strategy (e.g. "`acl_check`").
     fn name(&self) -> &str;
 
     /// AI-readable purpose description.
@@ -48,7 +48,7 @@ pub trait Step: Send + Sync {
         false
     }
 
-    /// `true` = no side effects. Safe to run during `validate()` (dry_run mode).
+    /// `true` = no side effects. Safe to run during `validate()` (`dry_run` mode).
     fn pure(&self) -> bool {
         false
     }
@@ -58,12 +58,12 @@ pub trait Step: Send + Sync {
         0
     }
 
-    /// PipelineContext fields this step reads (e.g. `["module", "context"]`). Advisory only.
+    /// `PipelineContext` fields this step reads (e.g. `["module", "context"]`). Advisory only.
     fn requires(&self) -> &[&str] {
         &[]
     }
 
-    /// PipelineContext fields this step writes (e.g. `["output"]`). Advisory only.
+    /// `PipelineContext` fields this step writes (e.g. `["output"]`). Advisory only.
     fn provides(&self) -> &[&str] {
         &[]
     }
@@ -112,11 +112,13 @@ impl Default for StepResult {
 
 impl StepResult {
     /// Create a result that continues to the next step.
+    #[must_use]
     pub fn continue_step() -> Self {
         Self::default()
     }
 
     /// Create a result that aborts the pipeline with an explanation.
+    #[must_use]
     pub fn abort(explanation: &str) -> Self {
         Self {
             action: "abort".into(),
@@ -126,6 +128,7 @@ impl StepResult {
     }
 
     /// Create a result that skips forward to the named step.
+    #[must_use]
     pub fn skip_to(target: &str) -> Self {
         Self {
             action: "skip_to".into(),
@@ -150,7 +153,7 @@ pub struct PipelineContext {
     pub module_id: String,
     /// Original inputs (may be mutated by `middleware_before`).
     pub inputs: serde_json::Value,
-    /// APCore execution context.
+    /// `APCore` execution context.
     pub context: Context<serde_json::Value>,
 
     // -- Resolved during pipeline (None until the responsible step runs) --
@@ -164,11 +167,11 @@ pub struct PipelineContext {
     pub validated_output: Option<serde_json::Value>,
 
     // -- Pipeline v2 --
-    /// `true` during `validate()`. PipelineEngine skips steps with `pure=false`.
+    /// `true` during `validate()`. `PipelineEngine` skips steps with `pure=false`.
     pub dry_run: bool,
-    /// Passed through to module_lookup for version negotiation.
+    /// Passed through to `module_lookup` for version negotiation.
     pub version_hint: Option<String>,
-    /// Tracks which middleware ran, enabling on_error recovery chain.
+    /// Tracks which middleware ran, enabling `on_error` recovery chain.
     pub executed_middlewares: Vec<usize>,
 
     // -- Executor resources (injected by Executor::call) --
@@ -239,7 +242,7 @@ pub struct StepTrace {
     pub skipped: bool,
     /// Whether this step is an AI decision point.
     pub decision_point: bool,
-    /// Reason the step was skipped: "no_match", "dry_run", or "error_ignored".
+    /// Reason the step was skipped: "`no_match`", "`dry_run`", or "`error_ignored`".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
 }
@@ -261,6 +264,7 @@ pub struct PipelineTrace {
 
 impl PipelineTrace {
     /// Create an empty trace for a new pipeline run.
+    #[must_use]
     pub fn new(module_id: String, strategy_name: String) -> Self {
         Self {
             module_id,
@@ -323,6 +327,28 @@ impl std::fmt::Debug for ExecutionStrategy {
     }
 }
 
+/// No-op step used as a temporary placeholder by [`ExecutionStrategy::replace_with`].
+struct PlaceholderStep;
+
+#[async_trait]
+impl Step for PlaceholderStep {
+    fn name(&self) -> &'static str {
+        "__placeholder__"
+    }
+    fn description(&self) -> &'static str {
+        ""
+    }
+    fn removable(&self) -> bool {
+        true
+    }
+    fn replaceable(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        Ok(StepResult::continue_step())
+    }
+}
+
 impl ExecutionStrategy {
     /// Create a new strategy with the given name and initial steps.
     ///
@@ -370,6 +396,7 @@ impl ExecutionStrategy {
     }
 
     /// Strategy name.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -380,11 +407,13 @@ impl ExecutionStrategy {
     }
 
     /// Ordered list of step names.
+    #[must_use]
     pub fn step_names(&self) -> Vec<String> {
         self.steps.iter().map(|s| s.name().to_string()).collect()
     }
 
     /// Read-only access to the step list.
+    #[must_use]
     pub fn steps(&self) -> &[Box<dyn Step>] {
         &self.steps
     }
@@ -433,7 +462,23 @@ impl ExecutionStrategy {
         Ok(())
     }
 
+    /// Replace a step by applying a wrapper function over its current value.
+    ///
+    /// Used by `build_strategy_from_config` to overlay YAML metadata
+    /// (`match_modules`, `ignore_errors`, etc.) on built-in steps without
+    /// losing the original step logic.
+    pub fn replace_with<F>(&mut self, step_name: &str, wrapper: F) -> Result<(), ModuleError>
+    where
+        F: FnOnce(Box<dyn Step>) -> Box<dyn Step>,
+    {
+        let idx = self.find_step_index(step_name)?;
+        let old = std::mem::replace(&mut self.steps[idx], Box::new(PlaceholderStep));
+        self.steps[idx] = wrapper(old);
+        Ok(())
+    }
+
     /// Build a [`StrategyInfo`] summary for AI introspection.
+    #[must_use]
     pub fn info(&self) -> StrategyInfo {
         let step_names = self.step_names();
         let description = self

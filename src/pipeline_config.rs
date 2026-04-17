@@ -53,12 +53,14 @@ pub fn register_step_type(name: &str, factory: StepFactory) -> Result<(), Module
 }
 
 /// Remove a registered step type. Returns `true` if found and removed.
+#[must_use]
 pub fn unregister_step_type(name: &str) -> bool {
     let mut map = global_step_factories().write();
     map.remove(name).is_some()
 }
 
 /// Return a list of all registered step type names.
+#[must_use]
 pub fn registered_step_types() -> Vec<String> {
     let map = global_step_factories().read();
     map.keys().cloned().collect()
@@ -72,24 +74,88 @@ pub(crate) fn reset_step_registry() {
 }
 
 // ---------------------------------------------------------------------------
-// Step resolution from config dict
+// Step resolution from config dict (DECLARATIVE_CONFIG_SPEC.md §4)
 // ---------------------------------------------------------------------------
+
+/// Wrapper that overlays YAML metadata fields onto a factory-created step.
+struct ConfiguredStep {
+    inner: Box<dyn Step>,
+    name_override: Option<String>,
+    match_modules: Option<Vec<String>>,
+    ignore_errors: bool,
+    pure: bool,
+    timeout_ms: u64,
+}
+
+#[async_trait::async_trait]
+impl Step for ConfiguredStep {
+    fn name(&self) -> &str {
+        self.name_override
+            .as_deref()
+            .unwrap_or_else(|| self.inner.name())
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn removable(&self) -> bool {
+        self.inner.removable()
+    }
+    fn replaceable(&self) -> bool {
+        self.inner.replaceable()
+    }
+    fn match_modules(&self) -> Option<&[String]> {
+        self.match_modules
+            .as_deref()
+            .or_else(|| self.inner.match_modules())
+    }
+    fn ignore_errors(&self) -> bool {
+        self.ignore_errors
+    }
+    fn pure(&self) -> bool {
+        self.pure
+    }
+    fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+    async fn execute(
+        &self,
+        ctx: &mut crate::pipeline::PipelineContext,
+    ) -> Result<crate::pipeline::StepResult, ModuleError> {
+        self.inner.execute(ctx).await
+    }
+}
 
 /// Resolve a single step definition dict into a `Box<dyn Step>`.
 ///
-/// The dict must contain a `"type"` field whose value matches a registered step type.
+/// Per `DECLARATIVE_CONFIG_SPEC.md` §4.3:
+///   - `type:` → registry lookup (only supported mode in Rust)
+///   - `handler:` → parse-time error (Rust cannot dynamically load modules)
+///   - Metadata: `match_modules`, `ignore_errors`, `pure`, `timeout_ms` applied via wrapper.
 fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
     let step_name = step_def.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let type_name = step_def.get("type").and_then(|v| v.as_str());
+    let handler_path = step_def.get("handler").and_then(|v| v.as_str());
     let config = step_def
         .get("config")
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
+    // handler: is not supported in Rust (compiled language, no runtime import).
+    if let Some(hp) = handler_path {
+        return Err(ModuleError::new(
+            ErrorCode::PipelineHandlerNotSupported,
+            format!(
+                "pipeline step '{step_name}' uses 'handler: {hp}' which is not supported in apcore-rust. \
+                 Use 'type:' with register_step_type(). \
+                 See DECLARATIVE_CONFIG_SPEC.md §4.4",
+            ),
+        ));
+    }
+
     let type_name = type_name.ok_or_else(|| {
         ModuleError::new(
             ErrorCode::GeneralInvalidInput,
-            format!("Step '{step_name}' has no 'type' field"),
+            format!("Step '{step_name}' has neither 'type' nor 'handler'"),
         )
     })?;
 
@@ -104,7 +170,43 @@ fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
         )
     })?;
 
-    factory(&config)
+    let inner = factory(&config)?;
+
+    // Parse metadata from YAML
+    let match_modules = step_def
+        .get("match_modules")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+    let ignore_errors = step_def
+        .get("ignore_errors")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let pure = step_def
+        .get("pure")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let timeout_ms = step_def
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    let name_override = step_def
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(Box::new(ConfiguredStep {
+        inner,
+        name_override,
+        match_modules,
+        ignore_errors,
+        pure,
+        timeout_ms,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +243,6 @@ pub fn build_strategy_from_config(
     if let Some(remove_list) = pipeline_config.get("remove").and_then(|v| v.as_array()) {
         for entry in remove_list {
             if let Some(step_name) = entry.as_str() {
-                // Log warning on failure but continue (matches Python behavior).
                 if let Err(e) = strategy.remove(step_name) {
                     tracing::warn!(step = step_name, error = %e, "Cannot remove step");
                 }
@@ -149,7 +250,62 @@ pub fn build_strategy_from_config(
         }
     }
 
-    // (2) Resolve and insert custom steps
+    // (2) Configure existing step fields (DECLARATIVE_CONFIG_SPEC.md §4.2)
+    if let Some(Value::Object(configure)) = pipeline_config.get("configure") {
+        for (step_name, overrides) in configure {
+            let step_name_str = step_name.as_str();
+            if let Value::Object(fields) = overrides {
+                let match_modules =
+                    fields
+                        .get("match_modules")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        });
+                let ignore_errors = fields
+                    .get("ignore_errors")
+                    .and_then(serde_json::Value::as_bool);
+                let pure_val = fields.get("pure").and_then(serde_json::Value::as_bool);
+                let timeout_ms = fields.get("timeout_ms").and_then(serde_json::Value::as_u64);
+
+                // Warn on unknown keys (never silently drop).
+                for key in fields.keys() {
+                    if !["match_modules", "ignore_errors", "pure", "timeout_ms"]
+                        .contains(&key.as_str())
+                    {
+                        tracing::warn!(
+                            step = step_name_str,
+                            field = key.as_str(),
+                            "Unknown configurable field — ignored"
+                        );
+                    }
+                }
+
+                // Wrap the existing step with a ConfiguredStep overlay.
+                if let Err(e) = strategy.replace_with(step_name_str, |inner| {
+                    Box::new(ConfiguredStep {
+                        name_override: None,
+                        match_modules: match_modules
+                            .or_else(|| inner.match_modules().map(<[std::string::String]>::to_vec)),
+                        ignore_errors: ignore_errors.unwrap_or_else(|| inner.ignore_errors()),
+                        pure: pure_val.unwrap_or_else(|| inner.pure()),
+                        timeout_ms: timeout_ms.unwrap_or_else(|| inner.timeout_ms()),
+                        inner,
+                    })
+                }) {
+                    tracing::warn!(
+                        step = step_name_str,
+                        error = %e,
+                        "Cannot configure step"
+                    );
+                }
+            }
+        }
+    }
+
+    // (3) Resolve and insert custom steps
     if let Some(steps_list) = pipeline_config.get("steps").and_then(|v| v.as_array()) {
         for step_def in steps_list {
             let step = resolve_step(step_def)?;
@@ -392,5 +548,71 @@ mod tests {
         let step_def = json!({"name": "no_type"});
         let result = resolve_step(&step_def);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handler_rejected_with_pipeline_handler_not_supported() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let step_def = json!({
+            "name": "dynamic",
+            "handler": "my_app.steps:CustomStep",
+            "after": "execute"
+        });
+        let result = resolve_step(&step_def);
+        match result {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::PipelineHandlerNotSupported);
+                assert!(err.message.contains("handler"));
+                assert!(err.message.contains("DECLARATIVE_CONFIG_SPEC.md §4.4"));
+            }
+            Ok(_) => panic!("expected PipelineHandlerNotSupportedError"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_step_applies_metadata_overrides() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_step_registry();
+        register_step_type(
+            "meta_step",
+            Box::new(|_config| Ok(Box::new(ConfigurableStep::new("meta")))),
+        )
+        .unwrap();
+
+        let step_def = json!({
+            "name": "configured",
+            "type": "meta_step",
+            "match_modules": ["api.*", "web.*"],
+            "ignore_errors": true,
+            "pure": true,
+            "timeout_ms": 5000
+        });
+        let step = resolve_step(&step_def).unwrap();
+        assert_eq!(step.name(), "configured");
+        assert_eq!(step.match_modules().unwrap(), &["api.*", "web.*"]);
+        assert!(step.ignore_errors());
+        assert!(step.pure());
+        assert_eq!(step.timeout_ms(), 5000);
+    }
+
+    #[test]
+    fn test_configure_section_overrides_existing_step() {
+        let config = json!({
+            "configure": {
+                "input_validation": {
+                    "ignore_errors": true,
+                    "timeout_ms": 3000
+                }
+            }
+        });
+        let strategy = build_strategy_from_config(&config).unwrap();
+        // Find the configured step and verify overrides took effect.
+        let step = strategy
+            .steps()
+            .iter()
+            .find(|s| s.name() == "input_validation")
+            .expect("input_validation step should exist");
+        assert!(step.ignore_errors());
+        assert_eq!(step.timeout_ms(), 3000);
     }
 }
