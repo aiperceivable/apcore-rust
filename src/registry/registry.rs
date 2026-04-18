@@ -81,11 +81,35 @@ pub struct DependencyInfo {
 }
 
 /// A module found via discovery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Every entry carries a live module instance. Discoverers for out-of-process
+/// modules (subprocesses, RPC endpoints, network-hosted modules) wrap the
+/// external resource in a [`Module`] impl — e.g., a
+/// `SubprocessModule { executable: PathBuf, descriptor }` whose `execute`
+/// spawns the process — so the registry can treat all modules uniformly.
+///
+/// Aligned with `apcore-python.Discoverer` (returns `{module_id, module}`)
+/// and `apcore-typescript.Discoverer` (returns `{moduleId, module}`).
+///
+/// Not serializable: the `module` field is a trait object and cannot round-trip
+/// through `serde`.
+#[derive(Clone)]
 pub struct DiscoveredModule {
     pub name: String,
     pub source: String,
     pub descriptor: ModuleDescriptor,
+    pub module: Arc<dyn Module>,
+}
+
+impl std::fmt::Debug for DiscoveredModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveredModule")
+            .field("name", &self.name)
+            .field("source", &self.source)
+            .field("descriptor", &self.descriptor)
+            .field("module", &"<Module>")
+            .finish()
+    }
 }
 
 /// Trait for discovering modules from external sources.
@@ -97,6 +121,10 @@ pub trait Discoverer: Send + Sync {
     /// Implementations that perform filesystem discovery SHOULD restrict their
     /// search to the provided roots. Passing an empty slice means "use the
     /// implementation's default search paths."
+    ///
+    /// Each returned [`DiscoveredModule`] carries a live `module` instance —
+    /// discoverers for out-of-process modules wrap the external resource in a
+    /// `Module` impl so the registry can treat every module uniformly.
     ///
     /// Aligned with `apcore-python.Discoverer.discover(roots)` and
     /// `apcore-typescript.Discoverer.discover(roots)`.
@@ -560,23 +588,19 @@ impl Registry {
 
     /// Discover and register modules from a discoverer.
     ///
-    /// Returns the number of newly registered modules, matching the
-    /// protocol spec's `Registry.discover() -> int` contract.
+    /// Returns the count of entries that were actually registered —
+    /// entries whose `name` fails `PROTOCOL_SPEC` §2.7 validation, whose
+    /// `name` duplicates an already-discovered descriptor, or whose
+    /// instance is rejected by the custom validator are skipped with a
+    /// `tracing::warn!` and excluded from the count.
+    ///
+    /// Aligned with `apcore-python.Registry._discover_custom` and
+    /// `apcore-typescript.Registry._discoverCustom` — same skip-and-warn
+    /// semantics for malformed entries.
     #[allow(clippy::similar_names)] // `discoverer` (param) and `discovered` (result) are semantically distinct
     pub async fn discover(&self, discoverer: &dyn Discoverer) -> Result<usize, ModuleError> {
         let discovered = discoverer.discover(&[]).await?;
-        let count = discovered.len();
-
-        {
-            let mut core = self.core.write();
-            for dm in discovered {
-                core.descriptors.insert(dm.name.clone(), dm.descriptor);
-                core.lowercase_map
-                    .insert(dm.name.to_lowercase(), dm.name.clone());
-            }
-        }
-
-        Ok(count)
+        Ok(self.register_discovered(discovered))
     }
 
     /// Register a sys/internal module that bypasses **only** the reserved
@@ -863,17 +887,77 @@ impl Registry {
         }
 
         let discovered = discover_result?;
-        let count = discovered.len();
-        {
-            let mut core = self.core.write();
-            for dm in discovered {
-                core.descriptors.insert(dm.name.clone(), dm.descriptor);
+        Ok(self.register_discovered(discovered))
+    }
+
+    /// Shared discovery post-processing for `discover()` and `discover_internal()`.
+    ///
+    /// For each entry: validate the name per `PROTOCOL_SPEC` §2.7, reject
+    /// duplicates, run the custom validator, invoke `on_load`, then register
+    /// the instance. Returns the count of entries that successfully registered.
+    /// Failed entries are logged at `warn` and skipped; one bad entry never
+    /// aborts the batch.
+    fn register_discovered(&self, discovered: Vec<DiscoveredModule>) -> usize {
+        let mut registered_count = 0usize;
+        let mut callbacks_to_fire: Vec<(String, Arc<dyn Module>)> = Vec::new();
+
+        for dm in discovered {
+            if let Err(e) = validate_module_id(&dm.name, false) {
+                tracing::warn!(
+                    module_id = %dm.name,
+                    error = %e.message,
+                    "Discovered module rejected: invalid module_id"
+                );
+                continue;
+            }
+
+            if let Some(validator) = self.validator.read().as_ref() {
+                let result = validator.validate(dm.module.as_ref(), Some(&dm.descriptor));
+                if !result.valid {
+                    tracing::warn!(
+                        module_id = %dm.name,
+                        errors = ?result.errors,
+                        "Custom validator rejected discovered module"
+                    );
+                    continue;
+                }
+            }
+
+            dm.module.on_load();
+
+            {
+                let mut core = self.core.write();
+                if core.modules.contains_key(&dm.name) {
+                    tracing::warn!(
+                        module_id = %dm.name,
+                        "Discovered module rejected: already registered"
+                    );
+                    continue;
+                }
+
+                let schema = serde_json::json!({
+                    "input": dm.descriptor.input_schema.clone(),
+                    "output": dm.descriptor.output_schema.clone(),
+                });
+                core.schema_cache.insert(dm.name.clone(), schema);
                 core.lowercase_map
                     .insert(dm.name.to_lowercase(), dm.name.clone());
+                core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
+                core.descriptors.insert(dm.name.clone(), dm.descriptor);
+                callbacks_to_fire.push((dm.name.clone(), dm.module));
+            }
+
+            registered_count += 1;
+        }
+
+        // Fire "register" callbacks outside any lock.
+        for (name, module_arc) in callbacks_to_fire {
+            for cb in self.snapshot_callbacks("register") {
+                cb(&name, module_arc.as_ref());
             }
         }
 
-        Ok(count)
+        registered_count
     }
 
     /// Set the discoverer.

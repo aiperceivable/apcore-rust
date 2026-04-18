@@ -529,3 +529,197 @@ fn test_off_returns_false_for_unknown_handle() {
     let removed = registry.off(99999);
     assert!(!removed, "off() with unknown handle should return false");
 }
+
+// ---------------------------------------------------------------------------
+// Discoverer — cross-language parity tests
+// ---------------------------------------------------------------------------
+
+mod discoverer_tests {
+    use super::*;
+    use apcore::module::ValidationResult;
+    use apcore::registry::registry::{DiscoveredModule, Discoverer, ModuleValidator};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    struct OnLoadCountingModule {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Module for OnLoadCountingModule {
+        fn description(&self) -> &'static str {
+            "on_load counter"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn on_load(&self) {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, ModuleError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    struct FixedDiscoverer {
+        entries: Mutex<Option<Vec<DiscoveredModule>>>,
+    }
+
+    impl FixedDiscoverer {
+        fn new(entries: Vec<DiscoveredModule>) -> Self {
+            Self {
+                entries: Mutex::new(Some(entries)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Discoverer for FixedDiscoverer {
+        async fn discover(&self, _roots: &[String]) -> Result<Vec<DiscoveredModule>, ModuleError> {
+            Ok(self.entries.lock().unwrap().take().unwrap_or_default())
+        }
+    }
+
+    struct RejectAllValidator {
+        called: Arc<AtomicUsize>,
+    }
+
+    impl ModuleValidator for RejectAllValidator {
+        fn validate(
+            &self,
+            _module: &dyn Module,
+            _descriptor: Option<&ModuleDescriptor>,
+        ) -> ValidationResult {
+            self.called.fetch_add(1, Ordering::SeqCst);
+            ValidationResult {
+                valid: false,
+                errors: vec!["rejected by test validator".to_string()],
+                warnings: vec![],
+            }
+        }
+    }
+
+    fn dm(name: &str, module: Arc<dyn Module>) -> DiscoveredModule {
+        DiscoveredModule {
+            name: name.to_string(),
+            source: "test".to_string(),
+            descriptor: make_descriptor(name),
+            module,
+        }
+    }
+
+    fn stub() -> Arc<dyn Module> {
+        Arc::new(StubModule)
+    }
+
+    #[tokio::test]
+    async fn registers_instance_and_fires_on_load() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let module: Arc<dyn Module> = Arc::new(OnLoadCountingModule {
+            counter: Arc::clone(&counter),
+        });
+        let registry = Registry::new();
+        let discoverer = FixedDiscoverer::new(vec![dm("math.add", module)]);
+
+        let count = registry.discover(&discoverer).await.unwrap();
+
+        assert_eq!(count, 1);
+        assert!(registry.has("math.add"));
+        assert!(registry.get_definition("math.add").is_some());
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "on_load called exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_module_id_is_skipped_and_does_not_abort_batch() {
+        let registry = Registry::new();
+        let discoverer = FixedDiscoverer::new(vec![
+            dm("Invalid-ID", stub()),    // uppercase + hyphen — EBNF fail
+            dm("", stub()),              // empty
+            dm("system.hacker", stub()), // reserved first segment
+            dm("good.one", stub()),
+        ]);
+
+        let count = registry.discover(&discoverer).await.unwrap();
+
+        assert_eq!(count, 1, "only the single valid entry should register");
+        assert!(registry.has("good.one"));
+        assert!(registry.get_definition("Invalid-ID").is_none());
+        assert!(registry.get_definition("").is_none());
+        assert!(registry.get_definition("system.hacker").is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_entry_within_batch_is_skipped() {
+        let registry = Registry::new();
+        let discoverer = FixedDiscoverer::new(vec![
+            dm("math.add", stub()),
+            dm("math.add", stub()), // duplicate
+        ]);
+
+        let count = registry.discover(&discoverer).await.unwrap();
+
+        assert_eq!(count, 1, "second duplicate should be skipped");
+        assert!(registry.has("math.add"));
+    }
+
+    #[tokio::test]
+    async fn custom_validator_rejects_entry() {
+        let called = Arc::new(AtomicUsize::new(0));
+        let registry = Registry::new();
+        registry.set_validator(Box::new(RejectAllValidator {
+            called: Arc::clone(&called),
+        }));
+        let discoverer = FixedDiscoverer::new(vec![dm("math.add", stub())]);
+
+        let count = registry.discover(&discoverer).await.unwrap();
+
+        assert_eq!(count, 0);
+        assert!(!registry.has("math.add"));
+        assert!(registry.get_definition("math.add").is_none());
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn register_callback_fires_once_per_entry() {
+        let callback_count = Arc::new(std::sync::Mutex::new(0usize));
+        let cc = Arc::clone(&callback_count);
+        let registry = Registry::new();
+        registry.on(
+            "register",
+            Box::new(move |_: &str, _: &dyn Module| {
+                *cc.lock().unwrap() += 1;
+            }),
+        );
+
+        let discoverer =
+            FixedDiscoverer::new(vec![dm("math.add", stub()), dm("math.subtract", stub())]);
+        let count = registry.discover(&discoverer).await.unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            *callback_count.lock().unwrap(),
+            2,
+            "register callback fires once per registered entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_internal_without_discoverer_returns_error() {
+        let registry = Registry::new();
+        let err = registry.discover_internal().await.unwrap_err();
+        assert_eq!(err.code, apcore::errors::ErrorCode::ModuleLoadError);
+    }
+}
