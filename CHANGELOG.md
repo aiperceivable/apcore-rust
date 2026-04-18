@@ -12,30 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.19.0] - 2026-04-19
 
 ### Added
 
 - **`ErrorCode::DependencyVersionMismatch`** — new error code raised by `resolve_dependencies` when a declared `version` constraint is not satisfied by the registered version of the target module. `ModuleError` details include `module_id`, `dependency_id`, `required`, `actual`.
 - **`resolve_dependencies(modules, known_ids, module_versions)`** — new third argument `Option<&HashMap<String, String>>` mapping `module_id → version`. When provided, declared dependency version constraints are enforced per PROTOCOL_SPEC §5.3. When absent, the `DepInfo.version` field is silently ignored.
 - **Caret (`^`) and tilde (`~`) constraint support** in `matches_version_hint` / `select_best_version` (npm/Cargo semantics): `^1.2.3 → >=1.2.3,<2.0.0`, `^0.2.3 → >=0.2.3,<0.3.0`, `^0.0.3 → >=0.0.3,<0.0.4`, `~1.2.3 → >=1.2.3,<1.3.0`, `~1.2 → >=1.2.0,<1.3.0`, `~1 → >=1.0.0,<2.0.0`.
-
-### Fixed
-
-- **`resolve_dependencies` cycle path accuracy** — `extract_cycle` previously returned a phantom path (all remaining nodes plus the first one re-appended) when the arbitrarily-picked start node had no outgoing edge inside `remaining`. This could happen when a module is blocked on an external `known_ids` dependency while another subset contains a real cycle. Rewritten to DFS from each remaining node (sorted) and return a true back-edge cycle `[n0, ..., nk, n0]`; falls back to the sorted `remaining` set only when no back-edge exists.
-- **`CircularDependencyError` now carries `cycle_path` in `ModuleError.details`** (as a JSON string array), matching the Python `details["cycle_path"]` / TypeScript `details.cyclePath` contract. Previously the path was only embedded in the message string, forcing downstream consumers to parse it.
-
-### Changed (BREAKING)
-
-- **`resolve_dependencies` signature** changed from `(modules, known_ids) -> Result<...>` to `(modules, known_ids, module_versions) -> Result<...>`. Pass `None` for `module_versions` to preserve prior behavior. All in-crate call sites updated.
-- **Missing required dependencies now return `ErrorCode::DependencyNotFound` instead of `ErrorCode::ModuleLoadError`.** Brings Rust into compliance with PROTOCOL_SPEC §5.15.2. The error's `details` map now includes `module_id` and `dependency_id`. Upgrade path: match on `ErrorCode::DependencyNotFound` where you previously matched `ErrorCode::ModuleLoadError` for missing-dep cases.
-
----
-
-## [0.19.0] - 2026-04-17
-
-### Added
-
 - **`TypedBindingHandler`** and **`typed_handler<I, O>()`** — Generic function that bundles an async handler with auto-derived JSON Schemas from `schemars::JsonSchema` trait bounds. When used with `register_into_with_typed_handlers()`, schemas from `schemars` are used for `auto_schema` bindings instead of the permissive `{"type":"object"}` fallback. No proc-macro crate needed. See DECLARATIVE_CONFIG_SPEC.md §6.5.
 - **`auto_schema: true | permissive | strict`** — `AutoSchemaValue` enum accepts boolean or mode string. Strict mode reserved for OpenAI/Anthropic schema compliance (enforcement via `schemars` + post-processing tracked for 0.20.0).
 - **New `ErrorCode` variants**: `BindingSchemaInferenceFailed`, `BindingSchemaModeConflict`, `BindingStrictSchemaIncompatible`, `BindingPolicyViolation`, `PipelineConfigInvalid`, `PipelineHandlerNotSupported`, `PipelineStepInsertionAmbiguous`, `EntryPointNotFound`, `EntryPointAmbiguous`, `EntryPointRuntimeUnsupported` (reserved). See DECLARATIVE_CONFIG_SPEC.md §7.1.
@@ -49,17 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cross-SDK conformance fixtures** in `apcore/conformance/fixtures/`.
 - **Reintroduced `AsyncTaskManager`** (`src/async_task.rs`) — background task execution with `submit`, `get_status`, `get_result`, `cancel`, `list_tasks`, `cleanup`, `shutdown`; bounded by `max_concurrent` and `max_tasks`. 24 tests in `tests/test_async_task.rs`. Re-exported from crate root. Was temporarily removed in 0.18.0 pending `Executor` integration.
 - **Reintroduced `ExtensionManager` / `ExtensionPoint`** (`src/extensions.rs`) — plugin registry with `register`, `get`, `get_all`, `unregister`, `list_points`, `apply`; supported extension points include `discoverer`, `module_validator`, `middleware`, `span_exporter`, `acl`, `approval_handler`. 21 tests in `tests/test_extensions.rs`. Re-exported from crate root. Was temporarily removed in 0.18.0.
-
-### Added (continued)
-
 - **`Context::builder()`** — New builder API supporting W3C trace_parent inheritance: `Context::builder().trace_parent(Option<TraceParent>).identity(id).services(s).build()`. The builder validates the incoming `trace_parent.trace_id` against `^[0-9a-f]{32}$` (rejecting all-zero and all-f per W3C), inheriting valid values verbatim and regenerating with `tracing::warn!` otherwise. See PROTOCOL_SPEC §10.5 `external_trace_parent_handling`. Existing `Context::new`, `Context::anonymous`, and `Context::create` constructors remain backward-compatible.
+
+### Fixed
+
+- **`resolve_dependencies` cycle path accuracy** — `extract_cycle` previously returned a phantom path (all remaining nodes plus the first one re-appended) when the arbitrarily-picked start node had no outgoing edge inside `remaining`. This could happen when a module is blocked on an external `known_ids` dependency while another subset contains a real cycle. Rewritten to DFS from each remaining node (sorted) and return a true back-edge cycle `[n0, ..., nk, n0]`; falls back to the sorted `remaining` set only when no back-edge exists.
+- **`CircularDependencyError` now carries `cycle_path` in `ModuleError.details`** (as a JSON string array), matching the Python `details["cycle_path"]` / TypeScript `details.cyclePath` contract. Previously the path was only embedded in the message string, forcing downstream consumers to parse it.
 
 ### Changed
 
 - **`Context` trace_id format** changed from 36-char UUID (with dashes) to **32-char lowercase hex** (aligned with W3C Trace Context `trace-id` field). Affects all internal constructors and external observability output. Downstream Jaeger/Tempo/Honeycomb/Datadog/OTLP consumers gain direct interoperability; the `TraceContext::inject()` dash-stripping workaround is now a no-op for freshly-created contexts but retained for backward compatibility with any persisted 36-char IDs.
-
-### Changed (BREAKING)
-
+- **`resolve_dependencies` signature** changed from `(modules, known_ids) -> Result<...>` to `(modules, known_ids, module_versions) -> Result<...>`. Pass `None` for `module_versions` to preserve prior behavior. All in-crate call sites updated.
+- **Missing required dependencies now return `ErrorCode::DependencyNotFound` instead of `ErrorCode::ModuleLoadError`.** Brings Rust into compliance with PROTOCOL_SPEC §5.15.2. The error's `details` map now includes `module_id` and `dependency_id`. Upgrade path: match on `ErrorCode::DependencyNotFound` where you previously matched `ErrorCode::ModuleLoadError` for missing-dep cases.
 - **Binding YAML format migrated to canonical** — Top-level `bindings:` list with `module_id` and string `target: "module:callable"`. Old format (`- name:` flat list, `target: {module_name, callable}`, `metadata:` wrapper) removed. See DECLARATIVE_CONFIG_SPEC.md §8.1 for migration guide.
 - **`BindingDefinition` and `BindingTarget` removed** — Replaced by `BindingEntry` and `BindingsFile`. Public re-exports updated.
 - **Handler-map key changed** from binding `name` to full `target` string (e.g., `"format_date:format_date_string"`).

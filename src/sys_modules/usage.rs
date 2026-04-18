@@ -54,7 +54,7 @@ impl Module for UsageSummaryModule {
 
         let mut summaries = self.collector.get_all_summaries();
         // Sort by call_count descending per spec.
-        summaries.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+        summaries.sort_by_key(|b| std::cmp::Reverse(b.call_count));
 
         let total_calls: u64 = summaries.iter().map(|s| s.call_count).sum();
         let total_errors: u64 = summaries.iter().map(|s| s.error_count).sum();

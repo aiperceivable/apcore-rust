@@ -126,7 +126,7 @@ impl ErrorHistory {
         match map.get(module_id) {
             Some(entries) => {
                 let mut result: Vec<ErrorEntry> = entries.iter().cloned().collect();
-                result.sort_by(|a, b| b.last_occurred.cmp(&a.last_occurred));
+                result.sort_by_key(|b| std::cmp::Reverse(b.last_occurred));
                 if let Some(lim) = limit {
                     result.truncate(lim);
                 }
@@ -144,7 +144,7 @@ impl ErrorHistory {
             .values()
             .flat_map(|entries| entries.iter().cloned())
             .collect();
-        all.sort_by(|a, b| b.last_occurred.cmp(&a.last_occurred));
+        all.sort_by_key(|b| std::cmp::Reverse(b.last_occurred));
         if let Some(lim) = limit {
             all.truncate(lim);
         }
