@@ -137,6 +137,7 @@ impl SchemaValidator {
 
         // --- object-specific checks ---
         if value.is_object() {
+            // INVARIANT: `value.is_object()` guard above ensures this succeeds.
             let obj = value.as_object().unwrap();
 
             // "required" fields
@@ -193,6 +194,7 @@ impl SchemaValidator {
         // --- array-specific checks ---
         if value.is_array() {
             if let Some(items_schema) = schema_obj.get("items") {
+                // INVARIANT: `value.is_array()` guard above ensures this succeeds.
                 let arr = value.as_array().unwrap();
                 for (i, item) in arr.iter().enumerate() {
                     let child_path = if path.is_empty() {

@@ -98,7 +98,12 @@ impl EventEmitter {
         for subscriber in &self.subscribers {
             if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 if let Err(e) = subscriber.on_event(event).await {
-                    eprintln!("Subscriber {} failed: {}", subscriber.subscriber_id(), e);
+                    tracing::warn!(
+                        subscriber_id = %subscriber.subscriber_id(),
+                        event_type = %event.event_type,
+                        error = %e,
+                        "event subscriber failed"
+                    );
                 }
             }
         }
@@ -117,7 +122,12 @@ impl EventEmitter {
                 && Self::matches_pattern(subscriber.event_pattern(), &event.event_type)
             {
                 if let Err(e) = subscriber.on_event(event).await {
-                    eprintln!("Subscriber {} failed: {}", subscriber.subscriber_id(), e);
+                    tracing::warn!(
+                        subscriber_id = %subscriber.subscriber_id(),
+                        event_type = %event.event_type,
+                        error = %e,
+                        "event subscriber failed"
+                    );
                 }
             }
         }

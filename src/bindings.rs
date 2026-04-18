@@ -250,20 +250,20 @@ impl BindingLoader {
     fn ingest(&mut self, file: BindingsFile, source_path: &Path) -> Result<(), ModuleError> {
         match file.spec_version.as_deref() {
             None => {
-                eprintln!(
-                    "[apcore::bindings] {}: spec_version missing; defaulting to '{}'. \
+                tracing::warn!(
+                    path = %source_path.display(),
+                    default_version = CURRENT_SPEC_VERSION,
+                    "spec_version missing in bindings file; defaulting. \
                      spec_version will be mandatory in spec 1.1. \
-                     See DECLARATIVE_CONFIG_SPEC.md §2.4",
-                    source_path.display(),
-                    CURRENT_SPEC_VERSION,
+                     See DECLARATIVE_CONFIG_SPEC.md §2.4"
                 );
             }
             Some(v) if !SUPPORTED_SPEC_VERSIONS.contains(&v) => {
-                eprintln!(
-                    "[apcore::bindings] {}: spec_version '{}' is newer than supported {:?}; proceeding best-effort.",
-                    source_path.display(),
-                    v,
-                    SUPPORTED_SPEC_VERSIONS,
+                tracing::warn!(
+                    path = %source_path.display(),
+                    spec_version = v,
+                    supported = ?SUPPORTED_SPEC_VERSIONS,
+                    "bindings spec_version is newer than supported; proceeding best-effort"
                 );
             }
             _ => {}

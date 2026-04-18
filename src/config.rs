@@ -410,6 +410,7 @@ impl Config {
             if !current.is_object() {
                 *current = serde_json::Value::Object(serde_json::Map::new());
             }
+            // INVARIANT: the preceding `if !current.is_object()` branch guarantees object shape.
             current = current
                 .as_object_mut()
                 .unwrap()
@@ -419,6 +420,7 @@ impl Config {
         if !current.is_object() {
             *current = serde_json::Value::Object(serde_json::Map::new());
         }
+        // INVARIANT: the preceding `if !current.is_object()` branch guarantees object shape.
         current
             .as_object_mut()
             .unwrap()

@@ -100,6 +100,7 @@ impl SchemaLoader {
         for path in &candidates {
             if path.exists() {
                 self.load_from_file(module_id, path)?;
+                // INVARIANT: load_from_file inserts into self.schemas on Ok; the key is present.
                 let value = self.get(module_id).expect("just loaded").clone();
                 return Self::value_to_schema_def(module_id, value);
             }

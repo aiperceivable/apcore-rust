@@ -22,7 +22,10 @@ impl SpanExporter for StdoutExporter {
                 format!("Failed to serialize span: {e}"),
             )
         })?;
-        println!("{json}");
+        // Route through tracing so the span line integrates with the
+        // application's tracing-subscriber configuration and does not
+        // bypass log aggregation pipelines.
+        tracing::info!(target: "apcore.span", span = %json);
         Ok(())
     }
 

@@ -179,6 +179,7 @@ impl Step for BuiltinCallChainGuard {
     }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        // INVARIANT: Executor::inject_resources sets config before any step runs.
         let config = ctx
             .config
             .as_ref()
@@ -203,6 +204,7 @@ impl Step for BuiltinModuleLookup {
     }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        // INVARIANT: Executor::inject_resources sets registry before any step runs.
         let registry = ctx
             .registry
             .as_ref()
@@ -289,6 +291,7 @@ impl Step for BuiltinApprovalGate {
             None => return Ok(StepResult::continue_step()),
         };
 
+        // INVARIANT: Executor::inject_resources sets registry before any step runs.
         let registry = ctx
             .registry
             .as_ref()
@@ -411,6 +414,7 @@ impl Step for BuiltinInputValidation {
     }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        // INVARIANT: BuiltinModuleLookup runs before this step and sets ctx.module.
         let module = ctx
             .module
             .as_ref()
@@ -479,11 +483,13 @@ impl Step for BuiltinExecute {
     }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        // INVARIANT: BuiltinModuleLookup runs before this step and sets ctx.module.
         let module = ctx
             .module
             .as_ref()
             .expect("module must be resolved before execute")
             .clone();
+        // INVARIANT: Executor::inject_resources sets config before any step runs.
         let config = ctx
             .config
             .as_ref()
@@ -581,6 +587,7 @@ impl Step for BuiltinOutputValidation {
         let Some(output) = ctx.output.as_ref() else {
             return Ok(StepResult::continue_step());
         };
+        // INVARIANT: BuiltinModuleLookup runs before this step and sets ctx.module.
         let module = ctx
             .module
             .as_ref()
@@ -617,6 +624,7 @@ impl Step for BuiltinMiddlewareAfter {
             None => return Ok(StepResult::continue_step()),
         };
 
+        // INVARIANT: BuiltinExecute runs before this step and sets ctx.output.
         let output = ctx
             .output
             .take()
@@ -688,6 +696,7 @@ pub fn build_standard_strategy() -> ExecutionStrategy {
             Box::new(BuiltinReturnResult),
         ],
     )
+    // INVARIANT: the builtin step list above uses distinct types — duplicates would be a compile-time error.
     .expect("standard strategy should have unique step names")
 }
 

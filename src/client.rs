@@ -16,7 +16,7 @@ use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::module::ModuleAnnotations;
 use crate::observability::metrics::MetricsCollector;
-use crate::registry::registry::{ModuleDescriptor, Registry};
+use crate::registry::registry::{ModuleDescriptor, Registry, DEFAULT_MODULE_VERSION};
 use crate::sys_modules::SysModulesContext;
 
 /// Main entry point for interacting with the `APCore` system.
@@ -196,7 +196,7 @@ impl APCore {
             + Sync
             + 'static,
     {
-        let resolved_version = version.unwrap_or("0.1.0").to_string();
+        let resolved_version = version.unwrap_or(DEFAULT_MODULE_VERSION).to_string();
         let resolved_metadata = metadata.unwrap_or_default();
         let descriptor = ModuleDescriptor {
             module_id: module_id.to_string(),
@@ -309,7 +309,7 @@ impl APCore {
     pub async fn discover(&self) -> Result<usize, ModuleError> {
         match self.registry.discover_internal().await {
             Ok(count) => Ok(count),
-            Err(e) if e.code == crate::errors::ErrorCode::ModuleLoadError => {
+            Err(e) if e.code == crate::errors::ErrorCode::NoDiscovererConfigured => {
                 // No discoverer configured — not an error, just nothing to discover.
                 Ok(0)
             }
@@ -507,9 +507,10 @@ impl APCore {
 
     /// Reload configuration from disk.
     ///
-    /// **Rust-specific:** This method is not available in Python or TypeScript
-    /// SDKs. It reloads the `Config` object; module re-discovery will be added
-    /// once the discoverer component is configured.
+    /// Reloads the `Config` object from its source path. Module re-discovery
+    /// is not triggered; call [`APCore::discover`] explicitly after `reload`
+    /// if you need fresh module discovery (matches `apcore-python APCore.reload`
+    /// behaviour — config-only, no automatic re-discovery).
     #[allow(clippy::unused_async)] // API stub for cross-language parity with Python/TypeScript SDKs
     pub async fn reload(&mut self) -> Result<(), ModuleError> {
         self.config.reload()?;
