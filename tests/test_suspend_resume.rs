@@ -389,7 +389,9 @@ async fn suspend_resume_preserves_state_across_simulated_reload() {
 #[test]
 fn on_load_default_does_not_panic() {
     let module = StatelessModule;
-    module.on_load().expect("on_load default must return Ok(())"); // must be a no-op
+    module
+        .on_load()
+        .expect("on_load default must return Ok(())"); // must be a no-op
 }
 
 #[test]

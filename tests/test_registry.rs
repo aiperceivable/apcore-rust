@@ -997,7 +997,11 @@ mod on_load_rollback_tests {
                 "simulated on_load failure".to_string(),
             ))
         }
-        async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, ModuleError> {
             Ok(serde_json::json!({}))
         }
     }
@@ -1044,7 +1048,9 @@ mod on_load_rollback_tests {
         // Registry must still accept a valid module with the same ID slot
         registry
             .register("foo.bad", Box::new(StubModule), make_descriptor("foo.bad"))
-            .expect("registry must accept registration after a prior failed on_load for the same id");
+            .expect(
+                "registry must accept registration after a prior failed on_load for the same id",
+            );
 
         assert!(registry.get("foo.bad").is_some());
     }
