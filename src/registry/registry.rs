@@ -13,6 +13,7 @@ use std::sync::{
 
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations, ModuleExample, ValidationResult};
+use crate::registry::conflicts::{detect_id_conflicts, ConflictSeverity};
 
 /// Cross-language compatible module descriptor.
 ///
@@ -64,7 +65,7 @@ pub struct ModuleDescriptor {
 }
 
 fn default_version() -> String {
-    "1.0.0".to_string()
+    DEFAULT_MODULE_VERSION.to_string()
 }
 
 fn default_enabled() -> bool {
@@ -91,8 +92,11 @@ pub struct DependencyInfo {
 /// Aligned with `apcore-python.Discoverer` (returns `{module_id, module}`)
 /// and `apcore-typescript.Discoverer` (returns `{moduleId, module}`).
 ///
-/// Not serializable: the `module` field is a trait object and cannot round-trip
-/// through `serde`.
+/// Not serializable: the `module` field is `Arc<dyn Module>` (a trait object)
+/// and has no meaningful serde representation. This is an intentional exception
+/// to the project-wide "all public data types implement Serialize/Deserialize"
+/// convention in `CLAUDE.md` — do not add the derives back without also solving
+/// how to round-trip a live module instance.
 #[derive(Clone)]
 pub struct DiscoveredModule {
     pub name: String,
@@ -169,6 +173,13 @@ pub const RESERVED_WORDS: &[&str] = &[
 ///
 /// Aligned with `apcore-python` and `apcore-typescript` `MAX_MODULE_ID_LENGTH`.
 pub const MAX_MODULE_ID_LENGTH: usize = 192;
+
+/// Default module version when a caller does not supply one.
+///
+/// Used by [`ModuleDescriptor`]'s serde default, by
+/// [`Registry::register_module`]'s auto-built descriptor, and by
+/// [`crate::client::APCore::module`]. Aligned with `apcore-python`'s default.
+pub const DEFAULT_MODULE_VERSION: &str = "1.0.0";
 
 /// Standard registry event names per `PROTOCOL_SPEC` §12.2.
 ///
@@ -332,7 +343,39 @@ pub struct Registry {
     /// Optional discoverer for module discovery.
     discoverer: RwLock<Option<Box<dyn Discoverer>>>,
     /// Optional validator for module validation.
-    validator: RwLock<Option<Box<dyn ModuleValidator>>>,
+    ///
+    /// Stored as `Arc` (not `Box`) so the validator can be cloned out of the
+    /// read lock before invocation. Holding a `parking_lot::RwLock` read
+    /// guard across user-supplied `validate()` would deadlock if the
+    /// validator re-entered `set_validator` (parking_lot's guards are not
+    /// reentrant).
+    validator: RwLock<Option<Arc<dyn ModuleValidator>>>,
+}
+
+/// RAII guard that restores a taken-out `Discoverer` back into the registry's
+/// slot when dropped — including during panic unwind from `discover().await`.
+///
+/// Without this, a panic inside a custom `Discoverer::discover` future would
+/// permanently lose the discoverer because the manual "put it back" block
+/// below the `.await` would be unreachable.
+///
+/// If a concurrent `set_discoverer` swapped in a new instance during the
+/// `.await`, that new one wins — the guard only restores when the slot is
+/// still `None`.
+struct DiscovererRestoreGuard<'a> {
+    slot: &'a RwLock<Option<Box<dyn Discoverer>>>,
+    discoverer: Option<Box<dyn Discoverer>>,
+}
+
+impl Drop for DiscovererRestoreGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(d) = self.discoverer.take() {
+            let mut slot = self.slot.write();
+            if slot.is_none() {
+                *slot = Some(d);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Registry {
@@ -410,55 +453,7 @@ impl Registry {
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
-        validate_module_id(name, false)?;
-
-        // Run validation callbacks if a validator is set (do NOT hold the
-        // core lock while calling user-supplied code).
-        if let Some(validator) = self.validator.read().as_ref() {
-            let result = validator.validate(module.as_ref(), Some(&descriptor));
-            if !result.valid {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::ModuleLoadError,
-                    format!(
-                        "Module '{}' failed validation: {}",
-                        name,
-                        result.errors.join(", ")
-                    ),
-                ));
-            }
-        }
-
-        // Call on_load lifecycle hook before taking the core lock.
-        module.on_load();
-
-        let module_arc: Arc<dyn Module> = module.into();
-        let module_clone = Arc::clone(&module_arc);
-        {
-            let mut core = self.core.write();
-            if core.modules.contains_key(name) {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::GeneralInvalidInput,
-                    format!("Module ID '{name}' is already registered"),
-                ));
-            }
-
-            let schema = serde_json::json!({
-                "input": descriptor.input_schema,
-                "output": descriptor.output_schema,
-            });
-            core.schema_cache.insert(name.to_string(), schema);
-            core.lowercase_map
-                .insert(name.to_lowercase(), name.to_string());
-            core.modules.insert(name.to_string(), module_arc);
-            core.descriptors.insert(name.to_string(), descriptor);
-        }
-
-        // Fire "register" callbacks outside any lock.
-        for cb in self.snapshot_callbacks("register") {
-            cb(name, module_clone.as_ref());
-        }
-
-        Ok(())
+        self.register_core(name, module, descriptor, false, true)
     }
 
     /// Register a module — **spec-compliant two-argument form**.
@@ -480,7 +475,7 @@ impl Registry {
             documentation: None,
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
-            version: "1.0.0".to_string(),
+            version: DEFAULT_MODULE_VERSION.to_string(),
             tags: vec![],
             annotations: Some(ModuleAnnotations::default()),
             examples: vec![],
@@ -493,40 +488,37 @@ impl Registry {
     }
 
     /// Unregister a module by name.
+    ///
+    /// Ordering (aligned with `apcore-python.Registry.unregister`):
+    /// 1. Acquire `core.write()`, remove from all maps atomically, drop lock.
+    /// 2. Fire `"unregister"` callbacks and call `on_unload()` OUTSIDE the
+    ///    lock, AFTER removal, so a concurrent `call()` cannot dispatch to
+    ///    a module whose `on_unload` has already released resources.
+    /// 3. Callers holding `Arc<dyn Module>` references from earlier `get()`
+    ///    calls keep the module alive; `on_unload` still runs exactly once.
     pub fn unregister(&self, name: &str) -> Result<(), ModuleError> {
-        // Extract module + fire callbacks outside the lock.
         let removed: Arc<dyn Module> = {
-            let core = self.core.read();
-            match core.modules.get(name) {
-                Some(m) => Arc::clone(m),
-                None => {
-                    return Err(ModuleError::new(
-                        crate::errors::ErrorCode::ModuleNotFound,
-                        format!("Module '{name}' not found"),
-                    ));
-                }
-            }
-        };
-
-        // Fire "unregister" callbacks before removal (no lock held).
-        for cb in self.snapshot_callbacks("unregister") {
-            cb(name, removed.as_ref());
-        }
-
-        // Call on_unload lifecycle hook.
-        removed.on_unload();
-
-        // Now actually remove the module under the core write lock.
-        {
             let mut core = self.core.write();
-            core.modules.remove(name);
+            let Some(module) = core.modules.remove(name) else {
+                return Err(ModuleError::new(
+                    crate::errors::ErrorCode::ModuleNotFound,
+                    format!("Module '{name}' not found"),
+                ));
+            };
             core.descriptors.remove(name);
             core.lowercase_map.remove(&name.to_lowercase());
             core.schema_cache.remove(name);
             core.ref_counts.remove(name);
             core.draining.remove(name);
-        }
+            module
+        };
         self.drain_events.write().remove(name);
+
+        // Fire callbacks + on_unload AFTER removal, outside any lock.
+        for cb in self.snapshot_callbacks("unregister") {
+            cb(name, removed.as_ref());
+        }
+        removed.on_unload();
 
         Ok(())
     }
@@ -617,19 +609,88 @@ impl Registry {
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
-        validate_module_id(name, true)?;
+        self.register_core(name, module, descriptor, true, false)
+    }
 
-        module.on_load();
+    /// Shared registration core for `register`, `register_internal`, and the
+    /// per-entry path of `register_discovered`.
+    ///
+    /// Ordering (aligned with `apcore-python.Registry.register`):
+    /// 1. `validate_module_id` (syntactic, no lock).
+    /// 2. Snapshot the validator `Arc` out of `self.validator` and invoke it
+    ///    WITHOUT holding any lock (prevents parking_lot non-reentrant
+    ///    deadlock if the validator calls back into the registry).
+    /// 3. Take `core.write()`, run `detect_id_conflicts` (surfaces duplicate,
+    ///    reserved-word, and case-collision conflicts at once), insert the
+    ///    module into all maps, drop the lock.
+    /// 4. Call `on_load` OUTSIDE the lock and only AFTER a successful insert,
+    ///    so duplicated registrations never trigger `on_load` side effects
+    ///    that `on_unload` would then never unwind.
+    /// 5. Fire `"register"` callbacks outside any lock.
+    fn register_core(
+        &self,
+        name: &str,
+        module: Box<dyn Module>,
+        descriptor: ModuleDescriptor,
+        allow_reserved: bool,
+        run_validator: bool,
+    ) -> Result<(), ModuleError> {
+        validate_module_id(name, allow_reserved)?;
+
+        if run_validator {
+            // Clone the validator Arc out of the lock so the user-supplied
+            // `validate()` call happens without any Registry lock held.
+            let validator_snapshot = self.validator.read().as_ref().map(Arc::clone);
+            if let Some(validator) = validator_snapshot {
+                let result = validator.validate(module.as_ref(), Some(&descriptor));
+                if !result.valid {
+                    return Err(ModuleError::new(
+                        crate::errors::ErrorCode::ModuleLoadError,
+                        format!(
+                            "Module '{}' failed validation: {}",
+                            name,
+                            result.errors.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+
         let module_arc: Arc<dyn Module> = module.into();
         let module_clone = Arc::clone(&module_arc);
 
         {
             let mut core = self.core.write();
-            if core.modules.contains_key(name) {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::GeneralInvalidInput,
-                    format!("Module ID '{name}' is already registered"),
-                ));
+
+            // Full conflict detection (duplicate / reserved / case-collision).
+            // Aligned with `apcore-python.Registry.register`, which invokes
+            // `detect_id_conflicts` on every register call — a prior audit
+            // flagged a cross-language drift where only exact duplicates
+            // were caught by the Rust path.
+            //
+            // When `allow_reserved` is true (sys-module internal path), the
+            // reserved-word check is suppressed by passing an empty slice;
+            // duplicate + case-collision detection still applies.
+            let reserved: &[&str] = if allow_reserved { &[] } else { RESERVED_WORDS };
+            let existing_ids: HashSet<String> = core.modules.keys().cloned().collect();
+            if let Some(conflict) =
+                detect_id_conflicts(name, &existing_ids, reserved, Some(&core.lowercase_map))
+            {
+                match conflict.severity {
+                    ConflictSeverity::Error => {
+                        return Err(ModuleError::new(
+                            crate::errors::ErrorCode::GeneralInvalidInput,
+                            conflict.message,
+                        ));
+                    }
+                    ConflictSeverity::Warning => {
+                        tracing::warn!(
+                            module_id = %name,
+                            conflict = %conflict.message,
+                            "Module registration proceeded despite warning-level ID conflict"
+                        );
+                    }
+                }
             }
 
             let schema = serde_json::json!({
@@ -643,7 +704,24 @@ impl Registry {
             core.descriptors.insert(name.to_string(), descriptor);
         }
 
-        // Fire "register" callbacks outside any lock.
+        // on_load runs AFTER successful insertion and OUTSIDE any lock.
+        // Duplicates never reach this point, so on_load cannot leak
+        // resources for a registration that the registry rejected.
+        // If on_load signals failure, roll back the four inserts above so no
+        // half-initialised module remains in the registry (mirrors
+        // apcore-python Registry._invoke_on_load rollback).
+        if let Err(e) = module_clone.on_load() {
+            let mut core = self.core.write();
+            core.schema_cache.remove(name);
+            core.lowercase_map.remove(&name.to_lowercase());
+            core.modules.remove(name);
+            core.descriptors.remove(name);
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::ModuleLoadError,
+                format!("Module '{}' on_load failed: {}", name, e.message),
+            ));
+        }
+
         for cb in self.snapshot_callbacks("register") {
             cb(name, module_clone.as_ref());
         }
@@ -867,24 +945,25 @@ impl Registry {
         // a read lock, we accept a subtle limitation: discovery and
         // set_discoverer are mutually exclusive in time. We hold the
         // discoverer write lock briefly, replace it with None, perform the
-        // discovery, then put it back.
+        // discovery, then put it back via an RAII guard so the discoverer
+        // is restored even if `discover().await` panics during unwind.
         let discoverer_opt = self.discoverer.write().take();
-        let Some(active_discoverer) = discoverer_opt else {
+        let guard = DiscovererRestoreGuard {
+            slot: &self.discoverer,
+            discoverer: discoverer_opt,
+        };
+        let Some(active_discoverer) = guard.discoverer.as_ref() else {
             return Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleLoadError,
+                crate::errors::ErrorCode::NoDiscovererConfigured,
                 "No discoverer configured".to_string(),
             ));
         };
 
         let discover_result = active_discoverer.discover(&[] as &[String]).await;
-        // Put the discoverer back, but only if no concurrent `set_discoverer`
-        // swapped a new one in during the await. Otherwise the new one wins.
-        {
-            let mut slot = self.discoverer.write();
-            if slot.is_none() {
-                *slot = Some(active_discoverer);
-            }
-        }
+        // Explicit drop restores the discoverer via Drop impl (also runs on
+        // panic unwind from the .await above). `active_discoverer` borrow
+        // ends here, so the drop is reachable.
+        drop(guard);
 
         let discovered = discover_result?;
         Ok(self.register_discovered(discovered))
@@ -899,7 +978,10 @@ impl Registry {
     /// aborts the batch.
     fn register_discovered(&self, discovered: Vec<DiscoveredModule>) -> usize {
         let mut registered_count = 0usize;
-        let mut callbacks_to_fire: Vec<(String, Arc<dyn Module>)> = Vec::new();
+        // Collect post-insert work: on_load + callbacks run outside the lock
+        // AFTER successful insertion, mirroring the single-entry `register_core`
+        // discipline so duplicates never observe on_load side effects.
+        let mut post_insert: Vec<(String, Arc<dyn Module>)> = Vec::new();
 
         for dm in discovered {
             if let Err(e) = validate_module_id(&dm.name, false) {
@@ -911,7 +993,9 @@ impl Registry {
                 continue;
             }
 
-            if let Some(validator) = self.validator.read().as_ref() {
+            // Snapshot the validator Arc out of the lock.
+            let validator_snapshot = self.validator.read().as_ref().map(Arc::clone);
+            if let Some(validator) = validator_snapshot {
                 let result = validator.validate(dm.module.as_ref(), Some(&dm.descriptor));
                 if !result.valid {
                     tracing::warn!(
@@ -923,35 +1007,81 @@ impl Registry {
                 }
             }
 
-            dm.module.on_load();
-
-            {
+            let inserted = {
                 let mut core = self.core.write();
-                if core.modules.contains_key(&dm.name) {
-                    tracing::warn!(
-                        module_id = %dm.name,
-                        "Discovered module rejected: already registered"
-                    );
-                    continue;
+
+                let existing_ids: HashSet<String> = core.modules.keys().cloned().collect();
+                match detect_id_conflicts(
+                    &dm.name,
+                    &existing_ids,
+                    RESERVED_WORDS,
+                    Some(&core.lowercase_map),
+                ) {
+                    Some(c) if c.severity == ConflictSeverity::Error => {
+                        tracing::warn!(
+                            module_id = %dm.name,
+                            conflict = %c.message,
+                            "Discovered module rejected: id conflict"
+                        );
+                        false
+                    }
+                    Some(c) => {
+                        tracing::warn!(
+                            module_id = %dm.name,
+                            conflict = %c.message,
+                            "Discovered module registered despite warning-level ID conflict"
+                        );
+                        let schema = serde_json::json!({
+                            "input": dm.descriptor.input_schema.clone(),
+                            "output": dm.descriptor.output_schema.clone(),
+                        });
+                        core.schema_cache.insert(dm.name.clone(), schema);
+                        core.lowercase_map
+                            .insert(dm.name.to_lowercase(), dm.name.clone());
+                        core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
+                        core.descriptors
+                            .insert(dm.name.clone(), dm.descriptor.clone());
+                        true
+                    }
+                    None => {
+                        let schema = serde_json::json!({
+                            "input": dm.descriptor.input_schema.clone(),
+                            "output": dm.descriptor.output_schema.clone(),
+                        });
+                        core.schema_cache.insert(dm.name.clone(), schema);
+                        core.lowercase_map
+                            .insert(dm.name.to_lowercase(), dm.name.clone());
+                        core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
+                        core.descriptors
+                            .insert(dm.name.clone(), dm.descriptor.clone());
+                        true
+                    }
                 }
+            };
 
-                let schema = serde_json::json!({
-                    "input": dm.descriptor.input_schema.clone(),
-                    "output": dm.descriptor.output_schema.clone(),
-                });
-                core.schema_cache.insert(dm.name.clone(), schema);
-                core.lowercase_map
-                    .insert(dm.name.to_lowercase(), dm.name.clone());
-                core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
-                core.descriptors.insert(dm.name.clone(), dm.descriptor);
-                callbacks_to_fire.push((dm.name.clone(), dm.module));
+            if inserted {
+                post_insert.push((dm.name.clone(), dm.module));
+                registered_count += 1;
             }
-
-            registered_count += 1;
         }
 
-        // Fire "register" callbacks outside any lock.
-        for (name, module_arc) in callbacks_to_fire {
+        // on_load + callbacks fire AFTER successful insertion, outside any lock.
+        // If on_load returns Err, roll back the insertion for that module.
+        for (name, module_arc) in post_insert {
+            if let Err(e) = module_arc.on_load() {
+                tracing::error!(
+                    module_id = %name,
+                    error = %e.message,
+                    "Discovered module on_load failed; rolling back registration"
+                );
+                let mut core = self.core.write();
+                core.schema_cache.remove(&name);
+                core.lowercase_map.remove(&name.to_lowercase());
+                core.modules.remove(&name);
+                core.descriptors.remove(&name);
+                registered_count = registered_count.saturating_sub(1);
+                continue;
+            }
             for cb in self.snapshot_callbacks("register") {
                 cb(&name, module_arc.as_ref());
             }
@@ -967,7 +1097,7 @@ impl Registry {
 
     /// Set the validator.
     pub fn set_validator(&self, validator: Box<dyn ModuleValidator>) {
-        *self.validator.write() = Some(validator);
+        *self.validator.write() = Some(validator.into());
     }
 
     /// Return count of registered modules.

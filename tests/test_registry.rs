@@ -558,8 +558,9 @@ mod discoverer_tests {
         fn output_schema(&self) -> Value {
             serde_json::json!({ "type": "object" })
         }
-        fn on_load(&self) {
+        fn on_load(&self) -> Result<(), ModuleError> {
             self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
         async fn execute(
             &self,
@@ -720,6 +721,331 @@ mod discoverer_tests {
     async fn discover_internal_without_discoverer_returns_error() {
         let registry = Registry::new();
         let err = registry.discover_internal().await.unwrap_err();
-        assert_eq!(err.code, apcore::errors::ErrorCode::ModuleLoadError);
+        assert_eq!(
+            err.code,
+            apcore::errors::ErrorCode::NoDiscovererConfigured,
+            "discover_internal must return the dedicated NoDiscovererConfigured \
+             error so real load failures surfaced as ModuleLoadError are not \
+             masked by APCore::discover's swallow policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn discoverer_is_restored_even_when_discover_panics() {
+        // Regression: previously, if a custom Discoverer's discover().await
+        // panicked, the RAII-less restore block was unreachable and the
+        // discoverer was permanently lost.
+        struct PanickingDiscoverer;
+        #[async_trait]
+        impl Discoverer for PanickingDiscoverer {
+            async fn discover(
+                &self,
+                _roots: &[String],
+            ) -> Result<Vec<DiscoveredModule>, ModuleError> {
+                panic!("simulated discoverer failure");
+            }
+        }
+
+        let registry = Arc::new(Registry::new());
+        registry.set_discoverer(Box::new(PanickingDiscoverer));
+
+        // First call panics; catch_unwind isolates the panic from the test harness.
+        let r = Arc::clone(&registry);
+        let first = tokio::spawn(async move { r.discover_internal().await }).await;
+        assert!(first.is_err(), "panicking discoverer must propagate panic");
+
+        // The Drop guard should have restored the discoverer; a second call
+        // should find it still present (and panic again, not return
+        // NoDiscovererConfigured).
+        let r2 = Arc::clone(&registry);
+        let second = tokio::spawn(async move { r2.discover_internal().await }).await;
+        assert!(
+            second.is_err(),
+            "discoverer must still be present after first panic — it should panic again, \
+             not disappear into 'NoDiscovererConfigured'"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle + conflict-detection regression tests
+// ---------------------------------------------------------------------------
+
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Module that records the sequence of `on_load` / `on_unload` calls and
+    /// tracks whether `execute` has ever been called — used to verify that
+    /// `on_unload` never runs before the module is removed from the registry's
+    /// live map (otherwise a concurrent `call()` could dispatch to an
+    /// already-torn-down module).
+    struct LifecycleModule {
+        load_count: Arc<AtomicUsize>,
+        unload_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Module for LifecycleModule {
+        fn description(&self) -> &'static str {
+            "lifecycle"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, ModuleError> {
+            Ok(serde_json::json!({}))
+        }
+        fn on_load(&self) -> Result<(), ModuleError> {
+            self.load_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn on_unload(&self) {
+            self.unload_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn register_rejects_exact_duplicate() {
+        let registry = Registry::new();
+        registry
+            .register("foo.bar", Box::new(StubModule), make_descriptor("foo.bar"))
+            .expect("first registration succeeds");
+
+        let err = registry
+            .register("foo.bar", Box::new(StubModule), make_descriptor("foo.bar"))
+            .unwrap_err();
+        assert_eq!(err.code, apcore::errors::ErrorCode::GeneralInvalidInput);
+        assert!(err.message.contains("already registered"));
+    }
+
+    #[test]
+    fn on_load_is_skipped_when_registration_is_rejected_as_duplicate() {
+        // Regression: previously on_load ran BEFORE the duplicate check, so
+        // a rejected duplicate would leak resources opened by on_load.
+        let registry = Registry::new();
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let unload_count = Arc::new(AtomicUsize::new(0));
+
+        registry
+            .register(
+                "foo.bar",
+                Box::new(LifecycleModule {
+                    load_count: Arc::clone(&load_count),
+                    unload_count: Arc::clone(&unload_count),
+                }),
+                make_descriptor("foo.bar"),
+            )
+            .unwrap();
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+
+        // Second register for same ID: rejected. A *new* LifecycleModule
+        // instance's on_load must NOT run because the ID is a duplicate.
+        let rejected_load_count = Arc::new(AtomicUsize::new(0));
+        let rejected_unload_count = Arc::new(AtomicUsize::new(0));
+        let err = registry.register(
+            "foo.bar",
+            Box::new(LifecycleModule {
+                load_count: Arc::clone(&rejected_load_count),
+                unload_count: Arc::clone(&rejected_unload_count),
+            }),
+            make_descriptor("foo.bar"),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            rejected_load_count.load(Ordering::SeqCst),
+            0,
+            "on_load MUST NOT fire for a registration rejected due to duplicate ID"
+        );
+    }
+
+    #[test]
+    fn unregister_removes_module_before_calling_on_unload() {
+        // Regression: previously on_unload ran BEFORE the core-map removal,
+        // so a concurrent `get()` could still dispatch to a module whose
+        // resources had already been freed.
+        let registry = Arc::new(Registry::new());
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let unload_count = Arc::new(AtomicUsize::new(0));
+
+        registry
+            .register(
+                "foo.bar",
+                Box::new(LifecycleModule {
+                    load_count: Arc::clone(&load_count),
+                    unload_count: Arc::clone(&unload_count),
+                }),
+                make_descriptor("foo.bar"),
+            )
+            .unwrap();
+
+        // Install a callback that runs DURING unregister (after remove,
+        // before on_unload) and observes the registry state — the module
+        // must already be gone from `get()` at this point.
+        let present_at_callback = Arc::new(AtomicUsize::new(0));
+        let pac_clone = Arc::clone(&present_at_callback);
+        let registry_weak = Arc::downgrade(&registry);
+        registry.on(
+            "unregister",
+            Box::new(move |name, _module| {
+                if let Some(reg) = registry_weak.upgrade() {
+                    if reg.get(name).is_some() {
+                        pac_clone.store(1, Ordering::SeqCst);
+                    }
+                }
+            }),
+        );
+
+        registry.unregister("foo.bar").unwrap();
+
+        assert_eq!(
+            present_at_callback.load(Ordering::SeqCst),
+            0,
+            "by the time the 'unregister' callback fires, the module must \
+             already be gone from the registry's live map"
+        );
+        assert_eq!(
+            unload_count.load(Ordering::SeqCst),
+            1,
+            "on_unload runs exactly once, after removal"
+        );
+    }
+
+    #[test]
+    fn validator_is_invoked_without_registry_lock_held() {
+        // Regression: validator was previously called while holding the
+        // validator read guard, so a validator that re-registered itself
+        // would deadlock (parking_lot guards are non-reentrant). With the
+        // Arc-snapshot fix the validator sees no lock held.
+        use apcore::module::ValidationResult;
+        use apcore::registry::registry::ModuleValidator;
+
+        struct ReentrantValidator {
+            registry: Arc<Registry>,
+        }
+        impl ModuleValidator for ReentrantValidator {
+            fn validate(
+                &self,
+                _module: &dyn Module,
+                _descriptor: Option<&ModuleDescriptor>,
+            ) -> ValidationResult {
+                // Re-entering the registry during validation must NOT deadlock.
+                // We replace the validator — this takes the validator write lock.
+                self.registry.set_validator(Box::new(PermissiveValidator));
+                ValidationResult {
+                    valid: true,
+                    errors: vec![],
+                    warnings: vec![],
+                }
+            }
+        }
+
+        struct PermissiveValidator;
+        impl ModuleValidator for PermissiveValidator {
+            fn validate(
+                &self,
+                _module: &dyn Module,
+                _descriptor: Option<&ModuleDescriptor>,
+            ) -> ValidationResult {
+                ValidationResult {
+                    valid: true,
+                    errors: vec![],
+                    warnings: vec![],
+                }
+            }
+        }
+
+        let registry = Arc::new(Registry::new());
+        registry.set_validator(Box::new(ReentrantValidator {
+            registry: Arc::clone(&registry),
+        }));
+
+        registry
+            .register("foo.bar", Box::new(StubModule), make_descriptor("foo.bar"))
+            .expect("validator that re-enters set_validator must not deadlock");
+    }
+}
+
+mod on_load_rollback_tests {
+    use super::*;
+    use apcore::errors::ErrorCode;
+
+    struct FailingOnLoadModule;
+
+    #[async_trait]
+    impl Module for FailingOnLoadModule {
+        fn description(&self) -> &'static str {
+            "fails on_load"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn on_load(&self) -> Result<(), ModuleError> {
+            Err(ModuleError::new(
+                ErrorCode::ModuleLoadError,
+                "simulated on_load failure".to_string(),
+            ))
+        }
+        async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[test]
+    fn register_rolls_back_when_on_load_returns_err() {
+        let registry = Registry::new();
+        let err = registry
+            .register(
+                "foo.bar",
+                Box::new(FailingOnLoadModule),
+                make_descriptor("foo.bar"),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err.code,
+            ErrorCode::ModuleLoadError,
+            "register must propagate on_load error"
+        );
+        assert!(err.message.contains("on_load failed"));
+        assert!(
+            registry.get("foo.bar").is_none(),
+            "module must not remain in registry after on_load failure"
+        );
+        assert_eq!(
+            registry.list(None, None).len(),
+            0,
+            "registry must be empty after failed registration"
+        );
+    }
+
+    #[test]
+    fn register_succeeding_module_after_failed_on_load_works() {
+        let registry = Registry::new();
+
+        // First registration fails due to on_load
+        let _ = registry.register(
+            "foo.bad",
+            Box::new(FailingOnLoadModule),
+            make_descriptor("foo.bad"),
+        );
+
+        // Registry must still accept a valid module with the same ID slot
+        registry
+            .register("foo.bad", Box::new(StubModule), make_descriptor("foo.bad"))
+            .expect("registry must accept registration after a prior failed on_load for the same id");
+
+        assert!(registry.get("foo.bad").is_some());
     }
 }

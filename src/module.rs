@@ -78,8 +78,16 @@ pub trait Module: Send + Sync {
         }
     }
 
-    /// Called after the module is registered. Default: no-op.
-    fn on_load(&self) {}
+    /// Called after the module is registered.
+    ///
+    /// Returns `Err` to signal that the module failed to initialise; the
+    /// registry rolls back the insertion so no half-initialised module remains
+    /// registered. Aligns with `apcore-python Registry._invoke_on_load`.
+    ///
+    /// Default: no-op (`Ok(())`).
+    fn on_load(&self) -> Result<(), ModuleError> {
+        Ok(())
+    }
 
     /// Called before the module is unregistered. Default: no-op.
     fn on_unload(&self) {}
