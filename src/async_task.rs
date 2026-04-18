@@ -93,27 +93,32 @@ impl AsyncTaskManager {
         inputs: serde_json::Value,
         context: Option<Context<serde_json::Value>>,
     ) -> Result<String, ModuleError> {
-        let task_count = self.tasks.lock().len();
-        if task_count >= self.max_tasks {
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::GeneralInternalError,
-                format!("Task limit reached ({})", self.max_tasks),
-            ));
-        }
-
-        let task_id = Uuid::new_v4().to_string();
-        let info = TaskInfo {
-            task_id: task_id.clone(),
-            module_id: module_id.to_string(),
-            status: TaskStatus::Pending,
-            submitted_at: now_secs(),
-            started_at: None,
-            completed_at: None,
-            result: None,
-            error: None,
+        // Hold the lock across both the capacity check and the insert so
+        // concurrent submit() calls cannot both observe task_count < max_tasks
+        // and both insert, violating the cap (TOCTOU). Mirrors Python's
+        // single-lock pattern in AsyncTaskManager.submit.
+        let task_id = {
+            let mut tasks = self.tasks.lock();
+            if tasks.len() >= self.max_tasks {
+                return Err(ModuleError::new(
+                    crate::errors::ErrorCode::GeneralInternalError,
+                    format!("Task limit reached ({})", self.max_tasks),
+                ));
+            }
+            let task_id = Uuid::new_v4().to_string();
+            let info = TaskInfo {
+                task_id: task_id.clone(),
+                module_id: module_id.to_string(),
+                status: TaskStatus::Pending,
+                submitted_at: now_secs(),
+                started_at: None,
+                completed_at: None,
+                result: None,
+                error: None,
+            };
+            tasks.insert(task_id.clone(), info);
+            task_id
         };
-
-        self.tasks.lock().insert(task_id.clone(), info);
 
         let tasks = Arc::clone(&self.tasks);
         let handles = Arc::clone(&self.handles);
@@ -471,6 +476,42 @@ mod tests {
         let s2 = mgr.get_status(&id2).unwrap().status;
         assert_eq!(s1, TaskStatus::Cancelled);
         assert_eq!(s2, TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn submit_respects_max_tasks_under_concurrent_load() {
+        // Regression: a TOCTOU between the capacity check and the insert in
+        // submit() allowed two concurrent callers to both observe
+        // task_count < max_tasks and both insert, exceeding the cap.
+        let exec = make_executor();
+        let mgr = Arc::new(AsyncTaskManager::new(exec, 4, 1));
+
+        let mgr_a = Arc::clone(&mgr);
+        let mgr_b = Arc::clone(&mgr);
+
+        // Spawn two tasks concurrently targeting a max_tasks=1 manager.
+        let (res_a, res_b) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                mgr_a.submit("nonexistent.module", serde_json::json!({}), None)
+            }),
+            tokio::task::spawn_blocking(move || {
+                mgr_b.submit("nonexistent.module", serde_json::json!({}), None)
+            }),
+        );
+
+        let ok_count = [res_a.unwrap(), res_b.unwrap()]
+            .iter()
+            .filter(|r| r.is_ok())
+            .count();
+
+        assert_eq!(
+            ok_count, 1,
+            "exactly one submit must succeed when max_tasks=1 and two concurrent submits race"
+        );
+        assert!(
+            mgr.task_count() <= 1,
+            "task count must never exceed max_tasks after concurrent submits"
+        );
     }
 
     #[test]
