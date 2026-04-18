@@ -731,6 +731,38 @@ mod discoverer_tests {
     }
 
     #[tokio::test]
+    async fn discovered_module_with_invalid_descriptor_schema_is_skipped() {
+        // Regression: register_discovered must validate descriptor schema shapes
+        // before inserting into schema_cache. A discoverer returning non-object
+        // schemas (e.g., a string) must be rejected, not silently cached.
+        fn dm_with_bad_schema(name: &str, module: Arc<dyn Module>) -> DiscoveredModule {
+            let mut desc = make_descriptor(name);
+            desc.input_schema = serde_json::json!("not-an-object"); // invalid schema shape
+            DiscoveredModule {
+                name: name.to_string(),
+                source: "test".to_string(),
+                descriptor: desc,
+                module,
+            }
+        }
+
+        let registry = Registry::new();
+        let discoverer = FixedDiscoverer::new(vec![
+            dm_with_bad_schema("bad.schema", stub()),
+            dm("good.one", stub()), // valid entry in the same batch
+        ]);
+
+        let count = registry.discover(&discoverer).await.unwrap();
+
+        assert_eq!(count, 1, "only the valid module should register");
+        assert!(
+            !registry.has("bad.schema"),
+            "module with non-object schema must be rejected"
+        );
+        assert!(registry.has("good.one"), "valid module must still register");
+    }
+
+    #[tokio::test]
     async fn discoverer_is_restored_even_when_discover_panics() {
         // Regression: previously, if a custom Discoverer's discover().await
         // panicked, the RAII-less restore block was unreachable and the

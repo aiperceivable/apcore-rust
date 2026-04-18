@@ -186,7 +186,10 @@ pub fn validate_against_schema(
 
     let errors_json: Vec<Value> = error_list
         .iter()
-        .map(|e| serde_json::to_value(e).unwrap_or_default())
+        .map(|e| {
+            // INVARIANT: HashMap<String, String> always serializes to a JSON object; to_value is infallible.
+            serde_json::to_value(e).expect("HashMap<String, String> serialization is infallible")
+        })
         .collect();
     let mut details = HashMap::new();
     details.insert("errors".to_string(), Value::Array(errors_json));
@@ -612,6 +615,9 @@ impl Executor {
                 .await?;
 
             // Phase 2: invoke module.stream() and forward chunks as they arrive.
+            // Note: individual chunks are NOT validated against output_schema here;
+            // validation runs on the deep-merged result in Phase 3 after the stream
+            // is exhausted. See Module::stream contract for details.
             let Some(mut inner) = setup.module.stream(setup.inputs.clone(), &setup.context) else {
                 Err(streaming_not_supported_error(&module_id_owned))?;
                 // Unreachable: the `?` above always returns from the block.
@@ -643,6 +649,12 @@ impl Executor {
     /// including) `execute`. Returns the resolved module, the (possibly
     /// middleware-mutated) inputs, the prepared context, the module's output
     /// schema, and a handle to the middleware manager for after-middleware.
+    ///
+    /// Drives the shared [`PipelineEngine::run_until`] so every per-step
+    /// declaration (`match_modules`, `ignore_errors`, `timeout_ms`, `dry_run`
+    /// purity filtering, `skip_to` targets) behaves identically to the
+    /// non-streaming `call()` path. A prior audit found this path had a
+    /// bespoke loop that ignored those declarations and silently diverged.
     async fn prepare_stream(
         &self,
         module_id: &str,
@@ -665,65 +677,31 @@ impl Executor {
         }
         self.inject_resources(&mut pipe_ctx);
 
-        // Run every step in the strategy that comes BEFORE `execute`. We
-        // intentionally piggyback on the existing built-in steps so the
-        // streaming path inherits any custom pipeline configuration (e.g.
-        // user-installed pre-execute steps in a custom strategy).
-        //
-        // We honor `continue` and `skip_to` flow control. `abort` and any
-        // step error short-circuit setup with an error.
-        let steps = self.strategy.steps();
-        let mut idx: usize = 0;
-        while idx < steps.len() {
-            let step = &steps[idx];
-            if step.name() == "execute" {
-                break;
-            }
-            let result = step.execute(&mut pipe_ctx).await?;
-            match result.action.as_str() {
-                "continue" => idx += 1,
-                "skip_to" => {
-                    let target = result.skip_to.as_deref().unwrap_or("");
-                    // Stop early if the skip target is at or after `execute`.
-                    let target_idx = steps.iter().position(|s| s.name() == target);
-                    match target_idx {
-                        Some(t) if t > idx => {
-                            // If we're skipping to or past `execute`, halt setup.
-                            let execute_idx = steps.iter().position(|s| s.name() == "execute");
-                            if let Some(eidx) = execute_idx {
-                                if t >= eidx {
-                                    break;
-                                }
-                            }
-                            idx = t;
-                        }
-                        _ => {
-                            return Err(ModuleError::new(
-                                ErrorCode::GeneralInvalidInput,
-                                format!(
-                                    "skip_to target '{}' not found after step '{}'",
-                                    target,
-                                    step.name(),
-                                ),
-                            ));
-                        }
+        // Drive the shared pipeline engine up to — but not including — the
+        // `execute` step. This inherits all per-step metadata handling from
+        // `PipelineEngine::run`, so streaming and non-streaming never diverge.
+        let (_output, trace) =
+            PipelineEngine::run_until(&self.strategy, &mut pipe_ctx, "execute").await?;
+
+        // `run_until` returns `Ok` for pipeline-level aborts (so the caller
+        // can observe the trace). Streaming requires a resolved module, so
+        // an aborted pre-execute phase is an error for us.
+        if !trace.success {
+            let explanation = trace
+                .steps
+                .iter()
+                .find_map(|s| {
+                    if s.result.action == "abort" {
+                        s.result.explanation.clone()
+                    } else {
+                        None
                     }
-                }
-                "abort" => {
-                    return Err(ModuleError::new(
-                        ErrorCode::GeneralInternalError,
-                        result
-                            .explanation
-                            .unwrap_or_else(|| "pre-stream pipeline aborted".to_string()),
-                    ));
-                }
-                other => {
-                    return Err(ModuleError::new(
-                        ErrorCode::GeneralInvalidInput,
-                        format!("Unknown step action: '{other}'"),
-                    ));
-                }
-            }
+                })
+                .unwrap_or_else(|| "pre-stream pipeline aborted".to_string());
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                explanation,
+            ));
         }
 
         let module = pipe_ctx.module.clone().ok_or_else(|| {

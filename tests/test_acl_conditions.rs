@@ -316,3 +316,57 @@ async fn test_async_check_default_allow() {
         .unwrap();
     assert!(result);
 }
+
+// ---------------------------------------------------------------------------
+// Sync/async path agreement (D5 regression)
+// ---------------------------------------------------------------------------
+
+/// Verify that ACL::check (sync, noop-waker path) and ACL::async_check produce
+/// the same result for all built-in condition handlers that complete immediately.
+/// Drift between the two paths is the failure mode flagged in the architecture review.
+#[tokio::test]
+async fn test_sync_and_async_check_agree_on_builtin_conditions() {
+    init_handlers();
+
+    // Case 1: identity_types matches → both allow
+    let acl = make_acl_with_condition("identity_types", json!(["service"]));
+    let ctx = make_context("service", vec![], vec![]);
+    let sync_result = acl.check(Some("caller"), "target", Some(&ctx)).unwrap();
+    let async_result = acl
+        .async_check(Some("caller"), "target", Some(&ctx))
+        .await
+        .unwrap();
+    assert_eq!(
+        sync_result, async_result,
+        "sync check and async_check must agree for identity_types (match)"
+    );
+
+    // Case 2: identity_types no match → both deny
+    let ctx_user = make_context("user", vec![], vec![]);
+    let sync_result = acl
+        .check(Some("caller"), "target", Some(&ctx_user))
+        .unwrap();
+    let async_result = acl
+        .async_check(Some("caller"), "target", Some(&ctx_user))
+        .await
+        .unwrap();
+    assert_eq!(
+        sync_result, async_result,
+        "sync check and async_check must agree for identity_types (no match)"
+    );
+
+    // Case 3: roles condition
+    let acl_roles = make_acl_with_condition("roles", json!(["admin"]));
+    let ctx_admin = make_context("user", vec!["admin".to_string()], vec![]);
+    let sync_result = acl_roles
+        .check(Some("caller"), "target", Some(&ctx_admin))
+        .unwrap();
+    let async_result = acl_roles
+        .async_check(Some("caller"), "target", Some(&ctx_admin))
+        .await
+        .unwrap();
+    assert_eq!(
+        sync_result, async_result,
+        "sync check and async_check must agree for roles condition"
+    );
+}

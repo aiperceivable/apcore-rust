@@ -235,6 +235,8 @@ impl ExtensionManager {
 
         let point = &self.points[point_name];
         if point.multiple {
+            // INVARIANT: new() pre-populates extensions[point_name] for every point in self.points;
+            // the register() guard above ensures point_name is in self.points before reaching here.
             self.extensions.get_mut(point_name).unwrap().push(extension);
         } else {
             self.extensions

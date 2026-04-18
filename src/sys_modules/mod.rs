@@ -227,12 +227,16 @@ pub fn register_sys_modules(
         .unwrap_or(1000) as usize;
     let error_history = ErrorHistory::with_limits(max_per_module, max_total);
     let eh_middleware = ErrorHistoryMiddleware::new(error_history.clone());
-    let _ = executor.use_middleware(Box::new(eh_middleware));
+    if let Err(e) = executor.use_middleware(Box::new(eh_middleware)) {
+        tracing::error!(error = %e, middleware = "ErrorHistoryMiddleware", "sys middleware registration failed");
+    }
 
     // --- Step 3: UsageCollector + middleware ---
     let usage_collector = UsageCollector::new();
     let usage_middleware = UsageMiddleware::new(usage_collector.clone());
-    let _ = executor.use_middleware(Box::new(usage_middleware));
+    if let Err(e) = executor.use_middleware(Box::new(usage_middleware)) {
+        tracing::error!(error = %e, middleware = "UsageMiddleware", "sys middleware registration failed");
+    }
 
     let config_arc = Arc::new(Mutex::new(config.clone()));
 
@@ -335,7 +339,9 @@ pub fn register_sys_modules(
             error_rate_threshold,
             latency_p99_threshold,
         );
-        let _ = executor.use_middleware(Box::new(pn_middleware));
+        if let Err(e) = executor.use_middleware(Box::new(pn_middleware)) {
+            tracing::error!(error = %e, middleware = "PlatformNotifyMiddleware", "sys middleware registration failed");
+        }
 
         // Step 5c: Control modules
         modules.push((

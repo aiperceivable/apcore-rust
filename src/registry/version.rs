@@ -31,7 +31,43 @@ fn parse_numeric_prefix(s: &str) -> Option<u64> {
     }
 }
 
-/// Check if a version string satisfies a single constraint like `>=1.0.0`, `<2.0.0`, or `1.0.0` (exact).
+/// Compute the exclusive upper bound for a caret (`^`) constraint.
+///
+/// npm/Cargo semantics:
+/// - `^1.2.3` -> `<2.0.0`
+/// - `^0.2.3` -> `<0.3.0`
+/// - `^0.0.3` -> `<0.0.4`
+fn caret_upper_bound(target: (u64, u64, u64)) -> (u64, u64, u64) {
+    let (major, minor, patch) = target;
+    if major > 0 {
+        (major + 1, 0, 0)
+    } else if minor > 0 {
+        (0, minor + 1, 0)
+    } else {
+        (0, 0, patch + 1)
+    }
+}
+
+/// Compute the exclusive upper bound for a tilde (`~`) constraint.
+///
+/// npm semantics:
+/// - `~1.2.3` -> `<1.3.0` (3 parts: patch bumps)
+/// - `~1.2`   -> `<1.3.0` (2 parts: patch bumps)
+/// - `~1`     -> `<2.0.0` (1 part: minor + patch bumps)
+fn tilde_upper_bound(target: (u64, u64, u64), part_count: usize) -> (u64, u64, u64) {
+    let (major, minor, _) = target;
+    if part_count >= 2 {
+        (major, minor + 1, 0)
+    } else {
+        (major + 1, 0, 0)
+    }
+}
+
+/// Check if a version string satisfies a single constraint.
+///
+/// Supported operators: `=`, `>=`, `>`, `<=`, `<`, `^`, `~`. When no operator
+/// is supplied, the constraint is treated as exact with partial-version
+/// shortcuts (`"1"` matches any `1.x.x`, `"1.2"` matches any `1.2.x`).
 fn check_single_constraint(version_tuple: (u64, u64, u64), constraint: &str) -> bool {
     let constraint = constraint.trim();
     if constraint.is_empty() {
@@ -46,6 +82,10 @@ fn check_single_constraint(version_tuple: (u64, u64, u64), constraint: &str) -> 
         (">", rest)
     } else if let Some(rest) = constraint.strip_prefix('<') {
         ("<", rest)
+    } else if let Some(rest) = constraint.strip_prefix('^') {
+        ("^", rest)
+    } else if let Some(rest) = constraint.strip_prefix('~') {
+        ("~", rest)
     } else if let Some(rest) = constraint.strip_prefix('=') {
         ("=", rest)
     } else {
@@ -54,6 +94,15 @@ fn check_single_constraint(version_tuple: (u64, u64, u64), constraint: &str) -> 
 
     let target = parse_semver(target_str);
     let parts: Vec<&str> = target_str.trim().split('.').collect();
+
+    if op == "^" {
+        let upper = caret_upper_bound(target);
+        return version_tuple >= target && version_tuple < upper;
+    }
+    if op == "~" {
+        let upper = tilde_upper_bound(target, parts.len());
+        return version_tuple >= target && version_tuple < upper;
+    }
 
     // Partial match for exact comparisons
     if op == "=" {

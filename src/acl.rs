@@ -107,7 +107,18 @@ impl ACL {
     }
 
     /// Evaluate all conditions with AND logic using the handler registry. Fail-closed on unknown.
-    /// This is a sync function that uses a lightweight executor to drive async handlers.
+    ///
+    /// This is a **sync** function. It drives each handler's future by polling it once with a
+    /// noop waker. If the handler future is `Pending` on the first poll (i.e., the handler is
+    /// genuinely async and needs to yield), the condition is treated as **unsatisfied** and a
+    /// `tracing::warn!` is emitted. This is the correct fail-closed behaviour for a synchronous
+    /// ACL gate, but callers should prefer [`ACL::async_check`] / [`Self::evaluate_conditions_async`]
+    /// for any handler that may perform I/O. Registering an async handler that returns `Pending`
+    /// and using `check()` will silently deny the call.
+    ///
+    /// **Architecture note:** two parallel paths exist — this sync path and the async
+    /// [`evaluate_conditions_async`]. Keep both in sync when adding new condition logic to avoid
+    /// drift. New conditions should be tested against both paths.
     pub fn evaluate_conditions(
         conditions: &HashMap<String, serde_json::Value>,
         ctx: &Context<serde_json::Value>,

@@ -291,7 +291,11 @@ impl AsyncTaskManager {
     ) {
         // Acquire a permit from the semaphore (limits concurrency).
         let Ok(_permit) = semaphore.acquire().await else {
-            // Semaphore closed — treat as cancellation
+            // Semaphore closed — treat as cancellation.
+            // INVARIANT: cancel() may concurrently write TaskStatus::Cancelled to the same entry.
+            // Both writes converge to the same value, so the outcome is always Cancelled regardless
+            // of ordering. The handles.remove at the spawn site (caller of run_task) runs after
+            // run_task returns, so the handle is cleaned up even on this early-return path.
             let mut guard = tasks.lock();
             if let Some(info) = guard.get_mut(&task_id) {
                 info.status = TaskStatus::Cancelled;

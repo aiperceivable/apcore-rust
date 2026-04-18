@@ -33,6 +33,8 @@ impl TraceParent {
             )
         })?;
 
+        // INVARIANT: TRACEPARENT_RE guarantees caps[1] and caps[4] are exactly 2 lowercase
+        // hex digits, so `u8::from_str_radix(.., 16)` cannot fail.
         let version = u8::from_str_radix(&caps[1], 16).unwrap();
         let trace_id = caps[2].to_string();
         let parent_id = caps[3].to_string();

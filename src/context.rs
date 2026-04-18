@@ -276,11 +276,23 @@ impl<T: Default> Context<T> {
     }
 
     /// Serialize context to JSON.
+    ///
+    /// On serialization failure (which can occur when `T` contains
+    /// non-serializable data), logs at `tracing::error!` and returns an
+    /// empty object. Callers needing hard failure semantics should
+    /// `serde_json::to_value(&ctx)` directly.
     pub fn to_json(&self) -> serde_json::Value
     where
         T: Serialize,
     {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        let mut value = serde_json::to_value(self).unwrap_or_else(|e| {
+            tracing::error!(
+                trace_id = %self.trace_id,
+                error = %e,
+                "Context::to_json serialization failed; returning empty object"
+            );
+            serde_json::json!({})
+        });
         // Filter out internal keys (keys starting with "_") from data
         if let Some(obj) = value.as_object_mut() {
             if let Some(data_val) = obj.get_mut("data") {
@@ -297,6 +309,34 @@ impl<T: Default> Context<T> {
             }
         }
         value
+    }
+
+    /// Serialize context to JSON, returning an error if serialization fails.
+    ///
+    /// Prefer this over [`to_json`](Self::to_json) when correctness matters — `to_json` returns
+    /// an empty object on failure, which silently drops context data. This variant propagates the
+    /// error so callers can decide how to handle it.
+    pub fn to_json_checked(&self) -> Result<serde_json::Value, crate::errors::ModuleError>
+    where
+        T: Serialize,
+    {
+        let mut value = serde_json::to_value(self)?;
+        // Filter out internal keys (keys starting with "_") from data
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(data_val) = obj.get_mut("data") {
+                if let Some(data_obj) = data_val.as_object_mut() {
+                    let internal_keys: Vec<String> = data_obj
+                        .keys()
+                        .filter(|k| k.starts_with('_'))
+                        .cloned()
+                        .collect();
+                    for key in internal_keys {
+                        data_obj.remove(&key);
+                    }
+                }
+            }
+        }
+        Ok(value)
     }
 
     /// Deserialize context from JSON.
@@ -332,10 +372,24 @@ impl<T: Default> Context<T> {
         }
 
         if let Some(ref redacted) = self.redacted_inputs {
-            result["redacted_inputs"] = serde_json::to_value(redacted).unwrap_or_default();
+            result["redacted_inputs"] = serde_json::to_value(redacted).unwrap_or_else(|e| {
+                tracing::error!(
+                    trace_id = %self.trace_id,
+                    error = %e,
+                    "Context::serialize failed to serialize redacted_inputs"
+                );
+                serde_json::Value::Null
+            });
         }
         if let Some(ref redacted) = self.redacted_output {
-            result["redacted_output"] = serde_json::to_value(redacted).unwrap_or_default();
+            result["redacted_output"] = serde_json::to_value(redacted).unwrap_or_else(|e| {
+                tracing::error!(
+                    trace_id = %self.trace_id,
+                    error = %e,
+                    "Context::serialize failed to serialize redacted_output"
+                );
+                serde_json::Value::Null
+            });
         }
 
         // Filter _-prefixed keys from data
@@ -347,7 +401,14 @@ impl<T: Default> Context<T> {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        result["data"] = serde_json::to_value(filtered).unwrap_or_default();
+        result["data"] = serde_json::to_value(filtered).unwrap_or_else(|e| {
+            tracing::error!(
+                trace_id = %self.trace_id,
+                error = %e,
+                "Context::serialize failed to serialize data; returning empty object"
+            );
+            serde_json::json!({})
+        });
         result
     }
 

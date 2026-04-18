@@ -534,10 +534,39 @@ pub struct PipelineEngine;
 impl PipelineEngine {
     /// Run every step in `strategy` against `ctx`, respecting flow-control
     /// actions (`continue`, `skip_to`, `abort`).
-    #[allow(clippy::too_many_lines)] // pipeline control loop is inherently stateful; splitting would reduce clarity
     pub async fn run(
         strategy: &ExecutionStrategy,
         ctx: &mut PipelineContext,
+    ) -> Result<(Option<serde_json::Value>, PipelineTrace), ModuleError> {
+        Self::run_inner(strategy, ctx, None).await
+    }
+
+    /// Run every step in `strategy` against `ctx` UP TO (but not including)
+    /// the named step. All step metadata — `match_modules`, `ignore_errors`,
+    /// `timeout_ms`, `dry_run` purity filtering, `skip_to` flow control — is
+    /// honored identically to [`Self::run`], so streaming and non-streaming
+    /// paths never diverge on per-step semantics.
+    ///
+    /// Used by `Executor::stream` (with `stop_before_step = Some("execute")`)
+    /// to prepare the pipeline without running the module itself, so the
+    /// caller can then drive true chunk-by-chunk streaming.
+    pub async fn run_until(
+        strategy: &ExecutionStrategy,
+        ctx: &mut PipelineContext,
+        stop_before_step: &str,
+    ) -> Result<(Option<serde_json::Value>, PipelineTrace), ModuleError> {
+        Self::run_inner(strategy, ctx, Some(stop_before_step)).await
+    }
+
+    /// Shared step-dispatch loop. `stop_before_step`, when `Some(name)`,
+    /// halts execution BEFORE the step with the matching name — the step
+    /// itself is not executed and not recorded in the trace. `None` runs to
+    /// the end of the strategy.
+    #[allow(clippy::too_many_lines)] // pipeline control loop is inherently stateful; splitting would reduce clarity
+    async fn run_inner(
+        strategy: &ExecutionStrategy,
+        ctx: &mut PipelineContext,
+        stop_before_step: Option<&str>,
     ) -> Result<(Option<serde_json::Value>, PipelineTrace), ModuleError> {
         let pipeline_start = std::time::Instant::now();
         let steps = strategy.steps();
@@ -545,6 +574,13 @@ impl PipelineEngine {
 
         while idx < steps.len() {
             let step = &steps[idx];
+
+            // Early exit for streaming / partial-pipeline callers.
+            if let Some(stop_name) = stop_before_step {
+                if step.name() == stop_name {
+                    break;
+                }
+            }
 
             // Read declarations (trait defaults for backward compat)
             let step_match_modules = step.match_modules();
@@ -976,5 +1012,130 @@ mod tests {
         assert!(pctx.output.is_none());
         assert!(pctx.validated_output.is_none());
         assert_eq!(pctx.trace.module_id, "test_module");
+    }
+
+    // --- run_until / prepare_stream unification tests --------------------
+
+    /// Step that records how many times it was invoked. Used to prove that
+    /// `run_until` stops BEFORE the named step and that `match_modules`
+    /// filtering runs on the streaming path exactly as on the non-streaming
+    /// path.
+    struct CountingStep {
+        name: String,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+        match_modules: Option<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Step for CountingStep {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            &self.name
+        }
+        fn removable(&self) -> bool {
+            true
+        }
+        fn replaceable(&self) -> bool {
+            true
+        }
+        fn match_modules(&self) -> Option<&[String]> {
+            self.match_modules.as_deref()
+        }
+        async fn execute(&self, _ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(StepResult::continue_step())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_until_stops_before_named_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pre_count = Arc::new(AtomicUsize::new(0));
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let post_count = Arc::new(AtomicUsize::new(0));
+
+        let steps: Vec<Box<dyn Step>> = vec![
+            Box::new(CountingStep {
+                name: "pre".into(),
+                invocations: Arc::clone(&pre_count),
+                match_modules: None,
+            }),
+            Box::new(CountingStep {
+                name: "execute".into(),
+                invocations: Arc::clone(&execute_count),
+                match_modules: None,
+            }),
+            Box::new(CountingStep {
+                name: "post".into(),
+                invocations: Arc::clone(&post_count),
+                match_modules: None,
+            }),
+        ];
+        let strategy = ExecutionStrategy::new("test", steps).unwrap();
+        let mut pctx = PipelineContext::new(
+            "mod.x",
+            serde_json::json!({}),
+            Context::<serde_json::Value>::anonymous(),
+            "test",
+        );
+
+        let (_, trace) = PipelineEngine::run_until(&strategy, &mut pctx, "execute")
+            .await
+            .unwrap();
+
+        assert_eq!(pre_count.load(Ordering::SeqCst), 1, "'pre' runs once");
+        assert_eq!(
+            execute_count.load(Ordering::SeqCst),
+            0,
+            "'execute' must NOT run — run_until stops before it"
+        );
+        assert_eq!(post_count.load(Ordering::SeqCst), 0, "'post' must not run");
+        assert!(trace.success);
+    }
+
+    #[tokio::test]
+    async fn run_until_applies_match_modules_filtering() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Regression: previously `prepare_stream` had a bespoke loop that
+        // skipped match_modules filtering, so a step declaring
+        // `match_modules: ["api.*"]` would run even for `mod.other`. This
+        // test confirms `run_until` inherits filtering from `run`.
+        let filtered_count = Arc::new(AtomicUsize::new(0));
+
+        let steps: Vec<Box<dyn Step>> = vec![
+            Box::new(CountingStep {
+                name: "filtered_step".into(),
+                invocations: Arc::clone(&filtered_count),
+                match_modules: Some(vec!["api.*".into()]),
+            }),
+            Box::new(CountingStep {
+                name: "execute".into(),
+                invocations: Arc::new(AtomicUsize::new(0)),
+                match_modules: None,
+            }),
+        ];
+        let strategy = ExecutionStrategy::new("test", steps).unwrap();
+        let mut pctx = PipelineContext::new(
+            "other.mod",
+            serde_json::json!({}),
+            Context::<serde_json::Value>::anonymous(),
+            "test",
+        );
+
+        PipelineEngine::run_until(&strategy, &mut pctx, "execute")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            filtered_count.load(Ordering::SeqCst),
+            0,
+            "step with match_modules=['api.*'] must be skipped when module_id='other.mod' \
+             — confirms streaming and non-streaming paths share dispatch semantics"
+        );
     }
 }

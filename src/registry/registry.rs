@@ -909,17 +909,22 @@ impl Registry {
         self.discover_internal().await
     }
 
-    /// Filesystem watching (no-op — filesystem watching is platform-specific).
+    /// Filesystem watching (stub — filesystem watching is not implemented on apcore-rust).
+    ///
+    /// Always returns `Ok(())` but emits a `tracing::warn!` so callers know the feature is
+    /// unavailable. Use [`Self::reload`] or `APCore::discover()` to trigger rediscovery instead.
     #[allow(clippy::unused_async)] // API stub for cross-language parity; real impl needs platform-specific deps
     pub async fn watch(&self) -> Result<(), ModuleError> {
-        // No-op: filesystem watching requires platform-specific dependencies
-        // (e.g. notify crate). Stubbed for API compatibility.
+        tracing::warn!(
+            "Registry::watch() called but filesystem watching is not implemented on apcore-rust; \
+             use Registry::reload() or APCore::discover() to trigger rediscovery instead"
+        );
         Ok(())
     }
 
     /// Stop filesystem watching (no-op).
     pub fn unwatch(&self) {
-        // No-op: filesystem watching is not implemented yet.
+        // No-op: filesystem watching is not implemented on apcore-rust.
     }
 
     /// Discover modules using the internally-set discoverer.
@@ -969,6 +974,17 @@ impl Registry {
         Ok(self.register_discovered(discovered))
     }
 
+    /// Return true if a descriptor's schema fields have an acceptable shape (object or null).
+    ///
+    /// Custom discoverers may return non-object JSON for `input_schema` / `output_schema`
+    /// (e.g., a string or number). Calling this before insertion prevents invalid values from
+    /// flowing into `schema_cache` and later breaking `export_schema()`.
+    fn descriptor_schema_shape_is_valid(descriptor: &ModuleDescriptor) -> bool {
+        let input_ok = descriptor.input_schema.is_object() || descriptor.input_schema.is_null();
+        let output_ok = descriptor.output_schema.is_object() || descriptor.output_schema.is_null();
+        input_ok && output_ok
+    }
+
     /// Shared discovery post-processing for `discover()` and `discover_internal()`.
     ///
     /// For each entry: validate the name per `PROTOCOL_SPEC` §2.7, reject
@@ -976,6 +992,7 @@ impl Registry {
     /// the instance. Returns the count of entries that successfully registered.
     /// Failed entries are logged at `warn` and skipped; one bad entry never
     /// aborts the batch.
+    #[allow(clippy::too_many_lines)] // sequential per-entry validation gates in a batch loop; splitting further requires passing state and reduces clarity
     fn register_discovered(&self, discovered: Vec<DiscoveredModule>) -> usize {
         let mut registered_count = 0usize;
         // Collect post-insert work: on_load + callbacks run outside the lock
@@ -1005,6 +1022,15 @@ impl Registry {
                     );
                     continue;
                 }
+            }
+
+            // Validate descriptor schema shapes before insertion.
+            if !Self::descriptor_schema_shape_is_valid(&dm.descriptor) {
+                tracing::warn!(
+                    module_id = %dm.name,
+                    "Discovered module descriptor has non-object schema shape — skipping"
+                );
+                continue;
             }
 
             let inserted = {

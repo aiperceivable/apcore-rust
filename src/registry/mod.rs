@@ -19,8 +19,8 @@ pub use entry_point::{infer_struct_name, resolve_entry_point_name, snake_to_pasc
 pub use metadata::{load_id_map, load_metadata, merge_module_metadata, parse_dependencies};
 pub use registry::{
     module_id_pattern, registry_events, DependencyInfo, DiscoveredModule, Discoverer,
-    ModuleDescriptor, ModuleValidator, Registry, RegistryEvents, MAX_MODULE_ID_LENGTH,
-    MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
+    ModuleDescriptor, ModuleValidator, Registry, RegistryEvents, DEFAULT_MODULE_VERSION,
+    MAX_MODULE_ID_LENGTH, MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
 pub use scanner::{scan_extensions, scan_multi_root};
 pub use types::{DepInfo, DiscoveredFile};

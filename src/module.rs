@@ -51,6 +51,14 @@ pub trait Module: Send + Sync {
     /// The returned `ChunkStream` is itself an async iterator; constructing
     /// it must be cheap and synchronous so the executor can wire it into
     /// its own pipeline before the first chunk is awaited.
+    ///
+    /// **Validation contract:** `Executor::stream` validates the module's
+    /// *merged* output (all chunks deep-merged) against `output_schema` only
+    /// *after* the stream is exhausted (Phase 3). Individual chunks are **not**
+    /// validated as they are yielded. Callers performing incremental chunk
+    /// processing must tolerate receiving chunks that may not independently
+    /// satisfy `output_schema`. If per-chunk schema guarantees are required,
+    /// validate each chunk inside this method before yielding it.
     fn stream(
         &self,
         _inputs: serde_json::Value,

@@ -63,6 +63,9 @@ pub enum ErrorCode {
     BindingNotCallable,
     /// Deprecated since 0.19.0; superseded by `BindingSchemaInferenceFailed`.
     /// Kept for backward-compatibility deserialization. See `DECLARATIVE_CONFIG_SPEC.md` §7.1.
+    /// The alias below makes the backward-compat contract explicit even if the variant is ever
+    /// renamed: old serialized payloads containing `"BINDING_SCHEMA_MISSING"` remain decodable.
+    #[serde(alias = "BINDING_SCHEMA_MISSING")]
     BindingSchemaMissing,
     BindingSchemaInferenceFailed,
     BindingSchemaModeConflict,
@@ -77,6 +80,7 @@ pub enum ErrorCode {
     VersionIncompatible,
     ErrorCodeCollision,
     DependencyNotFound,
+    DependencyVersionMismatch,
     ConfigNamespaceDuplicate,
     ConfigNamespaceReserved,
     ConfigEnvPrefixConflict,
@@ -99,6 +103,11 @@ pub enum ErrorCode {
     /// `libloading`-based plugin discovery). No current API path raises this
     /// error. See `DECLARATIVE_CONFIG_SPEC.md` §5.2.
     EntryPointRuntimeUnsupported,
+    /// `Registry::discover_internal()` was called but no custom discoverer
+    /// has been configured via `Registry::set_discoverer()`. Rust-specific:
+    /// `apcore-python` has a default filesystem discoverer so this state is
+    /// unreachable there.
+    NoDiscovererConfigured,
 }
 
 /// Structured error returned by module execution.

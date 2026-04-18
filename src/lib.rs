@@ -110,8 +110,8 @@ pub use pipeline_config::{
     build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,
 };
 pub use registry::registry::{
-    module_id_pattern, registry_events, Registry, RegistryEvents, MAX_MODULE_ID_LENGTH,
-    MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
+    module_id_pattern, registry_events, Registry, RegistryEvents, DEFAULT_MODULE_VERSION,
+    MAX_MODULE_ID_LENGTH, MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
 pub use registry::{detect_id_conflicts, ConflictResult, ConflictSeverity, ConflictType};
 pub use schema::{
