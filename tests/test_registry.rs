@@ -43,6 +43,7 @@ fn make_descriptor(name: &str) -> ModuleDescriptor {
         annotations: Some(ModuleAnnotations::default()),
         examples: vec![],
         metadata: std::collections::HashMap::new(),
+        display: None,
         sunset_date: None,
         dependencies: vec![],
         enabled: true,

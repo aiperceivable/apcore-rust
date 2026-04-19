@@ -1103,6 +1103,7 @@ mod tests {
             annotations: Some(annotations),
             examples: vec![],
             metadata: std::collections::HashMap::new(),
+            display: None,
             sunset_date: None,
             dependencies: vec![],
             enabled: true,

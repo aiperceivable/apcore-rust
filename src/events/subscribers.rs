@@ -35,6 +35,16 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
         "*"
     }
 
+    /// The bound event-type string for bulk unsubscription, if set.
+    ///
+    /// Returns `Some(event_type)` for subscribers wrapped by `APCore::on()`
+    /// (via `EventTypeSubscriber`), `None` for all others. Used internally by
+    /// `EventEmitter::unsubscribe_by_event_type()` to implement
+    /// `APCore::off_by_type()` without downcasting.
+    fn event_type_filter(&self) -> Option<&str> {
+        None
+    }
+
     /// Handle an incoming event.
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError>;
 }

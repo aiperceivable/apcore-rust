@@ -90,6 +90,18 @@ impl EventEmitter {
         }
     }
 
+    /// Remove all subscribers whose `event_type_filter()` equals `event_type`.
+    ///
+    /// Returns the number of subscribers removed. Matches Python/TypeScript
+    /// `off(event_type)` semantics where passing an event-type string removes
+    /// all handlers bound to that type.
+    pub fn unsubscribe_by_event_type(&mut self, event_type: &str) -> usize {
+        let before = self.subscribers.len();
+        self.subscribers
+            .retain(|s| s.event_type_filter().is_none_or(|t| t != event_type));
+        before - self.subscribers.len()
+    }
+
     /// Emit an event to all subscribers whose pattern matches the event type.
     ///
     /// Errors from individual subscribers are logged but not propagated

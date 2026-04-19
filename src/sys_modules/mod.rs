@@ -393,6 +393,7 @@ pub fn register_sys_modules(
             }),
             examples: vec![],
             metadata: std::collections::HashMap::new(),
+            display: None,
             sunset_date: None,
             dependencies: vec![],
             enabled: true,

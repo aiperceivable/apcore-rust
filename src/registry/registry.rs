@@ -53,6 +53,9 @@ pub struct ModuleDescriptor {
     /// Arbitrary metadata for display overlays, AI intent hints, and version hints.
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// UI display metadata (optional). Mirrors `display` in Python/TypeScript SDKs.
+    #[serde(default)]
+    pub display: Option<serde_json::Value>,
     /// ISO 8601 date string (YYYY-MM-DD) after which this module is removed.
     #[serde(default)]
     pub sunset_date: Option<String>,
@@ -488,6 +491,7 @@ impl Registry {
             annotations: Some(ModuleAnnotations::default()),
             examples: vec![],
             metadata: HashMap::new(),
+            display: None,
             sunset_date: None,
             dependencies: vec![],
             enabled: true,

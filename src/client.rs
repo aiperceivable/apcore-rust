@@ -151,12 +151,6 @@ impl APCore {
     /// `(serde_json::Value, &Context<serde_json::Value>)` and returns
     /// `Result<serde_json::Value, ModuleError>`.
     ///
-    /// **Cross-language note (D1-004):** the Python and TypeScript SDKs accept a
-    /// `display` parameter (`dict | None` / `Record<string, unknown> | None`) for
-    /// UI overlay metadata. In Rust, pass this data through the `metadata` map
-    /// using the key `"display"`. A dedicated `display` parameter will be added
-    /// in a future minor release.
-    ///
     /// # Example
     ///
     /// ```ignore
@@ -185,6 +179,7 @@ impl APCore {
         version: Option<&str>,
         metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         examples: Vec<crate::module::ModuleExample>,
+        display: Option<&serde_json::Value>,
         handler: F,
     ) -> Result<&mut Self, ModuleError>
     where
@@ -215,6 +210,7 @@ impl APCore {
             annotations: Some(ModuleAnnotations::default()),
             examples: examples.clone(),
             metadata: resolved_metadata.clone(),
+            display: display.cloned(),
             sunset_date: None,
             dependencies: vec![],
             enabled: true,
@@ -300,6 +296,7 @@ impl APCore {
             annotations: Some(ModuleAnnotations::default()),
             examples: vec![],
             metadata: std::collections::HashMap::new(),
+            display: None,
             sunset_date: None,
             dependencies: vec![],
             enabled: true,
@@ -445,36 +442,26 @@ impl APCore {
             .await
     }
 
-    /// **Preferred API:** Subscribe to an event type using a closure.
+    /// Subscribe to an event type using a closure. Returns the subscriber ID string.
     ///
-    /// Convenience wrapper around [`on()`](Self::on) that accepts a plain
-    /// function or closure instead of requiring a boxed [`EventSubscriber`].
-    /// The closure receives each matching [`ApCoreEvent`](crate::events::emitter::ApCoreEvent)
-    /// by reference.
+    /// Matches the Python and TypeScript `on(event_type, callback)` API. The
+    /// closure receives each matching [`ApCoreEvent`](crate::events::emitter::ApCoreEvent)
+    /// by reference. The returned ID can be passed to [`off()`](Self::off) to
+    /// unsubscribe the specific handler, or use [`off_by_type()`](Self::off_by_type)
+    /// to remove all handlers for an event type at once.
     ///
-    /// Returns the auto-generated subscriber ID (a UUID string).
-    ///
-    /// **Cross-language note:** Python and TypeScript SDKs register event
-    /// listeners with a plain callback closure and return the subscriber object.
-    /// `on_fn()` is the idiomatic Rust equivalent — it wraps the closure in an
-    /// internal `ClosureSubscriber` and returns the subscriber ID string,
-    /// which can be passed to [`off()`](Self::off) to unsubscribe.
-    ///
-    /// **Planned rename (D1-008):** this method will be renamed `on()` in a
-    /// future release to align with Python/TypeScript naming. The current
-    /// [`on()`](Self::on) accepting a boxed [`EventSubscriber`] will be renamed
-    /// `on_subscriber()` at the same time. Both renames are breaking and will
-    /// ship with a major version bump.
+    /// Lazily initializes the event emitter on first use.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let id = client.on_fn("apcore.*", |event| {
+    /// let id = client.on("apcore.*", |event| {
     ///     println!("Got event: {}", event.event_type);
     /// });
     /// client.off(&id); // unsubscribe by ID
+    /// client.off_by_type("apcore.*"); // or unsubscribe all for this type
     /// ```
-    pub fn on_fn(
+    pub fn on(
         &mut self,
         event_type: &str,
         callback: impl Fn(&crate::events::emitter::ApCoreEvent) + Send + Sync + 'static,
@@ -483,24 +470,19 @@ impl APCore {
             id: uuid::Uuid::new_v4().to_string(),
             callback: Box::new(callback),
         });
-        self.on(event_type, subscriber)
+        self.on_subscriber(event_type, subscriber)
     }
 
     /// Subscribe to an event type using a boxed [`EventSubscriber`]. Returns the subscriber ID.
     ///
-    /// The `event_type` is bound to the subscriber so it only receives matching
-    /// events (glob patterns like `"apcore.*"` are supported).
-    /// Lazily initializes the event emitter on first use.
-    ///
-    /// **Cross-language note:** Python and TypeScript SDKs accept a plain
-    /// callback closure here. In Rust, prefer [`on_fn()`](Self::on_fn) for
-    /// closure-based subscriptions; use `on()` only when you need a custom
-    /// [`EventSubscriber`] implementation.
-    ///
-    /// **Planned rename (D1-008):** this method will be renamed `on_subscriber()`
-    /// in a future major release. See [`on_fn()`](Self::on_fn) for the rename
-    /// roadmap.
-    pub fn on(&mut self, event_type: &str, subscriber: Box<dyn EventSubscriber>) -> String {
+    /// Use this when you need a custom [`EventSubscriber`] implementation. For
+    /// closure-based subscriptions (the common case), prefer [`on()`](Self::on)
+    /// which matches the Python/TypeScript API shape.
+    pub fn on_subscriber(
+        &mut self,
+        event_type: &str,
+        subscriber: Box<dyn EventSubscriber>,
+    ) -> String {
         let wrapped = Box::new(EventTypeSubscriber {
             event_type: event_type.to_string(),
             inner: subscriber,
@@ -511,18 +493,47 @@ impl APCore {
         id
     }
 
-    /// Unsubscribe by subscriber ID.
+    /// Deprecated: use [`on()`](Self::on) instead.
     ///
-    /// **Cross-language note (D1-009):** the Python and TypeScript SDKs accept
-    /// either a subscriber object or an event-type string to unsubscribe all
-    /// handlers for that type. This Rust implementation accepts only a subscriber
-    /// ID string (as returned by [`on_fn()`](Self::on_fn) or [`on()`](Self::on)).
-    /// Unsubscribing by event-type will be added in a future minor release.
+    /// `on_fn(event_type, callback)` was renamed to `on(event_type, callback)` in 0.19.0
+    /// to align with the Python and TypeScript SDK naming convention.
+    #[deprecated(
+        since = "0.19.0",
+        note = "Renamed to `on()`. Use `client.on(event_type, callback)` instead."
+    )]
+    pub fn on_fn(
+        &mut self,
+        event_type: &str,
+        callback: impl Fn(&crate::events::emitter::ApCoreEvent) + Send + Sync + 'static,
+    ) -> String {
+        self.on(event_type, callback)
+    }
+
+    /// Unsubscribe a single handler by its subscriber ID.
+    ///
+    /// The ID is the string returned by [`on()`](Self::on). Returns `true` if
+    /// a matching subscriber was found and removed.
+    ///
+    /// To remove all handlers bound to a given event type, use
+    /// [`off_by_type()`](Self::off_by_type).
     pub fn off(&mut self, subscriber_id: &str) -> bool {
         if let Some(ref mut emitter) = self.event_emitter {
             emitter.unsubscribe_by_id(subscriber_id)
         } else {
             false
+        }
+    }
+
+    /// Unsubscribe all handlers registered for `event_type`.
+    ///
+    /// Matches Python/TypeScript `off(event_type)` semantics — passing an event
+    /// type string removes every handler bound to that type in a single call.
+    /// Returns the number of handlers removed.
+    pub fn off_by_type(&mut self, event_type: &str) -> usize {
+        if let Some(ref mut emitter) = self.event_emitter {
+            emitter.unsubscribe_by_event_type(event_type)
+        } else {
+            0
         }
     }
 
@@ -658,6 +669,10 @@ impl EventSubscriber for EventTypeSubscriber {
 
     fn event_pattern(&self) -> &str {
         &self.event_type
+    }
+
+    fn event_type_filter(&self) -> Option<&str> {
+        Some(&self.event_type)
     }
 
     async fn on_event(
