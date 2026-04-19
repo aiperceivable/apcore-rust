@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Once};
 
-use crate::acl_handlers::{register_builtin_handlers, CONDITION_HANDLERS};
+use crate::acl_handlers::{
+    evaluate_conditions_async as handlers_evaluate_conditions_async, register_builtin_handlers,
+    CONDITION_HANDLERS,
+};
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::utils::match_pattern;
@@ -163,33 +166,13 @@ impl ACL {
 
     /// Async evaluate all conditions with AND logic using the handler registry.
     ///
-    /// Handlers are cloned out of the registry (as `Arc<dyn ACLConditionHandler>`)
-    /// before the read guard is dropped, so no `parking_lot` lock guard is held
-    /// across `.await`.
+    /// Delegates to `acl_handlers::evaluate_conditions_async` so compound
+    /// operators (`$or`, `$not`) share the same async evaluation path.
     pub async fn evaluate_conditions_async(
         conditions: &HashMap<String, serde_json::Value>,
         ctx: &Context<serde_json::Value>,
     ) -> bool {
-        let mut to_evaluate = Vec::with_capacity(conditions.len());
-        {
-            let handlers = CONDITION_HANDLERS.read();
-            for (key, value) in conditions {
-                let handler = if let Some(h) = handlers.get(key.as_str()) {
-                    h.clone()
-                } else {
-                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
-                    return false;
-                };
-                to_evaluate.push((handler, value));
-            }
-        }
-
-        for (handler, value) in to_evaluate {
-            if !handler.evaluate(value, ctx).await {
-                return false;
-            }
-        }
-        true
+        handlers_evaluate_conditions_async(conditions, ctx).await
     }
 
     /// Add a rule to the ACL (inserted at position 0, highest priority).
@@ -604,7 +587,7 @@ impl ACL {
     pub fn init_builtin_handlers() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            register_builtin_handlers(Self::evaluate_conditions);
+            register_builtin_handlers();
         });
     }
 }

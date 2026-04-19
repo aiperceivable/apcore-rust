@@ -51,7 +51,7 @@ source, plus the corresponding tests at `tests/test_async_task.rs` and
 | Type | Description |
 |------|-------------|
 | `APCore` | High-level client — register modules, call, stream, validate |
-| `Registry` | Module storage — discover, register, get, list, watch |
+| `Registry` | Module storage — discover, register, get, list (`watch()` is a no-op stub; use `reload()` or `discover()` instead) |
 | `Executor` | Execution engine — call with middleware pipeline, ACL, approval |
 | `Context` | Request context — trace ID, identity, call chain, cancel token |
 | `Config` | Configuration — from_defaults with env overrides, load YAML/JSON, get/set dot-path, validate, reload |

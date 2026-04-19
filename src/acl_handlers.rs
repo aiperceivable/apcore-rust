@@ -30,8 +30,39 @@ pub fn register_condition(key: impl Into<String>, handler: Arc<dyn ACLConditionH
     map.insert(key.into(), handler);
 }
 
-/// Type alias for the sync evaluation function used by compound handlers.
-pub(crate) type EvalFn = fn(&HashMap<String, Value>, &Context<Value>) -> bool;
+// ---------------------------------------------------------------------------
+// Free async evaluator (used by compound operators and re-exported to ACL)
+// ---------------------------------------------------------------------------
+
+/// Evaluate all conditions with AND logic using the handler registry.
+/// Unknown condition keys are treated as unsatisfied (fail-closed).
+/// Handlers are cloned out of the registry before any `.await` so no
+/// `parking_lot` read guard is held across await points.
+pub async fn evaluate_conditions_async<S: ::std::hash::BuildHasher>(
+    conditions: &HashMap<String, Value, S>,
+    ctx: &Context<Value>,
+) -> bool {
+    let mut to_evaluate: Vec<(Arc<dyn ACLConditionHandler>, Value)> =
+        Vec::with_capacity(conditions.len());
+    {
+        let handlers = CONDITION_HANDLERS.read();
+        for (key, value) in conditions {
+            let handler = if let Some(h) = handlers.get(key.as_str()) {
+                h.clone()
+            } else {
+                tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                return false;
+            };
+            to_evaluate.push((handler, value.clone()));
+        }
+    }
+    for (handler, value) in &to_evaluate {
+        if !handler.evaluate(value, ctx).await {
+            return false;
+        }
+    }
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Basic handlers
@@ -91,13 +122,13 @@ impl ACLConditionHandler for MaxCallDepthHandler {
 // ---------------------------------------------------------------------------
 
 /// $or: list of condition dicts. Returns true if ANY sub-set passes.
-pub(crate) struct OrHandler {
-    evaluate_fn: EvalFn,
-}
+/// Delegates to `evaluate_conditions_async` so async handlers in sub-conditions
+/// are fully awaited (fixes the prior sync-path footgun).
+pub(crate) struct OrHandler;
 
 impl OrHandler {
-    pub(crate) fn new(evaluate_fn: EvalFn) -> Self {
-        Self { evaluate_fn }
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
@@ -111,7 +142,7 @@ impl ACLConditionHandler for OrHandler {
             if let Some(obj) = sub.as_object() {
                 let map: HashMap<String, Value> =
                     obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                if (self.evaluate_fn)(&map, ctx) {
+                if evaluate_conditions_async(&map, ctx).await {
                     return true;
                 }
             }
@@ -121,13 +152,12 @@ impl ACLConditionHandler for OrHandler {
 }
 
 /// $not: single condition dict. Returns true if the sub-set FAILS.
-pub(crate) struct NotHandler {
-    evaluate_fn: EvalFn,
-}
+/// Delegates to `evaluate_conditions_async` for the same reason as `OrHandler`.
+pub(crate) struct NotHandler;
 
 impl NotHandler {
-    pub(crate) fn new(evaluate_fn: EvalFn) -> Self {
-        Self { evaluate_fn }
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
@@ -138,7 +168,7 @@ impl ACLConditionHandler for NotHandler {
             Some(obj) => {
                 let map: HashMap<String, Value> =
                     obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                !(self.evaluate_fn)(&map, ctx)
+                !evaluate_conditions_async(&map, ctx).await
             }
             None => false,
         }
@@ -146,12 +176,12 @@ impl ACLConditionHandler for NotHandler {
 }
 
 /// Register all built-in handlers. Called once during initialization.
-pub fn register_builtin_handlers(evaluate_fn: EvalFn) {
+pub fn register_builtin_handlers() {
     register_condition("identity_types", Arc::new(IdentityTypesHandler));
     register_condition("roles", Arc::new(RolesHandler));
     register_condition("max_call_depth", Arc::new(MaxCallDepthHandler));
-    register_condition("$or", Arc::new(OrHandler::new(evaluate_fn)));
-    register_condition("$not", Arc::new(NotHandler::new(evaluate_fn)));
+    register_condition("$or", Arc::new(OrHandler::new()));
+    register_condition("$not", Arc::new(NotHandler::new()));
 }
 
 #[cfg(test)]
@@ -281,17 +311,28 @@ mod tests {
     // OrHandler
     // -------------------------------------------------------------------------
 
-    fn simple_eval(conditions: &HashMap<String, Value>, _ctx: &Context<Value>) -> bool {
-        // Evaluates "pass: true" condition for testing purposes
-        conditions
-            .get("pass")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    /// Simple async handler for compound-operator tests: checks `{"pass": true}`.
+    struct PassHandler;
+
+    #[async_trait]
+    impl ACLConditionHandler for PassHandler {
+        async fn evaluate(&self, value: &Value, _ctx: &Context<Value>) -> bool {
+            value.as_bool().unwrap_or(false)
+        }
+    }
+
+    /// Register "pass" handler and ensure built-ins are present before compound tests.
+    fn setup_compound_test_handlers() {
+        register_condition("pass", Arc::new(PassHandler));
+        // Ensure the OrHandler / NotHandler themselves are registered so nested
+        // compound operators work in the integration tests below.
+        register_builtin_handlers();
     }
 
     #[tokio::test]
     async fn or_handler_true_if_any_sub_passes() {
-        let handler = OrHandler::new(simple_eval);
+        setup_compound_test_handlers();
+        let handler = OrHandler::new();
         let ctx = anon_ctx();
         let value = serde_json::json!([
             {"pass": false},
@@ -302,7 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn or_handler_false_if_none_pass() {
-        let handler = OrHandler::new(simple_eval);
+        setup_compound_test_handlers();
+        let handler = OrHandler::new();
         let ctx = anon_ctx();
         let value = serde_json::json!([
             {"pass": false},
@@ -313,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn or_handler_rejects_non_array_value() {
-        let handler = OrHandler::new(simple_eval);
+        let handler = OrHandler::new();
         let ctx = anon_ctx();
         let value = serde_json::json!({"pass": true}); // not an array
         assert!(!handler.evaluate(&value, &ctx).await);
@@ -325,7 +367,8 @@ mod tests {
 
     #[tokio::test]
     async fn not_handler_inverts_passing_condition() {
-        let handler = NotHandler::new(simple_eval);
+        setup_compound_test_handlers();
+        let handler = NotHandler::new();
         let ctx = anon_ctx();
         let value = serde_json::json!({"pass": true});
         assert!(!handler.evaluate(&value, &ctx).await);
@@ -333,7 +376,8 @@ mod tests {
 
     #[tokio::test]
     async fn not_handler_inverts_failing_condition() {
-        let handler = NotHandler::new(simple_eval);
+        setup_compound_test_handlers();
+        let handler = NotHandler::new();
         let ctx = anon_ctx();
         let value = serde_json::json!({"pass": false});
         assert!(handler.evaluate(&value, &ctx).await);
@@ -341,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn not_handler_rejects_non_object_value() {
-        let handler = NotHandler::new(simple_eval);
+        let handler = NotHandler::new();
         let ctx = anon_ctx();
         let value = serde_json::json!([{"pass": true}]); // not an object
         assert!(!handler.evaluate(&value, &ctx).await);

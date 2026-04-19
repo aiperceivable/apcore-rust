@@ -29,24 +29,34 @@ use crate::pipeline::{
 };
 use crate::registry::registry::{module_id_pattern, Registry};
 
+/// Maximum nesting depth for deep_merge_value to prevent stack overflow on
+/// adversarial or pathological inputs.
+const DEEP_MERGE_MAX_DEPTH: usize = 64;
+
 /// Deep-merge a list of JSON Value chunks into a single accumulated Value.
 ///
 /// For objects: keys from later chunks overwrite earlier keys; nested objects
-/// are merged recursively. For non-objects: returns the last chunk.
+/// are merged recursively up to `DEEP_MERGE_MAX_DEPTH` levels. For
+/// non-objects: returns the last chunk.
 fn deep_merge_chunks(chunks: &[Value]) -> Value {
     let mut acc = Value::Null;
     for chunk in chunks {
-        deep_merge_value(&mut acc, chunk);
+        deep_merge_value(&mut acc, chunk, 0);
     }
     acc
 }
 
-fn deep_merge_value(base: &mut Value, overlay: &Value) {
+fn deep_merge_value(base: &mut Value, overlay: &Value, depth: usize) {
+    if depth >= DEEP_MERGE_MAX_DEPTH {
+        // At the depth limit, replace rather than recurse to avoid stack overflow.
+        *base = overlay.clone();
+        return;
+    }
     match (base, overlay) {
         (Value::Object(base_map), Value::Object(overlay_map)) => {
             for (k, v) in overlay_map {
                 let entry = base_map.entry(k.clone()).or_insert(Value::Null);
-                deep_merge_value(entry, v);
+                deep_merge_value(entry, v, depth + 1);
             }
         }
         (base, overlay) => {
@@ -501,7 +511,23 @@ impl Executor {
         }
         self.inject_resources(&mut pipe_ctx);
         match PipelineEngine::run(&self.strategy, &mut pipe_ctx).await {
-            Ok((output, _trace)) => Ok(output.unwrap_or(serde_json::Value::Null)),
+            Ok((output, trace)) => {
+                if !trace.success {
+                    let (aborted_step, explanation) = trace
+                        .steps
+                        .iter()
+                        .find_map(|s| {
+                            if s.result.action == "abort" {
+                                Some((s.name.as_str(), s.result.explanation.as_deref()))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(("unknown", None));
+                    return Err(ModuleError::pipeline_abort(aborted_step, explanation));
+                }
+                Ok(output.unwrap_or(serde_json::Value::Null))
+            }
             Err(e) => {
                 // Run middleware on_error hooks in reverse so any registered
                 // recovery middleware can intercept the error.

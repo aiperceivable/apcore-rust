@@ -289,9 +289,10 @@ impl<T: Default> Context<T> {
             tracing::error!(
                 trace_id = %self.trace_id,
                 error = %e,
-                "Context::to_json serialization failed; returning empty object"
+                "Context::to_json serialization failed; returning partial object"
             );
-            serde_json::json!({})
+            // Preserve trace_id so callers can still correlate logs on failure.
+            serde_json::json!({ "trace_id": self.trace_id })
         });
         // Filter out internal keys (keys starting with "_") from data
         if let Some(obj) = value.as_object_mut() {
@@ -503,6 +504,9 @@ impl<T: Default> Context<T> {
     }
 
     /// Create a context from explicit parameters.
+    ///
+    /// For `trace_parent` (W3C trace-context propagation) or `global_deadline`
+    /// support, use [`Context::builder`] instead.
     pub fn create(
         identity: Identity,
         services: T,
@@ -548,6 +552,7 @@ pub struct ContextBuilder<T> {
     services: Option<T>,
     caller_id: Option<String>,
     data: Option<HashMap<String, serde_json::Value>>,
+    global_deadline: Option<f64>,
 }
 
 impl<T> Default for ContextBuilder<T> {
@@ -558,6 +563,7 @@ impl<T> Default for ContextBuilder<T> {
             services: None,
             caller_id: None,
             data: None,
+            global_deadline: None,
         }
     }
 }
@@ -602,6 +608,14 @@ impl<T> ContextBuilder<T> {
         self.data = Some(data);
         self
     }
+
+    /// Set an absolute deadline (epoch seconds, f64) that bounds the total
+    /// execution time for the call tree rooted at this context.
+    #[must_use]
+    pub fn global_deadline(mut self, deadline: Option<f64>) -> Self {
+        self.global_deadline = deadline;
+        self
+    }
 }
 
 impl<T: Default> ContextBuilder<T> {
@@ -626,7 +640,7 @@ impl<T: Default> ContextBuilder<T> {
             redacted_inputs: None,
             redacted_output: None,
             cancel_token: None,
-            global_deadline: None,
+            global_deadline: self.global_deadline,
             executor: None,
         }
     }
