@@ -784,15 +784,24 @@ impl Registry {
                 )
                 .await;
 
-                if let Ok(()) = result {
-                    self.unregister(name)?;
-                    Ok(true)
-                } else {
-                    // Timeout — remove draining flag but don't unregister.
-                    self.core.write().draining.remove(name);
-                    self.drain_events.write().remove(name);
-                    Ok(false)
+                let clean = result.is_ok();
+                if !clean {
+                    // Timeout — force-unload, matching Python and TypeScript behavior.
+                    let in_flight = self.core.read().ref_counts.get(name).copied().unwrap_or(0);
+                    tracing::warn!(
+                        "Force-unloading module '{}' after {}ms timeout ({} in-flight executions)",
+                        name,
+                        timeout_ms,
+                        in_flight,
+                    );
                 }
+                {
+                    let mut core = self.core.write();
+                    core.draining.remove(name);
+                }
+                self.drain_events.write().remove(name);
+                self.unregister(name)?;
+                Ok(clean)
             }
         }
     }
