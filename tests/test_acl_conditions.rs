@@ -286,27 +286,21 @@ async fn test_async_check_basic() {
     init_handlers();
     let acl = make_acl_with_condition("roles", json!(["admin"]));
     let ctx = make_context("user", vec!["admin".to_string()], vec![]);
-    let result = acl
-        .async_check(Some("caller"), "target", Some(&ctx))
-        .await;
+    let result = acl.async_check(Some("caller"), "target", Some(&ctx)).await;
     assert!(result);
 }
 
 #[tokio::test]
 async fn test_async_check_default_deny() {
     let acl = ACL::new(vec![], "deny", None);
-    let result = acl
-        .async_check(Some("caller"), "target", None)
-        .await;
+    let result = acl.async_check(Some("caller"), "target", None).await;
     assert!(!result);
 }
 
 #[tokio::test]
 async fn test_async_check_default_allow() {
     let acl = ACL::new(vec![], "allow", None);
-    let result = acl
-        .async_check(Some("caller"), "target", None)
-        .await;
+    let result = acl.async_check(Some("caller"), "target", None).await;
     assert!(result);
 }
 
@@ -325,9 +319,7 @@ async fn test_sync_and_async_check_agree_on_builtin_conditions() {
     let acl = make_acl_with_condition("identity_types", json!(["service"]));
     let ctx = make_context("service", vec![], vec![]);
     let sync_result = acl.check(Some("caller"), "target", Some(&ctx));
-    let async_result = acl
-        .async_check(Some("caller"), "target", Some(&ctx))
-        .await;
+    let async_result = acl.async_check(Some("caller"), "target", Some(&ctx)).await;
     assert_eq!(
         sync_result, async_result,
         "sync check and async_check must agree for identity_types (match)"
