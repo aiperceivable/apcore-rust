@@ -402,9 +402,7 @@ fn conformance_acl_evaluation() {
             Some(caller_id_val.as_str().unwrap())
         };
 
-        let result = acl
-            .check(caller_id, target_id, ctx.as_ref())
-            .unwrap_or(false);
+        let result = acl.check(caller_id, target_id, ctx.as_ref());
 
         assert_eq!(
             result, expected,

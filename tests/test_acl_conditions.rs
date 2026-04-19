@@ -161,7 +161,7 @@ async fn test_or_passes_when_any_match() {
         ]),
     );
     let ctx = make_context("user", vec!["admin".to_string()], vec![]);
-    let result = acl.check(Some("caller"), "target", Some(&ctx)).unwrap();
+    let result = acl.check(Some("caller"), "target", Some(&ctx));
     assert!(result);
 }
 
@@ -176,7 +176,7 @@ async fn test_or_fails_when_none_match() {
         ]),
     );
     let ctx = make_context("user", vec!["viewer".to_string()], vec![]);
-    let result = acl.check(Some("caller"), "target", Some(&ctx)).unwrap();
+    let result = acl.check(Some("caller"), "target", Some(&ctx));
     assert!(!result);
 }
 
@@ -185,7 +185,7 @@ async fn test_or_empty_list_returns_false() {
     init_handlers();
     let acl = make_acl_with_condition("$or", json!([]));
     let ctx = make_context("user", vec![], vec![]);
-    let result = acl.check(Some("caller"), "target", Some(&ctx)).unwrap();
+    let result = acl.check(Some("caller"), "target", Some(&ctx));
     assert!(!result);
 }
 
@@ -195,12 +195,8 @@ async fn test_not_negates_conditions() {
     let acl = make_acl_with_condition("$not", json!({"identity_types": ["service"]}));
     let ctx_user = make_context("user", vec![], vec![]);
     let ctx_service = make_context("service", vec![], vec![]);
-    assert!(acl
-        .check(Some("caller"), "target", Some(&ctx_user))
-        .unwrap());
-    assert!(!acl
-        .check(Some("caller"), "target", Some(&ctx_service))
-        .unwrap());
+    assert!(acl.check(Some("caller"), "target", Some(&ctx_user)));
+    assert!(!acl.check(Some("caller"), "target", Some(&ctx_service)));
 }
 
 #[tokio::test]
@@ -208,7 +204,7 @@ async fn test_not_non_dict_returns_false() {
     init_handlers();
     let acl = make_acl_with_condition("$not", json!("invalid"));
     let ctx = make_context("user", vec![], vec![]);
-    assert!(!acl.check(Some("caller"), "target", Some(&ctx)).unwrap());
+    assert!(!acl.check(Some("caller"), "target", Some(&ctx)));
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +216,7 @@ async fn test_unknown_condition_fails_closed() {
     init_handlers();
     let acl = make_acl_with_condition("nonexistent", json!(true));
     let ctx = make_context("user", vec![], vec![]);
-    assert!(!acl.check(Some("caller"), "target", Some(&ctx)).unwrap());
+    assert!(!acl.check(Some("caller"), "target", Some(&ctx)));
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +233,7 @@ fn test_empty_callers_matches_nothing() {
         conditions: None,
     };
     let acl = ACL::new(vec![rule], "deny", None);
-    assert!(!acl.check(Some("anyone"), "target", None).unwrap());
+    assert!(!acl.check(Some("anyone"), "target", None));
 }
 
 #[test]
@@ -250,7 +246,7 @@ fn test_empty_targets_matches_nothing() {
         conditions: None,
     };
     let acl = ACL::new(vec![rule], "deny", None);
-    assert!(!acl.check(Some("anyone"), "target", None).unwrap());
+    assert!(!acl.check(Some("anyone"), "target", None));
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +271,7 @@ fn test_audit_logger_via_constructor() {
         "deny",
         Some(Arc::new(audit_fn)),
     );
-    acl.check(Some("a"), "b", None).unwrap();
+    acl.check(Some("a"), "b", None);
     let entries = logged.lock().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0], "allow");
@@ -292,8 +288,7 @@ async fn test_async_check_basic() {
     let ctx = make_context("user", vec!["admin".to_string()], vec![]);
     let result = acl
         .async_check(Some("caller"), "target", Some(&ctx))
-        .await
-        .unwrap();
+        .await;
     assert!(result);
 }
 
@@ -302,8 +297,7 @@ async fn test_async_check_default_deny() {
     let acl = ACL::new(vec![], "deny", None);
     let result = acl
         .async_check(Some("caller"), "target", None)
-        .await
-        .unwrap();
+        .await;
     assert!(!result);
 }
 
@@ -312,8 +306,7 @@ async fn test_async_check_default_allow() {
     let acl = ACL::new(vec![], "allow", None);
     let result = acl
         .async_check(Some("caller"), "target", None)
-        .await
-        .unwrap();
+        .await;
     assert!(result);
 }
 
@@ -331,11 +324,10 @@ async fn test_sync_and_async_check_agree_on_builtin_conditions() {
     // Case 1: identity_types matches → both allow
     let acl = make_acl_with_condition("identity_types", json!(["service"]));
     let ctx = make_context("service", vec![], vec![]);
-    let sync_result = acl.check(Some("caller"), "target", Some(&ctx)).unwrap();
+    let sync_result = acl.check(Some("caller"), "target", Some(&ctx));
     let async_result = acl
         .async_check(Some("caller"), "target", Some(&ctx))
-        .await
-        .unwrap();
+        .await;
     assert_eq!(
         sync_result, async_result,
         "sync check and async_check must agree for identity_types (match)"
@@ -343,13 +335,10 @@ async fn test_sync_and_async_check_agree_on_builtin_conditions() {
 
     // Case 2: identity_types no match → both deny
     let ctx_user = make_context("user", vec![], vec![]);
-    let sync_result = acl
-        .check(Some("caller"), "target", Some(&ctx_user))
-        .unwrap();
+    let sync_result = acl.check(Some("caller"), "target", Some(&ctx_user));
     let async_result = acl
         .async_check(Some("caller"), "target", Some(&ctx_user))
-        .await
-        .unwrap();
+        .await;
     assert_eq!(
         sync_result, async_result,
         "sync check and async_check must agree for identity_types (no match)"
@@ -358,13 +347,10 @@ async fn test_sync_and_async_check_agree_on_builtin_conditions() {
     // Case 3: roles condition
     let acl_roles = make_acl_with_condition("roles", json!(["admin"]));
     let ctx_admin = make_context("user", vec!["admin".to_string()], vec![]);
-    let sync_result = acl_roles
-        .check(Some("caller"), "target", Some(&ctx_admin))
-        .unwrap();
+    let sync_result = acl_roles.check(Some("caller"), "target", Some(&ctx_admin));
     let async_result = acl_roles
         .async_check(Some("caller"), "target", Some(&ctx_admin))
-        .await
-        .unwrap();
+        .await;
     assert_eq!(
         sync_result, async_result,
         "sync check and async_check must agree for roles condition"

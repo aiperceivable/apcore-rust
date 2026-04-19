@@ -262,7 +262,7 @@ impl Step for BuiltinACLCheck {
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         if let Some(ref acl) = ctx.acl {
             let caller_id = ctx.context.caller_id.as_deref();
-            let allowed = acl.check(caller_id, &ctx.module_id, Some(&ctx.context))?;
+            let allowed = acl.check(caller_id, &ctx.module_id, Some(&ctx.context));
             if !allowed {
                 return Err(ModuleError::new(
                     ErrorCode::ACLDenied,

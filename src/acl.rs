@@ -216,6 +216,9 @@ impl ACL {
     /// Check whether the given caller is allowed to access the target.
     /// Uses first-match-wins evaluation. Maps `None` caller to `@external`.
     ///
+    /// Returns `true` for allow, `false` for deny. Never errors — deny is
+    /// signalled via the return value, not an `Err`, per the protocol spec.
+    ///
     /// Sync entry point. The shared post-decision audit logic lives in
     /// `finalize_*` helpers so this method and `async_check` cannot drift.
     pub fn check(
@@ -223,20 +226,20 @@ impl ACL {
         caller_id: Option<&str>,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> Result<bool, ModuleError> {
+    ) -> bool {
         let caller = caller_id.unwrap_or("@external");
 
         if self.rules.is_empty() {
-            return Ok(self.finalize_no_rules(caller, target_id, ctx));
+            return self.finalize_no_rules(caller, target_id, ctx);
         }
 
         for (idx, rule) in self.rules.iter().enumerate() {
             if self.matches_rule(rule, caller, target_id, ctx) {
-                return Ok(self.finalize_rule_match(idx, rule, caller, target_id, ctx));
+                return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
             }
         }
 
-        Ok(self.finalize_default_effect(caller, target_id, ctx))
+        self.finalize_default_effect(caller, target_id, ctx)
     }
 
     /// Load ACL rules from a YAML file.
@@ -546,20 +549,20 @@ impl ACL {
         caller_id: Option<&str>,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> Result<bool, ModuleError> {
+    ) -> bool {
         let caller = caller_id.unwrap_or("@external");
 
         if self.rules.is_empty() {
-            return Ok(self.finalize_no_rules(caller, target_id, ctx));
+            return self.finalize_no_rules(caller, target_id, ctx);
         }
 
         for (idx, rule) in self.rules.iter().enumerate() {
             if self.matches_rule_async(rule, caller, target_id, ctx).await {
-                return Ok(self.finalize_rule_match(idx, rule, caller, target_id, ctx));
+                return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
             }
         }
 
-        Ok(self.finalize_default_effect(caller, target_id, ctx))
+        self.finalize_default_effect(caller, target_id, ctx)
     }
 
     /// Async version of `matches_rule` that awaits async condition handlers.

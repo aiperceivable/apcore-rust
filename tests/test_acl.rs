@@ -117,9 +117,7 @@ fn test_check_allow_rule_matches() {
     }];
     let acl = ACL::new(rules, "deny", None);
     let ctx = make_ctx("admin", "user", vec![]);
-    let result = acl
-        .check(Some("admin"), "secrets.read", Some(&ctx))
-        .unwrap();
+    let result = acl.check(Some("admin"), "secrets.read", Some(&ctx));
     assert!(result, "Admin should be allowed to access secrets.*");
 }
 
@@ -134,7 +132,7 @@ fn test_check_allow_without_context() {
     }];
     let acl = ACL::new(rules, "deny", None);
     // check() with ctx=None should still match when there are no conditions
-    let result = acl.check(Some("bot"), "public.info", None).unwrap();
+    let result = acl.check(Some("bot"), "public.info", None);
     assert!(result);
 }
 
@@ -153,7 +151,7 @@ fn test_check_deny_rule_matches() {
     }];
     let acl = ACL::new(rules, "allow", None);
     let ctx = make_ctx("guest", "user", vec![]);
-    let result = acl.check(Some("guest"), "admin.panel", Some(&ctx)).unwrap();
+    let result = acl.check(Some("guest"), "admin.panel", Some(&ctx));
     assert!(!result, "Guest should be denied access to admin.*");
 }
 
@@ -172,7 +170,7 @@ fn test_check_default_deny_when_no_rules_match() {
     }];
     let acl = ACL::new(rules, "deny", None);
     // "user1" does not match the "admin" caller pattern
-    let result = acl.check(Some("user1"), "admin.panel", None).unwrap();
+    let result = acl.check(Some("user1"), "admin.panel", None);
     assert!(!result, "Should fall through to default deny");
 }
 
@@ -187,17 +185,17 @@ fn test_check_default_allow_when_no_rules_match() {
     }];
     let acl = ACL::new(rules, "allow", None);
     // "friendly" does not match "blocked"
-    let result = acl.check(Some("friendly"), "anything", None).unwrap();
+    let result = acl.check(Some("friendly"), "anything", None);
     assert!(result, "Should fall through to default allow");
 }
 
 #[test]
 fn test_check_default_effect_with_empty_rules() {
     let acl_deny = ACL::new(vec![], "deny", None);
-    assert!(!acl_deny.check(Some("anyone"), "anything", None).unwrap());
+    assert!(!acl_deny.check(Some("anyone"), "anything", None));
 
     let acl_allow = ACL::new(vec![], "allow", None);
-    assert!(acl_allow.check(Some("anyone"), "anything", None).unwrap());
+    assert!(acl_allow.check(Some("anyone"), "anything", None));
 }
 
 // ---------------------------------------------------------------------------
@@ -214,10 +212,8 @@ fn test_check_wildcard_target_matches_all() {
         conditions: None,
     }];
     let acl = ACL::new(rules, "deny", None);
-    assert!(acl
-        .check(Some("superadmin"), "any.module.here", None)
-        .unwrap());
-    assert!(acl.check(Some("superadmin"), "another", None).unwrap());
+    assert!(acl.check(Some("superadmin"), "any.module.here", None));
+    assert!(acl.check(Some("superadmin"), "another", None));
 }
 
 #[test]
@@ -230,10 +226,8 @@ fn test_check_wildcard_caller_matches_all() {
         conditions: None,
     }];
     let acl = ACL::new(rules, "deny", None);
-    assert!(acl.check(Some("anyone"), "public.health", None).unwrap());
-    assert!(acl
-        .check(Some("someone_else"), "public.health", None)
-        .unwrap());
+    assert!(acl.check(Some("anyone"), "public.health", None));
+    assert!(acl.check(Some("someone_else"), "public.health", None));
 }
 
 #[test]
@@ -246,10 +240,10 @@ fn test_check_glob_pattern_in_target() {
         conditions: None,
     }];
     let acl = ACL::new(rules, "deny", None);
-    assert!(acl.check(Some("svc"), "data.read", None).unwrap());
-    assert!(acl.check(Some("svc"), "data.write", None).unwrap());
+    assert!(acl.check(Some("svc"), "data.read", None));
+    assert!(acl.check(Some("svc"), "data.write", None));
     assert!(
-        !acl.check(Some("svc"), "admin.read", None).unwrap(),
+        !acl.check(Some("svc"), "admin.read", None),
         "Should not match non-data targets"
     );
 }
@@ -265,9 +259,9 @@ fn test_check_none_caller_maps_to_external() {
     }];
     let acl = ACL::new(rules, "deny", None);
     // None caller should be treated as @external
-    assert!(acl.check(None, "public.api", None).unwrap());
+    assert!(acl.check(None, "public.api", None));
     // Explicit non-@external caller should not match
-    assert!(!acl.check(Some("user1"), "public.api", None).unwrap());
+    assert!(!acl.check(Some("user1"), "public.api", None));
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +287,7 @@ fn test_check_first_match_wins_allow_before_deny() {
         },
     ];
     let acl = ACL::new(rules, "deny", None);
-    let result = acl.check(Some("user"), "resource", None).unwrap();
+    let result = acl.check(Some("user"), "resource", None);
     assert!(result, "First matching rule (allow) should win");
 }
 
@@ -316,7 +310,7 @@ fn test_check_first_match_wins_deny_before_allow() {
         },
     ];
     let acl = ACL::new(rules, "allow", None);
-    let result = acl.check(Some("user"), "resource", None).unwrap();
+    let result = acl.check(Some("user"), "resource", None);
     assert!(!result, "First matching rule (deny) should win");
 }
 
@@ -339,7 +333,7 @@ fn test_check_first_match_skips_non_matching_rules() {
         },
     ];
     let acl = ACL::new(rules, "deny", None);
-    let result = acl.check(Some("user"), "resource", None).unwrap();
+    let result = acl.check(Some("user"), "resource", None);
     assert!(
         result,
         "Should skip non-matching first rule and match second"
@@ -370,6 +364,6 @@ fn test_check_add_rule_inserts_at_front() {
     })
     .unwrap();
 
-    let result = acl.check(Some("user"), "resource", None).unwrap();
+    let result = acl.check(Some("user"), "resource", None);
     assert!(!result, "Newly added deny rule at front should win");
 }
