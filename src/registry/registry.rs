@@ -533,6 +533,9 @@ impl Registry {
 
     /// Get a shared reference to a module by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Module>> {
+        if name.is_empty() {
+            return None;
+        }
         self.core.read().modules.get(name).cloned()
     }
 
@@ -724,10 +727,9 @@ impl Registry {
             core.lowercase_map.remove(&name.to_lowercase());
             core.modules.remove(name);
             core.descriptors.remove(name);
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleLoadError,
-                format!("Module '{}' on_load failed: {}", name, e.message),
-            ));
+            // Re-raise the original error unchanged (mirrors Python `raise` / TypeScript `throw e`).
+            // Wrapping into ModuleLoadError loses the original code and breaks downstream dispatch.
+            return Err(e);
         }
 
         for cb in self.snapshot_callbacks("register") {

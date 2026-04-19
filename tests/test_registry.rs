@@ -1054,7 +1054,7 @@ mod on_load_rollback_tests {
             ErrorCode::ModuleLoadError,
             "register must propagate on_load error"
         );
-        assert!(err.message.contains("on_load failed"));
+        assert!(err.message.contains("on_load"), "error message: {}", err.message);
         assert!(
             registry.get("foo.bar").is_none(),
             "module must not remain in registry after on_load failure"

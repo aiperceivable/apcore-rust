@@ -185,6 +185,7 @@ impl SpanExporter for OTLPExporter {
     async fn export(&self, _span: &Span) -> Result<(), ModuleError> {
         // Without the `events` feature, export is a silent no-op.
         // No network call is made; spans are discarded.
+        tracing::warn!("OTLPExporter::export called but the `events` feature is not enabled; span discarded");
         Ok(())
     }
 

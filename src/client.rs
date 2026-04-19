@@ -71,11 +71,10 @@ impl APCore {
     /// This registration is now fully synchronous and runtime-agnostic because
     /// `Registry` uses `parking_lot::RwLock` for interior mutability.
     ///
-    /// **Cross-language note:** Python and TypeScript expose `config_path` /
-    /// `configPath` as a 5th constructor parameter. Rust splits this into a
-    /// dedicated [`APCore::from_path`] constructor — use `with_options` when
-    /// you want to inject explicit components, and `from_path` when you want
-    /// to load configuration from a YAML file.
+    /// **Cross-language note:** Python and TypeScript accept 4 options
+    /// (registry, executor, config, metricsCollector) and use `Config.load(path)`
+    /// separately — Rust's `from_path` constructor is a Rust-only convenience
+    /// that does not correspond to a 5th constructor parameter in other SDKs.
     pub fn with_options(
         registry: Option<Registry>,
         executor: Option<Executor>,
@@ -509,10 +508,11 @@ impl APCore {
     ///
     /// Reloads the `Config` object from its source path. Module re-discovery
     /// is not triggered; call [`APCore::discover`] explicitly after `reload`
-    /// if you need fresh module discovery (matches `apcore-python APCore.reload`
-    /// behaviour — config-only, no automatic re-discovery).
-    #[allow(clippy::unused_async)] // API stub for cross-language parity with Python/TypeScript SDKs
-    pub async fn reload(&mut self) -> Result<(), ModuleError> {
+    /// if you need fresh module discovery.
+    ///
+    /// **Rust-only convenience** — Python and TypeScript expose config reload
+    /// only on the Config object itself, not on the client facade.
+    pub fn reload(&mut self) -> Result<(), ModuleError> {
         self.config.reload()?;
         Ok(())
     }

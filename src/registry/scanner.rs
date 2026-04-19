@@ -126,6 +126,14 @@ fn scan_dir(
                 }
                 match entry_path.canonicalize() {
                     Ok(real) => {
+                        // Confinement check — reject symlinks whose target escapes the extension root
+                        if !real.starts_with(root) {
+                            tracing::warn!(
+                                "Symlink target outside extension root, skipping: {:?} -> {:?}",
+                                entry_path, real
+                            );
+                            continue;
+                        }
                         if visited_real_paths.contains(&real) {
                             tracing::warn!(
                                 "Symlink cycle detected at {} -> {}, skipping",

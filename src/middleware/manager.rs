@@ -116,14 +116,15 @@ impl MiddlewareManager {
         };
         let mut executed: Vec<usize> = Vec::new();
         for (i, mw) in mws.iter().enumerate() {
+            // Push BEFORE calling before() so the failing middleware is included in
+            // executed — enabling on_error self-heal (mirrors Python/TS behaviour).
+            executed.push(i);
             match mw.before(module_id, inputs.clone(), ctx).await {
                 Ok(Some(modified)) => {
                     inputs = modified;
-                    executed.push(i);
                 }
                 Ok(None) => {
                     // No modification — keep current inputs
-                    executed.push(i);
                 }
                 Err(e) => {
                     return Err(ModuleError::new(
@@ -173,10 +174,11 @@ impl MiddlewareManager {
     /// Run the `on_error` hooks in reverse order over the middlewares that
     /// were executed during `execute_before`.
     ///
-    /// Returns `Ok(Some(recovery))` if any middleware provides a recovery
-    /// value, or `Ok(None)` if no handler recovers. All executed middlewares
-    /// are called for cleanup even after a recovery is found, but only the
-    /// first recovery value is returned — matching the Python onion-model.
+    /// Returns `Some(recovery)` if any middleware provides a recovery value.
+    /// Returns `None` if no handler recovers.
+    ///
+    /// Early-returns on the first recovery value — subsequent middlewares'
+    /// `on_error` hooks are NOT called after recovery (mirrors Python/TS).
     pub async fn execute_on_error(
         &self,
         module_id: &str,
@@ -190,18 +192,16 @@ impl MiddlewareManager {
             let guard = self.middlewares.lock();
             guard.iter().map(Arc::clone).collect()
         };
-        let mut recovery: Option<serde_json::Value> = None;
 
         for &i in executed.iter().rev() {
             if let Some(mw) = mws.get(i) {
                 match mw.on_error(module_id, inputs.clone(), error, ctx).await {
                     Ok(Some(value)) => {
-                        if recovery.is_none() {
-                            recovery = Some(value);
-                        }
+                        // Early-return on first recovery (matches Python/TS semantics).
+                        return Some(value);
                     }
                     Ok(None) => {
-                        // No recovery from this middleware
+                        // No recovery from this middleware — continue
                     }
                     Err(e) => {
                         tracing::error!("Middleware '{}' on_error failed: {}", mw.name(), e);
@@ -210,7 +210,7 @@ impl MiddlewareManager {
             }
         }
 
-        recovery
+        None
     }
 }
 

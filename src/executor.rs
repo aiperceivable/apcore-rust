@@ -813,6 +813,10 @@ impl Executor {
     /// Register a strategy's info in the global registry for introspection.
     ///
     /// Delegates to the module-level [`register_strategy`] function.
+    #[deprecated(
+        since = "0.20.0",
+        note = "Use the module-level `register_strategy` function directly."
+    )]
     pub fn register_strategy(info: StrategyInfo) {
         register_strategy(info);
     }
@@ -820,6 +824,10 @@ impl Executor {
     /// List all registered strategy summaries.
     ///
     /// Delegates to the module-level [`list_strategies`] function.
+    #[deprecated(
+        since = "0.20.0",
+        note = "Use the module-level `list_strategies` function directly."
+    )]
     pub fn list_strategies() -> Vec<StrategyInfo> {
         list_strategies()
     }

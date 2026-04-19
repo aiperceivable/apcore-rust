@@ -135,8 +135,10 @@ impl EventEmitter {
     }
 
     /// Flush all pending events, waiting up to `timeout_ms` milliseconds.
-    #[allow(clippy::unused_async)] // API stub for cross-language parity; future batched dispatch will await
-    pub async fn flush(&self, _timeout_ms: u64) -> Result<(), ModuleError> {
+    ///
+    /// This implementation uses a synchronous dispatch model — all events are
+    /// dispatched inline during `emit()`, so there is nothing to flush.
+    pub fn flush(&self, _timeout_ms: u64) -> Result<(), ModuleError> {
         // Synchronous dispatch model — nothing to flush.
         Ok(())
     }
@@ -327,10 +329,10 @@ mod tests {
         assert_eq!(received.lock().len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_flush_succeeds() {
+    #[test]
+    fn test_flush_succeeds() {
         let emitter = EventEmitter::new();
-        emitter.flush(1000).await.unwrap();
+        emitter.flush(1000).unwrap();
     }
 
     #[test]

@@ -3,6 +3,8 @@
 // ModuleError is intentionally large (rich structured error for an SDK); boxing it
 // everywhere would change the public API, so we suppress this lint crate-wide.
 #![allow(clippy::result_large_err)]
+// ACL, ACL-rule, etc. are protocol-defined uppercase acronyms — matches Python/TS naming.
+#![allow(clippy::upper_case_acronyms)]
 
 /// The compile-time version of this crate, sourced from Cargo.toml.
 ///

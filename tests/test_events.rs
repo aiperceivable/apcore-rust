@@ -269,10 +269,10 @@ async fn test_emitter_emit_filtered() {
     assert_eq!(received.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn test_emitter_flush_is_noop() {
+#[test]
+fn test_emitter_flush_is_noop() {
     let emitter = EventEmitter::new();
-    let result = emitter.flush(1000).await;
+    let result = emitter.flush(1000);
     assert!(result.is_ok());
 }
 
