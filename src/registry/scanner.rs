@@ -130,7 +130,8 @@ fn scan_dir(
                         if !real.starts_with(root) {
                             tracing::warn!(
                                 "Symlink target outside extension root, skipping: {:?} -> {:?}",
-                                entry_path, real
+                                entry_path,
+                                real
                             );
                             continue;
                         }
