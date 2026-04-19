@@ -350,6 +350,13 @@ pub struct Registry {
     /// validator re-entered `set_validator` (parking_lot's guards are not
     /// reentrant).
     validator: RwLock<Option<Arc<dyn ModuleValidator>>>,
+    /// Extension roots passed to custom Discoverers.
+    ///
+    /// Aligned with `apcore-python.Registry._extension_roots` and
+    /// `apcore-typescript.Registry._extensionRoots`. Set via
+    /// [`set_extension_roots`](Self::set_extension_roots); passed verbatim to
+    /// `Discoverer::discover(roots)` in `discover_internal()`.
+    extension_roots: RwLock<Vec<String>>,
 }
 
 /// RAII guard that restores a taken-out `Discoverer` back into the registry's
@@ -422,6 +429,7 @@ impl Registry {
             drain_events: RwLock::new(HashMap::new()),
             discoverer: RwLock::new(None),
             validator: RwLock::new(None),
+            extension_roots: RwLock::new(Vec::new()),
         }
     }
 
@@ -973,7 +981,8 @@ impl Registry {
             ));
         };
 
-        let discover_result = active_discoverer.discover(&[] as &[String]).await;
+        let roots = self.extension_roots.read().clone();
+        let discover_result = active_discoverer.discover(&roots).await;
         // Explicit drop restores the discoverer via Drop impl (also runs on
         // panic unwind from the .await above). `active_discoverer` borrow
         // ends here, so the drop is reachable.
@@ -1128,6 +1137,20 @@ impl Registry {
     /// Set the discoverer.
     pub fn set_discoverer(&self, discoverer: Box<dyn Discoverer>) {
         *self.discoverer.write() = Some(discoverer);
+    }
+
+    /// Set the extension roots passed to `Discoverer::discover()`.
+    ///
+    /// Aligned with `apcore-python.Registry` (`_extension_roots`) and
+    /// `apcore-typescript.Registry` (`_extensionRoots`). Each string is a
+    /// filesystem path (or logical namespace) the discoverer should search.
+    pub fn set_extension_roots(&self, roots: Vec<String>) {
+        *self.extension_roots.write() = roots;
+    }
+
+    /// Return a snapshot of the configured extension roots.
+    pub fn extension_roots(&self) -> Vec<String> {
+        self.extension_roots.read().clone()
     }
 
     /// Set the validator.

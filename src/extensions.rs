@@ -11,6 +11,7 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::executor::Executor;
 use crate::middleware::base::Middleware;
 use crate::observability::span::SpanExporter;
+use crate::observability::tracing_middleware::TracingMiddleware;
 use crate::registry::registry::{Discoverer, ModuleValidator, Registry};
 
 // ---------------------------------------------------------------------------
@@ -348,18 +349,33 @@ impl ExtensionManager {
             }
         }
 
-        // Span exporters — warn if registered but no way to wire them
-        let exporter_count = self
+        // Span exporters: wrap in TracingMiddleware and add to executor pipeline.
+        // Aligned with apcore-typescript: find existing TracingMiddleware or create one.
+        let exporters: Vec<Box<dyn SpanExporter>> = self
             .extensions
-            .get("span_exporter")
-            .map_or(0, std::vec::Vec::len);
-        if exporter_count > 0 {
-            tracing::warn!(
-                "span_exporter extensions registered but TracingMiddleware \
-                 must be constructed with exporters in Rust; {} exporter(s) \
-                 were not wired",
-                exporter_count
-            );
+            .get_mut("span_exporter")
+            .map(std::mem::take)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|ext| {
+                if let ExtensionKind::SpanExporter(e) = ext {
+                    Some(e)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !exporters.is_empty() {
+            if exporters.len() > 1 {
+                tracing::warn!(
+                    "[apcore:extensions] {} span_exporters registered; \
+                     only the first will be wired (composite exporter not yet supported)",
+                    exporters.len()
+                );
+            }
+            let exporter = exporters.into_iter().next().unwrap();
+            executor.use_middleware(Box::new(TracingMiddleware::new(exporter)))?;
         }
 
         Ok(())
