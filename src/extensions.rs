@@ -192,8 +192,8 @@ impl ExtensionManager {
 
     /// Register an extension for the given extension point.
     ///
-    /// The `extension` must be an [`ExtensionKind`] variant whose
-    /// [`ExtensionKind::point_name`] matches `point_name`.
+    /// The `extension` must be an [`ExtensionKind`] variant whose internal
+    /// point name matches `point_name`.
     ///
     /// # Errors
     ///

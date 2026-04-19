@@ -657,11 +657,11 @@ pub trait ContextFactory: Send + Sync {
         services: serde_json::Value,
     ) -> Result<Context<serde_json::Value>, crate::errors::ModuleError>;
 
-    /// Spec-compliant alias for [`create`].
+    /// Spec-compliant alias for [`ContextFactory::create`].
     ///
     /// `create_context` is the canonical method name defined in the apcore protocol
     /// spec (`ContextFactory.create_context(request)`). This default implementation
-    /// delegates to [`create`] so existing implementations remain unbroken.
+    /// delegates to [`ContextFactory::create`] so existing implementations remain unbroken.
     async fn create_context(
         &self,
         identity: Option<Identity>,

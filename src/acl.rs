@@ -120,7 +120,7 @@ impl ACL {
     /// and using `check()` will silently deny the call.
     ///
     /// **Architecture note:** two parallel paths exist — this sync path and the async
-    /// [`evaluate_conditions_async`]. Keep both in sync when adding new condition logic to avoid
+    /// [`Self::evaluate_conditions_async`]. Keep both in sync when adding new condition logic to avoid
     /// drift. New conditions should be tested against both paths.
     pub fn evaluate_conditions(
         conditions: &HashMap<String, serde_json::Value>,

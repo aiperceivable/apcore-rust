@@ -132,7 +132,7 @@ impl APCore {
     /// Create a new `APCore` client from a pre-built Registry and Executor.
     ///
     /// Builds an `Executor` from the given `registry` and a default `Config`.
-    /// To supply a custom config, use [`with_options`] instead.
+    /// To supply a custom config, use [`Self::with_options`] instead.
     pub fn with_components(registry: Registry, config: Config) -> Self {
         Self::with_options(Some(registry), None, Some(config), None)
     }
@@ -150,6 +150,12 @@ impl APCore {
     /// SDKs. The handler closure must be an async function that takes
     /// `(serde_json::Value, &Context<serde_json::Value>)` and returns
     /// `Result<serde_json::Value, ModuleError>`.
+    ///
+    /// **Cross-language note (D1-004):** the Python and TypeScript SDKs accept a
+    /// `display` parameter (`dict | None` / `Record<string, unknown> | None`) for
+    /// UI overlay metadata. In Rust, pass this data through the `metadata` map
+    /// using the key `"display"`. A dedicated `display` parameter will be added
+    /// in a future minor release.
     ///
     /// # Example
     ///
@@ -345,6 +351,11 @@ impl APCore {
     /// This is a Rust-specific convenience that accepts a `&str` directly.
     /// For an API closer to Python/TypeScript (which accept the middleware
     /// object), see [`remove_middleware`](Self::remove_middleware).
+    ///
+    /// **Deprecation notice (D1-006):** the Python and TypeScript SDKs expose
+    /// `remove(middleware)` accepting the middleware object — not a name string.
+    /// Prefer [`remove_middleware`](Self::remove_middleware) for cross-language
+    /// consistency. The name-based form will be removed in a future major release.
     pub fn remove(&self, name: &str) -> bool {
         self.executor.remove(name)
     }
@@ -449,6 +460,12 @@ impl APCore {
     /// internal `ClosureSubscriber` and returns the subscriber ID string,
     /// which can be passed to [`off()`](Self::off) to unsubscribe.
     ///
+    /// **Planned rename (D1-008):** this method will be renamed `on()` in a
+    /// future release to align with Python/TypeScript naming. The current
+    /// [`on()`](Self::on) accepting a boxed [`EventSubscriber`] will be renamed
+    /// `on_subscriber()` at the same time. Both renames are breaking and will
+    /// ship with a major version bump.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -479,6 +496,10 @@ impl APCore {
     /// callback closure here. In Rust, prefer [`on_fn()`](Self::on_fn) for
     /// closure-based subscriptions; use `on()` only when you need a custom
     /// [`EventSubscriber`] implementation.
+    ///
+    /// **Planned rename (D1-008):** this method will be renamed `on_subscriber()`
+    /// in a future major release. See [`on_fn()`](Self::on_fn) for the rename
+    /// roadmap.
     pub fn on(&mut self, event_type: &str, subscriber: Box<dyn EventSubscriber>) -> String {
         let wrapped = Box::new(EventTypeSubscriber {
             event_type: event_type.to_string(),
@@ -491,6 +512,12 @@ impl APCore {
     }
 
     /// Unsubscribe by subscriber ID.
+    ///
+    /// **Cross-language note (D1-009):** the Python and TypeScript SDKs accept
+    /// either a subscriber object or an event-type string to unsubscribe all
+    /// handlers for that type. This Rust implementation accepts only a subscriber
+    /// ID string (as returned by [`on_fn()`](Self::on_fn) or [`on()`](Self::on)).
+    /// Unsubscribing by event-type will be added in a future minor release.
     pub fn off(&mut self, subscriber_id: &str) -> bool {
         if let Some(ref mut emitter) = self.event_emitter {
             emitter.unsubscribe_by_id(subscriber_id)
@@ -508,7 +535,7 @@ impl APCore {
     ///
     /// To receive system events you **MUST** subscribe via [`APCore::on`] or
     /// [`APCore::on_fn`] — those methods route subscriptions to the correct emitter
-    /// once this divergence is resolved. See: https://github.com/aipartnerup/apcore-rust/issues (D1-011).
+    /// once this divergence is resolved. Tracked as D1-011 in the apcore-rust issue tracker.
     ///
     /// Python and TypeScript SDKs surface the sys-modules emitter here; this Rust
     /// implementation will align in a future minor release when `event_emitter` is
