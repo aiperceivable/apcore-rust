@@ -108,6 +108,13 @@ pub enum ErrorCode {
     /// `apcore-python` has a default filesystem discoverer so this state is
     /// unreachable there.
     NoDiscovererConfigured,
+    /// Raised when `AsyncTaskManager::submit` is called at the task-slot limit.
+    /// Cross-language: Python `TASK_LIMIT_EXCEEDED`, TypeScript `TASK_LIMIT_EXCEEDED`.
+    TaskLimitExceeded,
+    /// Raised when a version constraint string is malformed (e.g., `">="`
+    /// without a digit operand, `"v1.0"` prefix, or a non-semver operand).
+    /// Cross-language: Python `VERSION_CONSTRAINT_INVALID`, TypeScript `VERSION_CONSTRAINT_INVALID`.
+    VersionConstraintInvalid,
 }
 
 /// Structured error returned by module execution.

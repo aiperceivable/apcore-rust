@@ -500,6 +500,19 @@ impl APCore {
     }
 
     /// Get the event emitter, if configured.
+    ///
+    /// **Limitation:** when system modules are enabled via config, the canonical
+    /// event emitter is `sys_modules_context.emitter` (an `Arc<Mutex<EventEmitter>>`).
+    /// This method returns the *local* emitter created by `on_fn`/`on` calls, which
+    /// is a separate instance and does NOT receive system events.
+    ///
+    /// To receive system events you **MUST** subscribe via [`APCore::on`] or
+    /// [`APCore::on_fn`] — those methods route subscriptions to the correct emitter
+    /// once this divergence is resolved. See: https://github.com/aipartnerup/apcore-rust/issues (D1-011).
+    ///
+    /// Python and TypeScript SDKs surface the sys-modules emitter here; this Rust
+    /// implementation will align in a future minor release when `event_emitter` is
+    /// migrated to `Option<Arc<Mutex<EventEmitter>>>`.
     pub fn events(&self) -> Option<&EventEmitter> {
         self.event_emitter.as_ref()
     }
