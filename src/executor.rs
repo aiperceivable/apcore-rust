@@ -27,7 +27,7 @@ use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
-use crate::registry::registry::Registry;
+use crate::registry::registry::{module_id_pattern, Registry};
 
 /// Deep-merge a list of JSON Value chunks into a single accumulated Value.
 ///
@@ -455,6 +455,26 @@ impl Executor {
         self.remove(name)
     }
 
+    /// Validate module_id format before pipeline setup.
+    ///
+    /// Mirrors `apcore-python.Executor._validate_module_id` and
+    /// `apcore-typescript.Executor.validateModuleId`. Fails fast with
+    /// `InvalidInput` rather than letting the pipeline's module-lookup step
+    /// produce a generic "not found" error for a malformed ID.
+    fn validate_module_id(module_id: &str) -> Result<(), ModuleError> {
+        if module_id.is_empty() || !module_id_pattern().is_match(module_id) {
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Invalid module ID: '{}'. Must match pattern: {}",
+                    module_id,
+                    crate::registry::registry::MODULE_ID_PATTERN,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Execute (call) a module by ID with the given inputs and context.
     ///
     /// Delegates to `PipelineEngine::run()` using the configured strategy.
@@ -465,6 +485,7 @@ impl Executor {
         ctx: Option<&Context<serde_json::Value>>,
         version_hint: Option<&str>,
     ) -> Result<serde_json::Value, ModuleError> {
+        Self::validate_module_id(module_id)?;
         let context = match ctx {
             Some(c) => c.clone(),
             None => Context::<serde_json::Value>::new(Identity::new(
@@ -479,8 +500,30 @@ impl Executor {
             pipe_ctx.version_hint = Some(hint.to_string());
         }
         self.inject_resources(&mut pipe_ctx);
-        let (output, _trace) = PipelineEngine::run(&self.strategy, &mut pipe_ctx).await?;
-        Ok(output.unwrap_or(serde_json::Value::Null))
+        match PipelineEngine::run(&self.strategy, &mut pipe_ctx).await {
+            Ok((output, _trace)) => Ok(output.unwrap_or(serde_json::Value::Null)),
+            Err(e) => {
+                // Run middleware on_error hooks in reverse so any registered
+                // recovery middleware can intercept the error.
+                let executed = pipe_ctx.executed_middlewares.clone();
+                if !executed.is_empty() {
+                    if let Some(recovery) = self
+                        .middleware_manager
+                        .execute_on_error(
+                            module_id,
+                            pipe_ctx.inputs,
+                            &e,
+                            &pipe_ctx.context,
+                            &executed,
+                        )
+                        .await
+                    {
+                        return Ok(recovery);
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Validate module inputs without executing (steps 1-7, spec §12.3).
@@ -503,6 +546,7 @@ impl Executor {
         inputs: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> Result<PreflightResult, ModuleError> {
+        Self::validate_module_id(module_id)?;
         let context = ctx.cloned().unwrap_or_else(|| {
             Context::<serde_json::Value>::new(Identity::new(
                 "@external".to_string(),
@@ -604,6 +648,9 @@ impl Executor {
         let initial_context = ctx.cloned();
 
         Box::pin(async_stream::try_stream! {
+            // Fail fast for invalid module IDs before setting up any pipeline state.
+            Self::validate_module_id(&module_id_owned)?;
+
             // Phase 1: pre-stream setup. Any error short-circuits the whole stream.
             let mut setup = self
                 .prepare_stream(
