@@ -1193,6 +1193,41 @@ impl Registry {
         self.core.read().schema_cache.get(name).cloned()
     }
 
+    /// Export the combined input/output schema with optional strict-mode
+    /// transformation applied.
+    ///
+    /// When `strict=true`, applies [`to_strict_schema`](crate::schema::to_strict_schema)
+    /// to the descriptor's `input_schema` and `output_schema`, producing a
+    /// schema that disallows `additionalProperties`, marks all properties
+    /// required, and rewrites optional fields as nullable. The returned
+    /// JSON has shape `{module_id, description, input_schema, output_schema}`.
+    ///
+    /// When `strict=false`, equivalent to [`export_schema`](Self::export_schema)
+    /// but returned in the structured envelope instead of the raw cached
+    /// schema. Returns `None` if the module is not registered.
+    ///
+    /// Aligned with `apcore-python.Registry.export_schema(module_id, strict=True)`.
+    pub fn export_schema_strict(&self, name: &str, strict: bool) -> Option<serde_json::Value> {
+        let descriptor = self.get_definition(name)?;
+        let (input_schema, output_schema) = if strict {
+            (
+                crate::schema::to_strict_schema(&descriptor.input_schema),
+                crate::schema::to_strict_schema(&descriptor.output_schema),
+            )
+        } else {
+            (
+                descriptor.input_schema.clone(),
+                descriptor.output_schema.clone(),
+            )
+        };
+        Some(serde_json::json!({
+            "module_id": descriptor.module_id,
+            "description": descriptor.description,
+            "input_schema": input_schema,
+            "output_schema": output_schema,
+        }))
+    }
+
     /// Mark a module as disabled in its descriptor.
     ///
     /// Disabled modules remain registered but callers should check `is_enabled()`
