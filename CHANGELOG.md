@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.19.1] - 2026-04-27
+
+### Added
+
+- **`Registry::export_schema_strict(name, strict)`** — Adds a strict-mode variant of `Registry::export_schema` that returns the full schema envelope (`module_id`, `description`, `input_schema`, `output_schema`) with strict-mode transformation applied when `strict=true` (sets `additionalProperties:false` on objects, marks all properties required, rewrites optional fields as nullable). This aligns the Rust SDK with `apcore-python` and `apcore-typescript` `Registry` interfaces for MCP compatibility.
+
 ## [0.19.0] - 2026-04-19
 
 ### Added
