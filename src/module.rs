@@ -289,9 +289,23 @@ pub struct PreflightResult {
 }
 
 impl PreflightResult {
-    /// Computed view: only checks where `passed` is false (duck-type ValidationResult.errors).
+    /// Computed view: failed checks as typed refs (idiomatic Rust accessor).
     #[must_use]
     pub fn errors(&self) -> Vec<&PreflightCheckResult> {
         self.checks.iter().filter(|c| !c.passed).collect()
+    }
+
+    /// Computed view: failed checks serialized to JSON Value maps.
+    ///
+    /// Cross-language parity with apcore-python PreflightResult.errors
+    /// (returns list[dict]) and apcore-typescript PreflightResult.errors
+    /// (returns array of objects) — sync finding A-014.
+    #[must_use]
+    pub fn errors_as_json(&self) -> Vec<serde_json::Value> {
+        self.checks
+            .iter()
+            .filter(|c| !c.passed)
+            .filter_map(|c| serde_json::to_value(c).ok())
+            .collect()
     }
 }

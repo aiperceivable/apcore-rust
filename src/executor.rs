@@ -315,6 +315,11 @@ static STRATEGY_REGISTRY: LazyLock<RwLock<Vec<StrategyInfo>>> =
 /// Register a strategy's info in the global registry for introspection.
 ///
 /// Replaces any existing entry with the same name.
+///
+/// Cross-language parity: apcore-python and apcore-typescript accept
+/// `(name, strategy)` to the equivalent `Executor.register_strategy()` class
+/// method. Use [`register_strategy_from_executor`] for that form
+/// (sync finding A-015).
 pub fn register_strategy(info: StrategyInfo) {
     let mut registry = STRATEGY_REGISTRY.write();
     // Replace existing entry with same name, or append.
@@ -323,6 +328,19 @@ pub fn register_strategy(info: StrategyInfo) {
     } else {
         registry.push(info);
     }
+}
+
+/// Register a strategy by (name, strategy) pair — cross-language parity form.
+///
+/// Builds a `StrategyInfo` from the given `ExecutionStrategy` and registers
+/// it. Mirrors apcore-python `Executor.register_strategy(name, strategy)`
+/// and apcore-typescript `Executor.registerStrategy(name, strategy)`
+/// (sync finding A-015).
+pub fn register_strategy_by_name(name: impl Into<String>, strategy: &ExecutionStrategy) {
+    let name = name.into();
+    let mut info = strategy.info();
+    info.name = name;
+    register_strategy(info);
 }
 
 /// List all registered strategy summaries.
