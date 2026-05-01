@@ -19,6 +19,7 @@ use crate::builtin_steps::{
 use crate::config::Config;
 use crate::context::{Context, Identity};
 use crate::errors::{ErrorCode, ModuleError};
+use crate::utils::propagate_module_error;
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::middleware::manager::MiddlewareManager;
@@ -534,6 +535,11 @@ impl Executor {
                 // public callers (and middleware on_error handlers) see the
                 // underlying cause — matches Python `Executor.call`.
                 let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+                // Algorithm A11: decorate with trace_id + module_id before
+                // middleware.on_error and final re-raise — matches
+                // apcore-python executor.py:781-782 and apcore-typescript
+                // executor.ts:352 (sync finding A-D-016).
+                let underlying = propagate_module_error(underlying, module_id, &pipe_ctx.context);
                 // Run middleware on_error hooks in reverse so any registered
                 // recovery middleware can intercept the error.
                 let executed = pipe_ctx.executed_middlewares.clone();
