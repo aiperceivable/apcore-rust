@@ -508,14 +508,21 @@ impl Registry {
     ///    a module whose `on_unload` has already released resources.
     /// 3. Callers holding `Arc<dyn Module>` references from earlier `get()`
     ///    calls keep the module alive; `on_unload` still runs exactly once.
-    pub fn unregister(&self, name: &str) -> Result<(), ModuleError> {
+    /// Unregister a module by name.
+    ///
+    /// Returns `Ok(true)` if the module was found and removed, `Ok(false)` if
+    /// the module was not registered (idempotent — matches apcore-python
+    /// `return False` and apcore-typescript `return false` semantics,
+    /// sync finding A-D-002).
+    ///
+    /// Note: the return type changes from `Result<(), ModuleError>` to
+    /// `Result<bool, ModuleError>` in this version. Callers should check the
+    /// bool rather than treating Ok(()) as success.
+    pub fn unregister(&self, name: &str) -> Result<bool, ModuleError> {
         let removed: Arc<dyn Module> = {
             let mut core = self.core.write();
             let Some(module) = core.modules.remove(name) else {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::ModuleNotFound,
-                    format!("Module '{name}' not found"),
-                ));
+                return Ok(false);
             };
             core.descriptors.remove(name);
             core.lowercase_map.remove(&name.to_lowercase());
@@ -534,7 +541,7 @@ impl Registry {
             cb(name, removed.as_ref());
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Get a shared reference to a module by name.
@@ -770,10 +777,9 @@ impl Registry {
         let need_wait_notify: Option<Arc<tokio::sync::Notify>> = {
             let mut core = self.core.write();
             if !core.modules.contains_key(name) {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::ModuleNotFound,
-                    format!("Module '{name}' not found"),
-                ));
+                // Idempotent — match apcore-python `return False` and
+                // apcore-typescript `return false` semantics (sync finding A-D-007).
+                return Ok(false);
             }
             core.draining.insert(name.to_string());
             let current_refs = core.ref_counts.get(name).copied().unwrap_or(0);
