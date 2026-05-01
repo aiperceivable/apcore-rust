@@ -96,6 +96,11 @@ impl ACL {
         default_effect: impl Into<String>,
         audit_logger: Option<Arc<AuditLoggerFn>>,
     ) -> Self {
+        // Auto-register built-in condition handlers ($or, $not, identity_types,
+        // roles, max_call_depth) — matches apcore-python and apcore-typescript
+        // module-load auto-registration. Idempotent via std::sync::Once
+        // (sync finding A-D-027).
+        Self::init_builtin_handlers();
         Self {
             rules,
             default_effect: default_effect.into(),
@@ -184,11 +189,31 @@ impl ACL {
     /// Remove the first rule matching the given callers and targets.
     /// Returns true if a rule was removed.
     pub fn remove_rule(&mut self, callers: &[String], targets: &[String]) -> bool {
-        if let Some(pos) = self
-            .rules
-            .iter()
-            .position(|r| r.callers == callers && r.targets == targets)
-        {
+        self.remove_rule_with_conditions(callers, targets, None)
+    }
+
+    /// Remove the first rule matching callers, targets, and (optional) conditions.
+    ///
+    /// When `conditions` is `Some(value)`, additionally disambiguate by
+    /// `ACLRule.conditions` via JSON value equality. Two rules with identical
+    /// callers+targets but different conditions can be selectively removed by
+    /// passing the matching conditions. Cross-language parity with
+    /// apcore-typescript removeRule (sync finding A-D-026).
+    pub fn remove_rule_with_conditions(
+        &mut self,
+        callers: &[String],
+        targets: &[String],
+        conditions: Option<&serde_json::Value>,
+    ) -> bool {
+        if let Some(pos) = self.rules.iter().position(|r| {
+            if r.callers != callers || r.targets != targets {
+                return false;
+            }
+            match conditions {
+                Some(want) => r.conditions.as_ref() == Some(want),
+                None => true,
+            }
+        }) {
             self.rules.remove(pos);
             true
         } else {

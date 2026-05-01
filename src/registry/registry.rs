@@ -526,11 +526,13 @@ impl Registry {
         };
         self.drain_events.write().remove(name);
 
-        // Fire callbacks + on_unload AFTER removal, outside any lock.
+        // Fire on_unload BEFORE the "unregister" callback so subscribers observe
+        // the post-on_unload module state, matching apcore-python and
+        // apcore-typescript ordering (sync finding A-D-003).
+        removed.on_unload();
         for cb in self.snapshot_callbacks("unregister") {
             cb(name, removed.as_ref());
         }
-        removed.on_unload();
 
         Ok(())
     }
