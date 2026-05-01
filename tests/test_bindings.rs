@@ -60,7 +60,7 @@ bindings:
         .unwrap();
 
     assert_eq!(count, 1);
-    assert!(registry.get("test.echo").is_some());
+    assert!(registry.get("test.echo").unwrap().is_some());
 }
 
 #[test]
@@ -95,9 +95,9 @@ bindings:
         .register_into_with_handlers(&registry, handlers)
         .unwrap();
     assert_eq!(count, 3);
-    assert!(registry.get("test.b1").is_some());
-    assert!(registry.get("test.b2").is_some());
-    assert!(registry.get("test.b3").is_some());
+    assert!(registry.get("test.b1").unwrap().is_some());
+    assert!(registry.get("test.b2").unwrap().is_some());
+    assert!(registry.get("test.b3").unwrap().is_some());
 }
 
 #[test]
@@ -128,7 +128,7 @@ bindings:
         .register_into_with_handlers(&registry, handlers)
         .unwrap();
     assert_eq!(count, 1);
-    assert!(registry.get("test.described").is_some());
+    assert!(registry.get("test.described").unwrap().is_some());
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn json_load_canonical_format() {
         .register_into_with_handlers(&registry, handlers)
         .unwrap();
     assert_eq!(count, 1);
-    assert!(registry.get("test.j").is_some());
+    assert!(registry.get("test.j").unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +225,7 @@ bindings:
 
     let module = registry
         .get("test.yaml_echo")
+        .unwrap()
         .expect("module should be registered");
     let identity = apcore::context::Identity::new(
         "tester".to_string(),
@@ -263,6 +264,7 @@ bindings:
 
     let module = registry
         .get("test.failing")
+        .unwrap()
         .expect("module should be registered");
     let identity = apcore::context::Identity::new(
         "tester".to_string(),

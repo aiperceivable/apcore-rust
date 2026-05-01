@@ -164,6 +164,12 @@ pub enum ErrorCode {
     /// during `register_sys_modules` and the caller requested strict failure.
     /// Cross-language: Python/TS `SYS_MODULE_REGISTRATION_FAILED`.
     SysModuleRegistrationFailed,
+    /// `APCore::disable()` / `APCore::enable()` was called but `sys_modules` is
+    /// not enabled in the current config. Cross-language: Python `RuntimeError`,
+    /// TypeScript `Error` (sync finding A-007). The Rust SDK uses a typed
+    /// `ModuleError` with this code rather than panicking, matching idiomatic
+    /// Rust error handling.
+    SysModulesDisabled,
 }
 
 /// Structured error returned by module execution.

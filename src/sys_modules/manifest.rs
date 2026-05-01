@@ -76,7 +76,7 @@ impl Module for ManifestModule {
             format!("{}/{}.rs", source_root, module_id.replace('.', "/"))
         };
 
-        let module_ref = self.registry.get(module_id);
+        let module_ref = self.registry.get(module_id).ok().flatten();
         let description = module_ref
             .map(|m| m.description().to_string())
             .unwrap_or_default();
@@ -194,7 +194,7 @@ impl Module for ManifestFullModule {
                 }
             }
 
-            let module_ref = self.registry.get(mid);
+            let module_ref = self.registry.get(mid).ok().flatten();
             let description = module_ref
                 .map(|m| m.description().to_string())
                 .unwrap_or_default();

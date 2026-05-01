@@ -209,7 +209,7 @@ impl Step for BuiltinModuleLookup {
             .registry
             .as_ref()
             .expect("registry must be injected into PipelineContext");
-        let module = registry.get(&ctx.module_id).ok_or_else(|| {
+        let module = registry.get(&ctx.module_id)?.ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ModuleNotFound,
                 format!("Module '{}' not found in registry", ctx.module_id),

@@ -78,7 +78,7 @@ fn test_registry_default_is_empty() {
 #[test]
 fn test_registry_get_unknown_module_returns_none() {
     let registry = Registry::new();
-    assert!(registry.get("nonexistent").is_none());
+    assert!(registry.get("nonexistent").unwrap().is_none());
 }
 
 #[test]
@@ -930,7 +930,7 @@ mod lifecycle_tests {
             "unregister",
             Box::new(move |name, _module| {
                 if let Some(reg) = registry_weak.upgrade() {
-                    if reg.get(name).is_some() {
+                    if matches!(reg.get(name), Ok(Some(_))) {
                         pac_clone.store(1, Ordering::SeqCst);
                     }
                 }
@@ -1061,7 +1061,7 @@ mod on_load_rollback_tests {
             err.message
         );
         assert!(
-            registry.get("foo.bar").is_none(),
+            registry.get("foo.bar").unwrap().is_none(),
             "module must not remain in registry after on_load failure"
         );
         assert_eq!(
@@ -1089,6 +1089,6 @@ mod on_load_rollback_tests {
                 "registry must accept registration after a prior failed on_load for the same id",
             );
 
-        assert!(registry.get("foo.bad").is_some());
+        assert!(registry.get("foo.bad").unwrap().is_some());
     }
 }

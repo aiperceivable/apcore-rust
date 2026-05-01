@@ -408,6 +408,13 @@ impl APCore {
         module_id: &str,
         reason: Option<&str>,
     ) -> Result<Value, ModuleError> {
+        if self.sys_modules_context.is_none() {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::SysModulesDisabled,
+                "disable() requires sys_modules to be enabled. \
+                 Pass a Config with sys_modules.enabled=true to APCore::new().",
+            ));
+        }
         self.executor
             .call(
                 "system.control.toggle_feature",
@@ -437,6 +444,13 @@ impl APCore {
         module_id: &str,
         reason: Option<&str>,
     ) -> Result<Value, ModuleError> {
+        if self.sys_modules_context.is_none() {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::SysModulesDisabled,
+                "enable() requires sys_modules to be enabled. \
+                 Pass a Config with sys_modules.enabled=true to APCore::new().",
+            ));
+        }
         self.executor
             .call(
                 "system.control.toggle_feature",
@@ -604,8 +618,8 @@ impl APCore {
     /// Describe a module by ID.
     pub fn describe(&self, module_id: &str) -> String {
         match self.registry.get(module_id) {
-            Some(module) => module.description().to_string(),
-            None => format!("Module '{module_id}' not found"),
+            Ok(Some(module)) => module.description().to_string(),
+            Ok(None) | Err(_) => format!("Module '{module_id}' not found"),
         }
     }
 

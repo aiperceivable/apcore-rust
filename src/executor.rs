@@ -19,7 +19,6 @@ use crate::builtin_steps::{
 use crate::config::Config;
 use crate::context::{Context, Identity};
 use crate::errors::{ErrorCode, ModuleError};
-use crate::utils::propagate_module_error;
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::middleware::manager::MiddlewareManager;
@@ -29,6 +28,7 @@ use crate::pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
 use crate::registry::registry::{module_id_pattern, Registry};
+use crate::utils::propagate_module_error;
 
 /// Maximum nesting depth for deep_merge_value to prevent stack overflow on
 /// adversarial or pathological inputs.
@@ -664,17 +664,17 @@ impl Executor {
         // pipe_ctx.module existing, which implies lookup succeeded).
         let pipeline_ok = checks.iter().all(|c| c.passed);
         if pipeline_ok {
-            if let Some(module) = self.registry.get(module_id) {
+            if let Ok(Some(module)) = self.registry.get(module_id) {
                 let preflight_result = module.preflight();
                 let passed = preflight_result.valid;
-                let error = if !passed {
+                let error = if passed {
+                    None
+                } else {
                     preflight_result
                         .checks
                         .iter()
                         .find(|c| !c.passed)
                         .and_then(|c| c.error.clone())
-                } else {
-                    None
                 };
                 let warnings: Vec<String> = preflight_result
                     .checks

@@ -97,7 +97,6 @@ impl Clone for ACL {
 
 impl ACL {
     /// Create a new ACL with the given rules, default effect, and optional audit logger.
-    /// Create a new ACL with the given rules, default effect, and optional audit logger.
     ///
     /// # Errors
     ///
@@ -113,9 +112,7 @@ impl ACL {
         if default_effect != "allow" && default_effect != "deny" {
             return Err(ModuleError::new(
                 ErrorCode::ACLRuleError,
-                format!(
-                    "Invalid default_effect '{default_effect}': must be 'allow' or 'deny'"
-                ),
+                format!("Invalid default_effect '{default_effect}': must be 'allow' or 'deny'"),
             ));
         }
         Ok(Self::new_unchecked(rules, default_effect, audit_logger))
@@ -298,8 +295,20 @@ impl ACL {
         // Use the snapshotted default_effect rather than re-reading self.default_effect
         // to maintain consistency with the snapshotted rules.
         let decision = default_effect == "allow";
-        let reason = if rules.is_empty() { "no_rules" } else { "default_effect" };
-        let entry = self.build_audit_entry(caller, target_id, if decision { "allow" } else { "deny" }, reason, None, None, ctx);
+        let reason = if rules.is_empty() {
+            "no_rules"
+        } else {
+            "default_effect"
+        };
+        let entry = self.build_audit_entry(
+            caller,
+            target_id,
+            if decision { "allow" } else { "deny" },
+            reason,
+            None,
+            None,
+            ctx,
+        );
         self.emit_audit(&entry);
         decision
     }

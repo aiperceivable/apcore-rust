@@ -501,23 +501,22 @@ impl Registry {
 
     /// Unregister a module by name.
     ///
-    /// Ordering (aligned with `apcore-python.Registry.unregister`):
-    /// 1. Acquire `core.write()`, remove from all maps atomically, drop lock.
-    /// 2. Fire `"unregister"` callbacks and call `on_unload()` OUTSIDE the
-    ///    lock, AFTER removal, so a concurrent `call()` cannot dispatch to
-    ///    a module whose `on_unload` has already released resources.
-    /// 3. Callers holding `Arc<dyn Module>` references from earlier `get()`
-    ///    calls keep the module alive; `on_unload` still runs exactly once.
-    /// Unregister a module by name.
-    ///
     /// Returns `Ok(true)` if the module was found and removed, `Ok(false)` if
     /// the module was not registered (idempotent — matches apcore-python
     /// `return False` and apcore-typescript `return false` semantics,
     /// sync finding A-D-002).
     ///
+    /// Ordering (aligned with `apcore-python.Registry.unregister`):
+    ///
+    /// 1. Acquire `core.write()`, remove from all maps atomically, drop lock.
+    /// 2. Invoke `module.on_unload()` BEFORE firing the `"unregister"` callback
+    ///    so subscribers observe the post-on_unload module state (sync A-D-003).
+    /// 3. Callers holding `Arc<dyn Module>` references from earlier `get()`
+    ///    calls keep the module alive; `on_unload` still runs exactly once.
+    ///
     /// Note: the return type changes from `Result<(), ModuleError>` to
     /// `Result<bool, ModuleError>` in this version. Callers should check the
-    /// bool rather than treating Ok(()) as success.
+    /// bool rather than treating `Ok(())` as success.
     pub fn unregister(&self, name: &str) -> Result<bool, ModuleError> {
         let removed: Arc<dyn Module> = {
             let mut core = self.core.write();
@@ -545,11 +544,26 @@ impl Registry {
     }
 
     /// Get a shared reference to a module by name.
-    pub fn get(&self, name: &str) -> Option<Arc<dyn Module>> {
+    ///
+    /// # Errors
+    ///
+    /// - `Err(ModuleError(code=ModuleNotFound))` if `name` is an empty string —
+    ///   per `registry-system.md §Contract: Registry.get` Preconditions:
+    ///   "module_id MUST NOT be an empty string. An empty module_id MUST be
+    ///   rejected before any lock is acquired" (sync finding A-004).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(module))` if the module is registered
+    /// - `Ok(None)` if `name` is well-formed but the module is not registered
+    pub fn get(&self, name: &str) -> Result<Option<Arc<dyn Module>>, ModuleError> {
         if name.is_empty() {
-            return None;
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::ModuleNotFound,
+                "Module ID must not be empty",
+            ));
         }
-        self.core.read().modules.get(name).cloned()
+        Ok(self.core.read().modules.get(name).cloned())
     }
 
     /// Get the definition (descriptor) for a module by name.
