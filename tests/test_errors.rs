@@ -142,3 +142,35 @@ fn test_module_error_is_std_error() {
     // Verify it satisfies std::error::Error
     let _: &dyn std::error::Error = &err;
 }
+
+// ---------------------------------------------------------------------------
+// A-D-015: MiddlewareChainError unwrap recovers the original typed error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unwrap_middleware_chain_error_recovers_inner() {
+    let inner = ModuleError::new(ErrorCode::ApprovalDenied, "approval rejected");
+    let mut details = std::collections::HashMap::new();
+    details.insert(
+        "inner_error".to_string(),
+        serde_json::to_value(&inner).unwrap(),
+    );
+    let wrapped = ModuleError::new(ErrorCode::MiddlewareChainError, inner.message.clone())
+        .with_details(details);
+
+    let recovered = wrapped.unwrap_middleware_chain_error().expect("unwrap");
+    assert_eq!(recovered.code, ErrorCode::ApprovalDenied);
+    assert_eq!(recovered.message, "approval rejected");
+}
+
+#[test]
+fn unwrap_middleware_chain_error_returns_none_for_other_codes() {
+    let err = ModuleError::new(ErrorCode::ModuleTimeout, "timeout");
+    assert!(err.unwrap_middleware_chain_error().is_none());
+}
+
+#[test]
+fn unwrap_middleware_chain_error_returns_none_when_inner_missing() {
+    let err = ModuleError::new(ErrorCode::MiddlewareChainError, "no inner");
+    assert!(err.unwrap_middleware_chain_error().is_none());
+}

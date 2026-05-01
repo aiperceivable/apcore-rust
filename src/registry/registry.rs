@@ -844,10 +844,21 @@ impl Registry {
 
     /// Ref-counted module access with explicit reference tracking.
     ///
-    /// Increments the reference count for the module before returning it.
-    /// Call `release_ref()` when done to decrement the count. This is required
-    /// for `safe_unregister()` drain logic to work correctly.
-    pub fn acquire_ref(&self, name: &str) -> Result<Arc<dyn Module>, ModuleError> {
+    /// Acquire a reference to a module, incrementing its ref count.
+    ///
+    /// Cross-language parity: matches `apcore-python.Registry.acquire()` and
+    /// `apcore-typescript.Registry.acquire()` — both bump ref_counts so
+    /// `safe_unregister()` can wait for in-flight calls to drain (sync
+    /// finding A-D-009).
+    ///
+    /// Callers MUST call [`release`](Self::release) when done with the module
+    /// or `safe_unregister()` will hang until its timeout elapses.
+    ///
+    /// # Errors
+    ///
+    /// - `Err(ModuleError(code=ModuleNotFound))` if the module is currently
+    ///   draining (a `safe_unregister` is in progress) or not registered.
+    pub fn acquire(&self, name: &str) -> Result<Arc<dyn Module>, ModuleError> {
         let mut core = self.core.write();
         if core.draining.contains(name) {
             return Err(ModuleError::new(
@@ -865,8 +876,17 @@ impl Registry {
         Ok(module)
     }
 
-    /// Decrement the reference count for a module. Notifies drain waiters when count reaches 0.
-    pub fn release_ref(&self, name: &str) {
+    /// Release a previously acquired module reference.
+    ///
+    /// Decrements the ref count; when it reaches zero, notifies any drain
+    /// waiter (i.e. `safe_unregister`) that the module is unused.
+    ///
+    /// Cross-language parity with `apcore-python.Registry.release()` and
+    /// `apcore-typescript.Registry.release()` (sync finding A-D-009).
+    ///
+    /// Calling `release()` on a name that was never acquired is a no-op —
+    /// matches Python/TS forgiving semantics.
+    pub fn release(&self, name: &str) {
         let should_notify = {
             let mut core = self.core.write();
             if let Some(count) = core.ref_counts.get_mut(name) {
@@ -891,25 +911,19 @@ impl Registry {
         }
     }
 
-    /// Simple module access (no ref-counting).
-    ///
-    /// Checks draining status before returning the module reference.
-    /// Note: For safe-unregister scenarios, use `acquire_ref()`/`release_ref()`
-    /// instead, which track reference counts for drain logic.
-    pub fn acquire(&self, name: &str) -> Result<Arc<dyn Module>, ModuleError> {
-        let core = self.core.read();
-        if core.draining.contains(name) {
-            return Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{name}' is draining"),
-            ));
-        }
-        core.modules.get(name).cloned().ok_or_else(|| {
-            ModuleError::new(
-                crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{name}' not found"),
-            )
-        })
+    /// Deprecated alias for [`acquire`](Self::acquire) — kept for backward
+    /// compatibility with apcore-rust 0.19.x which had separate
+    /// `acquire`/`acquire_ref` semantics.
+    #[deprecated(since = "0.20.0", note = "Use `acquire()` — it now ref-counts.")]
+    pub fn acquire_ref(&self, name: &str) -> Result<Arc<dyn Module>, ModuleError> {
+        self.acquire(name)
+    }
+
+    /// Deprecated alias for [`release`](Self::release) — kept for backward
+    /// compatibility with apcore-rust 0.19.x.
+    #[deprecated(since = "0.20.0", note = "Use `release()`.")]
+    pub fn release_ref(&self, name: &str) {
+        self.release(name);
     }
 
     /// Check if a module is draining.

@@ -553,6 +553,16 @@ impl Executor {
                 // public callers (and middleware on_error handlers) see the
                 // underlying cause — matches Python `Executor.call`.
                 let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+                // §1.2 fail-fast: MiddlewareManager.execute_before wraps a
+                // failing middleware's error as MiddlewareChainError preserving
+                // the original in details["inner_error"]. Unwrap so callers
+                // can dispatch on the original error class (e.g.
+                // ApprovalDeniedError) — matches apcore-python and
+                // apcore-typescript MiddlewareChainError.original semantics
+                // (sync finding A-D-015).
+                let underlying = underlying
+                    .unwrap_middleware_chain_error()
+                    .unwrap_or(underlying);
                 // Algorithm A11: decorate with trace_id + module_id before
                 // middleware.on_error and final re-raise — matches
                 // apcore-python executor.py:781-782 and apcore-typescript
@@ -768,13 +778,36 @@ impl Executor {
                 yield chunk;
             }
 
-            // Phase 3: post-stream validation + middleware_after on the merged output.
-            // Errors here become the final `Err` item delivered to the caller.
+            // Phase 3: post-stream validation + middleware_after on the merged
+            // output. Chunks are already delivered, so failures here are
+            // SWALLOWED with a tracing::warn rather than yielded as a final
+            // Err item — matches apcore-python (executor.py:920 emits
+            // `apcore.stream.post_validation_failed` event and does not raise)
+            // and apcore-typescript (console.warn + swallow) behavior
+            // (sync finding A-D-012).
             let merged = deep_merge_chunks(&accumulated);
-            validate_against_schema(&merged, &setup.output_schema, "Output")?;
-            if let Some(ref mm) = setup.middleware_manager {
-                mm.execute_after(&module_id_owned, setup.inputs.clone(), merged, &setup.context)
-                    .await?;
+            if let Err(e) = validate_against_schema(&merged, &setup.output_schema, "Output") {
+                tracing::warn!(
+                    module_id = %module_id_owned,
+                    error = %e.message,
+                    "stream phase-3 output schema validation failed (chunks already delivered, swallowed)"
+                );
+            } else if let Some(ref mm) = setup.middleware_manager {
+                if let Err(e) = mm
+                    .execute_after(
+                        &module_id_owned,
+                        setup.inputs.clone(),
+                        merged,
+                        &setup.context,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        module_id = %module_id_owned,
+                        error = %e.message,
+                        "stream phase-3 middleware_after failed (chunks already delivered, swallowed)"
+                    );
+                }
             }
             // We intentionally do NOT yield the merged result — chunks are the
             // payload, Phase 3 is pure side effects (validation + observation).

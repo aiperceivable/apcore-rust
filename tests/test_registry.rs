@@ -1092,3 +1092,73 @@ mod on_load_rollback_tests {
         assert!(registry.get("foo.bad").unwrap().is_some());
     }
 }
+
+// ---------------------------------------------------------------------------
+// A-D-009: acquire() bumps ref_counts for safe_unregister drain
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn acquire_bumps_ref_count_and_release_decrements() {
+    let registry = Registry::new();
+    registry
+        .register(
+            "drain.test",
+            Box::new(StubModule),
+            make_descriptor("drain.test"),
+        )
+        .unwrap();
+
+    // First acquire — ref count goes to 1
+    let _m1 = registry.acquire("drain.test").unwrap();
+    // Second acquire — ref count goes to 2
+    let _m2 = registry.acquire("drain.test").unwrap();
+
+    // Releases bring it back to 0
+    registry.release("drain.test");
+    registry.release("drain.test");
+
+    // Releasing past zero is a no-op (idempotent, like Python/TS)
+    registry.release("drain.test");
+    registry.release("never.acquired");
+}
+
+#[tokio::test]
+async fn safe_unregister_waits_for_acquire_drain() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let registry = Arc::new(Registry::new());
+    registry
+        .register(
+            "drain.wait",
+            Box::new(StubModule),
+            make_descriptor("drain.wait"),
+        )
+        .unwrap();
+
+    let m = registry.acquire("drain.wait").unwrap();
+    assert_eq!(m.description(), "stub");
+
+    // safe_unregister should not complete until release() is called.
+    let registry_clone = Arc::clone(&registry);
+    let unregister_task =
+        tokio::spawn(async move { registry_clone.safe_unregister("drain.wait", 5000).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !unregister_task.is_finished(),
+        "safe_unregister must wait for ref count to drain"
+    );
+
+    registry.release("drain.wait");
+
+    let result = tokio::time::timeout(Duration::from_secs(2), unregister_task)
+        .await
+        .expect("safe_unregister must complete after release()")
+        .expect("join")
+        .expect("safe_unregister Result");
+    assert!(
+        result,
+        "safe_unregister returned Ok(true) after clean drain"
+    );
+}

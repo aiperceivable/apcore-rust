@@ -413,6 +413,28 @@ impl ModuleError {
             .and_then(|v| serde_json::from_value::<ModuleError>(v.clone()).ok())
     }
 
+    /// Returns true if this error is a `MiddlewareChainError`.
+    #[must_use]
+    pub fn is_middleware_chain_error(&self) -> bool {
+        matches!(self.code, ErrorCode::MiddlewareChainError)
+    }
+
+    /// Recover the original error wrapped by `MiddlewareManager.execute_before()`.
+    ///
+    /// Returns `None` if this error is not a `MiddlewareChainError` or the
+    /// inner error was not preserved in a structured form. Cross-language
+    /// parity with apcore-python `MiddlewareChainError.original` and
+    /// apcore-typescript `MiddlewareChainError.original` (sync finding A-D-015).
+    #[must_use]
+    pub fn unwrap_middleware_chain_error(&self) -> Option<ModuleError> {
+        if !self.is_middleware_chain_error() {
+            return None;
+        }
+        self.details
+            .get("inner_error")
+            .and_then(|v| serde_json::from_value::<ModuleError>(v.clone()).ok())
+    }
+
     /// Builder for `MODULE_ID_CONFLICT` (Issue #32, PROTOCOL_SPEC §2.1.1).
     ///
     /// Two or more classes in the same file produced the same `class_segment`

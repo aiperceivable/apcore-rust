@@ -127,10 +127,21 @@ impl MiddlewareManager {
                     // No modification — keep current inputs
                 }
                 Err(e) => {
+                    // Wrap as MiddlewareChainError but preserve the original
+                    // typed error in details["inner_error"] so callers can
+                    // recover it via ModuleError::unwrap_middleware_chain_error()
+                    // (sync finding A-D-015 — match Python's
+                    // `MiddlewareChainError.original` and TypeScript's
+                    // `MiddlewareChainError.original`).
+                    let mut details = std::collections::HashMap::new();
+                    if let Ok(inner_json) = serde_json::to_value(&e) {
+                        details.insert("inner_error".to_string(), inner_json);
+                    }
                     return Err(ModuleError::new(
                         ErrorCode::MiddlewareChainError,
                         e.message.clone(),
                     )
+                    .with_details(details)
                     .with_cause(format!(
                         "Middleware '{}' before() failed: {}",
                         mw.name(),

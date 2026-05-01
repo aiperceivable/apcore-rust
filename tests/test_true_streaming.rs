@@ -178,7 +178,12 @@ async fn streaming_not_supported_yields_error() {
 }
 
 #[tokio::test]
-async fn phase3_validation_failure_becomes_final_error_item() {
+async fn phase3_validation_failure_is_swallowed_chunks_still_delivered() {
+    // Per spec (sync finding A-D-012): chunks are already delivered when
+    // Phase-3 validation runs, so failures MUST NOT bubble out as a final
+    // stream Err item. They are logged via tracing::warn and the stream
+    // ends cleanly. Matches apcore-python's `apcore.stream.post_validation_failed`
+    // event-emit-and-swallow and apcore-typescript's console.warn-and-swallow.
     let apcore = APCore::new();
     apcore
         .register("bad.stream", Box::new(BadSchemaStreamingModule))
@@ -188,17 +193,16 @@ async fn phase3_validation_failure_becomes_final_error_item() {
         .executor()
         .stream("bad.stream", json!({}), None, None);
     let mut ok_count = 0usize;
-    let mut last_err: Option<ModuleError> = None;
+    let mut err_count = 0usize;
     while let Some(item) = s.next().await {
         match item {
             Ok(_) => ok_count += 1,
-            Err(e) => {
-                last_err = Some(e);
-                break;
-            }
+            Err(_) => err_count += 1,
         }
     }
     assert_eq!(ok_count, 2, "both data chunks should reach the caller");
-    let err = last_err.expect("Phase 3 validation must yield a final error item");
-    assert_eq!(err.code, ErrorCode::SchemaValidationError);
+    assert_eq!(
+        err_count, 0,
+        "Phase-3 validation failure must be swallowed (logged) — chunks already delivered"
+    );
 }
