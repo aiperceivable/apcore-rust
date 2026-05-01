@@ -770,6 +770,35 @@ fn conformance_config_env() {
 // Context.create trace_parent handling (PROTOCOL_SPEC §10.5)
 // ---------------------------------------------------------------------------
 
+// MakeWriter that buffers tracing output into a shared Vec<u8> so tests can
+// assert on emitted log lines. Mirrors the Python conformance test's use of
+// pytest's caplog fixture.
+#[derive(Clone, Default)]
+struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn as_string(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 #[test]
 fn conformance_context_trace_parent() {
     use apcore::trace_context::TraceParent;
@@ -782,6 +811,7 @@ fn conformance_context_trace_parent() {
         let incoming = tc["input"]["trace_parent_trace_id"].as_str();
         let expected = &tc["expected"];
         let expected_regen = expected["regenerated"].as_bool().unwrap();
+        let expected_warn = expected["warn_logged"].as_bool().unwrap();
 
         // Construct a TraceParent directly from the raw trace_id string,
         // bypassing TraceParent::parse so we can exercise the builder's
@@ -794,7 +824,17 @@ fn conformance_context_trace_parent() {
             trace_flags: 1,
         });
 
-        let ctx: Context<serde_json::Value> = Context::builder().trace_parent(trace_parent).build();
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+
+        let ctx: Context<serde_json::Value> = tracing::subscriber::with_default(subscriber, || {
+            Context::builder().trace_parent(trace_parent).build()
+        });
 
         assert!(
             hex_re.is_match(&ctx.trace_id),
@@ -827,6 +867,13 @@ fn conformance_context_trace_parent() {
                 ctx.trace_id
             );
         }
+
+        let log_output = captured.as_string();
+        let warn_seen = log_output.contains("Invalid trace_id format");
+        assert_eq!(
+            warn_seen, expected_warn,
+            "FAIL [{id}]: expected warn_logged={expected_warn}, got warn_seen={warn_seen} output={log_output:?}"
+        );
     }
 }
 

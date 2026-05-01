@@ -12,6 +12,7 @@ use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::executor::REDACTED_VALUE;
 use crate::middleware::base::Middleware;
+use crate::observability::redaction::RedactionConfig;
 
 /// Log level numeric values matching Python reference.
 fn level_value(level: &str) -> u32 {
@@ -207,11 +208,18 @@ impl ContextLogger {
 ///
 /// WARNING: The internal start-time stack is not safe for concurrent use on
 /// the same middleware instance. Use separate instances per concurrent pipeline.
+///
+/// When constructed with [`Self::with_redaction_config`], the supplied
+/// `RedactionConfig` is unioned with schema-level `x-sensitive` annotations
+/// per observability.md §1.5: any field/value matched by EITHER rule set is
+/// replaced before being logged. `trace_id`, `caller_id`, and `module_id`
+/// are never redacted (correlation-required fields).
 #[derive(Debug)]
 pub struct ObsLoggingMiddleware {
     logger: ContextLogger,
     log_inputs: bool,
     log_outputs: bool,
+    redaction: Option<RedactionConfig>,
     starts: Mutex<HashMap<String, std::time::Instant>>,
 }
 
@@ -223,6 +231,7 @@ impl ObsLoggingMiddleware {
             logger,
             log_inputs: true,
             log_outputs: true,
+            redaction: None,
             starts: Mutex::new(HashMap::new()),
         }
     }
@@ -234,7 +243,24 @@ impl ObsLoggingMiddleware {
             logger,
             log_inputs,
             log_outputs,
+            redaction: None,
             starts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attach a runtime-configurable redaction policy. Applied as a union
+    /// with any schema-level `x-sensitive` redaction performed upstream.
+    #[must_use]
+    pub fn with_redaction_config(mut self, config: RedactionConfig) -> Self {
+        self.redaction = Some(config);
+        self
+    }
+
+    /// Apply the configured `RedactionConfig` (if any) to a JSON value in
+    /// place. No-op when no config is attached.
+    fn apply_redaction(&self, value: &mut serde_json::Value) {
+        if let Some(ref cfg) = self.redaction {
+            cfg.redact(value);
         }
     }
 }
@@ -267,7 +293,9 @@ impl Middleware for ObsLoggingMiddleware {
             serde_json::Value::String(ctx.trace_id.clone()),
         );
         if self.log_inputs {
-            extra.insert("input".to_string(), inputs.clone());
+            let mut payload = inputs.clone();
+            self.apply_redaction(&mut payload);
+            extra.insert("input".to_string(), payload);
         }
         self.logger
             .emit("info", &format!("Starting {module_id}"), Some(&extra));
@@ -301,7 +329,9 @@ impl Middleware for ObsLoggingMiddleware {
         );
         extra.insert("duration_ms".to_string(), serde_json::json!(duration_ms));
         if self.log_outputs {
-            extra.insert("output".to_string(), _output.clone());
+            let mut payload = _output.clone();
+            self.apply_redaction(&mut payload);
+            extra.insert("output".to_string(), payload);
         }
         self.logger.emit(
             "info",

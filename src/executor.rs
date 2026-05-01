@@ -529,6 +529,11 @@ impl Executor {
                 Ok(output.unwrap_or(serde_json::Value::Null))
             }
             Err(e) => {
+                // §1.1 fail-fast: PipelineEngine wraps step failures in a
+                // `PipelineStepError`. Unwrap to the original typed error so
+                // public callers (and middleware on_error handlers) see the
+                // underlying cause — matches Python `Executor.call`.
+                let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
                 // Run middleware on_error hooks in reverse so any registered
                 // recovery middleware can intercept the error.
                 let executed = pipe_ctx.executed_middlewares.clone();
@@ -538,7 +543,7 @@ impl Executor {
                         .execute_on_error(
                             module_id,
                             pipe_ctx.inputs,
-                            &e,
+                            &underlying,
                             &pipe_ctx.context,
                             &executed,
                         )
@@ -547,7 +552,7 @@ impl Executor {
                         return Ok(recovery);
                     }
                 }
-                Err(e)
+                Err(underlying)
             }
         }
     }
@@ -595,7 +600,10 @@ impl Executor {
             Err(e) => {
                 // Pipeline step raised an error; convert to a failed check.
                 checks.extend(trace_to_checks(&pipe_ctx.trace));
-                let check_name = match e.code {
+                // §1.1 fail-fast: unwrap `PipelineStepError` to the original
+                // typed cause for preflight categorization (mirrors Python).
+                let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+                let check_name = match underlying.code {
                     ErrorCode::ModuleNotFound => "module_lookup",
                     ErrorCode::ACLDenied => "acl",
                     ErrorCode::SchemaValidationError | ErrorCode::GeneralInvalidInput => "schema",
@@ -606,8 +614,8 @@ impl Executor {
                     check: check_name.to_string(),
                     passed: false,
                     error: Some(serde_json::json!({
-                        "code": format!("{:?}", e.code),
-                        "message": e.message,
+                        "code": format!("{:?}", underlying.code),
+                        "message": underlying.message,
                     })),
                     warnings: vec![],
                 });
@@ -723,7 +731,7 @@ impl Executor {
     /// middleware-mutated) inputs, the prepared context, the module's output
     /// schema, and a handle to the middleware manager for after-middleware.
     ///
-    /// Drives the shared [`PipelineEngine::run_until`] so every per-step
+    /// Drives the shared [`PipelineEngine::run_until_step`] so every per-step
     /// declaration (`match_modules`, `ignore_errors`, `timeout_ms`, `dry_run`
     /// purity filtering, `skip_to` targets) behaves identically to the
     /// non-streaming `call()` path. A prior audit found this path had a
@@ -753,8 +761,12 @@ impl Executor {
         // Drive the shared pipeline engine up to — but not including — the
         // `execute` step. This inherits all per-step metadata handling from
         // `PipelineEngine::run`, so streaming and non-streaming never diverge.
+        // §1.1 fail-fast: unwrap PipelineStepError to surface the original
+        // typed error to the streaming caller.
         let (_output, trace) =
-            PipelineEngine::run_until(&self.strategy, &mut pipe_ctx, "execute").await?;
+            PipelineEngine::run_until_step(&self.strategy, &mut pipe_ctx, "execute")
+                .await
+                .map_err(|e| e.unwrap_pipeline_step_error().unwrap_or(e))?;
 
         // `run_until` returns `Ok` for pipeline-level aborts (so the caller
         // can observe the trace). Streaming requires a resolved module, so
@@ -859,7 +871,11 @@ impl Executor {
             PipelineContext::new(module_id, inputs, context, effective_strategy.name());
         self.inject_resources(&mut pipeline_ctx);
 
-        let (output, trace) = PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await?;
+        // §1.1 fail-fast: PipelineStepError wraps step failures; unwrap so
+        // public callers see the original typed error.
+        let (output, trace) = PipelineEngine::run(effective_strategy, &mut pipeline_ctx)
+            .await
+            .map_err(|e| e.unwrap_pipeline_step_error().unwrap_or(e))?;
 
         Ok((output.unwrap_or(Value::Null), trace))
     }

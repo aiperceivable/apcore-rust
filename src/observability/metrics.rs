@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
+use crate::observability::store::{InMemoryObservabilityStore, MetricPoint, ObservabilityStore};
 
 /// Metric name for total module call count.
 pub const METRIC_CALLS_TOTAL: &str = "apcore_module_calls_total";
@@ -54,20 +55,40 @@ impl HistogramData {
 }
 
 /// Collects and stores metrics counters and histogram observations.
+///
+/// Construction injects a `Arc<dyn ObservabilityStore>`; the default store is
+/// `InMemoryObservabilityStore`. The store MUST NOT be replaced after
+/// construction (observability.md §1.1). Every `increment`/`observe` call
+/// also forwards a `MetricPoint` to the store, mirroring Python's
+/// `MetricsCollector` reference implementation.
 #[derive(Debug, Clone)]
 pub struct MetricsCollector {
     counters: Arc<Mutex<HashMap<MetricKey, f64>>>,
     histograms: Arc<Mutex<HashMap<MetricKey, HistogramData>>>,
+    store: Arc<dyn ObservabilityStore>,
 }
 
 impl MetricsCollector {
-    /// Create a new metrics collector.
+    /// Create a new metrics collector with the default in-memory store.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_store(Arc::new(InMemoryObservabilityStore::new()))
+    }
+
+    /// Create a new metrics collector backed by the given observability store.
+    #[must_use]
+    pub fn with_store(store: Arc<dyn ObservabilityStore>) -> Self {
         Self {
             counters: Arc::new(Mutex::new(HashMap::new())),
             histograms: Arc::new(Mutex::new(HashMap::new())),
+            store,
         }
+    }
+
+    /// Get a clone of the underlying store handle.
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn ObservabilityStore> {
+        self.store.clone()
     }
 
     /// Format labels into a composite key.
@@ -81,18 +102,46 @@ impl MetricsCollector {
     #[allow(clippy::needless_pass_by_value)] // public API: HashMap passed by value is idiomatic for fire-and-forget metrics
     pub fn increment(&self, name: &str, labels: HashMap<String, String>, amount: f64) {
         let key = Self::make_key(name, &labels);
-        let mut counters = self.counters.lock();
-        let entry = counters.entry(key).or_insert(0.0);
-        *entry += amount;
+        {
+            let mut counters = self.counters.lock();
+            let entry = counters.entry(key).or_insert(0.0);
+            *entry += amount;
+        }
+        self.notify_store(name, &labels, amount);
     }
 
     /// Observe a value for a histogram metric.
     #[allow(clippy::needless_pass_by_value)] // public API: HashMap passed by value is idiomatic for fire-and-forget metrics
     pub fn observe(&self, name: &str, labels: HashMap<String, String>, value: f64) {
         let key = Self::make_key(name, &labels);
-        let mut histograms = self.histograms.lock();
-        let entry = histograms.entry(key).or_insert_with(HistogramData::new);
-        entry.observe(value);
+        {
+            let mut histograms = self.histograms.lock();
+            let entry = histograms.entry(key).or_insert_with(HistogramData::new);
+            entry.observe(value);
+        }
+        self.notify_store(name, &labels, value);
+    }
+
+    /// Forward a metric observation to the pluggable store. Best-effort:
+    /// when no tokio runtime is active the call is dropped (with a debug log).
+    fn notify_store(&self, name: &str, labels: &HashMap<String, String>, value: f64) {
+        let module_id = labels.get("module_id").cloned();
+        let mut metric = MetricPoint::new(name, value).with_labels(labels.clone());
+        if let Some(id) = module_id {
+            metric = metric.with_module_id(id);
+        }
+        let store = self.store.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                store.record_metric(metric).await;
+            });
+        } else {
+            tracing::debug!(
+                metric = %name,
+                "MetricsCollector observation outside a tokio runtime; \
+                 store notification skipped"
+            );
+        }
     }
 
     /// Return a snapshot of all current metric values as JSON.

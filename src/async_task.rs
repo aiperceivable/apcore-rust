@@ -1,19 +1,22 @@
 // APCore Protocol — Async task manager for background module execution
-// Spec reference: Background execution with concurrency limiting
+// Spec reference: docs/features/async-tasks.md
+// Issue #34: Pluggable TaskStore, retry with exponential backoff, Reaper TTL cleanup.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use std::collections::HashMap;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::context::Context;
-use crate::errors::ModuleError;
+use crate::errors::{ErrorCode, ModuleError};
 use crate::executor::Executor;
 
 /// Status of an async task.
@@ -27,6 +30,16 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+impl TaskStatus {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Running)
+    }
+}
+
 /// Metadata and result tracking for a submitted async task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInfo {
@@ -34,14 +47,18 @@ pub struct TaskInfo {
     pub module_id: String,
     pub status: TaskStatus,
     pub submitted_at: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub max_retries: u32,
 }
 
 /// Returns the current time as seconds since the UNIX epoch.
@@ -52,90 +69,354 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
+// ---------------------------------------------------------------------------
+// TaskStore
+// ---------------------------------------------------------------------------
+
+/// Pluggable backing store for [`TaskInfo`] records.
+///
+/// Implementations decouple task state from in-process memory and enable
+/// distributed deployments. The default backend is [`InMemoryTaskStore`].
+///
+/// Concrete implementations include `RedisTaskStore` and `SqlTaskStore`
+/// (provided as optional add-ons in downstream crates).
+#[async_trait]
+pub trait TaskStore: Send + Sync {
+    /// Persist a task record (create or overwrite).
+    async fn save(&self, task: &TaskInfo) -> Result<(), ModuleError>;
+
+    /// Look up a task by id; returns `None` if no record exists.
+    async fn get(&self, id: &str) -> Result<Option<TaskInfo>, ModuleError>;
+
+    /// List all tasks, optionally filtered by exact status match.
+    async fn list(&self, status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError>;
+
+    /// Remove a task record. No-op if `id` is absent.
+    async fn delete(&self, id: &str) -> Result<(), ModuleError>;
+
+    /// Return all terminal-state tasks whose `completed_at` is strictly less
+    /// than `before_timestamp` (Unix seconds). Pending and Running tasks MUST
+    /// NOT be returned by this method.
+    async fn list_expired(&self, before_timestamp: f64) -> Result<Vec<TaskInfo>, ModuleError>;
+
+    /// Identifier of the concrete store type, used by tooling to expose the
+    /// active backend (matches the type name; e.g. `"InMemoryTaskStore"`).
+    fn store_type_name(&self) -> &'static str;
+}
+
+/// Default in-memory [`TaskStore`] backed by [`DashMap`] for lock-free
+/// concurrent access.
+#[derive(Default)]
+pub struct InMemoryTaskStore {
+    tasks: DashMap<String, TaskInfo>,
+}
+
+impl InMemoryTaskStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl TaskStore for InMemoryTaskStore {
+    async fn save(&self, task: &TaskInfo) -> Result<(), ModuleError> {
+        self.tasks.insert(task.task_id.clone(), task.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<TaskInfo>, ModuleError> {
+        Ok(self.tasks.get(id).map(|entry| entry.clone()))
+    }
+
+    async fn list(&self, status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError> {
+        let mut out: Vec<TaskInfo> = self
+            .tasks
+            .iter()
+            .filter(|entry| match status {
+                Some(s) => entry.value().status == s,
+                None => true,
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+        // Stable order is helpful for deterministic tests; sort by task_id.
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(out)
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), ModuleError> {
+        self.tasks.remove(id);
+        Ok(())
+    }
+
+    async fn list_expired(&self, before_timestamp: f64) -> Result<Vec<TaskInfo>, ModuleError> {
+        let mut out: Vec<TaskInfo> = self
+            .tasks
+            .iter()
+            .filter(|entry| {
+                let info = entry.value();
+                if !info.status.is_terminal() {
+                    return false;
+                }
+                match info.completed_at {
+                    Some(ts) => ts < before_timestamp,
+                    None => false,
+                }
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(out)
+    }
+
+    fn store_type_name(&self) -> &'static str {
+        "InMemoryTaskStore"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RetryConfig
+// ---------------------------------------------------------------------------
+
+/// Retry policy applied per task on failure.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts after the initial execution. `0` disables retry.
+    pub max_retries: u32,
+    /// Base delay between retries in milliseconds.
+    pub retry_delay_ms: u64,
+    /// Multiplicative factor applied at each attempt (`1.0` = constant, `2.0` = exponential doubling).
+    pub backoff_multiplier: f64,
+    /// Upper bound on the computed retry delay, in milliseconds.
+    pub max_retry_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            retry_delay_ms: 1000,
+            backoff_multiplier: 2.0,
+            max_retry_delay_ms: 60_000,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Compute the retry delay for the given attempt index (`0`-based).
+    ///
+    /// Formula: `min(retry_delay_ms * (backoff_multiplier ^ attempt), max_retry_delay_ms)`.
+    #[must_use]
+    pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
+        // Use f64 arithmetic to apply the backoff factor, then clamp to the cap.
+        // The `as f64` casts are intentional: retry delays are bounded small
+        // integers in practice (sub-second to minutes), so precision loss is a
+        // non-issue.
+        #[allow(clippy::cast_precision_loss)]
+        let base = self.retry_delay_ms as f64;
+        // `powf` accepts an f64 exponent and avoids the i32 cast lint while
+        // producing the same result for non-negative integer attempt values.
+        let raw = base * self.backoff_multiplier.powf(f64::from(attempt));
+        #[allow(clippy::cast_precision_loss)]
+        let cap = self.max_retry_delay_ms as f64;
+        let capped = raw.min(cap);
+        // Saturate negative or NaN values to zero, then truncate.
+        if !capped.is_finite() || capped <= 0.0 {
+            return 0;
+        }
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let out = capped as u64;
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reaper
+// ---------------------------------------------------------------------------
+
+/// Configuration for the [`AsyncTaskManager`] background reaper.
+#[derive(Debug, Clone, Copy)]
+pub struct ReaperConfig {
+    /// Age threshold (seconds) before a terminal task becomes eligible for deletion.
+    pub ttl_seconds: f64,
+    /// Sweep interval (milliseconds) between reaper runs.
+    pub sweep_interval_ms: u64,
+}
+
+impl Default for ReaperConfig {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: 3600.0,
+            sweep_interval_ms: 300_000,
+        }
+    }
+}
+
+/// Handle returned by [`AsyncTaskManager::start_reaper`] to control the
+/// background reaper task. Drop the handle to detach (the reaper continues to
+/// run); call [`ReaperHandle::stop`] to gracefully signal cancellation and
+/// await termination.
+pub struct ReaperHandle {
+    handle: JoinHandle<()>,
+    stop_tx: watch::Sender<bool>,
+}
+
+impl ReaperHandle {
+    /// Signal the reaper to stop and await its clean shutdown.
+    pub async fn stop(self) {
+        // Receivers may have already been dropped — ignore the send error.
+        let _ = self.stop_tx.send(true);
+        // The reaper observes the signal and exits its loop; await the join.
+        if let Err(err) = self.handle.await {
+            if !err.is_cancelled() {
+                warn!("reaper task join failed: {err}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AsyncTaskManager
+// ---------------------------------------------------------------------------
+
 /// Manages background execution of modules via tokio tasks.
 ///
-/// Limits concurrency with a semaphore and tracks task lifecycle.
+/// Bounds concurrency with a semaphore, persists task state through a
+/// pluggable [`TaskStore`], and supports retry with exponential backoff and
+/// an opt-in [`ReaperHandle`] for TTL-based cleanup.
 pub struct AsyncTaskManager {
     executor: Arc<Executor>,
     max_tasks: usize,
-    tasks: Arc<Mutex<HashMap<String, TaskInfo>>>,
+    store: Arc<dyn TaskStore>,
     handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     semaphore: Arc<Semaphore>,
+    // Serialises the capacity-check + save sequence in `submit_with_retry`.
+    // Without this guard, two concurrent submits can both observe
+    // `store.list().len() < max_tasks` and both `save()` — exceeding the cap.
+    // The lock is held only for the synchronous `block_on_local` poll; we never
+    // hold it across a real .await (the in-memory store resolves immediately,
+    // and a yielding store would already panic in `block_on_local`).
+    admission_lock: Arc<Mutex<()>>,
 }
 
 impl AsyncTaskManager {
-    /// Create a new `AsyncTaskManager`.
+    /// Create a new manager backed by the default [`InMemoryTaskStore`].
     ///
     /// # Arguments
     ///
-    /// * `executor` — The executor used to run modules.
-    /// * `max_concurrent` — Maximum number of tasks running simultaneously.
-    /// * `max_tasks` — Maximum number of tracked tasks (pending + active + terminal).
+    /// * `executor` — Executor used to invoke modules.
+    /// * `max_concurrent` — Maximum simultaneously running tasks (semaphore size).
+    /// * `max_tasks` — Maximum tracked task records (rejects further submits).
     pub fn new(executor: Arc<Executor>, max_concurrent: usize, max_tasks: usize) -> Self {
+        Self::with_store(
+            executor,
+            max_concurrent,
+            max_tasks,
+            Arc::new(InMemoryTaskStore::new()),
+        )
+    }
+
+    /// Create a manager with a caller-provided [`TaskStore`] implementation.
+    pub fn with_store(
+        executor: Arc<Executor>,
+        max_concurrent: usize,
+        max_tasks: usize,
+        store: Arc<dyn TaskStore>,
+    ) -> Self {
         Self {
             executor,
             max_tasks,
-            tasks: Arc::new(Mutex::new(HashMap::new())),
+            store,
             handles: Arc::new(Mutex::new(HashMap::new())),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            admission_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Submit a module for background execution.
-    ///
-    /// Creates a `TaskInfo` in `Pending` state, spawns a tokio task that
-    /// acquires the concurrency semaphore before calling `executor.call()`.
-    ///
-    /// Returns the generated task ID (UUID v4 string).
+    /// Identifier of the underlying store backend.
+    pub fn store_type_name(&self) -> &'static str {
+        self.store.store_type_name()
+    }
+
+    /// Borrow the underlying [`TaskStore`] handle (for direct interaction or
+    /// custom maintenance routines).
+    pub fn store(&self) -> Arc<dyn TaskStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Submit a module call for background execution. See [`Self::submit_with_retry`].
     pub fn submit(
         &self,
         module_id: &str,
         inputs: serde_json::Value,
         context: Option<Context<serde_json::Value>>,
     ) -> Result<String, ModuleError> {
-        // Hold the lock across both the capacity check and the insert so
-        // concurrent submit() calls cannot both observe task_count < max_tasks
-        // and both insert, violating the cap (TOCTOU). Mirrors Python's
-        // single-lock pattern in AsyncTaskManager.submit.
-        let task_id = {
-            let mut tasks = self.tasks.lock();
-            if tasks.len() >= self.max_tasks {
-                return Err(ModuleError::new(
-                    crate::errors::ErrorCode::GeneralInternalError,
-                    format!("Task limit reached ({})", self.max_tasks),
-                ));
-            }
-            let task_id = Uuid::new_v4().to_string();
-            let info = TaskInfo {
-                task_id: task_id.clone(),
-                module_id: module_id.to_string(),
-                status: TaskStatus::Pending,
-                submitted_at: now_secs(),
-                started_at: None,
-                completed_at: None,
-                result: None,
-                error: None,
-            };
-            tasks.insert(task_id.clone(), info);
-            task_id
+        self.submit_with_retry(module_id, inputs, context, None)
+    }
+
+    /// Submit a module call with optional retry policy.
+    ///
+    /// Returns the generated task ID (UUID v4). Spawns a background tokio task
+    /// that will acquire a concurrency permit before invoking the executor.
+    /// On failure, when `retry` is supplied, the task is rescheduled after
+    /// the policy-derived backoff delay until `max_retries` is exhausted.
+    pub fn submit_with_retry(
+        &self,
+        module_id: &str,
+        inputs: serde_json::Value,
+        context: Option<Context<serde_json::Value>>,
+        retry: Option<RetryConfig>,
+    ) -> Result<String, ModuleError> {
+        // Construct the initial TaskInfo and reserve a slot in the store.
+        // Concurrent submits are serialised through `admission_lock` so the
+        // capacity check and subsequent save below are atomic.
+        let task_id = Uuid::new_v4().to_string();
+        let max_retries = retry.as_ref().map_or(0, |r| r.max_retries);
+        let info = TaskInfo {
+            task_id: task_id.clone(),
+            module_id: module_id.to_string(),
+            status: TaskStatus::Pending,
+            submitted_at: now_secs(),
+            started_at: None,
+            completed_at: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            max_retries,
         };
 
-        let tasks = Arc::clone(&self.tasks);
+        // Capacity check + persist must be atomic with respect to other
+        // concurrent submits, otherwise two submitters can both pass the
+        // `len < max_tasks` check before either saves. Hold `admission_lock`
+        // around the whole sequence. The lock is sync (parking_lot) and is
+        // only held for the single immediate poll of `block_on_local` — no
+        // real await happens while the guard is alive.
+        let store = Arc::clone(&self.store);
+        let max_tasks = self.max_tasks;
+        let info_clone = info.clone();
+        {
+            let _admit = self.admission_lock.lock();
+            block_on_local(async move {
+                check_capacity_and_save(&*store, max_tasks, &info_clone).await
+            })?;
+        }
+
         let handles = Arc::clone(&self.handles);
         let semaphore = Arc::clone(&self.semaphore);
         let executor = Arc::clone(&self.executor);
+        let store_for_run = Arc::clone(&self.store);
         let mid = module_id.to_string();
         let tid = task_id.clone();
 
         let handle = tokio::spawn(async move {
-            Self::run_task(
+            run_task(
                 tid.clone(),
                 mid,
                 inputs,
                 context,
+                retry,
                 executor,
                 semaphore,
-                tasks,
+                store_for_run,
             )
             .await;
             handles.lock().remove(&tid);
@@ -146,213 +427,352 @@ impl AsyncTaskManager {
         Ok(task_id)
     }
 
-    /// Return the `TaskInfo` for a task, or `None` if not found.
+    /// Return the current snapshot of a task, or `None` if unknown.
+    ///
+    /// This is the synchronous wrapper used by the existing public API. For
+    /// network-backed stores, prefer [`Self::get_status_async`].
     pub fn get_status(&self, task_id: &str) -> Option<TaskInfo> {
-        self.tasks.lock().get(task_id).cloned()
+        block_on_local(self.store.get(task_id)).ok().flatten()
     }
 
-    /// Return the result of a completed task.
-    ///
-    /// Returns an error if the task is not found or not in `Completed` status.
+    /// Async variant of [`Self::get_status`] for network-backed stores.
+    pub async fn get_status_async(&self, task_id: &str) -> Option<TaskInfo> {
+        self.store.get(task_id).await.ok().flatten()
+    }
+
+    /// Return the result of a completed task or an error if not found / not completed.
     pub fn get_result(&self, task_id: &str) -> Result<serde_json::Value, ModuleError> {
-        let tasks = self.tasks.lock();
-        let info = tasks.get(task_id).ok_or_else(|| {
+        block_on_local(self.get_result_async(task_id))
+    }
+
+    /// Async variant of [`Self::get_result`] for network-backed stores.
+    pub async fn get_result_async(&self, task_id: &str) -> Result<serde_json::Value, ModuleError> {
+        let info = self.store.get(task_id).await?.ok_or_else(|| {
             ModuleError::new(
-                crate::errors::ErrorCode::GeneralInternalError,
+                ErrorCode::GeneralInternalError,
                 format!("Task not found: {task_id}"),
             )
         })?;
         if info.status != TaskStatus::Completed {
             return Err(ModuleError::new(
-                crate::errors::ErrorCode::GeneralInternalError,
+                ErrorCode::GeneralInternalError,
                 format!("Task {task_id} is not completed (status={:?})", info.status),
             ));
         }
-        Ok(info.result.clone().unwrap_or(serde_json::Value::Null))
+        Ok(info.result.unwrap_or(serde_json::Value::Null))
     }
 
-    /// Cancel a running or pending task.
-    ///
-    /// Aborts the tokio task and marks it as `Cancelled`.
-    ///
-    /// Returns `true` if the task was successfully cancelled.
+    /// Cancel a pending or running task. Returns `true` if cancellation was applied.
     pub fn cancel(&self, task_id: &str) -> bool {
-        let should_cancel = {
-            let tasks = self.tasks.lock();
-            match tasks.get(task_id) {
-                Some(info) => matches!(info.status, TaskStatus::Pending | TaskStatus::Running),
-                None => false,
-            }
+        let store = Arc::clone(&self.store);
+        let Some(info) = block_on_local(store.get(task_id)).ok().flatten() else {
+            return false;
         };
-
-        if !should_cancel {
+        if !info.status.is_active() {
             return false;
         }
 
-        // Abort the tokio task if it exists
         if let Some(handle) = self.handles.lock().remove(task_id) {
             handle.abort();
         }
 
-        // Force status to Cancelled if still active
-        let mut tasks = self.tasks.lock();
-        if let Some(info) = tasks.get_mut(task_id) {
-            if matches!(info.status, TaskStatus::Pending | TaskStatus::Running) {
-                info.status = TaskStatus::Cancelled;
-                info.completed_at = Some(now_secs());
-            }
+        // Transition to Cancelled if still active.
+        let mut updated = info;
+        if updated.status.is_active() {
+            updated.status = TaskStatus::Cancelled;
+            updated.completed_at = Some(now_secs());
+            let _ = block_on_local(self.store.save(&updated));
         }
-
         true
     }
 
     /// Cancel all pending and running tasks.
     pub fn shutdown(&self) {
-        let task_ids: Vec<String> = {
-            let tasks = self.tasks.lock();
-            tasks
-                .iter()
-                .filter(|(_, info)| {
-                    matches!(info.status, TaskStatus::Pending | TaskStatus::Running)
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
+        let task_ids: Vec<String> = block_on_local(self.store.list(None))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|info| info.status.is_active().then_some(info.task_id))
+            .collect();
 
         for task_id in task_ids {
             self.cancel(&task_id);
         }
     }
 
-    /// Return all tasks, optionally filtered by status.
+    /// Return all tasks, optionally filtered by status. Synchronous wrapper.
     pub fn list_tasks(&self, status: Option<TaskStatus>) -> Vec<TaskInfo> {
-        let tasks = self.tasks.lock();
-        match status {
-            None => tasks.values().cloned().collect(),
-            Some(s) => tasks
-                .values()
-                .filter(|info| info.status == s)
-                .cloned()
-                .collect(),
-        }
+        block_on_local(self.store.list(status)).unwrap_or_default()
     }
 
-    /// Remove terminal-state tasks older than `max_age_seconds`.
-    ///
-    /// Terminal states: `Completed`, `Failed`, `Cancelled`.
-    ///
-    /// Returns the number of tasks removed.
+    /// Remove terminal-state tasks older than `max_age_seconds`. Returns the
+    /// count of removed tasks.
     pub fn cleanup(&self, max_age_seconds: f64) -> usize {
         let now = now_secs();
-        let mut tasks = self.tasks.lock();
-
-        let to_remove: Vec<String> = tasks
-            .iter()
-            .filter(|(_, info)| {
-                matches!(
-                    info.status,
-                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-                )
-            })
-            .filter(|(_, info)| {
+        let to_remove: Vec<String> = block_on_local(self.store.list(None))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|info| info.status.is_terminal())
+            .filter(|info| {
                 let ref_time = info.completed_at.unwrap_or(info.submitted_at);
                 (now - ref_time) >= max_age_seconds
             })
-            .map(|(id, _)| id.clone())
+            .map(|info| info.task_id)
             .collect();
 
         let count = to_remove.len();
         for id in &to_remove {
-            tasks.remove(id);
+            let _ = block_on_local(self.store.delete(id));
+            self.handles.lock().remove(id);
         }
-        // Also clean up any stale handles (should already be removed, but be safe)
-        let mut handles = self.handles.lock();
-        for id in &to_remove {
-            handles.remove(id);
-        }
-
         count
     }
 
-    /// Maximum number of currently tracked tasks (all states).
+    /// Total tracked task count across all states.
     pub fn task_count(&self) -> usize {
-        self.tasks.lock().len()
+        block_on_local(self.store.list(None))
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
-    /// Internal coroutine that executes a module under the concurrency semaphore.
-    async fn run_task(
-        task_id: String,
-        module_id: String,
-        inputs: serde_json::Value,
-        context: Option<Context<serde_json::Value>>,
-        executor: Arc<Executor>,
-        semaphore: Arc<Semaphore>,
-        tasks: Arc<Mutex<HashMap<String, TaskInfo>>>,
-    ) {
-        // Acquire a permit from the semaphore (limits concurrency).
-        let Ok(_permit) = semaphore.acquire().await else {
-            // Semaphore closed — treat as cancellation.
-            // INVARIANT: cancel() may concurrently write TaskStatus::Cancelled to the same entry.
-            // Both writes converge to the same value, so the outcome is always Cancelled regardless
-            // of ordering. The handles.remove at the spawn site (caller of run_task) runs after
-            // run_task returns, so the handle is cleaned up even on this early-return path.
-            let mut guard = tasks.lock();
-            if let Some(info) = guard.get_mut(&task_id) {
-                info.status = TaskStatus::Cancelled;
-                info.completed_at = Some(now_secs());
+    /// Start the opt-in background reaper. Returns a [`ReaperHandle`] used to
+    /// stop the reaper gracefully. Multiple concurrent reapers can be started;
+    /// callers SHOULD guard against this and keep at most one handle live.
+    pub fn start_reaper(&self, config: ReaperConfig) -> ReaperHandle {
+        let store = Arc::clone(&self.store);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let interval = Duration::from_millis(config.sweep_interval_ms);
+        let ttl = config.ttl_seconds;
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = stop_rx.changed() => {
+                        if changed.is_ok() && *stop_rx.borrow() {
+                            debug!("reaper received stop signal");
+                            return;
+                        }
+                    }
+                    () = tokio::time::sleep(interval) => {
+                        let before = now_secs() - ttl;
+                        match store.list_expired(before).await {
+                            Ok(expired) => {
+                                let count = expired.len();
+                                for info in &expired {
+                                    if let Err(err) = store.delete(&info.task_id).await {
+                                        warn!(task_id = %info.task_id, "reaper delete failed: {err}");
+                                    }
+                                }
+                                if count > 0 {
+                                    debug!("reaper deleted {count} expired tasks");
+                                }
+                            }
+                            Err(err) => {
+                                warn!("reaper list_expired failed: {err}");
+                            }
+                        }
+                    }
+                }
             }
+        });
+
+        ReaperHandle { handle, stop_tx }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Capacity-check then persist a new task record.
+async fn check_capacity_and_save(
+    store: &dyn TaskStore,
+    max_tasks: usize,
+    info: &TaskInfo,
+) -> Result<(), ModuleError> {
+    let current = store.list(None).await?;
+    if current.len() >= max_tasks {
+        return Err(ModuleError::new(
+            ErrorCode::TaskLimitExceeded,
+            format!("Task limit reached ({max_tasks})"),
+        ));
+    }
+    store.save(info).await?;
+    Ok(())
+}
+
+/// Run a single task with optional retry/backoff. Persists state transitions
+/// via the [`TaskStore`].
+#[allow(clippy::too_many_arguments)]
+async fn run_task(
+    task_id: String,
+    module_id: String,
+    inputs: serde_json::Value,
+    context: Option<Context<serde_json::Value>>,
+    retry: Option<RetryConfig>,
+    executor: Arc<Executor>,
+    semaphore: Arc<Semaphore>,
+    store: Arc<dyn TaskStore>,
+) {
+    let max_retries = retry.as_ref().map_or(0, |r| r.max_retries);
+
+    loop {
+        // Acquire concurrency permit. A closed semaphore is treated as
+        // cancellation (matches the legacy `_run` behaviour).
+        let Ok(permit) = semaphore.acquire().await else {
+            mark_cancelled(&store, &task_id).await;
             return;
         };
 
-        // Mark as running
-        {
-            let mut guard = tasks.lock();
-            if let Some(info) = guard.get_mut(&task_id) {
-                // If already cancelled while waiting for permit, bail out
-                if info.status == TaskStatus::Cancelled {
-                    return;
-                }
-                info.status = TaskStatus::Running;
-                info.started_at = Some(now_secs());
-            }
+        // Re-fetch and short-circuit if cancellation happened during the wait.
+        let Ok(Some(mut info)) = store.get(&task_id).await else {
+            return;
+        };
+        if info.status == TaskStatus::Cancelled {
+            return;
+        }
+        info.status = TaskStatus::Running;
+        if info.started_at.is_none() {
+            info.started_at = Some(now_secs());
+        }
+        if let Err(err) = store.save(&info).await {
+            error!(task_id = %task_id, "store.save(running) failed: {err}");
+            return;
         }
 
-        // Execute the module
+        // Execute the module.
         let result = executor
-            .call(&module_id, inputs, context.as_ref(), None)
+            .call(&module_id, inputs.clone(), context.as_ref(), None)
             .await;
+        drop(permit);
 
-        // Update task status based on result
-        let mut guard = tasks.lock();
-        if let Some(info) = guard.get_mut(&task_id) {
-            // Don't overwrite a cancellation that happened during execution
-            if info.status == TaskStatus::Cancelled {
+        // Re-fetch in case cancel() raced with the executor call.
+        let Ok(Some(mut info)) = store.get(&task_id).await else {
+            return;
+        };
+        if info.status == TaskStatus::Cancelled {
+            return;
+        }
+
+        match result {
+            Ok(output) => {
+                info.status = TaskStatus::Completed;
+                info.completed_at = Some(now_secs());
+                info.result = Some(output);
+                save_terminal_if_not_cancelled(&store, &task_id, &info).await;
                 return;
             }
-
-            match result {
-                Ok(output) => {
-                    info.status = TaskStatus::Completed;
-                    info.completed_at = Some(now_secs());
-                    info.result = Some(output);
+            Err(err) => {
+                if let Some(cfg) = retry.as_ref() {
+                    if info.retry_count < max_retries {
+                        let delay_ms = cfg.delay_for_attempt(info.retry_count);
+                        info.retry_count += 1;
+                        info.status = TaskStatus::Pending;
+                        // `started_at` is intentionally NOT reset across retries:
+                        // it captures the wall-clock of the first execution and
+                        // matches the Python reference behaviour so cross-language
+                        // TaskInfo snapshots remain comparable mid-retry.
+                        let _ = store.save(&info).await;
+                        debug!(
+                            task_id = %task_id,
+                            attempt = info.retry_count,
+                            delay_ms,
+                            "scheduling retry"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
                 }
-                Err(err) => {
-                    info.status = TaskStatus::Failed;
-                    info.completed_at = Some(now_secs());
-                    info.error = Some(err.to_string());
-                    error!("Task {} failed: {}", task_id, err);
-                }
+                info.status = TaskStatus::Failed;
+                info.completed_at = Some(now_secs());
+                info.error = Some(err.to_string());
+                save_terminal_if_not_cancelled(&store, &task_id, &info).await;
+                error!(task_id = %task_id, "task failed: {err}");
+                return;
             }
         }
     }
 }
+
+/// Re-fetches the task immediately before writing a terminal status. If a
+/// concurrent `cancel()` flipped the task to Cancelled while the executor was
+/// finishing, leave that state intact — do not overwrite it with
+/// Completed/Failed. The intermediate `re-fetch + check + save` is not
+/// atomic at the store level, so a perfectly-timed cancel can still slip in
+/// between the `get` and the `save`; closing that final window would require
+/// CAS support in the `TaskStore` trait. The window left here is small and
+/// the cost of slipping (one extra terminal write that the next cancel will
+/// no-op against) is non-corrupting.
+pub(crate) async fn save_terminal_if_not_cancelled(
+    store: &Arc<dyn TaskStore>,
+    task_id: &str,
+    info: &TaskInfo,
+) {
+    if let Ok(Some(current)) = store.get(task_id).await {
+        if current.status == TaskStatus::Cancelled {
+            return;
+        }
+    }
+    let _ = store.save(info).await;
+}
+
+async fn mark_cancelled(store: &Arc<dyn TaskStore>, task_id: &str) {
+    if let Ok(Some(mut info)) = store.get(task_id).await {
+        if info.status.is_active() {
+            info.status = TaskStatus::Cancelled;
+            info.completed_at = Some(now_secs());
+            let _ = store.save(&info).await;
+        }
+    }
+}
+
+/// Drive a future to completion synchronously by polling it once with a
+/// no-op waker. This is intentional: the manager exposes a synchronous
+/// facade on top of an async [`TaskStore`], and the supported in-process
+/// stores ([`InMemoryTaskStore`]) resolve without yielding so a single poll
+/// is sufficient. For network-backed stores callers MUST use the `_async`
+/// variants instead.
+///
+/// If a custom store actually yields, this panics — surfacing the misuse
+/// rather than silently deadlocking the calling thread.
+fn block_on_local<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use std::pin::pin;
+    use std::ptr;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // No-op waker: synchronous stores never wake themselves; if they did, we
+    // would not be in this code path.
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    // SAFETY: the vtable above performs no operations on the data pointer,
+    // so a null pointer is safe for every callback.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!(
+            "block_on_local: TaskStore future yielded — use the _async variants for non-blocking stores"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::executor::Executor;
     use crate::registry::registry::Registry;
-    use std::sync::Arc;
 
     fn make_executor() -> Arc<Executor> {
         let registry = Arc::new(Registry::default());
@@ -361,180 +781,168 @@ mod tests {
     }
 
     #[test]
-    fn new_creates_empty_task_list() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 4, 100);
-        assert_eq!(mgr.task_count(), 0);
-        assert!(mgr.list_tasks(None).is_empty());
-    }
-
-    #[test]
-    fn get_status_returns_none_for_unknown_task() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 4, 100);
-        assert!(mgr.get_status("nonexistent-task-id").is_none());
-    }
-
-    #[test]
-    fn get_result_errors_for_unknown_task() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 4, 100);
-        assert!(mgr.get_result("nonexistent-task-id").is_err());
-    }
-
-    #[test]
-    fn cancel_returns_false_for_unknown_task() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 4, 100);
-        assert!(!mgr.cancel("nonexistent-task-id"));
-    }
-
-    #[tokio::test]
-    async fn submit_returns_task_id_and_records_pending() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 4, 100);
-        let task_id = mgr
-            .submit("some.module", serde_json::json!({}), None)
-            .expect("submit should succeed");
-        assert!(!task_id.is_empty());
-        // Task should be tracked (may have transitioned to Running/Failed by now)
-        assert!(mgr.get_status(&task_id).is_some());
-    }
-
-    #[tokio::test]
-    async fn submit_rejected_when_at_capacity() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 4, 2); // max 2 tasks
-                                                     // Spawn 2 tasks to fill the limit
-        let _ = mgr.submit("a.module", serde_json::json!({}), None);
-        let _ = mgr.submit("b.module", serde_json::json!({}), None);
-        // Third submit should fail
-        let result = mgr.submit("c.module", serde_json::json!({}), None);
-        assert!(result.is_err(), "Should reject when task limit is reached");
-    }
-
-    #[tokio::test]
-    async fn list_tasks_filtered_by_status() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 0, 100); // max_concurrent=0 keeps tasks pending
-                                                       // Submit a task; with 0 concurrency slots it stays Pending until the semaphore opens
-        let _ = mgr.submit("some.module", serde_json::json!({}), None);
-        // list_tasks(Some(Pending)) should contain it; other statuses should be empty
-        let completed = mgr.list_tasks(Some(TaskStatus::Completed));
-        let cancelled = mgr.list_tasks(Some(TaskStatus::Cancelled));
-        // The task was submitted; it may be Pending or Running depending on scheduling,
-        // but it should NOT be Completed or Cancelled yet
-        assert!(completed.is_empty(), "no completed tasks yet");
-        assert!(cancelled.is_empty(), "no cancelled tasks yet");
-    }
-
-    #[tokio::test]
-    async fn cancel_changes_status_to_cancelled() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(Arc::clone(&exec), 0, 100); // 0 concurrency — tasks stay Pending
-        let task_id = mgr
-            .submit("some.module", serde_json::json!({}), None)
-            .unwrap();
-        let cancelled = mgr.cancel(&task_id);
-        assert!(cancelled, "cancel should return true for a Pending task");
-        let info = mgr.get_status(&task_id).expect("task should still exist");
-        assert_eq!(info.status, TaskStatus::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_terminal_tasks_past_max_age() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 0, 100);
-        let task_id = mgr.submit("m", serde_json::json!({}), None).unwrap();
-        // Cancel it so it reaches a terminal state
-        mgr.cancel(&task_id);
-        // Cleanup with max_age = -1 (everything is "old enough")
-        let removed = mgr.cleanup(-1.0);
-        assert_eq!(removed, 1, "one terminal task should be removed");
-        assert!(mgr.get_status(&task_id).is_none(), "task should be gone");
-    }
-
-    #[tokio::test]
-    async fn cleanup_keeps_tasks_within_max_age() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 0, 100);
-        let task_id = mgr.submit("m", serde_json::json!({}), None).unwrap();
-        mgr.cancel(&task_id);
-        // Cleanup with very large max_age — nothing should be removed
-        let removed = mgr.cleanup(9_999_999.0);
-        assert_eq!(removed, 0, "task within max_age should not be removed");
-        assert!(
-            mgr.get_status(&task_id).is_some(),
-            "task should still exist"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_all_pending_tasks() {
-        let exec = make_executor();
-        let mgr = AsyncTaskManager::new(exec, 0, 100); // 0 concurrency keeps tasks Pending
-        let id1 = mgr.submit("m1", serde_json::json!({}), None).unwrap();
-        let id2 = mgr.submit("m2", serde_json::json!({}), None).unwrap();
-        mgr.shutdown();
-        let s1 = mgr.get_status(&id1).unwrap().status;
-        let s2 = mgr.get_status(&id2).unwrap().status;
-        assert_eq!(s1, TaskStatus::Cancelled);
-        assert_eq!(s2, TaskStatus::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn submit_respects_max_tasks_under_concurrent_load() {
-        // Regression: a TOCTOU between the capacity check and the insert in
-        // submit() allowed two concurrent callers to both observe
-        // task_count < max_tasks and both insert, exceeding the cap.
-        let exec = make_executor();
-        let mgr = Arc::new(AsyncTaskManager::new(exec, 4, 1));
-
-        let mgr_a = Arc::clone(&mgr);
-        let mgr_b = Arc::clone(&mgr);
-
-        // Spawn two tasks concurrently targeting a max_tasks=1 manager.
-        let (res_a, res_b) = tokio::join!(
-            tokio::task::spawn_blocking(move || {
-                mgr_a.submit("nonexistent.module", serde_json::json!({}), None)
-            }),
-            tokio::task::spawn_blocking(move || {
-                mgr_b.submit("nonexistent.module", serde_json::json!({}), None)
-            }),
-        );
-
-        let ok_count = [res_a.unwrap(), res_b.unwrap()]
-            .iter()
-            .filter(|r| r.is_ok())
-            .count();
-
-        assert_eq!(
-            ok_count, 1,
-            "exactly one submit must succeed when max_tasks=1 and two concurrent submits race"
-        );
-        assert!(
-            mgr.task_count() <= 1,
-            "task count must never exceed max_tasks after concurrent submits"
-        );
-    }
-
-    #[test]
-    fn task_info_serializes_and_deserializes() {
-        let info = TaskInfo {
-            task_id: "abc".to_string(),
-            module_id: "m.foo".to_string(),
-            status: TaskStatus::Completed,
-            submitted_at: 1_000_000.0,
-            started_at: Some(1_000_001.0),
-            completed_at: Some(1_000_002.0),
-            result: Some(serde_json::json!({"x": 1})),
-            error: None,
+    fn retry_delay_grows_exponentially_and_caps() {
+        let cfg = RetryConfig {
+            max_retries: 5,
+            retry_delay_ms: 1000,
+            backoff_multiplier: 2.0,
+            max_retry_delay_ms: 30_000,
         };
-        let json = serde_json::to_string(&info).expect("serialization should succeed");
-        let restored: TaskInfo =
-            serde_json::from_str(&json).expect("deserialization should succeed");
-        assert_eq!(restored.task_id, "abc");
-        assert_eq!(restored.status, TaskStatus::Completed);
-        assert_eq!(restored.result, Some(serde_json::json!({"x": 1})));
+        assert_eq!(cfg.delay_for_attempt(0), 1000);
+        assert_eq!(cfg.delay_for_attempt(1), 2000);
+        assert_eq!(cfg.delay_for_attempt(2), 4000);
+        assert_eq!(cfg.delay_for_attempt(3), 8000);
+        assert_eq!(cfg.delay_for_attempt(4), 16_000);
+        assert_eq!(cfg.delay_for_attempt(5), 30_000);
+    }
+
+    #[tokio::test]
+    async fn default_store_is_in_memory() {
+        let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
+        assert_eq!(mgr.store_type_name(), "InMemoryTaskStore");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_save_and_get_round_trip() {
+        let store = InMemoryTaskStore::new();
+        let info = TaskInfo {
+            task_id: "abc".into(),
+            module_id: "data.process".into(),
+            status: TaskStatus::Completed,
+            submitted_at: 1.0,
+            started_at: Some(2.0),
+            completed_at: Some(3.0),
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+            retry_count: 0,
+            max_retries: 0,
+        };
+        store.save(&info).await.unwrap();
+        let got = store.get("abc").await.unwrap().unwrap();
+        assert_eq!(got.task_id, "abc");
+        assert_eq!(got.status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_list_filters_by_status() {
+        let store = InMemoryTaskStore::new();
+        for (id, status) in [
+            ("c1", TaskStatus::Completed),
+            ("c2", TaskStatus::Running),
+            ("c3", TaskStatus::Failed),
+        ] {
+            store
+                .save(&TaskInfo {
+                    task_id: id.into(),
+                    module_id: "m".into(),
+                    status,
+                    submitted_at: 0.0,
+                    started_at: None,
+                    completed_at: None,
+                    result: None,
+                    error: None,
+                    retry_count: 0,
+                    max_retries: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let completed = store.list(Some(TaskStatus::Completed)).await.unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].task_id, "c1");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_list_expired_skips_active_tasks() {
+        let store = InMemoryTaskStore::new();
+        store
+            .save(&TaskInfo {
+                task_id: "old-completed".into(),
+                module_id: "m".into(),
+                status: TaskStatus::Completed,
+                submitted_at: 0.0,
+                started_at: Some(0.0),
+                completed_at: Some(100.0),
+                result: None,
+                error: None,
+                retry_count: 0,
+                max_retries: 0,
+            })
+            .await
+            .unwrap();
+        store
+            .save(&TaskInfo {
+                task_id: "old-running".into(),
+                module_id: "m".into(),
+                status: TaskStatus::Running,
+                submitted_at: 0.0,
+                started_at: Some(0.0),
+                completed_at: None,
+                result: None,
+                error: None,
+                retry_count: 0,
+                max_retries: 0,
+            })
+            .await
+            .unwrap();
+        let expired = store.list_expired(1000.0).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].task_id, "old-completed");
+    }
+
+    /// Regression: when a `cancel()` flips the task to Cancelled in the
+    /// store between the run-task post-execution re-fetch and its terminal
+    /// `save()`, the helper MUST refrain from overwriting the Cancelled
+    /// status with Completed/Failed.
+    #[tokio::test]
+    async fn save_terminal_does_not_overwrite_cancelled() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let task_id = "race-task";
+
+        // Seed the store with the cancelled state (as `cancel()` would have
+        // written between re-fetch and the terminal save).
+        store
+            .save(&TaskInfo {
+                task_id: task_id.into(),
+                module_id: "m".into(),
+                status: TaskStatus::Cancelled,
+                submitted_at: 0.0,
+                started_at: Some(0.0),
+                completed_at: Some(1.0),
+                result: None,
+                error: None,
+                retry_count: 0,
+                max_retries: 0,
+            })
+            .await
+            .unwrap();
+
+        // The terminal info `run_task` would otherwise write — Completed
+        // with a payload. The helper must observe the Cancelled state in
+        // the store and skip the save.
+        let terminal = TaskInfo {
+            task_id: task_id.into(),
+            module_id: "m".into(),
+            status: TaskStatus::Completed,
+            submitted_at: 0.0,
+            started_at: Some(0.0),
+            completed_at: Some(2.0),
+            result: Some(serde_json::json!({"value": 42})),
+            error: None,
+            retry_count: 0,
+            max_retries: 0,
+        };
+        save_terminal_if_not_cancelled(&store, task_id, &terminal).await;
+
+        let after = store.get(task_id).await.unwrap().expect("task present");
+        assert_eq!(
+            after.status,
+            TaskStatus::Cancelled,
+            "terminal save MUST NOT overwrite a concurrent cancellation"
+        );
+        assert!(
+            after.result.is_none(),
+            "the cancel-time TaskInfo had no result; the overwriting Completed payload must not leak through"
+        );
     }
 }

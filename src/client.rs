@@ -94,12 +94,21 @@ impl APCore {
             .unwrap_or_else(|| Executor::new(Arc::clone(&registry), Arc::new(config.clone())));
 
         let sys_modules_context = if Self::sys_modules_enabled(&config) {
-            crate::sys_modules::register_sys_modules(
+            match crate::sys_modules::register_sys_modules(
                 Arc::clone(&registry),
                 &executor,
                 &config,
                 metrics_collector.clone(),
-            )
+            ) {
+                Ok(ctx) => Some(ctx),
+                Err(e) => {
+                    // Lenient default: log and continue. Callers wanting
+                    // strict failure should use `register_sys_modules_with_options`
+                    // with `fail_on_error: true` directly.
+                    tracing::error!(error = %e, "System modules registration failed");
+                    None
+                }
+            }
         } else {
             None
         };

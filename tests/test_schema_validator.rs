@@ -380,7 +380,7 @@ fn test_schema_validator_validate_or_error_returns_module_error() {
 
 #[test]
 fn test_schema_validator_default() {
-    let v = SchemaValidator;
+    let v = SchemaValidator::default();
     let schema = json!({ "type": "string" });
     assert!(v.validate(&json!("ok"), &schema).valid);
 }

@@ -48,7 +48,13 @@ pub use approval::{
     AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,
     CallbackApprovalHandler,
 };
-pub use async_task::{AsyncTaskManager, TaskInfo, TaskStatus};
+// Note: `async_task::RetryConfig` is intentionally NOT re-exported at the
+// crate root because the name collides with `middleware::RetryConfig`. Users
+// MUST import it via `apcore::async_task::RetryConfig`.
+pub use async_task::{
+    AsyncTaskManager, InMemoryTaskStore, ReaperConfig, ReaperHandle, TaskInfo, TaskStatus,
+    TaskStore,
+};
 pub use bindings::{
     typed_handler, AutoSchemaValue, BindingEntry, BindingHandler, BindingLoader, BindingsFile,
     TypedBindingHandler,
@@ -78,35 +84,54 @@ pub use errors::{
     ErrorCode, ErrorCodeRegistry, ModuleError, VersionIncompatibleError,
     FRAMEWORK_ERROR_CODE_PREFIXES,
 };
+pub use events::circuit_breaker::{
+    CircuitBreakerWrapper, CircuitEventSink, CircuitState, DEFAULT_OPEN_THRESHOLD,
+    DEFAULT_RECOVERY_WINDOW_MS, DEFAULT_TIMEOUT_MS,
+};
 pub use events::emitter::{ApCoreEvent, EventEmitter};
 pub use events::subscribers::{
     register_subscriber_type, reset_subscriber_registry, unregister_subscriber_type, A2ASubscriber,
-    EventSubscriber, WebhookSubscriber,
+    EventSubscriber, FileSubscriber, FilterSubscriber, OutputFormat, StdoutSubscriber,
+    WebhookSubscriber,
 };
 pub use executor::{
     list_strategies, redact_sensitive, register_strategy, Executor, REDACTED_VALUE,
 };
 pub use extensions::{ExtensionKind, ExtensionManager, ExtensionPoint};
 pub use middleware::{
-    AfterMiddleware, BeforeMiddleware, LoggingMiddleware, Middleware, MiddlewareManager,
-    PlatformNotifyMiddleware, RetryConfig, RetryMiddleware,
+    AfterMiddleware, BeforeMiddleware, CircuitBreakerBuilder, CircuitBreakerConfig,
+    CircuitBreakerMiddleware, CircuitBreakerMiddlewareConfig, CircuitBreakerState, ContextWriter,
+    CustomMiddlewareConfig, CustomMiddlewareFactory, LoggingMiddleware, LoggingMiddlewareConfig,
+    Middleware, MiddlewareChainConfig, MiddlewareConfig, MiddlewareFactory, MiddlewareManager,
+    NamespaceCheck, OtelTracingBuilder, OtelTracingConfig, OtelTracingMiddleware,
+    PlatformNotifyMiddleware, RetryConfig, RetryMiddleware, TracingMiddlewareConfig,
+    APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
 };
 pub use module::{
     ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult, PreflightResult,
     ValidationResult, DEFAULT_ANNOTATIONS,
 };
-pub use observability::error_history::{ErrorEntry, ErrorHistory, ErrorHistoryMiddleware};
+pub use observability::error_history::{
+    compute_fingerprint, normalize_message, ErrorEntry, ErrorHistory, ErrorHistoryMiddleware,
+};
 pub use observability::exporters::{InMemoryExporter, OTLPExporter, StdoutExporter};
 pub use observability::logging::{ContextLogger, ObsLoggingMiddleware};
 pub use observability::metrics::{
     MetricsCollector, MetricsMiddleware, METRIC_CALLS_TOTAL, METRIC_DURATION_SECONDS,
 };
+pub use observability::processor::{
+    BatchSpanProcessor, BatchSpanProcessorBuilder, BatchSpanProcessorConfig, SimpleSpanProcessor,
+    SpanProcessor,
+};
+pub use observability::prometheus_exporter::PrometheusExporter;
+pub use observability::redaction::{RedactionConfig, RedactionConfigBuilder, RedactionConfigError};
 pub use observability::span::{Span, SpanExporter};
+pub use observability::store::{InMemoryObservabilityStore, MetricPoint, ObservabilityStore};
 pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use observability::usage::{UsageCollector, UsageMiddleware, UsageStats};
 pub use pipeline::{
-    ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, Step, StepResult, StepTrace,
-    StrategyInfo,
+    ExecutionStrategy, PipelineContext, PipelineEngine, PipelineState, PipelineTrace, RunOptions,
+    RunUntilPredicate, Step, StepResult, StepTrace, StrategyInfo,
 };
 pub use pipeline_config::{
     build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,
@@ -115,14 +140,24 @@ pub use registry::registry::{
     module_id_pattern, registry_events, Registry, RegistryEvents, DEFAULT_MODULE_VERSION,
     MAX_MODULE_ID_LENGTH, MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
 };
-pub use registry::{detect_id_conflicts, ConflictResult, ConflictSeverity, ConflictType};
+pub use registry::{
+    class_name_to_segment, compute_base_id, derive_module_ids, detect_id_conflicts, ConflictResult,
+    ConflictSeverity, ConflictType, DiscoveredClass, DiscoveryConfig, MultiClassEntry,
+    MAX_MODULE_ID_LEN,
+};
 pub use schema::{
     to_strict_schema, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader,
     SchemaStrategy, SchemaValidator,
 };
+pub use sys_modules::audit::{
+    AuditAction as SysAuditAction, AuditChange as SysAuditChange, AuditEntry as SysAuditEntry,
+    AuditStore as SysAuditStore, InMemoryAuditStore as SysInMemoryAuditStore,
+};
 pub use sys_modules::control::UpdateConfigModule;
 pub use sys_modules::{
-    check_module_disabled, is_module_disabled, register_sys_modules, SysModulesContext, ToggleState,
+    check_module_disabled, is_module_disabled, register_sys_modules,
+    register_sys_modules_with_options, SysModuleError, SysModulesContext, SysModulesOptions,
+    ToggleState,
 };
 pub use trace_context::{TraceContext, TraceParent};
 pub use utils::{

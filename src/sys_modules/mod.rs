@@ -1,17 +1,22 @@
 // APCore Protocol — System modules registration
-// Spec reference: Built-in system modules (F10, F11, F19)
+// Spec reference: Built-in system modules (F10, F11, F19) +
+//                 system-modules.md §1.1–§1.5 hardening (Issue #45).
 
+pub mod audit;
 pub mod control;
 pub mod health;
 pub mod manifest;
+pub mod overrides;
 pub mod usage;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
 use serde_json::json;
+use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
@@ -26,6 +31,7 @@ use crate::observability::metrics::MetricsCollector;
 use crate::observability::usage::{UsageCollector, UsageMiddleware};
 use crate::registry::registry::{ModuleDescriptor, Registry};
 
+pub use audit::{AuditAction, AuditChange, AuditEntry, AuditStore, InMemoryAuditStore};
 pub use control::UpdateConfigModule;
 pub(crate) use control::{ReloadModule, ToggleFeatureModule};
 
@@ -170,6 +176,37 @@ pub(crate) async fn emit_event(
 }
 
 // ---------------------------------------------------------------------------
+// SysModuleError — strict registration failure (Issue #45 §1.5)
+// ---------------------------------------------------------------------------
+
+/// Error type returned by `register_sys_modules`. The `RegistrationFailed`
+/// variant carries the offending `module_id` so callers can route the failure
+/// to module-specific recovery logic.
+#[derive(Debug, Error)]
+pub enum SysModuleError {
+    #[error("system module '{module_id}' failed to register: {source}")]
+    RegistrationFailed {
+        module_id: String,
+        #[source]
+        source: ModuleError,
+    },
+}
+
+impl SysModuleError {
+    #[must_use]
+    pub fn module_id(&self) -> &str {
+        match self {
+            Self::RegistrationFailed { module_id, .. } => module_id,
+        }
+    }
+
+    #[must_use]
+    pub fn error_code(&self) -> ErrorCode {
+        ErrorCode::SysModuleRegistrationFailed
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SysModulesContext — typed return value for register_sys_modules
 // ---------------------------------------------------------------------------
 
@@ -180,48 +217,117 @@ pub struct SysModulesContext {
     pub toggle_state: Arc<ToggleState>,
     pub error_history: ErrorHistory,
     pub usage_collector: UsageCollector,
+    pub audit_store: Option<Arc<dyn AuditStore>>,
 }
 
 // ---------------------------------------------------------------------------
-// register_sys_modules
+// SysModulesOptions — optional inputs for hardening features (§1.1, §1.2, §1.5)
+// ---------------------------------------------------------------------------
+
+/// Optional knobs accepted by [`register_sys_modules_with_options`].
+///
+/// Defaults preserve pre-hardening behavior: no overrides file, no audit store,
+/// `fail_on_error: false`. Cross-language: maps to the `audit_store`,
+/// `overrides_path`, and `fail_on_error` parameters in the Python and
+/// TypeScript SDKs.
+#[derive(Default, Clone)]
+pub struct SysModulesOptions {
+    /// When set, runtime overrides are loaded from this YAML path on startup
+    /// and persisted on every `update_config` / `toggle_feature` call.
+    pub overrides_path: Option<PathBuf>,
+    /// When set, every state-changing control call appends an `AuditEntry`.
+    /// When `None`, audit entries are logged at INFO level and discarded.
+    pub audit_store: Option<Arc<dyn AuditStore>>,
+    /// When `true`, any module-registration failure halts startup with an
+    /// `Err(SysModuleError::RegistrationFailed)`. Default is `false`, which
+    /// matches the lenient behavior of the Python/TypeScript SDKs.
+    pub fail_on_error: bool,
+}
+
+// ---------------------------------------------------------------------------
+// register_sys_modules — main entry, breaking change in 0.20.0 (§1.5)
 // ---------------------------------------------------------------------------
 
 /// Register built-in system modules into the registry.
 ///
-/// Workflow (per spec §9.15):
-/// 1. Check `sys_modules.enabled` — return `None` if false.
-/// 2. Create `ErrorHistory` + `ErrorHistoryMiddleware`, register on executor.
-/// 3. Create `UsageCollector` + `UsageMiddleware`, register on executor.
-/// 4. Register health, manifest, and usage modules (always).
-/// 5. If `sys_modules.events.enabled`: register control modules + `EventEmitter`.
+/// **Breaking change in 0.20.0** (system-modules.md §1.5): the return type is
+/// now `Result<SysModulesContext, SysModuleError>`. When `sys_modules.enabled`
+/// is `false`, the function returns `Ok(SysModulesContext { … empty … })`
+/// rather than `Option::None` so callers can always destructure the value.
 ///
-/// The registry is shared via `Arc<Registry>` — `Registry` provides interior
-/// mutability, so no external `Mutex` wrapper is needed and this function is
-/// fully synchronous and runtime-agnostic.
-#[allow(clippy::too_many_lines)] // complex orchestration function; extraction would obscure the registration flow
-#[allow(clippy::needless_pass_by_value)] // public API: Arc<Registry> and Option<MetricsCollector> consumed by sub-modules
+/// For overrides persistence and audit trails, use
+/// [`register_sys_modules_with_options`].
+///
+/// Workflow (per spec §9.15):
+/// 1. Check `sys_modules.enabled` — return an empty `SysModulesContext` if `false`.
+/// 2. Load `overrides_path` (if any) into the live `Config` after the base load.
+/// 3. Create `ErrorHistory` + `ErrorHistoryMiddleware`.
+/// 4. Create `UsageCollector` + `UsageMiddleware`.
+/// 5. Register health, manifest, and usage modules.
+/// 6. If `sys_modules.events.enabled`: register control modules + `EventEmitter`.
 pub fn register_sys_modules(
     registry: Arc<Registry>,
     executor: &Executor,
     config: &Config,
     metrics_collector: Option<MetricsCollector>,
-) -> Option<SysModulesContext> {
+) -> Result<SysModulesContext, SysModuleError> {
+    register_sys_modules_with_options(
+        registry,
+        executor,
+        config,
+        metrics_collector,
+        SysModulesOptions::default(),
+    )
+}
+
+/// Variant of [`register_sys_modules`] accepting hardening options. See
+/// [`SysModulesOptions`] for details.
+#[allow(clippy::too_many_lines)] // complex orchestration; extraction would obscure the registration flow
+#[allow(clippy::needless_pass_by_value)] // public API: Arc<Registry> and Option<MetricsCollector> consumed by sub-modules
+pub fn register_sys_modules_with_options(
+    registry: Arc<Registry>,
+    executor: &Executor,
+    config: &Config,
+    metrics_collector: Option<MetricsCollector>,
+    options: SysModulesOptions,
+) -> Result<SysModulesContext, SysModuleError> {
+    let SysModulesOptions {
+        overrides_path,
+        audit_store,
+        fail_on_error,
+    } = options;
+
+    let toggle_state = Arc::new(ToggleState::new());
+
     let enabled = config
         .get("sys_modules.enabled")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     if !enabled {
-        return None;
+        return Ok(SysModulesContext {
+            registered_modules: HashMap::new(),
+            emitter: Arc::new(Mutex::new(EventEmitter::new())),
+            toggle_state,
+            error_history: ErrorHistory::with_limits(50, 1000),
+            usage_collector: UsageCollector::new(),
+            audit_store,
+        });
+    }
+
+    // --- §1.1: load overrides into a mutable Config clone, then share it ---
+    let mut effective_config = config.clone();
+    if let Some(path) = overrides_path.as_deref() {
+        overrides::load_overrides(path, &mut effective_config, Some(&toggle_state));
     }
 
     // --- Step 2: ErrorHistory + middleware ---
     #[allow(clippy::cast_possible_truncation)] // config value won't exceed platform usize limits
-    let max_per_module = config
+    let max_per_module = effective_config
         .get("sys_modules.error_history.max_entries_per_module")
         .and_then(|v| v.as_u64())
         .unwrap_or(50) as usize;
     #[allow(clippy::cast_possible_truncation)] // config value won't exceed platform usize limits
-    let max_total = config
+    let max_total = effective_config
         .get("sys_modules.error_history.max_total_entries")
         .and_then(|v| v.as_u64())
         .unwrap_or(1000) as usize;
@@ -238,22 +344,37 @@ pub fn register_sys_modules(
         tracing::error!(error = %e, middleware = "UsageMiddleware", "sys middleware registration failed");
     }
 
-    let config_arc = Arc::new(Mutex::new(config.clone()));
+    let config_arc = Arc::new(Mutex::new(effective_config.clone()));
 
     // Build the EventEmitter up-front as an owned value so we can populate
     // its subscribers from config synchronously, then wrap it in the Arc<Mutex<_>>
     // shared with sys modules.
     let mut emitter = EventEmitter::new();
 
-    let events_enabled = config
+    let events_enabled = effective_config
         .get("sys_modules.events.enabled")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // §1.1 + §1.2 wire `overrides_path` and `audit_store` through the control
+    // modules — but control modules are only registered when events are
+    // enabled. Surface a warning instead of silently dropping the options so
+    // misconfiguration shows up at startup, not as missing audit entries.
+    if !events_enabled && (overrides_path.is_some() || audit_store.is_some()) {
+        tracing::warn!(
+            overrides_path_set = overrides_path.is_some(),
+            audit_store_set = audit_store.is_some(),
+            "SysModulesOptions.overrides_path / audit_store are set but \
+             sys_modules.events.enabled=false — control modules are not \
+             registered, so these options have no effect. Enable events to \
+             activate runtime overrides and audit trails."
+        );
+    }
+
     if events_enabled {
         // Instantiate subscribers from config while we still own `emitter`
         // directly — no lock required.
-        if let Some(subs) = config.get("sys_modules.events.subscribers") {
+        if let Some(subs) = effective_config.get("sys_modules.events.subscribers") {
             if let Some(arr) = subs.as_array() {
                 for sub_config in arr {
                     match create_subscriber(sub_config) {
@@ -268,7 +389,6 @@ pub fn register_sys_modules(
     }
 
     let emitter_arc = Arc::new(Mutex::new(emitter));
-    let toggle_state = Arc::new(ToggleState::new());
 
     // --- Step 4: Build module list (health + manifest + usage always) ---
     let mut modules: Vec<(&str, Box<dyn Module>, Vec<String>)> = vec![
@@ -324,12 +444,11 @@ pub fn register_sys_modules(
 
     // --- Step 5: Control modules only if events.enabled ---
     if events_enabled {
-        // Step 5a: PlatformNotifyMiddleware (gets its own EventEmitter instance).
-        let error_rate_threshold = config
+        let error_rate_threshold = effective_config
             .get("sys_modules.events.thresholds.error_rate")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.1);
-        let latency_p99_threshold = config
+        let latency_p99_threshold = effective_config
             .get("sys_modules.events.thresholds.latency_p99_ms")
             .and_then(|v| v.as_f64())
             .unwrap_or(5000.0);
@@ -343,30 +462,34 @@ pub fn register_sys_modules(
             tracing::error!(error = %e, middleware = "PlatformNotifyMiddleware", "sys middleware registration failed");
         }
 
-        // Step 5c: Control modules
         modules.push((
             "system.control.update_config",
-            Box::new(UpdateConfigModule::new(
-                Arc::clone(&config_arc),
-                Arc::clone(&emitter_arc),
-            )),
+            Box::new(
+                UpdateConfigModule::new(Arc::clone(&config_arc), Arc::clone(&emitter_arc))
+                    .with_overrides_path(overrides_path.clone())
+                    .with_audit_store(audit_store.clone()),
+            ),
             vec!["system".into(), "control".into()],
         ));
         modules.push((
             "system.control.reload_module",
-            Box::new(ReloadModule::new(
-                Arc::clone(&registry),
-                Arc::clone(&emitter_arc),
-            )),
+            Box::new(
+                ReloadModule::new(Arc::clone(&registry), Arc::clone(&emitter_arc))
+                    .with_audit_store(audit_store.clone()),
+            ),
             vec!["system".into(), "control".into()],
         ));
         modules.push((
             "system.control.toggle_feature",
-            Box::new(ToggleFeatureModule::new(
-                Arc::clone(&registry),
-                Arc::clone(&emitter_arc),
-                Arc::clone(&toggle_state),
-            )),
+            Box::new(
+                ToggleFeatureModule::new(
+                    Arc::clone(&registry),
+                    Arc::clone(&emitter_arc),
+                    Arc::clone(&toggle_state),
+                )
+                .with_overrides_path(overrides_path.clone())
+                .with_audit_store(audit_store.clone()),
+            ),
             vec!["system".into(), "control".into()],
         ));
     }
@@ -407,7 +530,13 @@ pub fn register_sys_modules(
                 registered.insert(id.to_string(), info);
             }
             Err(e) => {
-                tracing::warn!(module_id = %id, error = %e, "Failed to register sys module");
+                if fail_on_error {
+                    return Err(SysModuleError::RegistrationFailed {
+                        module_id: id.to_string(),
+                        source: e,
+                    });
+                }
+                tracing::error!(module_id = %id, error = %e, "System module failed to register; continuing");
             }
         }
     }
@@ -428,11 +557,12 @@ pub fn register_sys_modules(
         );
     }
 
-    Some(SysModulesContext {
+    Ok(SysModulesContext {
         registered_modules: registered,
         emitter: emitter_arc,
         toggle_state,
         error_history,
         usage_collector,
+        audit_store,
     })
 }

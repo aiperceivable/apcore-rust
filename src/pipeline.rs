@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::acl::ACL;
@@ -14,6 +15,11 @@ use crate::middleware::manager::MiddlewareManager;
 use crate::module::Module;
 use crate::registry::registry::Registry;
 use crate::utils::helpers::match_pattern;
+
+/// Predicate evaluated by [`PipelineEngine`] after each step completes.
+/// Returning `true` halts the pipeline; subsequent steps are not executed.
+/// See `core-executor.md` §Pipeline Hardening §1.4.
+pub type RunUntilPredicate = Box<dyn Fn(&PipelineState) -> bool + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Step trait
@@ -277,6 +283,26 @@ impl PipelineTrace {
 }
 
 // ---------------------------------------------------------------------------
+// PipelineState
+// ---------------------------------------------------------------------------
+
+/// Snapshot passed to a [`RunUntilPredicate`] after each pipeline step
+/// completes. See `core-executor.md` §Pipeline Hardening §1.4.
+///
+/// Mirrors `apcore.pipeline.PipelineState` in Python.
+pub struct PipelineState<'a> {
+    /// Name of the step that just completed.
+    pub step_name: &'a str,
+    /// Output snapshots, keyed by step name. The value is a shallow copy of
+    /// `ctx.output` taken right after the step ran (or `None` if the step did
+    /// not set an output). Snapshots are append-only across the run.
+    pub outputs: &'a HashMap<String, Option<serde_json::Value>>,
+    /// The live pipeline context. Held by reference — predicates must not
+    /// mutate state through it.
+    pub context: &'a PipelineContext,
+}
+
+// ---------------------------------------------------------------------------
 // StrategyInfo
 // ---------------------------------------------------------------------------
 
@@ -312,9 +338,15 @@ impl std::fmt::Display for StrategyInfo {
 ///
 /// Provides safe mutation methods that enforce removability / replaceability
 /// constraints and step-name uniqueness.
+///
+/// Maintains an internal `HashMap<String, usize>` index from step name to
+/// position so step lookups (used by `skip_to`, `configure_step`, and the
+/// streaming `run_until_step` path) are O(1) per `core-executor.md`
+/// §Pipeline Hardening §1.5. The index is rebuilt after every mutation.
 pub struct ExecutionStrategy {
     name: String,
     steps: Vec<Box<dyn Step>>,
+    name_to_idx: HashMap<String, usize>,
 }
 
 impl std::fmt::Debug for ExecutionStrategy {
@@ -323,6 +355,7 @@ impl std::fmt::Debug for ExecutionStrategy {
             .field("name", &self.name)
             .field("step_names", &self.step_names())
             .field("step_count", &self.steps.len())
+            .field("name_to_idx_len", &self.name_to_idx.len())
             .finish()
     }
 }
@@ -369,9 +402,31 @@ impl ExecutionStrategy {
                 ));
             }
         }
-        let strategy = Self { name, steps };
+        let mut strategy = Self {
+            name,
+            steps,
+            name_to_idx: HashMap::new(),
+        };
+        strategy.rebuild_index();
         strategy.validate_dependencies();
         Ok(strategy)
+    }
+
+    /// Rebuild the O(1) name→index map. Called after any structural mutation.
+    fn rebuild_index(&mut self) {
+        self.name_to_idx = self
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name().to_string(), i))
+            .collect();
+    }
+
+    /// Read-only access to the step name→index map. Useful for tests asserting
+    /// O(1) lookup compliance per §1.5.
+    #[must_use]
+    pub fn name_to_idx(&self) -> &HashMap<String, usize> {
+        &self.name_to_idx
     }
 
     /// Warn if any step's requires are not provided by a preceding step.
@@ -423,6 +478,7 @@ impl ExecutionStrategy {
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx + 1, step);
+        self.rebuild_index();
         self.validate_dependencies();
         Ok(())
     }
@@ -432,6 +488,7 @@ impl ExecutionStrategy {
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx, step);
+        self.rebuild_index();
         self.validate_dependencies();
         Ok(())
     }
@@ -446,6 +503,7 @@ impl ExecutionStrategy {
             ));
         }
         self.steps.remove(idx);
+        self.rebuild_index();
         Ok(())
     }
 
@@ -458,7 +516,31 @@ impl ExecutionStrategy {
                 format!("Step '{step_name}' is not replaceable"),
             ));
         }
+        // Step name may differ from original; rebuild the index either way.
         self.steps[idx] = new_step;
+        self.rebuild_index();
+        Ok(())
+    }
+
+    /// Configure a step by replacing it in place — `core-executor.md`
+    /// §Pipeline Hardening §1.2 (Replace Semantic).
+    ///
+    /// Calling this twice with the same `step_name` is idempotent: there is
+    /// always exactly one step at the original position. Fails with
+    /// [`ErrorCode::PipelineStepNotFound`] when the target does not exist.
+    pub fn configure_step(
+        &mut self,
+        step_name: &str,
+        new_step: Box<dyn Step>,
+    ) -> Result<(), ModuleError> {
+        let idx = self.name_to_idx.get(step_name).copied().ok_or_else(|| {
+            ModuleError::new(
+                ErrorCode::PipelineStepNotFound,
+                format!("Pipeline step not found: '{step_name}'"),
+            )
+        })?;
+        self.steps[idx] = new_step;
+        self.rebuild_index();
         Ok(())
     }
 
@@ -474,6 +556,7 @@ impl ExecutionStrategy {
         let idx = self.find_step_index(step_name)?;
         let old = std::mem::replace(&mut self.steps[idx], Box::new(PlaceholderStep));
         self.steps[idx] = wrapper(old);
+        self.rebuild_index();
         Ok(())
     }
 
@@ -498,19 +581,17 @@ impl ExecutionStrategy {
     // -- helpers --
 
     fn find_step_index(&self, step_name: &str) -> Result<usize, ModuleError> {
-        self.steps
-            .iter()
-            .position(|s| s.name() == step_name)
-            .ok_or_else(|| {
-                ModuleError::new(
-                    ErrorCode::GeneralInvalidInput,
-                    format!("Step '{}' not found in strategy '{}'", step_name, self.name),
-                )
-            })
+        // O(1) via name_to_idx (§1.5).
+        self.name_to_idx.get(step_name).copied().ok_or_else(|| {
+            ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!("Step '{}' not found in strategy '{}'", step_name, self.name),
+            )
+        })
     }
 
     fn validate_no_duplicate(&self, name: &str) -> Result<(), ModuleError> {
-        if self.steps.iter().any(|s| s.name() == name) {
+        if self.name_to_idx.contains_key(name) {
             return Err(ModuleError::new(
                 ErrorCode::GeneralInvalidInput,
                 format!(
@@ -531,6 +612,43 @@ impl ExecutionStrategy {
 /// the final output and a complete execution trace.
 pub struct PipelineEngine;
 
+/// Optional knobs for [`PipelineEngine::run_with_options`]. All fields are
+/// independent — set only what you need.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Halt execution **before** the step with this name (the step is not run
+    /// and not recorded in the trace). Used by the streaming path to drive the
+    /// shared engine up to the `execute` step. `None` runs to the end.
+    pub stop_before_step: Option<String>,
+    /// Predicate evaluated **after** every successful step completes. Returning
+    /// `true` halts the pipeline; the current step's output is preserved.
+    /// See `core-executor.md` §Pipeline Hardening §1.4.
+    pub until: Option<RunUntilPredicate>,
+}
+
+impl RunOptions {
+    /// Build options that stop before the step with the given name.
+    #[must_use]
+    pub fn stop_before(step_name: impl Into<String>) -> Self {
+        Self {
+            stop_before_step: Some(step_name.into()),
+            until: None,
+        }
+    }
+
+    /// Build options with a predicate-based termination condition.
+    #[must_use]
+    pub fn run_until<F>(predicate: F) -> Self
+    where
+        F: Fn(&PipelineState) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            stop_before_step: None,
+            until: Some(Box::new(predicate)),
+        }
+    }
+}
+
 impl PipelineEngine {
     /// Run every step in `strategy` against `ctx`, respecting flow-control
     /// actions (`continue`, `skip_to`, `abort`).
@@ -538,7 +656,24 @@ impl PipelineEngine {
         strategy: &ExecutionStrategy,
         ctx: &mut PipelineContext,
     ) -> Result<(Option<serde_json::Value>, PipelineTrace), ModuleError> {
-        Self::run_inner(strategy, ctx, None).await
+        Self::run_with_options(strategy, ctx, RunOptions::default()).await
+    }
+
+    /// Run with a predicate-based termination condition — `core-executor.md`
+    /// §Pipeline Hardening §1.4.
+    ///
+    /// The predicate is evaluated **after** each step completes successfully.
+    /// Returning `true` halts the pipeline and returns the accumulated output;
+    /// returning `false` lets the pipeline proceed to the next step.
+    pub async fn run_until<F>(
+        strategy: &ExecutionStrategy,
+        ctx: &mut PipelineContext,
+        predicate: F,
+    ) -> Result<(Option<serde_json::Value>, PipelineTrace), ModuleError>
+    where
+        F: Fn(&PipelineState) -> bool + Send + Sync + 'static,
+    {
+        Self::run_with_options(strategy, ctx, RunOptions::run_until(predicate)).await
     }
 
     /// Run every step in `strategy` against `ctx` UP TO (but not including)
@@ -547,36 +682,36 @@ impl PipelineEngine {
     /// honored identically to [`Self::run`], so streaming and non-streaming
     /// paths never diverge on per-step semantics.
     ///
-    /// Used by `Executor::stream` (with `stop_before_step = Some("execute")`)
-    /// to prepare the pipeline without running the module itself, so the
-    /// caller can then drive true chunk-by-chunk streaming.
-    pub async fn run_until(
+    /// Used by `Executor::stream` (with `stop_before_step = "execute"`) to
+    /// prepare the pipeline without running the module itself, so the caller
+    /// can then drive true chunk-by-chunk streaming.
+    pub async fn run_until_step(
         strategy: &ExecutionStrategy,
         ctx: &mut PipelineContext,
         stop_before_step: &str,
     ) -> Result<(Option<serde_json::Value>, PipelineTrace), ModuleError> {
-        Self::run_inner(strategy, ctx, Some(stop_before_step)).await
+        Self::run_with_options(strategy, ctx, RunOptions::stop_before(stop_before_step)).await
     }
 
-    /// Shared step-dispatch loop. `stop_before_step`, when `Some(name)`,
-    /// halts execution BEFORE the step with the matching name — the step
-    /// itself is not executed and not recorded in the trace. `None` runs to
-    /// the end of the strategy.
+    /// Run with full control over termination. See [`RunOptions`].
     #[allow(clippy::too_many_lines)] // pipeline control loop is inherently stateful; splitting would reduce clarity
-    async fn run_inner(
+    pub async fn run_with_options(
         strategy: &ExecutionStrategy,
         ctx: &mut PipelineContext,
-        stop_before_step: Option<&str>,
+        options: RunOptions,
     ) -> Result<(Option<serde_json::Value>, PipelineTrace), ModuleError> {
         let pipeline_start = std::time::Instant::now();
         let steps = strategy.steps();
         let mut idx: usize = 0;
+        // Snapshot of ctx.output keyed by step name, accumulated across the
+        // run. Passed to run_until predicates as PipelineState::outputs.
+        let mut step_outputs: HashMap<String, Option<serde_json::Value>> = HashMap::new();
 
         while idx < steps.len() {
             let step = &steps[idx];
 
             // Early exit for streaming / partial-pipeline callers.
-            if let Some(stop_name) = stop_before_step {
+            if let Some(stop_name) = options.stop_before_step.as_deref() {
                 if step.name() == stop_name {
                     break;
                 }
@@ -649,7 +784,7 @@ impl PipelineEngine {
             let result = match exec_result {
                 Ok(r) => r,
                 Err(err) => {
-                    // (4) ignore_errors: log and continue
+                    // (4) ignore_errors: log and continue (§1.1)
                     if step_ignore_errors {
                         tracing::warn!(
                             step = step.name(),
@@ -671,7 +806,11 @@ impl PipelineEngine {
                         idx += 1;
                         continue;
                     }
-                    // Not ignored: record and raise
+                    // Fail-fast (§1.1): record the abort in the trace and
+                    // surface a `PipelineStepError` carrying the step name and
+                    // original cause. Executor consumers (call/validate)
+                    // unwrap this back to the original error before returning
+                    // to user code.
                     ctx.trace.steps.push(StepTrace {
                         name: step.name().to_string(),
                         duration_ms,
@@ -681,7 +820,7 @@ impl PipelineEngine {
                         skip_reason: None,
                     });
                     ctx.trace.total_duration_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
-                    return Err(err);
+                    return Err(ModuleError::pipeline_step_error(step.name(), &err));
                 }
             };
 
@@ -698,9 +837,33 @@ impl PipelineEngine {
                 skip_reason: None,
             });
 
-            // (6) Handle abort / skip_to
+            // (6) Snapshot output for run_until predicates. `Value::clone` walks
+            // the full JSON tree, so later in-place mutations of `ctx.output`
+            // cannot alter the historical record. (Python's `dict(ctx.output)`
+            // does only a one-level copy; the Rust snapshot is deeper but the
+            // intent — a frozen copy — is the same.)
+            let step_name_owned = step.name().to_string();
+            step_outputs.insert(step_name_owned.clone(), ctx.output.clone());
+
+            // (7) Handle abort / skip_to
             match action.as_str() {
                 "continue" => {
+                    // (8) run_until predicate (§1.4): evaluated after a clean
+                    // continue. Stops further steps when it returns true; the
+                    // pipeline reports success and returns the current output.
+                    if let Some(ref predicate) = options.until {
+                        let state = PipelineState {
+                            step_name: &step_name_owned,
+                            outputs: &step_outputs,
+                            context: ctx,
+                        };
+                        if predicate(&state) {
+                            ctx.trace.total_duration_ms =
+                                pipeline_start.elapsed().as_secs_f64() * 1000.0;
+                            ctx.trace.success = true;
+                            return Ok((ctx.output.clone(), ctx.trace.clone()));
+                        }
+                    }
                     idx += 1;
                 }
                 "abort" => {
@@ -710,12 +873,16 @@ impl PipelineEngine {
                 }
                 "skip_to" => {
                     let target = skip_target.as_deref().unwrap_or("");
-                    // Find the target step by name starting after current position.
-                    let found = steps
-                        .iter()
-                        .enumerate()
-                        .position(|(i, s)| i > idx && s.name() == target);
-                    match found {
+                    // O(1) lookup via the strategy's name_to_idx map (§1.5).
+                    // The lookup must reject same-position and backward
+                    // targets explicitly to prevent infinite loops; the prior
+                    // linear scan implicitly enforced this.
+                    let target_idx = strategy
+                        .name_to_idx()
+                        .get(target)
+                        .copied()
+                        .filter(|t| *t > idx);
+                    match target_idx {
                         Some(target_idx) => {
                             // Mark skipped steps in trace.
                             for step in steps.iter().take(target_idx).skip(idx + 1) {
@@ -732,7 +899,7 @@ impl PipelineEngine {
                         }
                         None => {
                             return Err(ModuleError::new(
-                                ErrorCode::GeneralInvalidInput,
+                                ErrorCode::StepNotFound,
                                 format!(
                                     "skip_to target '{}' not found after step '{}'",
                                     target,
@@ -1083,7 +1250,7 @@ mod tests {
             "test",
         );
 
-        let (_, trace) = PipelineEngine::run_until(&strategy, &mut pctx, "execute")
+        let (_, trace) = PipelineEngine::run_until_step(&strategy, &mut pctx, "execute")
             .await
             .unwrap();
 
@@ -1127,7 +1294,7 @@ mod tests {
             "test",
         );
 
-        PipelineEngine::run_until(&strategy, &mut pctx, "execute")
+        PipelineEngine::run_until_step(&strategy, &mut pctx, "execute")
             .await
             .unwrap();
 

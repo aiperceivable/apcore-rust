@@ -1,21 +1,47 @@
-// APCore Protocol — Error history tracking
-// Spec reference: Error recording and history middleware
+// APCore Protocol — Error history tracking with fingerprinting & min-heap eviction
+// Spec reference: observability.md §1.3, §1.4
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::context::Context;
-use crate::errors::ModuleError;
+use crate::errors::{ErrorCode, ModuleError};
 use crate::middleware::base::Middleware;
 
+use super::store::{InMemoryObservabilityStore, ObservabilityStore};
+
+/// Canonical string representation of an `ErrorCode` (the SCREAMING_SNAKE_CASE
+/// serde name, e.g. `MODULE_EXECUTE_ERROR`). This MUST match the wire format
+/// emitted by `ModuleError` serialization and the corresponding Python/TS
+/// representation, so that cross-language fingerprints (observability.md §1.4)
+/// are stable. Falls back to Debug formatting only if the enum lacks a serde
+/// representation, which should never occur in practice.
+fn error_code_string(code: ErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{code:?}"))
+}
+
 /// A recorded error entry with deduplication support.
+///
+/// `fingerprint` is the SHA-256 of `error_code:module_id:normalized_message`.
+/// Two errors that differ only by ephemeral values (UUIDs, large integers,
+/// ISO 8601 timestamps) share the same fingerprint and are deduplicated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEntry {
     pub module_id: String,
+    /// Canonical error code string. Serializes as `code` to match the
+    /// cross-language wire format (Python `ErrorEntry.code`, observability.md §1.4).
+    #[serde(rename = "code", alias = "error_code")]
     pub error_code: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,144 +49,328 @@ pub struct ErrorEntry {
     pub timestamp: DateTime<Utc>,
     pub count: u64,
     pub first_occurred: DateTime<Utc>,
+    /// Most recent occurrence; semantically equivalent to spec's `last_seen_at`.
     pub last_occurred: DateTime<Utc>,
+    /// SHA-256(error_code:module_id:normalize(message)) as 64-char lowercase hex.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
-/// Stores a history of errors for diagnostics.
+// ---------------------------------------------------------------------------
+// Normalization & fingerprinting (observability.md §1.4)
+// ---------------------------------------------------------------------------
+
+fn uuid_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+            .expect("UUID regex is valid")
+    })
+}
+
+fn iso8601_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?)?")
+            .expect("ISO8601 regex is valid")
+    })
+}
+
+fn integer_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b\d{4,}\b").expect("integer regex is valid"))
+}
+
+/// Normalize a message by replacing ephemeral values with placeholders.
+///
+/// Order is significant:
+/// 1. UUIDs → `<uuid>`
+/// 2. ISO 8601 timestamps → `<timestamp>` (must precede integers — years are 4 digits)
+/// 3. Integers ≥ 4 digits → `<id>`
+///
+/// Final result is lowercased and trimmed.
+#[must_use]
+pub fn normalize_message(msg: &str) -> String {
+    let s = uuid_re().replace_all(msg, "<UUID>");
+    let s = iso8601_re().replace_all(&s, "<TIMESTAMP>");
+    let s = integer_re().replace_all(&s, "<ID>");
+    s.trim().to_lowercase()
+}
+
+/// Compute the deduplication fingerprint for an error.
+#[must_use]
+pub fn compute_fingerprint(error_code: &str, module_id: &str, message: &str) -> String {
+    let normalized = normalize_message(message);
+    let raw = format!("{error_code}:{module_id}:{normalized}");
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+// ---------------------------------------------------------------------------
+// ErrorHistory — pluggable storage + min-heap eviction + fingerprint dedup
+// ---------------------------------------------------------------------------
+
+/// Internal heap entry: (last_occurred, monotonic seq, fingerprint).
+/// Wrapped in `Reverse` so `BinaryHeap` becomes a min-heap on last_occurred.
+type HeapEntry = Reverse<(DateTime<Utc>, u64, String)>;
+
+#[derive(Debug, Default)]
+struct ErrorHistoryState {
+    /// fingerprint → entry (O(1) dedup lookup).
+    fp_index: HashMap<String, ErrorEntry>,
+    /// module_id → fingerprints in insertion order. `VecDeque` gives O(1)
+    /// `pop_front` for per-module eviction (observability.md §1.3 mandates
+    /// O(log N) — this is the per-module half; heap pop is O(log N) total).
+    module_index: HashMap<String, VecDeque<String>>,
+    /// Min-heap on last_occurred timestamp for O(log N) eviction.
+    /// Lazy deletion: stale entries (where stored timestamp != entry.last_occurred,
+    /// or fingerprint already evicted) are skipped on pop. Bound is roughly
+    /// `max_total_entries × dedup_factor` — every dedup hit pushes a new heap
+    /// entry that becomes stale immediately.
+    heap: BinaryHeap<HeapEntry>,
+    /// Tie-breaker for heap ordering when timestamps collide.
+    seq: u64,
+}
+
+/// Stores a history of errors with O(log N) eviction and SHA-256 deduplication.
+///
+/// Construction injects a `Arc<dyn ObservabilityStore>`; the default store is
+/// `InMemoryObservabilityStore`. The store MUST NOT be replaced after
+/// construction (observability.md §1.1).
 #[derive(Debug, Clone)]
 pub struct ErrorHistory {
-    entries: Arc<Mutex<HashMap<String, VecDeque<ErrorEntry>>>>,
+    state: Arc<Mutex<ErrorHistoryState>>,
     max_entries_per_module: usize,
     max_total_entries: usize,
+    store: Arc<dyn ObservabilityStore>,
 }
 
 impl ErrorHistory {
-    /// Create a new error history with the given capacity per module.
+    /// Create a new error history with default in-memory store.
     #[must_use]
     pub fn new(max_entries_per_module: usize) -> Self {
-        Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+        Self::with_store_and_limits(
             max_entries_per_module,
-            max_total_entries: max_entries_per_module * 100,
-        }
+            max_entries_per_module * 100,
+            Arc::new(InMemoryObservabilityStore::new()),
+        )
     }
 
-    /// Create with explicit per-module and total limits.
+    /// Create with explicit per-module and total limits, default in-memory store.
     #[must_use]
     pub fn with_limits(max_entries_per_module: usize, max_total_entries: usize) -> Self {
-        Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+        Self::with_store_and_limits(
             max_entries_per_module,
             max_total_entries,
+            Arc::new(InMemoryObservabilityStore::new()),
+        )
+    }
+
+    /// Create with an explicit observability store and default limits (50 / 1000).
+    #[must_use]
+    pub fn with_store(store: Arc<dyn ObservabilityStore>) -> Self {
+        Self::with_store_and_limits(50, 1000, store)
+    }
+
+    /// Create with explicit limits and an observability store.
+    #[must_use]
+    pub fn with_store_and_limits(
+        max_entries_per_module: usize,
+        max_total_entries: usize,
+        store: Arc<dyn ObservabilityStore>,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ErrorHistoryState::default())),
+            max_entries_per_module,
+            max_total_entries,
+            store,
         }
     }
 
-    /// Record an error for a module. Deduplicates by (`error_code`, message).
+    /// Get a clone of the underlying store handle.
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn ObservabilityStore> {
+        self.store.clone()
+    }
+
+    /// Record an error, deduplicating by fingerprint. Uses the current time.
     pub fn record(&self, module_id: &str, error: &ModuleError) {
-        let mut map = self.entries.lock();
-        let error_code = format!("{:?}", error.code);
-        let now = Utc::now();
+        self.record_at(module_id, error, Utc::now());
+    }
 
-        let module_entries = map.entry(module_id.to_string()).or_default();
+    /// Record an error at an explicit timestamp. Used by conformance tests
+    /// to verify time-based eviction behavior independently of wall-clock.
+    pub fn record_at(&self, module_id: &str, error: &ModuleError, when: DateTime<Utc>) {
+        let error_code = error_code_string(error.code);
+        let fp = compute_fingerprint(&error_code, module_id, &error.message);
 
-        // Check for existing entry with same code and message (deduplication)
-        let existing = module_entries
-            .iter_mut()
-            .find(|e| e.error_code == error_code && e.message == error.message);
+        // Capture the entry to forward to the store BEFORE eviction can run —
+        // when `max_total_entries` is small or `when` is older than every
+        // existing `last_occurred`, eviction may pop the entry we just inserted.
+        let entry_to_notify: ErrorEntry;
+        {
+            let mut state = self.state.lock();
 
-        if let Some(entry) = existing {
-            entry.count += 1;
-            entry.last_occurred = now;
-            entry.timestamp = now;
-        } else {
-            let entry = ErrorEntry {
-                module_id: module_id.to_string(),
-                error_code,
-                message: error.message.clone(),
-                ai_guidance: error.ai_guidance.clone(),
-                timestamp: now,
-                count: 1,
-                first_occurred: now,
-                last_occurred: now,
-            };
-            module_entries.push_back(entry);
+            if let Some(existing) = state.fp_index.get_mut(&fp) {
+                existing.count += 1;
+                existing.last_occurred = when;
+                existing.timestamp = when;
+                entry_to_notify = existing.clone();
+                state.seq += 1;
+                let seq = state.seq;
+                state.heap.push(Reverse((when, seq, fp.clone())));
+            } else {
+                let entry = ErrorEntry {
+                    module_id: module_id.to_string(),
+                    error_code,
+                    message: error.message.clone(),
+                    ai_guidance: error.ai_guidance.clone(),
+                    timestamp: when,
+                    count: 1,
+                    first_occurred: when,
+                    last_occurred: when,
+                    fingerprint: fp.clone(),
+                };
+                entry_to_notify = entry.clone();
+                state.fp_index.insert(fp.clone(), entry);
+                state
+                    .module_index
+                    .entry(module_id.to_string())
+                    .or_default()
+                    .push_back(fp.clone());
+                state.seq += 1;
+                let seq = state.seq;
+                state.heap.push(Reverse((when, seq, fp)));
 
-            // Evict per-module if over limit
-            while module_entries.len() > self.max_entries_per_module {
-                module_entries.pop_front();
+                // Eviction may now remove the entry we just inserted (if it has
+                // the oldest last_occurred); that's fine — the store has already
+                // been notified above with the entry's full state.
+                evict_per_module(&mut state, module_id, self.max_entries_per_module);
+                evict_total(&mut state, self.max_total_entries);
             }
         }
 
-        // Evict total entries if over limit
-        let mut total: usize = map.values().map(std::collections::VecDeque::len).sum();
-        while total > self.max_total_entries {
-            // Find the module with the oldest entry and remove it
-            let mut oldest_module = None;
-            let mut oldest_time = None;
-            for (mid, entries) in map.iter() {
-                if let Some(front) = entries.front() {
-                    if oldest_time.is_none() || front.first_occurred < oldest_time.unwrap() {
-                        oldest_time = Some(front.first_occurred);
-                        oldest_module = Some(mid.clone());
-                    }
-                }
-            }
-            if let Some(mid) = oldest_module {
-                if let Some(entries) = map.get_mut(&mid) {
-                    entries.pop_front();
-                    if entries.is_empty() {
-                        map.remove(&mid);
-                    }
-                }
-                total -= 1;
-            } else {
-                break;
-            }
+        // Notify the store outside the internal lock to avoid lock-ordering issues.
+        // Use try_current so callers in non-async contexts (e.g. unit tests)
+        // do not panic; if no runtime is active the notification is dropped and
+        // a debug log is emitted so production callers see the silent path.
+        let store = self.store.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                store.record_error(entry_to_notify).await;
+            });
+        } else {
+            tracing::debug!(
+                "ErrorHistory::record called outside a tokio runtime; \
+                 store notification skipped"
+            );
         }
     }
 
     /// Get errors for a specific module, newest first.
     #[must_use]
     pub fn get(&self, module_id: &str, limit: Option<usize>) -> Vec<ErrorEntry> {
-        let map = self.entries.lock();
-        match map.get(module_id) {
-            Some(entries) => {
-                let mut result: Vec<ErrorEntry> = entries.iter().cloned().collect();
-                result.sort_by_key(|b| std::cmp::Reverse(b.last_occurred));
-                if let Some(lim) = limit {
-                    result.truncate(lim);
-                }
-                result
-            }
-            None => Vec::new(),
+        let state = self.state.lock();
+        let Some(fps) = state.module_index.get(module_id) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<ErrorEntry> = fps
+            .iter()
+            .filter_map(|fp| state.fp_index.get(fp).cloned())
+            .collect();
+        entries.sort_by_key(|e| Reverse(e.last_occurred));
+        if let Some(n) = limit {
+            entries.truncate(n);
         }
+        entries
     }
 
     /// Get all recorded errors across all modules, sorted by `last_occurred` desc.
     #[must_use]
     pub fn get_all(&self, limit: Option<usize>) -> Vec<ErrorEntry> {
-        let map = self.entries.lock();
-        let mut all: Vec<ErrorEntry> = map
-            .values()
-            .flat_map(|entries| entries.iter().cloned())
-            .collect();
-        all.sort_by_key(|b| std::cmp::Reverse(b.last_occurred));
-        if let Some(lim) = limit {
-            all.truncate(lim);
+        let state = self.state.lock();
+        let mut all: Vec<ErrorEntry> = state.fp_index.values().cloned().collect();
+        all.sort_by_key(|e| Reverse(e.last_occurred));
+        if let Some(n) = limit {
+            all.truncate(n);
         }
         all
     }
 
+    /// Total number of distinct (deduplicated) entries currently retained.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.state.lock().fp_index.len()
+    }
+
     /// Clear errors. If `module_id` is Some, clear only that module; otherwise clear all.
     pub fn clear(&self, module_id: Option<&str>) {
-        let mut map = self.entries.lock();
-        match module_id {
-            Some(id) => {
-                map.remove(id);
+        let mut state = self.state.lock();
+        if let Some(id) = module_id {
+            if let Some(fps) = state.module_index.remove(id) {
+                for fp in fps {
+                    state.fp_index.remove(&fp);
+                }
             }
-            None => map.clear(),
+        } else {
+            state.fp_index.clear();
+            state.module_index.clear();
+            state.heap.clear();
+            state.seq = 0;
         }
     }
+}
+
+fn evict_per_module(state: &mut ErrorHistoryState, module_id: &str, max_per_module: usize) {
+    let Some(fps) = state.module_index.get_mut(module_id) else {
+        return;
+    };
+    while fps.len() > max_per_module {
+        if let Some(evicted_fp) = fps.pop_front() {
+            state.fp_index.remove(&evicted_fp);
+        } else {
+            break;
+        }
+    }
+    if state
+        .module_index
+        .get(module_id)
+        .is_some_and(VecDeque::is_empty)
+    {
+        state.module_index.remove(module_id);
+    }
+}
+
+fn evict_total(state: &mut ErrorHistoryState, max_total: usize) {
+    while state.fp_index.len() > max_total {
+        if !pop_oldest(state) {
+            break;
+        }
+    }
+}
+
+/// Pop the oldest live entry from the heap; returns true if an entry was removed.
+fn pop_oldest(state: &mut ErrorHistoryState) -> bool {
+    while let Some(Reverse((heap_ts, _seq, fp))) = state.heap.pop() {
+        if let Some(entry) = state.fp_index.get(&fp) {
+            // Skip stale heap entries: dedup may have refreshed last_occurred,
+            // leaving older heap entries that no longer reflect entry state.
+            if entry.last_occurred != heap_ts {
+                continue;
+            }
+            let module_id = entry.module_id.clone();
+            state.fp_index.remove(&fp);
+            if let Some(fps) = state.module_index.get_mut(&module_id) {
+                fps.retain(|f| f != &fp);
+                if fps.is_empty() {
+                    state.module_index.remove(&module_id);
+                }
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Middleware that records errors into an `ErrorHistory`.
@@ -217,5 +427,51 @@ impl Middleware for ErrorHistoryMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         self.history.record(module_id, error);
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_replaces_uuid() {
+        let s = normalize_message("token a1b2c3d4-e5f6-7890-abcd-ef1234567890 is invalid");
+        assert_eq!(s, "token <uuid> is invalid");
+    }
+
+    #[test]
+    fn normalize_replaces_integers_over_3_digits() {
+        // Word-boundary on both sides: matches numeric tokens flanked by non-word chars.
+        let s = normalize_message("retry after 30000 ms");
+        assert_eq!(s, "retry after <id> ms");
+    }
+
+    #[test]
+    fn normalize_replaces_iso8601() {
+        let s = normalize_message("at 2026-01-01T10:00:00Z something failed");
+        assert_eq!(s, "at <timestamp> something failed");
+    }
+
+    #[test]
+    fn fingerprint_is_64_char_hex() {
+        let fp = compute_fingerprint("DB_TIMEOUT", "executor.db", "connection timed out");
+        assert_eq!(fp.len(), 64);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn fingerprint_dedup_normalized_messages() {
+        let a = compute_fingerprint(
+            "TOKEN_INVALID",
+            "executor.auth",
+            "token a1b2c3d4-e5f6-7890-abcd-ef1234567890 is invalid",
+        );
+        let b = compute_fingerprint(
+            "TOKEN_INVALID",
+            "executor.auth",
+            "token 00000000-0000-0000-0000-000000000001 is invalid",
+        );
+        assert_eq!(a, b);
     }
 }

@@ -2,16 +2,18 @@
 // Spec reference: Schema loading, validation, export, and reference resolution
 
 pub mod exporter;
+pub mod hardening;
 pub mod loader;
 pub mod ref_resolver;
 pub mod strict;
 pub mod validator;
 
 pub use exporter::{ExportOptions, ExportProfile, SchemaExporter};
+pub use hardening::{content_hash, format_warnings, FormatWarning};
 pub use loader::{SchemaLoader, SchemaStrategy};
 pub use ref_resolver::RefResolver;
 pub use strict::to_strict_schema;
-pub use validator::SchemaValidator;
+pub use validator::{DetailedValidationResult, SchemaValidator};
 
 use serde::{Deserialize, Serialize};
 

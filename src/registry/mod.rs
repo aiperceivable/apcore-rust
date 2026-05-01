@@ -8,6 +8,7 @@ pub mod conflicts;
 pub mod dependencies;
 pub mod entry_point;
 pub mod metadata;
+pub mod multi_class;
 pub mod scanner;
 pub mod types;
 pub mod validation;
@@ -17,6 +18,10 @@ pub use conflicts::{detect_id_conflicts, ConflictResult, ConflictSeverity, Confl
 pub use dependencies::resolve_dependencies;
 pub use entry_point::{infer_struct_name, resolve_entry_point_name, snake_to_pascal};
 pub use metadata::{load_id_map, load_metadata, merge_module_metadata, parse_dependencies};
+pub use multi_class::{
+    class_name_to_segment, compute_base_id, derive_module_ids, DiscoveredClass, DiscoveryConfig,
+    MultiClassEntry, MAX_MODULE_ID_LEN,
+};
 pub use registry::{
     module_id_pattern, registry_events, DependencyInfo, DiscoveredModule, Discoverer,
     ModuleDescriptor, ModuleValidator, Registry, RegistryEvents, DEFAULT_MODULE_VERSION,

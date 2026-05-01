@@ -301,9 +301,10 @@ fn test_register_sys_modules_returns_none_when_disabled() {
     let executor = Executor::new(Arc::clone(&registry), Config::default());
 
     let result = register_sys_modules(Arc::clone(&registry), &executor, &config, None);
+    let ctx = result.expect("Ok variant expected when sys_modules.enabled=false");
     assert!(
-        result.is_none(),
-        "should return None when sys_modules.enabled=false"
+        ctx.registered_modules.is_empty(),
+        "no modules should be registered when sys_modules.enabled=false"
     );
 }
 
@@ -316,11 +317,8 @@ fn test_register_sys_modules_registers_health_but_not_control_when_events_disabl
     config.set("sys_modules.events.enabled", serde_json::json!(false));
     let executor = Executor::new(Arc::clone(&registry), Config::default());
 
-    let ctx = register_sys_modules(Arc::clone(&registry), &executor, &config, None);
-    assert!(
-        ctx.is_some(),
-        "should return Some when sys_modules enabled but events disabled"
-    );
+    let _ctx = register_sys_modules(Arc::clone(&registry), &executor, &config, None)
+        .expect("should return Ok when sys_modules enabled but events disabled");
 
     assert!(
         registry.has("system.health.summary"),
@@ -352,11 +350,8 @@ fn test_register_sys_modules_registers_control_modules_into_caller_registry() {
     config.set("sys_modules.events.enabled", serde_json::json!(true));
     let executor = Executor::new(Arc::clone(&registry), Config::default());
 
-    let ctx = register_sys_modules(Arc::clone(&registry), &executor, &config, None);
-    assert!(
-        ctx.is_some(),
-        "should return Some when sys_modules.enabled=true"
-    );
+    let _ctx = register_sys_modules(Arc::clone(&registry), &executor, &config, None)
+        .expect("should return Ok when sys_modules.enabled=true");
 
     assert!(
         registry.has("system.control.update_config"),

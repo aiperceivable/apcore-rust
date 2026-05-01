@@ -523,3 +523,60 @@ async fn shutdown_cancels_all_pending_tasks() {
     assert_eq!(mgr.get_status(&id1).unwrap().status, TaskStatus::Cancelled);
     assert_eq!(mgr.get_status(&id2).unwrap().status, TaskStatus::Cancelled);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: concurrent submits must not exceed max_tasks (TOCTOU guard).
+// Without the admission_lock around the capacity-check + save in
+// `submit_with_retry`, two racing submits can both observe `len < max` and
+// both insert, exceeding the cap. With max_concurrent=0 the spawned tasks
+// stay Pending so they never finish or get cleaned up — any over-cap insert
+// is observable in the final task count.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submit_max_tasks_holds_under_concurrent_load() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const CAP: usize = 8;
+    const SUBMITTERS: usize = 32;
+
+    // max_concurrent = 0 keeps every accepted task Pending — they do not
+    // complete and are not eligible for cleanup, so the post-race
+    // task_count() reads exactly the number of accepted submits.
+    let mgr = Arc::new(AsyncTaskManager::new(make_executor(), 0, CAP));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+
+    let mut joins = Vec::with_capacity(SUBMITTERS);
+    for _ in 0..SUBMITTERS {
+        let mgr = Arc::clone(&mgr);
+        let accepted = Arc::clone(&accepted);
+        let rejected = Arc::clone(&rejected);
+        joins.push(tokio::task::spawn_blocking(move || {
+            match mgr.submit("m", json!({}), None) {
+                Ok(_) => accepted.fetch_add(1, Ordering::SeqCst),
+                Err(_) => rejected.fetch_add(1, Ordering::SeqCst),
+            };
+        }));
+    }
+    for j in joins {
+        j.await.unwrap();
+    }
+
+    let accepted = accepted.load(Ordering::SeqCst);
+    let rejected = rejected.load(Ordering::SeqCst);
+    assert_eq!(
+        accepted + rejected,
+        SUBMITTERS,
+        "every submitter must observe a definite outcome"
+    );
+    assert!(
+        accepted <= CAP,
+        "accepted submits must never exceed max_tasks; got accepted={accepted}, cap={CAP}"
+    );
+    assert_eq!(
+        mgr.task_count(),
+        accepted,
+        "task_count must equal the number of accepted submits"
+    );
+}

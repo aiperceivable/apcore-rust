@@ -5,14 +5,27 @@ pub mod error_history;
 pub mod exporters;
 pub mod logging;
 pub mod metrics;
+pub mod processor;
+pub mod prometheus_exporter;
+pub mod redaction;
 pub mod span;
+pub mod store;
 pub mod tracing_middleware;
 pub mod usage;
 
-pub use error_history::{ErrorEntry, ErrorHistory, ErrorHistoryMiddleware};
+pub use error_history::{
+    compute_fingerprint, normalize_message, ErrorEntry, ErrorHistory, ErrorHistoryMiddleware,
+};
 pub use exporters::{InMemoryExporter, OTLPExporter, StdoutExporter};
 pub use logging::{ContextLogger, ObsLoggingMiddleware};
 pub use metrics::{MetricsCollector, MetricsMiddleware};
+pub use processor::{
+    BatchSpanProcessor, BatchSpanProcessorBuilder, BatchSpanProcessorConfig, SimpleSpanProcessor,
+    SpanProcessor,
+};
+pub use prometheus_exporter::PrometheusExporter;
+pub use redaction::{RedactionConfig, RedactionConfigBuilder, RedactionConfigError};
 pub use span::{Span, SpanExporter};
+pub use store::{InMemoryObservabilityStore, MetricPoint, ObservabilityStore};
 pub use tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use usage::{UsageCollector, UsageMiddleware, UsageStats};

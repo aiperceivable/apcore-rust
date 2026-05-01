@@ -244,6 +244,149 @@ impl UsageCollector {
     pub fn reset(&self) {
         self.data.lock().clear();
     }
+
+    /// Compute a percentile (0.0..=1.0) from a sorted latency slice.
+    /// Returns 0.0 for empty input. Used by `export_prometheus`.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn percentile_from_sorted(sorted: &[f64], q: f64) -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        let rank = (sorted.len() as f64 * q).ceil() as usize;
+        sorted[rank.min(sorted.len()).saturating_sub(1)]
+    }
+
+    /// Render the collector's data in Prometheus text exposition format.
+    ///
+    /// Spec: system-modules.md §1.3 normative metrics:
+    ///   - `apcore_usage_calls_total{module_id, status}` (counter)
+    ///   - `apcore_usage_error_rate{module_id}` (gauge, 0.0–1.0)
+    ///   - `apcore_usage_p50/p95/p99_latency_ms{module_id}` (gauges)
+    ///
+    /// `# HELP` and `# TYPE` lines are always emitted, even when the
+    /// collector is empty, so scrape discovery succeeds on cold start.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // call counts comfortably fit in f64
+    pub fn export_prometheus(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "# HELP apcore_usage_calls_total Total module call count by status"
+        );
+        let _ = writeln!(out, "# TYPE apcore_usage_calls_total counter");
+        let _ = writeln!(
+            out,
+            "# HELP apcore_usage_error_rate Module error rate (0.0–1.0)"
+        );
+        let _ = writeln!(out, "# TYPE apcore_usage_error_rate gauge");
+        let _ = writeln!(
+            out,
+            "# HELP apcore_usage_p50_latency_ms Module p50 latency in milliseconds"
+        );
+        let _ = writeln!(out, "# TYPE apcore_usage_p50_latency_ms gauge");
+        let _ = writeln!(
+            out,
+            "# HELP apcore_usage_p95_latency_ms Module p95 latency in milliseconds"
+        );
+        let _ = writeln!(out, "# TYPE apcore_usage_p95_latency_ms gauge");
+        let _ = writeln!(
+            out,
+            "# HELP apcore_usage_p99_latency_ms Module p99 latency in milliseconds"
+        );
+        let _ = writeln!(out, "# TYPE apcore_usage_p99_latency_ms gauge");
+
+        // Snapshot under the lock, drop the guard, then format. Keeps the
+        // critical section short and avoids holding the mutex across the
+        // sorts and writeln! calls below.
+        let snapshot: Vec<(String, u64, u64, Vec<f64>)> = {
+            let data = self.data.lock();
+            data.iter()
+                .map(|(mid, md)| {
+                    let mut latencies: Vec<f64> = Vec::new();
+                    let mut total: u64 = 0;
+                    let mut errors: u64 = 0;
+                    for recs in md.records.values() {
+                        for r in recs {
+                            total += 1;
+                            if !r.success {
+                                errors += 1;
+                            }
+                            latencies.push(r.latency_ms);
+                        }
+                    }
+                    (mid.clone(), total, errors, latencies)
+                })
+                .collect()
+        };
+
+        let mut snapshot = snapshot;
+        snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (mid, total, errors, mut latencies) in snapshot {
+            let escaped = escape_label_value(&mid);
+            let success = total.saturating_sub(errors);
+            let _ = writeln!(
+                out,
+                "apcore_usage_calls_total{{module_id=\"{escaped}\",status=\"success\"}} {success}"
+            );
+            let _ = writeln!(
+                out,
+                "apcore_usage_calls_total{{module_id=\"{escaped}\",status=\"error\"}} {errors}"
+            );
+
+            let error_rate = if total == 0 {
+                0.0
+            } else {
+                errors as f64 / total as f64
+            };
+            let _ = writeln!(
+                out,
+                "apcore_usage_error_rate{{module_id=\"{escaped}\"}} {error_rate}"
+            );
+
+            latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p50 = Self::percentile_from_sorted(&latencies, 0.50);
+            let p95 = Self::percentile_from_sorted(&latencies, 0.95);
+            let p99 = Self::percentile_from_sorted(&latencies, 0.99);
+            let _ = writeln!(
+                out,
+                "apcore_usage_p50_latency_ms{{module_id=\"{escaped}\"}} {p50}"
+            );
+            let _ = writeln!(
+                out,
+                "apcore_usage_p95_latency_ms{{module_id=\"{escaped}\"}} {p95}"
+            );
+            let _ = writeln!(
+                out,
+                "apcore_usage_p99_latency_ms{{module_id=\"{escaped}\"}} {p99}"
+            );
+        }
+
+        out
+    }
+}
+
+/// Escape a Prometheus label value per the text exposition spec:
+/// backslash, double-quote, and newline are the only characters that need
+/// escaping. Module IDs in apcore are restricted to `[a-z0-9._-]`, so this
+/// is defense-in-depth — but cheap and worth keeping.
+fn escape_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Per-caller usage statistics.

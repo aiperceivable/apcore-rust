@@ -3,15 +3,40 @@
 
 pub mod adapters;
 pub mod base;
+pub mod circuit_breaker;
+pub mod context_namespace;
 pub mod logging;
 pub mod manager;
+pub mod otel_tracing;
 pub mod retry;
+pub mod yaml_config;
 
 pub use adapters::{AfterMiddleware, BeforeMiddleware};
 pub use base::Middleware;
+pub use circuit_breaker::{
+    CircuitBreakerBuilder, CircuitBreakerConfig, CircuitBreakerMiddleware, CircuitBreakerState,
+    DEFAULT_MIN_SAMPLES as CB_DEFAULT_MIN_SAMPLES,
+    DEFAULT_OPEN_THRESHOLD as CB_DEFAULT_OPEN_THRESHOLD,
+    DEFAULT_RECOVERY_WINDOW_MS as CB_DEFAULT_RECOVERY_WINDOW_MS,
+    DEFAULT_WINDOW_SIZE as CB_DEFAULT_WINDOW_SIZE,
+};
+pub use context_namespace::{
+    enforce_context_key, namespace_keys, validate_context_key, ContextWriter, NamespaceCheck,
+    APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
+};
 pub use logging::LoggingMiddleware;
 pub use manager::MiddlewareManager;
+pub use otel_tracing::{
+    TracingBuilder as OtelTracingBuilder, TracingConfig as OtelTracingConfig,
+    TracingMiddleware as OtelTracingMiddleware, TRACING_ATTRIBUTES_KEY, TRACING_SPAN_NAME_KEY,
+    TRACING_SPAN_STATUS_KEY,
+};
 pub use retry::{RetryConfig, RetryMiddleware};
+pub use yaml_config::{
+    CircuitBreakerMiddlewareConfig, CustomMiddlewareConfig, CustomMiddlewareFactory,
+    LoggingMiddlewareConfig, MiddlewareChainConfig, MiddlewareConfig, MiddlewareFactory,
+    TracingMiddlewareConfig,
+};
 
 use std::collections::{HashMap, HashSet};
 

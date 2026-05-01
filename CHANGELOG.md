@@ -12,6 +12,356 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.20.0] - 2026-04-30
+
+### System Modules Hardening (Issue #45, system-modules.md §1.1–§1.5)
+
+Implements the cross-language System Modules Hardening normative rules:
+overrides persistence, contextual audit trail, Prometheus exporter for the
+UsageCollector, glob-based bulk reload, and a strict registration entry
+point. Aligns Rust with the `apcore-python` reference implementation.
+
+#### Added
+
+- **`sys_modules::audit`** — `AuditAction`, `AuditChange`, `AuditEntry`, the
+  async `AuditStore` trait, and `InMemoryAuditStore`. Every state-changing
+  control call (`update_config`, `reload_module`, `toggle_feature`) records
+  an entry with `actor_id` / `actor_type` extracted from `context.identity`
+  and the call's `trace_id`. When no store is configured, entries are logged
+  at INFO level and discarded.
+- **`sys_modules::overrides`** — `load_overrides` and `write_override` for
+  YAML-backed runtime override persistence. Writes use a per-path lock and
+  tempfile + rename to avoid partial-write corruption. Loaded after the
+  base `Config`, so manual restores never erase runtime overrides.
+- **`UpdateConfigModule::with_overrides_path` / `with_audit_store`,
+  `ToggleFeatureModule::with_overrides_path` / `with_audit_store`,
+  `ReloadModule::with_audit_store`** — opt-in builders for §1.1/§1.2.
+- **Sensitive-key redaction in `UpdateConfigModule`** — `old_value` / `new_value`
+  in the response payload, the `apcore.config.updated` event payload, and the
+  `AuditChange` are replaced with `***REDACTED***` whenever the key matches a
+  sensitive segment (`token`, `secret`, `key`, `password`, `auth`, `credential`).
+  The in-memory `Config` still holds the real value — redaction is for egress
+  only. Aligned with `apcore-python` (`utils/redaction.REDACTED_VALUE`).
+- **Misconfiguration warning in `register_sys_modules_with_options`** — when
+  `overrides_path` or `audit_store` is set but `sys_modules.events.enabled=false`,
+  a `WARN`-level tracing event flags that control modules are not registered
+  and the options have no effect.
+- **`ReloadModule` `path_filter` input** — accepts a glob pattern and
+  reloads every matching module in dependency-topological order (leaves
+  first). `module_id` and `path_filter` are mutually exclusive — providing
+  both raises `ErrorCode::ModuleReloadConflict`.
+- **`UsageCollector::export_prometheus`** — emits
+  `apcore_usage_calls_total{module_id,status}` (counter),
+  `apcore_usage_error_rate{module_id}` (gauge), and
+  `apcore_usage_p50/p95/p99_latency_ms{module_id}` (gauges).
+  `PrometheusExporter::with_usage_collector` wires the new metrics into
+  the existing `/metrics` endpoint.
+- **`SysModulesOptions`** + **`register_sys_modules_with_options`** — passes
+  `overrides_path`, `audit_store`, and `fail_on_error` into the registration
+  flow without breaking the simpler 4-arg call site.
+- **`SysModuleError`** — `RegistrationFailed { module_id, source }` returned
+  from `register_sys_modules` when `fail_on_error` is `true`.
+- **`ErrorCode::ModuleReloadConflict`** (`MODULE_RELOAD_CONFLICT`) and
+  **`ErrorCode::SysModuleRegistrationFailed`** (`SYS_MODULE_REGISTRATION_FAILED`).
+- **`tests/test_system_modules_hardening_conformance.rs`** — 10/10 cases from
+  `apcore/conformance/fixtures/system_modules_hardening.json`.
+
+#### Changed (BREAKING)
+
+- **`register_sys_modules` signature** — now returns
+  `Result<SysModulesContext, SysModuleError>` instead of
+  `Option<SysModulesContext>`. When `sys_modules.enabled` is `false`, the
+  function returns `Ok(SysModulesContext { … empty … })`. Callers that
+  previously matched on `Option::Some` / `None` must switch to `Result`.
+  `client::APCore::with_options` updated to log and continue on failure,
+  preserving lenient default behavior.
+
+---
+
+### Middleware Architecture Hardening (Issue #42, middleware-system.md §1.x)
+
+Implements the cross-language Middleware Architecture Hardening normative
+rules: context-data namespace partitioning, the `CircuitBreakerMiddleware`
+state machine, the OpenTelemetry-compatible `TracingMiddleware`, and the
+YAML-driven middleware chain configuration.
+
+#### Added
+
+- **`middleware::context_namespace`** — `ContextWriter`, `validate_context_key`,
+  and `enforce_context_key` helpers enforcing the `_apcore.*` (framework) /
+  `ext.*` (user) prefix rules. Canonical key constants exposed via
+  `middleware::namespace_keys` (`LOGGING_START_TIME`, `TRACING_SPAN_ID`,
+  `CIRCUIT_STATE`).
+- **`middleware::circuit_breaker::CircuitBreakerMiddleware`** — per-`(module_id,
+  caller_id)` rolling-window breaker with `CLOSED → OPEN → HALF_OPEN → CLOSED`
+  state machine. Emits `apcore.circuit.opened` and `apcore.circuit.closed`
+  via an injected `Arc<EventEmitter>`. Writes `CLOSED` / `OPEN` / `HALF_OPEN`
+  into `context.data["_apcore.mw.circuit.state"]` on every call.
+- **`middleware::otel_tracing::TracingMiddleware`** (OTel-compatible) — opens
+  a logical span on `before()` with attributes `apcore.trace_id`,
+  `apcore.caller_id`, `apcore.module_id`, writes the span id under
+  `_apcore.mw.tracing.span_id`, and records lifecycle status (`ok` / `error`)
+  on `after()` / `on_error()`. Gated by the new compile-time `opentelemetry`
+  feature with a runtime `enabled(bool)` builder override; silent no-op when
+  disabled.
+- **`ErrorCode::CircuitBreakerOpen`** — serialized as `CIRCUIT_OPEN`.
+  Constructor: `ModuleError::circuit_breaker_open(module_id, caller_id)`.
+- **`middleware::yaml_config`** — declarative middleware chain config:
+  `MiddlewareConfig` enum (`Tracing`, `CircuitBreaker`, `Logging`, `Custom`),
+  `MiddlewareChainConfig::from_yaml` / `from_json`, and `MiddlewareFactory`
+  with custom-handler registration and optional event-emitter injection.
+- **`tests/test_middleware_hardening_conformance.rs`** — 10/10 cases from
+  `apcore/conformance/fixtures/middleware_hardening.json`.
+
+#### Notes
+
+- Async-handler detection is satisfied statically by Rust's type system; the
+  conformance test asserts compile-time witness via the `Middleware` trait.
+- The pre-existing `observability::tracing_middleware::TracingMiddleware`
+  (span-exporter based) is unchanged. The new OTel-compatible middleware is
+  re-exported at the crate root as `OtelTracingMiddleware` to avoid a name
+  collision.
+
+### Multi-Module Discovery (Issue #32, PROTOCOL_SPEC §2.1.1, multi-module-discovery.md)
+
+Adds opt-in multi-class discovery: multiple `Module` implementations may
+coexist in a single source file, each receiving an ID of the form
+`base_id.snake_case(struct_name)`. Off by default — single-class files are
+unaffected and produce identical IDs regardless of whether the feature is
+enabled (single-class identity guarantee).
+
+#### Added
+
+- **`registry::multi_class` module** — new module hosting the cross-language
+  ID-derivation primitives.
+- **`DiscoveryConfig { multi_class: bool }`** — opt-in flag (default `false`).
+- **`class_name_to_segment(&str) -> String`** — snake_case conversion
+  algorithm aligned with `apcore-python.class_name_to_segment`. Handles
+  `Addition` → `addition`, `MathOps` → `math_ops`, `HTTPSender` →
+  `http_sender`, `MyModule_V2` → `my_module_v2`.
+- **`compute_base_id(&Path, &str) -> String`** — Algorithm A01 base ID
+  derivation from file path + extensions root.
+- **`derive_module_ids(&Path, &str, &[DiscoveredClass], &DiscoveryConfig)`** —
+  pure ID-derivation function returning the list of derived IDs (or
+  `MODULE_ID_CONFLICT` / `INVALID_SEGMENT` / `ID_TOO_LONG` errors).
+- **`DiscoveredClass`** struct (`name`, `implements_module`) for the
+  conformance-fixture interface.
+- **`MultiClassEntry`** struct + **`Registry::register_multi_class()`** — the
+  user-facing registration helper. Atomic registration: if any per-module
+  registration fails, already-registered modules from the batch are rolled
+  back so the file is registered all-or-nothing.
+- **`ErrorCode::ModuleIdConflict`** (`MODULE_ID_CONFLICT`) — two or more
+  classes in the same file produce the same `class_segment` after snake_case
+  conversion. Details carry `file_path`, `class_names`, and
+  `conflicting_segment`.
+- **`ErrorCode::InvalidSegment`** (`INVALID_SEGMENT`) — derived segment does
+  not conform to the canonical ID grammar.
+- **`ErrorCode::IdTooLong`** (`ID_TOO_LONG`) — full derived `module_id`
+  exceeds `MAX_MODULE_ID_LEN` (192).
+- **`ModuleError::module_id_conflict()`**, **`invalid_segment()`**,
+  **`id_too_long()`** builders.
+- **`MAX_MODULE_ID_LEN: usize = 192`** constant in the multi_class module
+  (mirrors the existing `MAX_MODULE_ID_LENGTH` in the registry module for
+  cross-SDK naming consistency).
+- **Cross-language conformance tests** for all eight Issue #32 fixture cases
+  (`single_class_id_unchanged`, `two_classes_distinct_ids`,
+  `class_name_snake_case_addition`, `class_name_snake_case_math_ops`,
+  `class_name_snake_case_https_sender`, `conflict_same_segment`,
+  `full_id_grammar_valid`, `disabled_by_default`) in
+  `tests/test_multi_module_discovery_conformance.rs`.
+
+#### Notes
+
+- **Rust integration model**: Rust has no runtime reflection, so
+  multi-class discovery cannot enumerate `impl Module for X` at scan time
+  the way Python `inspect.getmembers` does. Module authors register a list
+  of `(class_name, instance)` pairs explicitly via
+  `Registry::register_multi_class`. The pure ID-derivation logic is shared
+  with the conformance fixture so all three SDKs validate against the same
+  test cases.
+- The single-class identity guarantee applies regardless of
+  `multi_class` mode: a file with exactly one qualifying class always
+  receives the bare `base_id` (no `.class_segment` suffix). This preserves
+  all existing module IDs.
+- Multi-class disabled with multiple classes in a file: the file is
+  treated as single-class — only the first qualifying class is loaded
+  under `base_id`. Mirrors the `disabled_by_default` fixture case and
+  apcore-python policy.
+
+### Pipeline Architecture Hardening (Issue #33, core-executor.md §Pipeline Hardening)
+
+This release adds the cross-SDK pipeline hardening primitives required by
+Issue #33. Public APIs (`Executor::call`, `Executor::validate`,
+`Executor::stream`) preserve their existing typed errors — `PipelineEngine`
+wraps step failures in `PipelineStepError` internally and the executor
+unwraps before returning, mirroring the apcore-python reference.
+
+#### Added
+
+- **`ErrorCode::PipelineStepError`** (`PIPELINE_STEP_ERROR`) — fail-fast wrapper
+  carrying the failing step's name and the original `ModuleError` cause.
+- **`ErrorCode::PipelineStepNotFound`** (`PIPELINE_STEP_NOT_FOUND`) — surfaced by
+  `ExecutionStrategy::configure_step` when the target step does not exist.
+- **`ModuleError::pipeline_step_error(step_name, &cause)`** builder, plus the
+  `is_pipeline_step_error()`, `step_name()`, and `unwrap_pipeline_step_error()`
+  accessors for inspecting / unwrapping wrapped errors.
+- **`ExecutionStrategy::configure_step(name, step)`** — replace-semantic that is
+  idempotent and preserves the step's position in the execution order (§1.2).
+- **`ExecutionStrategy::name_to_idx()`** — exposes the maintained
+  `HashMap<String, usize>` so the O(1) lookup is observable per §1.5. The map
+  is rebuilt after every mutation (`new`, `insert_after`, `insert_before`,
+  `remove`, `replace`, `replace_with`, `configure_step`).
+- **`PipelineState`** — snapshot type passed to `run_until` predicates, carrying
+  `step_name`, `outputs`, and a borrowed reference to the live `PipelineContext`.
+- **`RunUntilPredicate`** type alias and **`RunOptions`** struct for the new
+  `PipelineEngine::run_with_options` entry point.
+- **`PipelineEngine::run_until(strategy, ctx, predicate)`** — predicate-based
+  termination per §1.4. Evaluated after each step's clean continue; returning
+  `true` halts the pipeline and reports success.
+- **Cross-language conformance tests** for the five Issue #33 fixtures
+  (`fail_fast_on_step_error`, `continue_on_ignored_error`,
+  `replace_semantic_no_duplicate`, `run_until_stops_early`,
+  `step_lookup_is_not_linear`) in
+  `tests/test_pipeline_hardening_conformance.rs`.
+
+#### Changed
+
+- **`PipelineEngine` step-error behavior** — when a step returns `Err` and its
+  `ignore_errors` is `false`, the engine now wraps the error in a
+  `PipelineStepError` (§1.1). `Executor::call`, `Executor::validate`, and
+  `Executor::stream` unwrap before returning so user-visible error codes are
+  unchanged. Callers that drive `PipelineEngine::run` directly will observe the
+  wrapped code and should call `unwrap_pipeline_step_error()` for the cause.
+- **`PipelineEngine::run_until` previously took `stop_before_step: &str`** for
+  the streaming pre-execute phase. That method is renamed to
+  **`run_until_step`**; the `run_until` name now hosts the spec-conformant
+  predicate-based API. The two streaming callers in `executor.rs` and
+  `pipeline.rs` were migrated.
+- **`skip_to` lookup** in the engine now uses `ExecutionStrategy::name_to_idx`
+  (O(1)) and explicitly rejects same-position / backward targets to prevent
+  infinite loops.
+
+#### Notes
+
+- **§1.3 step-level middleware** is `SHOULD` in the spec, has no conformance
+  fixture, and is not yet implemented in apcore-python. Per the
+  reference-implementation alignment policy (apcore-python is canonical),
+  this is deferred — to be revisited once Python lands the API.
+
+### Schema System Hardening (Issue #44, PROTOCOL_SPEC §4.15)
+
+This release replaces the hand-written schema validator with the `jsonschema`
+crate (Draft 2020-12) and adds the cross-SDK hardening primitives required by
+Issue #44. All previously passing schema tests continue to pass.
+
+### Added
+
+- **`jsonschema = "0.28"` Draft 2020-12 backend** — `SchemaValidator` now wraps
+  `jsonschema::Validator` and gains complete support for `anyOf` / `oneOf` /
+  `allOf` / `not`, recursive `$ref` (e.g. self-referencing TreeNode schemas via
+  `"$ref": "#"`), and all numerical / string constraints (`minimum`, `maximum`,
+  `exclusiveMinimum`, `minLength`, `maxLength`, `pattern`).
+- **`SchemaValidator::validate_detailed`** — new structured-result variant that
+  returns mapped error codes (`SchemaUnionNoMatch`, `SchemaUnionAmbiguous`,
+  `SchemaValidationError`) and non-fatal format warnings.
+- **`schema::content_hash(&Value) -> String`** — SHA-256 hex digest of the
+  canonical (sorted-keys) JSON form of a schema. Two byte-equivalent schemas
+  hash to the same digest, satisfying the cross-SDK deduplication invariant.
+- **Content-addressable compile cache** on `SchemaValidator` — repeated
+  validation against the same schema (or a key-reordered copy) compiles the
+  schema exactly once. `cache_len()` and `clear_cache()` accessors included.
+- **`schema::format_warnings(&Value, &Value)`** — opt-in semantic format check
+  for `date-time`, `date`, `time`, `email`, `uri`, `uuid`, `ipv4`, `ipv6`.
+  Format enforcement is SHOULD-level: invalid values produce a warning rather
+  than failing validation, matching the Python and TypeScript SDKs.
+- **New `ErrorCode` variants**: `SchemaUnionNoMatch` (`SCHEMA_UNION_NO_MATCH`),
+  `SchemaUnionAmbiguous` (`SCHEMA_UNION_AMBIGUOUS`), `SchemaMaxDepthExceeded`
+  (`SCHEMA_MAX_DEPTH_EXCEEDED`).
+- **`sha2 = "0.10"`** dependency for the canonical-JSON content hash.
+- **Cross-language conformance tests** for the five new fixtures
+  (`schema_hardening_union`, `schema_hardening_recursive`,
+  `schema_hardening_constraints`, `schema_hardening_formats`,
+  `schema_hardening_cache`) in `tests/test_schema_hardening_conformance.rs`.
+
+### Changed
+
+- **`SchemaValidator` is no longer a unit struct.** It now owns an internal
+  `Arc<Mutex<HashMap<String, Arc<jsonschema::Validator>>>>` compile cache.
+  Existing constructors (`SchemaValidator::new()`,
+  `SchemaValidator::default()`) and the `validate` / `validate_or_error`
+  methods remain source-compatible. Code that relied on the unit-struct form
+  (`SchemaValidator;`) must switch to `SchemaValidator::default()` or
+  `SchemaValidator::new()`.
+
+### AsyncTask Evolution (Issue #34, async-tasks.md §AsyncTaskManager Evolution)
+
+Adds three capability extensions to `AsyncTaskManager`: a pluggable
+`TaskStore` trait, configurable retry with exponential backoff, and an
+opt-in TTL-based Reaper background task. The pre-existing 3-arg
+`AsyncTaskManager::new(executor, max_concurrent, max_tasks)` constructor is
+preserved; it now defaults to the new `InMemoryTaskStore` so existing
+callers and tests are unaffected.
+
+#### Added
+
+- **`async_task::TaskStore`** trait (`#[async_trait]`) — pluggable storage
+  backend with `save / get / list / delete / list_expired` and
+  `store_type_name`. Decouples task state from in-process memory and enables
+  distributed deployments / persistence across process restarts. Ships with
+  `InMemoryTaskStore` (default, `dashmap`-backed) — third-party backends
+  (`RedisTaskStore`, `SqlTaskStore`) live in downstream crates.
+- **`AsyncTaskManager::with_store(executor, max_concurrent, max_tasks, store)`** —
+  constructor accepting a caller-provided `Arc<dyn TaskStore>`.
+- **`AsyncTaskManager::store_type_name()`** — exposes the active backend's
+  identifier for tooling / introspection.
+- **`AsyncTaskManager::store()`** — returns a clone of the underlying
+  `Arc<dyn TaskStore>` for direct interaction.
+- **`async_task::RetryConfig` { `max_retries`, `retry_delay_ms`,
+  `backoff_multiplier`, `max_retry_delay_ms` }** — per-task retry policy.
+  `delay_for_attempt(attempt)` computes
+  `min(retry_delay_ms * (backoff_multiplier ^ attempt), max_retry_delay_ms)`.
+  Not re-exported at the crate root to avoid colliding with
+  `middleware::RetryConfig` — import via `apcore::async_task::RetryConfig`.
+- **`AsyncTaskManager::submit_with_retry(module_id, inputs, ctx, retry)`** —
+  submission variant that accepts an optional retry policy. On failure the
+  task is rescheduled with `tokio::time::sleep` and `status` returns to
+  `Pending` until `max_retries` is exhausted, after which it transitions to
+  `Failed` with `error` populated.
+- **`async_task::ReaperConfig` { `ttl_seconds`, `sweep_interval_ms`}** and
+  **`async_task::ReaperHandle`** — opt-in background reaper.
+  `AsyncTaskManager::start_reaper(ReaperConfig)` returns a handle; calling
+  `handle.stop().await` signals graceful shutdown via a
+  `tokio::sync::watch` channel and awaits the join. The sweep calls
+  `store.list_expired(now - ttl)` which only returns terminal-state tasks,
+  so pending and running tasks are never deleted by the reaper.
+- **`async_task::AsyncTaskManager::get_status_async` / `get_result_async`** —
+  async variants of the synchronous facade methods, intended for callers
+  with network-backed `TaskStore` implementations.
+- **`TaskInfo.retry_count` and `TaskInfo.max_retries`** fields (both
+  `#[serde(default)]`, so wire-format compatibility is preserved).
+- **`dashmap = "6"`** dependency (used internally by `InMemoryTaskStore` for
+  lock-free concurrent access).
+- **`tests/test_async_task_evolution_conformance.rs`** — 10/10 cases from
+  `apcore/conformance/fixtures/async_task_evolution.json` plus a smoke test
+  for the `ReaperHandle` lifecycle.
+
+#### Notes
+
+- The synchronous facade (`submit`, `cancel`, `cleanup`, `shutdown`,
+  `list_tasks`, `get_status`, `get_result`, `task_count`) is preserved and
+  internally drives the async `TaskStore` through a single-poll no-op-waker
+  helper. Custom `TaskStore` implementations whose futures actually yield
+  MUST use the `_async` variants — the synchronous facade panics if a future
+  returns `Pending`.
+- Concurrent `submit_with_retry` calls are serialised through an
+  `admission_lock` so the `len() < max_tasks` check and the subsequent
+  `save` are atomic — without this, two racing submits could both pass the
+  cap check and exceed `max_tasks`.
+- Cross-language alignment: `RETRYING` is not a separate `TaskStatus` in the
+  Rust SDK (the cross-language spec lifecycle pins five states); a task
+  awaiting its next retry attempt stays in `Pending`. `started_at` is set
+  on the first execution and preserved across retries to match Python.
+
 ## [0.19.1] - 2026-04-27
 
 ### Added
