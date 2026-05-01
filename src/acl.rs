@@ -277,17 +277,31 @@ impl ACL {
     ) -> bool {
         let caller = caller_id.unwrap_or("@external");
 
-        if self.rules.is_empty() {
+        // Snapshot rules + default_effect before evaluation so any concurrent
+        // add_rule/reload caller (wrapped in Arc<RwLock<ACL>> by the user) does
+        // not mutate the list mid-check. Matches apcore-python's
+        // _snapshot() (acl.py:282) and apcore-typescript's rules.slice()
+        // (acl.ts:203) — sync finding A-D-021.
+        let rules: Vec<ACLRule> = self.rules.clone();
+        let default_effect = self.default_effect.clone();
+
+        if rules.is_empty() {
             return self.finalize_no_rules(caller, target_id, ctx);
         }
 
-        for (idx, rule) in self.rules.iter().enumerate() {
+        for (idx, rule) in rules.iter().enumerate() {
             if self.matches_rule(rule, caller, target_id, ctx) {
                 return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
             }
         }
 
-        self.finalize_default_effect(caller, target_id, ctx)
+        // Use the snapshotted default_effect rather than re-reading self.default_effect
+        // to maintain consistency with the snapshotted rules.
+        let decision = default_effect == "allow";
+        let reason = if rules.is_empty() { "no_rules" } else { "default_effect" };
+        let entry = self.build_audit_entry(caller, target_id, if decision { "allow" } else { "deny" }, reason, None, None, ctx);
+        self.emit_audit(&entry);
+        decision
     }
 
     /// Load ACL rules from a YAML file.
