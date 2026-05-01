@@ -354,6 +354,20 @@ impl ACL {
         crate::acl_handlers::register_condition(key, handler);
     }
 
+    /// Register a custom async-capable condition handler.
+    ///
+    /// In Rust all handlers are structurally async (`ACLConditionHandler::evaluate`
+    /// is `async fn`), so this is an alias for [`ACL::register_condition`].
+    /// The alias exists for cross-language API parity with apcore-python
+    /// `register_async_condition` and apcore-typescript `registerAsyncCondition`
+    /// (sync finding A-D-022).
+    pub fn register_async_condition(
+        key: impl Into<String>,
+        handler: std::sync::Arc<dyn crate::acl_handlers::ACLConditionHandler>,
+    ) {
+        Self::register_condition(key, handler);
+    }
+
     /// Reload rules from the stored YAML path.
     pub fn reload(&mut self) -> Result<(), ModuleError> {
         let path = self.yaml_path.clone().ok_or_else(|| {
