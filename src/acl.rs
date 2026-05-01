@@ -50,6 +50,12 @@ pub struct AuditEntry {
     pub call_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// Error message from a condition handler that panicked or returned an error
+    /// during evaluation, if any. Cross-language parity with apcore-python
+    /// AuditEntry.handler_error and apcore-typescript AuditEntry.handlerError
+    /// (sync finding A-D-024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler_error: Option<String>,
 }
 
 /// Type alias for the audit logger callback.
@@ -91,7 +97,41 @@ impl Clone for ACL {
 
 impl ACL {
     /// Create a new ACL with the given rules, default effect, and optional audit logger.
+    /// Create a new ACL with the given rules, default effect, and optional audit logger.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ModuleError` with `ErrorCode::ACLRuleError` if `default_effect` is
+    /// not `"allow"` or `"deny"`, matching the constructor validation in
+    /// apcore-typescript (sync finding A-D-025).
+    pub fn try_new(
+        rules: Vec<ACLRule>,
+        default_effect: impl Into<String>,
+        audit_logger: Option<Arc<AuditLoggerFn>>,
+    ) -> Result<Self, ModuleError> {
+        let default_effect = default_effect.into();
+        if default_effect != "allow" && default_effect != "deny" {
+            return Err(ModuleError::new(
+                ErrorCode::ACLRuleError,
+                format!(
+                    "Invalid default_effect '{default_effect}': must be 'allow' or 'deny'"
+                ),
+            ));
+        }
+        Ok(Self::new_unchecked(rules, default_effect, audit_logger))
+    }
+
+    /// Create a new ACL without validating `default_effect`. Prefer [`ACL::try_new`] for
+    /// validated construction; this method is kept for `Default` and internal use.
     pub fn new(
+        rules: Vec<ACLRule>,
+        default_effect: impl Into<String>,
+        audit_logger: Option<Arc<AuditLoggerFn>>,
+    ) -> Self {
+        Self::new_unchecked(rules, default_effect, audit_logger)
+    }
+
+    fn new_unchecked(
         rules: Vec<ACLRule>,
         default_effect: impl Into<String>,
         audit_logger: Option<Arc<AuditLoggerFn>>,
@@ -543,6 +583,7 @@ impl ACL {
                 .unwrap_or_default(),
             call_depth: ctx.map(|c| c.call_chain.len()),
             trace_id: ctx.map(|c| c.trace_id.clone()),
+            handler_error: None,
         }
     }
 
