@@ -71,10 +71,17 @@ impl MiddlewareManager {
         Ok(())
     }
 
-    /// Remove the first middleware matching the given name.
+    /// Remove the first middleware whose `name()` matches `name`.
     ///
-    /// Removes only the first match (not all), matching Python's
-    /// identity-based semantics which also removes exactly one instance.
+    /// **Name-based, NOT identity-based.** Unlike Python's `id()` /
+    /// reference-equality removal, this method matches on the
+    /// `Middleware::name()` string. Two middlewares registered with the
+    /// same name **cannot be removed independently** — disambiguate them
+    /// at registration time by giving each a unique name (sync finding
+    /// A-D-401).
+    ///
+    /// Removes only the first match in pipeline order; returns `false` if
+    /// no middleware with that name is registered.
     ///
     /// Takes `&self` — mutation goes through the internal `Mutex`.
     pub fn remove(&self, name: &str) -> bool {
