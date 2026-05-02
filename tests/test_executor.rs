@@ -118,6 +118,86 @@ impl Middleware for TagMiddleware {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Global deadline (sync A-D-201)
+// ---------------------------------------------------------------------------
+
+/// Module that asserts ctx.global_deadline is set when it executes.
+#[derive(Debug)]
+struct DeadlineProbeModule;
+
+#[async_trait]
+impl Module for DeadlineProbeModule {
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn description(&self) -> &'static str {
+        "probe"
+    }
+    async fn execute(&self, _inputs: Value, ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        Ok(json!({
+            "global_deadline": ctx.global_deadline,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn test_global_deadline_set_by_context_creation() {
+    // Spec (A-D-201): when executor.global_timeout > 0, BuiltinContextCreation
+    // MUST populate ctx.global_deadline with now + global_timeout (fractional
+    // seconds since UNIX epoch — same unit BuiltinExecute reads at line 500).
+    let mut config = apcore::config::Config::default();
+    config.set("sys_modules.enabled", json!(false));
+    config.set("executor.global_timeout", json!(60_000_u64));
+    let client = APCore::with_config(config);
+    client
+        .register("probe.deadline", Box::new(DeadlineProbeModule))
+        .unwrap();
+
+    let now_before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    let result = client
+        .call("probe.deadline", json!({}), None, None)
+        .await
+        .expect("call should succeed");
+
+    let deadline = result["global_deadline"]
+        .as_f64()
+        .expect("global_deadline should be set as a number");
+    // Should be ~60s in the future from the time we measured.
+    assert!(
+        deadline >= now_before + 50.0 && deadline <= now_before + 70.0,
+        "deadline {deadline} should be ~60s past now {now_before}"
+    );
+}
+
+#[tokio::test]
+async fn test_global_deadline_unset_when_timeout_zero() {
+    // executor.global_timeout = 0 means "no global deadline" — leave it None.
+    let mut config = apcore::config::Config::default();
+    config.set("sys_modules.enabled", json!(false));
+    config.set("executor.global_timeout", json!(0_u64));
+    let client = APCore::with_config(config);
+    client
+        .register("probe.deadline", Box::new(DeadlineProbeModule))
+        .unwrap();
+
+    let result = client
+        .call("probe.deadline", json!({}), None, None)
+        .await
+        .expect("call should succeed");
+    assert!(
+        result["global_deadline"].is_null(),
+        "global_deadline must be null when global_timeout=0, got {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_apcore_register_and_call() {
     let client = APCore::new();

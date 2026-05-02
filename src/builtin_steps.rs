@@ -167,6 +167,30 @@ impl Step for BuiltinContextCreation {
                 HashMap::new(),
             ));
         }
+
+        // Spec: BuiltinContextCreation MUST set context.global_deadline if
+        // the context does not already carry one and the executor config
+        // declares a non-zero global_timeout (sync finding A-D-201).
+        // Cross-language parity with apcore-python (sets in step 1) and
+        // apcore-typescript (sets via Context constructor).
+        //
+        // Units: BuiltinExecute reads global_deadline as fractional seconds
+        // since UNIX_EPOCH (see builtin_steps.rs:500-507). We store the same
+        // unit here so set+read are consistent.
+        if ctx.context.global_deadline.is_none() {
+            if let Some(config) = ctx.config.as_ref() {
+                let global_timeout_ms = config.executor.global_timeout;
+                if global_timeout_ms > 0 {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    #[allow(clippy::cast_precision_loss)]
+                    let deadline = now + (global_timeout_ms as f64) / 1000.0;
+                    ctx.context.global_deadline = Some(deadline);
+                }
+            }
+        }
         Ok(StepResult::continue_step())
     }
 }
@@ -301,7 +325,6 @@ impl Step for BuiltinApprovalGate {
             Some(d) if d.annotations.as_ref().is_some_and(|a| a.requires_approval) => d,
             _ => return Ok(StepResult::continue_step()),
         };
-        let _ = desc; // used only for the requires_approval check above
 
         // Phase B: check for _approval_token in inputs.
         let approval_result = if let Some(token) = ctx
@@ -334,13 +357,24 @@ impl Step for BuiltinApprovalGate {
             }
             handler.check_approval(&token_str).await?
         } else {
+            // Spec (A-D-203): ApprovalRequest MUST carry the resolved module's
+            // real annotations / description / tags so handlers can inspect
+            // them. Sourced from the registry's ModuleDescriptor (cross-language
+            // parity with apcore-python and apcore-typescript).
+            let annotations = desc.annotations.clone().unwrap_or_default();
+            let description = if desc.description.is_empty() {
+                None
+            } else {
+                Some(desc.description.clone())
+            };
+            let tags = desc.tags.clone();
             let request = crate::approval::ApprovalRequest {
                 module_id: ctx.module_id.clone(),
                 arguments: ctx.inputs.clone(),
                 context: Some(ctx.context.clone()),
-                annotations: crate::module::ModuleAnnotations::default(),
-                description: None,
-                tags: vec![],
+                annotations,
+                description,
+                tags,
             };
             handler.request_approval(&request).await?
         };
