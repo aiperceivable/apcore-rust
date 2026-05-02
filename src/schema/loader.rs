@@ -73,7 +73,11 @@ impl SchemaLoader {
     /// Resolution order:
     /// 1. If the schema was previously loaded in-memory via [`Self::load_from_value`] or
     ///    [`Self::load_from_file`], return it wrapped in a `SchemaDefinition`.
-    /// 2. Otherwise, attempt to load `<schemas_dir>/<module_id>.json` (then `.yaml`).
+    /// 2. Otherwise, attempt to load
+    ///    `<schemas_dir>/<module_id_path>.schema.yaml` (then `.schema.yml`,
+    ///    then `.schema.json`), where `module_id_path` is `module_id.replace('.', '/')`.
+    ///    Aligned with `apcore-python.SchemaLoader.load` (loader.py:62) and
+    ///    `apcore-typescript.SchemaLoader.load` (loader.ts:53). Sync SCHEMA-002.
     ///
     /// `schemas_dir` is the directory supplied to [`Self::with_config`], or the current working
     /// directory when none was provided.
@@ -89,11 +93,14 @@ impl SchemaLoader {
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // Try .json first, then .yaml/.yml
+        // Convert the dot-separated module ID to a directory path and append
+        // the canonical `.schema.yaml` (or `.schema.yml` / `.schema.json`)
+        // suffix per spec — matches Python and TypeScript loaders.
+        let module_path = module_id.replace('.', "/");
         let candidates = [
-            base.join(format!("{module_id}.json")),
-            base.join(format!("{module_id}.yaml")),
-            base.join(format!("{module_id}.yml")),
+            base.join(format!("{module_path}.schema.yaml")),
+            base.join(format!("{module_path}.schema.yml")),
+            base.join(format!("{module_path}.schema.json")),
         ];
 
         let mut last_err: Option<ModuleError> = None;

@@ -242,7 +242,8 @@ fn test_schema_loader_with_config_uses_modules_path_fallback() {
 #[test]
 fn test_schema_loader_load_from_json_file_via_load() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("my_module.json");
+    // Sync SCHEMA-002: filename is `<module_id>.schema.json`.
+    let path = dir.path().join("my_module.schema.json");
     let mut file = std::fs::File::create(&path).unwrap();
     write!(
         file,
@@ -288,7 +289,8 @@ fn test_schema_loader_load_missing_module_returns_error() {
 #[test]
 fn test_schema_loader_load_yaml_file_via_load() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("email_module.yaml");
+    // Sync SCHEMA-002: filename is `<module_id>.schema.yaml`.
+    let path = dir.path().join("email_module.schema.yaml");
     let mut file = std::fs::File::create(&path).unwrap();
     write!(
         file,
@@ -302,4 +304,49 @@ fn test_schema_loader_load_yaml_file_via_load() {
     let def = loader.load("email_module").unwrap();
     assert_eq!(def.module_id, "email_module");
     assert_eq!(def.description, "Send email");
+}
+
+/// Sync SCHEMA-002: a dotted module_id like `executor.email.send_email` must
+/// resolve to `<schemas_dir>/executor/email/send_email.schema.yaml`. Mirrors
+/// apcore-python loader.py:62 and apcore-typescript loader.ts:53.
+#[test]
+fn test_schema_loader_dotted_module_id_resolves_to_subdirectories() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("executor").join("email");
+    std::fs::create_dir_all(&nested).unwrap();
+    let path = nested.join("send_email.schema.yaml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        "module_id: executor.email.send_email\ndescription: Send email via SMTP\ninput_schema:\n  type: object\noutput_schema:\n  type: object\n"
+    )
+    .unwrap();
+    drop(file);
+
+    let config = Config::default();
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let def = loader
+        .load("executor.email.send_email")
+        .expect("dotted module_id must resolve to nested .schema.yaml file");
+    assert_eq!(def.module_id, "executor.email.send_email");
+    assert_eq!(def.description, "Send email via SMTP");
+}
+
+/// Sync SCHEMA-002: `.schema.yml` is a valid fallback after `.schema.yaml`.
+#[test]
+fn test_schema_loader_falls_back_to_schema_yml_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_mod.schema.yml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        "module_id: legacy_mod\ndescription: legacy\ninput_schema:\n  type: object\noutput_schema:\n  type: object\n"
+    )
+    .unwrap();
+    drop(file);
+
+    let config = Config::default();
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let def = loader.load("legacy_mod").unwrap();
+    assert_eq!(def.module_id, "legacy_mod");
 }
