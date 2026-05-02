@@ -461,3 +461,231 @@ fn test_subscriber_factory_operations() {
     let config = json!({ "type": "webhook", "url": "https://restored.com" });
     assert!(create_subscriber(&config).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// A-D-501: emit_spawn — fire-and-forget event dispatch
+// ---------------------------------------------------------------------------
+
+/// Subscriber that blocks until released by an external signal.
+#[derive(Debug)]
+struct BlockingSubscriber {
+    id: String,
+    barrier: Arc<tokio::sync::Notify>,
+    started: Arc<std::sync::atomic::AtomicBool>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl EventSubscriber for BlockingSubscriber {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+    fn event_pattern(&self) -> &'static str {
+        "*"
+    }
+    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.barrier.notified().await;
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_emit_spawn_returns_immediately() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let barrier = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+
+    let sub = BlockingSubscriber {
+        id: "block-1".into(),
+        barrier: Arc::clone(&barrier),
+        started: Arc::clone(&started),
+        finished: Arc::clone(&finished),
+    };
+
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(sub));
+
+    let event = ApCoreEvent::new("spawn.test", json!({}));
+
+    let t0 = std::time::Instant::now();
+    emitter.emit_spawn(event);
+    let elapsed = t0.elapsed();
+
+    // emit_spawn must not block on subscriber execution. Allow 250ms slack
+    // for CI scheduling jitter — the actual subscriber will block ~forever
+    // without the notify, so a non-spawn implementation would never return.
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "emit_spawn returned in {elapsed:?} — should be near-instant"
+    );
+
+    // Wait for subscriber to start running, then release it.
+    for _ in 0..50 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        started.load(Ordering::SeqCst),
+        "subscriber should have started"
+    );
+    barrier.notify_one();
+
+    for _ in 0..50 {
+        if finished.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "subscriber should have finished"
+    );
+}
+
+#[tokio::test]
+async fn test_emit_spawn_dispatches_subscribers_concurrently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Subscriber that sleeps a fixed duration, then increments a counter.
+    #[derive(Debug)]
+    struct SlowSub {
+        id: String,
+        sleep_ms: u64,
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl EventSubscriber for SlowSub {
+        fn subscriber_id(&self) -> &str {
+            &self.id
+        }
+        fn event_pattern(&self) -> &'static str {
+            "*"
+        }
+        async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut emitter = EventEmitter::new();
+    for i in 0..3 {
+        emitter.subscribe(Box::new(SlowSub {
+            id: format!("slow-{i}"),
+            sleep_ms: 100,
+            counter: Arc::clone(&counter),
+        }));
+    }
+
+    let event = ApCoreEvent::new("conc.test", json!({}));
+    let t0 = std::time::Instant::now();
+    emitter.emit_spawn(event);
+
+    // Wait until all 3 subscribers complete.
+    for _ in 0..50 {
+        if counter.load(Ordering::SeqCst) == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let elapsed = t0.elapsed();
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+    // Concurrent execution: total wall-clock should be closer to 100ms than
+    // 300ms (sequential). Allow 250ms ceiling for CI variance.
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "subscribers should run concurrently, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_emit_spawn_subscriber_error_does_not_propagate() {
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(FailingSubscriber {
+        id: "fail-1".into(),
+        pattern: "*".into(),
+    }));
+    let good = RecordingSubscriber::new("good-1", "*");
+    let received = good.received.clone();
+    emitter.subscribe(Box::new(good));
+
+    let event = ApCoreEvent::new("err.iso", json!({}));
+    emitter.emit_spawn(event);
+
+    // Wait for the good subscriber to receive.
+    for _ in 0..50 {
+        if !received.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &["err.iso".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A-D-502: shutdown — idempotent flush + drop post-shutdown
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_shutdown_is_idempotent() {
+    let mut emitter = EventEmitter::new();
+    emitter.shutdown(100).await.expect("first shutdown");
+    // Second call must succeed without error.
+    emitter
+        .shutdown(100)
+        .await
+        .expect("second shutdown idempotent");
+}
+
+#[tokio::test]
+async fn test_emit_spawn_after_shutdown_is_dropped() {
+    let sub = RecordingSubscriber::new("post-shutdown", "*");
+    let received = sub.received.clone();
+
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(sub));
+
+    emitter.shutdown(100).await.expect("shutdown");
+
+    let event = ApCoreEvent::new("dropped.event", json!({}));
+    emitter.emit_spawn(event);
+
+    // Give any spawned task a chance to run (it must not).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "events emitted after shutdown must be dropped"
+    );
+}
+
+#[tokio::test]
+async fn test_emit_async_after_shutdown_is_dropped() {
+    let sub = RecordingSubscriber::new("post-shutdown-async", "*");
+    let received = sub.received.clone();
+
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(sub));
+
+    emitter.shutdown(100).await.expect("shutdown");
+
+    let event = ApCoreEvent::new("dropped.async", json!({}));
+    emitter.emit(&event).await.expect("emit succeeds (no-op)");
+
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "async emit() after shutdown must drop the event"
+    );
+}

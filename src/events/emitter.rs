@@ -1,6 +1,9 @@
 // APCore Protocol — Event emitter
 // Spec reference: Event types and emission
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use super::subscribers::EventSubscriber;
@@ -48,10 +51,17 @@ impl ApCoreEvent {
 }
 
 /// Manages event subscribers and dispatches events.
+///
+/// Subscribers are stored as `Arc<dyn EventSubscriber>` so they can be
+/// cheaply cloned into spawned tasks for [`Self::emit_spawn`]'s
+/// fire-and-forget dispatch model (sync finding A-D-501).
 #[derive(Debug)]
 pub struct EventEmitter {
-    subscribers: Vec<Box<dyn EventSubscriber>>,
+    subscribers: Vec<Arc<dyn EventSubscriber>>,
     pub max_workers: usize,
+    /// Set to `true` by [`Self::shutdown`]. Once set, all `emit*` methods
+    /// drop incoming events as no-ops (sync finding A-D-502).
+    is_shutdown: Arc<AtomicBool>,
 }
 
 impl EventEmitter {
@@ -61,12 +71,15 @@ impl EventEmitter {
         Self {
             subscribers: vec![],
             max_workers: 4,
+            is_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Add a subscriber (matching Python's void return signature).
     pub fn subscribe(&mut self, subscriber: Box<dyn EventSubscriber>) {
-        self.subscribers.push(subscriber);
+        // Convert Box -> Arc so subscribers can be cloned into spawned
+        // tasks by `emit_spawn` (sync finding A-D-501).
+        self.subscribers.push(Arc::from(subscriber));
     }
 
     /// Remove the first subscriber whose `subscriber_id()` matches the given
@@ -106,7 +119,13 @@ impl EventEmitter {
     ///
     /// Errors from individual subscribers are logged but not propagated
     /// (error isolation), matching Python's behaviour.
+    ///
+    /// **Post-shutdown behaviour:** if [`Self::shutdown`] has been called,
+    /// this method returns immediately as a no-op (sync finding A-D-502).
     pub async fn emit(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
+        if self.is_shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         for subscriber in &self.subscribers {
             if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 if let Err(e) = subscriber.on_event(event).await {
@@ -124,11 +143,17 @@ impl EventEmitter {
 
     /// Emit an event to subscribers matching both the caller's filter pattern
     /// AND the subscriber's own `event_pattern`.
+    ///
+    /// **Post-shutdown behaviour:** drops the event as a no-op (sync
+    /// finding A-D-502).
     pub async fn emit_filtered(
         &self,
         event: &ApCoreEvent,
         pattern: &str,
     ) -> Result<(), ModuleError> {
+        if self.is_shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         for subscriber in &self.subscribers {
             if Self::matches_pattern(pattern, &event.event_type)
                 && Self::matches_pattern(subscriber.event_pattern(), &event.event_type)
@@ -153,6 +178,82 @@ impl EventEmitter {
     pub fn flush(&self, _timeout_ms: u64) -> Result<(), ModuleError> {
         // Synchronous dispatch model — nothing to flush.
         Ok(())
+    }
+
+    /// Fire-and-forget dispatch: spawns one `tokio::task` per matching
+    /// subscriber and returns immediately.
+    ///
+    /// Use this when the caller cannot wait for subscriber completion (the
+    /// canonical "fire-and-forget" path called out by the spec, sync finding
+    /// A-D-501). Errors from subscribers are logged via `tracing::warn!` and
+    /// never propagated. Subscribers run **concurrently** because each is
+    /// driven on its own task.
+    ///
+    /// `emit_spawn` is the preferred dispatch path for runtime modules
+    /// (system modules, circuit breaker, etc.); the sequential `emit` is
+    /// retained for tests that need deterministic ordering.
+    ///
+    /// **Post-shutdown behaviour:** drops the event as a no-op once
+    /// [`Self::shutdown`] has been called (sync finding A-D-502).
+    // Takes `event: ApCoreEvent` by value because each spawned task needs an
+    // owned `ApCoreEvent`; passing by reference would force the caller to
+    // clone, hiding the cost. The spec's pseudocode signature also
+    // matches by-value (sync finding A-D-501).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn emit_spawn(&self, event: ApCoreEvent) {
+        if self.is_shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        for subscriber in &self.subscribers {
+            if !Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+                continue;
+            }
+            let sub = Arc::clone(subscriber);
+            let evt = event.clone();
+            tokio::spawn(async move {
+                if let Err(e) = sub.on_event(&evt).await {
+                    tracing::warn!(
+                        subscriber_id = %sub.subscriber_id(),
+                        event_type = %evt.event_type,
+                        error = %e,
+                        "emit_spawn: subscriber on_event failed"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Mark this emitter as shut down and flush any pending work.
+    ///
+    /// After `shutdown` returns:
+    /// - Subsequent calls to `emit`, `emit_filtered`, and `emit_spawn` are
+    ///   no-ops — the event is dropped.
+    /// - Subsequent calls to `shutdown` return `Ok(())` immediately
+    ///   (idempotent).
+    ///
+    /// `timeout_ms` bounds the wait for any in-flight flush. The current
+    /// implementation dispatches events synchronously / via spawned tasks
+    /// that the emitter does not own, so flush is a no-op pass-through —
+    /// the parameter is reserved for future buffering implementations and
+    /// kept for API parity with apcore-python and apcore-typescript
+    /// (sync finding A-D-502).
+    ///
+    /// `async fn` is preserved for cross-language API parity even though
+    /// the current body has no `.await` points; future buffered/spawned
+    /// implementations will need to await flush completion.
+    #[allow(clippy::unused_async)]
+    pub async fn shutdown(&mut self, timeout_ms: u64) -> Result<(), ModuleError> {
+        if self.is_shutdown.swap(true, Ordering::SeqCst) {
+            // Already shut down — idempotent.
+            return Ok(());
+        }
+        self.flush(timeout_ms)
+    }
+
+    /// Returns `true` if this emitter has been shut down.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(Ordering::SeqCst)
     }
 
     /// Simple glob-style pattern matching with `*` wildcard.
