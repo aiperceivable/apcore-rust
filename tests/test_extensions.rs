@@ -276,6 +276,51 @@ fn test_apply_wires_multiple_middleware() {
 }
 
 // ---------------------------------------------------------------------------
+// Sync EXT-003 — CompositeExporter wiring for N>=2 span exporters
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_composite_exporter_fans_out_spans_to_all_wrapped_exporters() {
+    use apcore::observability::span::{Span, SpanExporter};
+    use apcore::observability::{CompositeExporter, InMemoryExporter};
+
+    let a = InMemoryExporter::new();
+    let b = InMemoryExporter::new();
+    let composite = CompositeExporter::new(vec![Box::new(a.clone()), Box::new(b.clone())]);
+    let span = Span::new("test.span", "trace");
+    composite.export(&span).await.unwrap();
+    assert_eq!(a.get_spans().len(), 1, "first exporter must receive span");
+    assert_eq!(b.get_spans().len(), 1, "second exporter must receive span");
+}
+
+#[test]
+fn test_apply_wires_two_span_exporters_via_composite() {
+    use apcore::observability::InMemoryExporter;
+
+    let mut mgr = ExtensionManager::new();
+    mgr.register(
+        "span_exporter",
+        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+    )
+    .unwrap();
+    mgr.register(
+        "span_exporter",
+        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+    )
+    .unwrap();
+    assert_eq!(mgr.count("span_exporter"), Some(2));
+
+    let registry = Arc::new(Registry::new());
+    let config = Arc::new(apcore::Config::default());
+    let mut executor = Executor::new(Arc::clone(&registry), config);
+
+    // Apply must wire both exporters via a CompositeExporter rather than
+    // silently dropping the second one.
+    mgr.apply(&registry, &mut executor)
+        .expect("apply should succeed with two span_exporters");
+}
+
+// ---------------------------------------------------------------------------
 // Debug output
 // ---------------------------------------------------------------------------
 

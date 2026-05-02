@@ -16,7 +16,7 @@ pub mod usage;
 pub use error_history::{
     compute_fingerprint, normalize_message, ErrorEntry, ErrorHistory, ErrorHistoryMiddleware,
 };
-pub use exporters::{InMemoryExporter, OTLPExporter, StdoutExporter};
+pub use exporters::{CompositeExporter, InMemoryExporter, OTLPExporter, StdoutExporter};
 pub use logging::{ContextLogger, ObsLoggingMiddleware};
 pub use metrics::{MetricsCollector, MetricsMiddleware};
 pub use processor::{

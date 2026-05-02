@@ -367,15 +367,16 @@ impl ExtensionManager {
             .collect();
 
         if !exporters.is_empty() {
-            if exporters.len() > 1 {
-                tracing::warn!(
-                    "[apcore:extensions] {} span_exporters registered; \
-                     only the first will be wired (composite exporter not yet supported)",
-                    exporters.len()
-                );
-            }
-            let exporter = exporters.into_iter().next().unwrap();
-            executor.use_middleware(Box::new(TracingMiddleware::new(exporter)))?;
+            // Sync EXT-003: when N >= 2 exporters are registered, wrap them in
+            // a CompositeExporter so each span fans out to every exporter with
+            // per-exporter error isolation. Mirrors apcore-python's
+            // `_CompositeExporter` (extensions.py:27-38).
+            let combined: Box<dyn SpanExporter> = if exporters.len() == 1 {
+                exporters.into_iter().next().unwrap()
+            } else {
+                Box::new(crate::observability::CompositeExporter::new(exporters))
+            };
+            executor.use_middleware(Box::new(TracingMiddleware::new(combined)))?;
         }
 
         Ok(())

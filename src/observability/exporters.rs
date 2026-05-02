@@ -195,3 +195,73 @@ impl SpanExporter for OTLPExporter {
         Ok(())
     }
 }
+
+/// Composite span exporter that fan-outs each span to multiple wrapped
+/// exporters with per-exporter error isolation. A failure in one wrapped
+/// exporter is logged and the remaining exporters still receive the span,
+/// matching apcore-python's `_CompositeExporter` (extensions.py:27-38).
+///
+/// Sync EXT-003: when ≥2 span exporters are registered via the
+/// `ExtensionManager`, they are wrapped in this struct so all of them are
+/// invoked instead of silently dropping the trailing entries.
+pub struct CompositeExporter {
+    inner: Vec<Box<dyn SpanExporter>>,
+}
+
+impl std::fmt::Debug for CompositeExporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompositeExporter")
+            .field("count", &self.inner.len())
+            .finish()
+    }
+}
+
+impl CompositeExporter {
+    /// Wrap N span exporters into a single composite exporter that forwards
+    /// each span to all of them.
+    #[must_use]
+    pub fn new(inner: Vec<Box<dyn SpanExporter>>) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the number of wrapped exporters.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns true if the composite has no wrapped exporters.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+#[async_trait]
+impl SpanExporter for CompositeExporter {
+    async fn export(&self, span: &Span) -> Result<(), ModuleError> {
+        for (idx, exporter) in self.inner.iter().enumerate() {
+            if let Err(e) = exporter.export(span).await {
+                tracing::warn!(
+                    exporter_index = idx,
+                    error = %e.message,
+                    "CompositeExporter: wrapped exporter failed; continuing with remaining exporters"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), ModuleError> {
+        for (idx, exporter) in self.inner.iter().enumerate() {
+            if let Err(e) = exporter.shutdown().await {
+                tracing::warn!(
+                    exporter_index = idx,
+                    error = %e.message,
+                    "CompositeExporter: wrapped exporter shutdown failed"
+                );
+            }
+        }
+        Ok(())
+    }
+}
