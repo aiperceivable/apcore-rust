@@ -1262,3 +1262,52 @@ async fn safe_unregister_waits_for_acquire_drain() {
         "safe_unregister returned Ok(true) after clean drain"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sorted list contract (sync A-D-103)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_list_returns_sorted_unique_ids() {
+    // Spec: Registry.list() must return sorted, unique IDs for cross-language
+    // parity with apcore-python and apcore-typescript (sync A-D-103).
+    let registry = Registry::new();
+    let names = ["zeta.module", "alpha.module", "mike.module", "beta.module"];
+    for n in names {
+        let descriptor = make_descriptor(n);
+        registry
+            .register_internal(n, Box::new(StubModule), descriptor)
+            .expect("registration should succeed");
+    }
+
+    let listed = registry.list(None, None);
+    let mut expected: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "Registry::list() must return module IDs in sorted order"
+    );
+}
+
+#[test]
+fn test_list_with_prefix_returns_sorted() {
+    let registry = Registry::new();
+    let names = ["math.zeta", "math.alpha", "other.gamma", "math.beta"];
+    for n in names {
+        let descriptor = make_descriptor(n);
+        registry
+            .register_internal(n, Box::new(StubModule), descriptor)
+            .expect("registration should succeed");
+    }
+
+    let listed = registry.list(None, Some("math."));
+    let expected: Vec<String> = vec![
+        "math.alpha".to_string(),
+        "math.beta".to_string(),
+        "math.zeta".to_string(),
+    ];
+    assert_eq!(
+        listed, expected,
+        "Registry::list(prefix) must return sorted IDs"
+    );
+}

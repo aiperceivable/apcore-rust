@@ -592,7 +592,8 @@ impl Registry {
     /// Returns owned `String` values because the storage is behind a lock.
     pub fn list(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<String> {
         let core = self.core.read();
-        core.modules
+        let mut result: Vec<String> = core
+            .modules
             .keys()
             .filter(|name| {
                 if let Some(pfx) = prefix {
@@ -616,7 +617,11 @@ impl Registry {
                 true
             })
             .cloned()
-            .collect()
+            .collect();
+        // Spec: list() MUST return sorted, unique IDs for cross-language parity
+        // with apcore-python and apcore-typescript (sync finding A-D-103).
+        result.sort();
+        result
     }
 
     /// Check if a module is registered.
