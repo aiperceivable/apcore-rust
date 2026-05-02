@@ -11,7 +11,6 @@
 use std::time::{Duration, Instant};
 
 use apcore::context::Context;
-use apcore::errors::ErrorCode;
 use apcore::module::Module;
 use apcore::{APCore, ChunkStream, ModuleError};
 use async_stream::stream;
@@ -159,8 +158,11 @@ async fn all_chunks_arrive_in_order() {
     }
 }
 
+/// Sync STREAM-002: a module that does NOT override `stream()` must fall back
+/// to `execute()` and yield its result as a single chunk. Mirrors apcore-python
+/// (executor.py:862-865) and apcore-typescript (executor.ts:519-522).
 #[tokio::test]
-async fn streaming_not_supported_yields_error() {
+async fn streaming_falls_back_to_execute_when_module_does_not_support_streaming() {
     let apcore = APCore::new();
     apcore
         .register("plain.mod", Box::new(NonStreamingModule))
@@ -170,11 +172,70 @@ async fn streaming_not_supported_yields_error() {
     let first = s
         .next()
         .await
-        .expect("stream should yield a single error item");
-    let err = first.expect_err("non-streaming modules must surface an error");
-    assert_eq!(err.code, ErrorCode::GeneralNotImplemented);
-    // No further items should be produced after the error.
+        .expect("stream should yield exactly one chunk equal to execute()'s output");
+    let chunk = first.expect("fallback path must succeed");
+    assert_eq!(chunk, json!({"ok": true}));
+    // No further items should be produced after the single execute() chunk.
     assert!(s.next().await.is_none());
+}
+
+/// Sync STREAM-003: streaming must enforce `Context::global_deadline` between
+/// chunks. A slow stream that exceeds the deadline yields a `ModuleTimeout`
+/// error and stops yielding further chunks.
+#[tokio::test]
+async fn streaming_global_deadline_aborts_between_chunks() {
+    use apcore::context::Identity;
+
+    let apcore = APCore::new();
+    apcore
+        .register("slow.stream", Box::new(SlowStreamingModule))
+        .unwrap();
+
+    // Set a global_deadline 150ms from now. SlowStreamingModule yields one
+    // chunk every 100ms, so after the second chunk the deadline is past.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let mut ctx = Context::<Value>::new(Identity::new(
+        "@external".to_string(),
+        "external".to_string(),
+        vec![],
+        std::collections::HashMap::new(),
+    ));
+    // Set caller_id so BuiltinContextCreation does not replace this context
+    // (it clobbers user-supplied contexts whose caller_id is None).
+    ctx.caller_id = Some("@external".to_string());
+    ctx.global_deadline = Some(now_secs + 0.15);
+
+    let mut s = apcore
+        .executor()
+        .stream("slow.stream", json!({}), Some(&ctx), None);
+
+    let mut ok_count = 0usize;
+    let mut got_timeout = false;
+    while let Some(item) = s.next().await {
+        match item {
+            Ok(_) => ok_count += 1,
+            Err(e) => {
+                assert_eq!(
+                    e.code,
+                    apcore::errors::ErrorCode::ModuleTimeout,
+                    "deadline-exceeded error must be ModuleTimeout"
+                );
+                got_timeout = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        got_timeout,
+        "stream must surface a ModuleTimeout once the global deadline elapses"
+    );
+    assert!(
+        ok_count < 5,
+        "stream must abort before all 5 chunks are delivered (saw {ok_count})"
+    );
 }
 
 #[tokio::test]

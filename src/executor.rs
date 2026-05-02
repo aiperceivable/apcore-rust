@@ -32,7 +32,9 @@ use crate::utils::propagate_module_error;
 
 /// Maximum nesting depth for deep_merge_value to prevent stack overflow on
 /// adversarial or pathological inputs.
-const DEEP_MERGE_MAX_DEPTH: usize = 64;
+///
+/// Aligned with apcore-python and apcore-typescript (32) per spec (sync STREAM-001).
+const DEEP_MERGE_MAX_DEPTH: usize = 32;
 
 /// Deep-merge a list of JSON Value chunks into a single accumulated Value.
 ///
@@ -148,15 +150,6 @@ struct StreamSetup {
     context: Context<Value>,
     output_schema: Value,
     middleware_manager: Option<Arc<MiddlewareManager>>,
-}
-
-/// Build a `ModuleError` for the case where a module does not implement
-/// `stream()` (returns `None`).
-fn streaming_not_supported_error(module_id: &str) -> ModuleError {
-    ModuleError::new(
-        ErrorCode::GeneralNotImplemented,
-        format!("Module '{module_id}' does not support streaming (Module::stream returned None)"),
-    )
 }
 
 /// Validate a JSON value against a JSON Schema.
@@ -787,17 +780,45 @@ impl Executor {
             // Note: individual chunks are NOT validated against output_schema here;
             // validation runs on the deep-merged result in Phase 3 after the stream
             // is exhausted. See Module::stream contract for details.
-            let Some(mut inner) = setup.module.stream(setup.inputs.clone(), &setup.context) else {
-                Err(streaming_not_supported_error(&module_id_owned))?;
-                // Unreachable: the `?` above always returns from the block.
-                return;
-            };
-
+            //
+            // Fallback (sync STREAM-002): if Module::stream returns None, fall back
+            // to Module::execute() and yield the result as a single chunk.
+            // Mirrors apcore-python/src/apcore/executor.py:862-865 and
+            // apcore-typescript/src/executor.ts:519-522.
+            let stream_handle = setup.module.stream(setup.inputs.clone(), &setup.context);
             let mut accumulated: Vec<Value> = Vec::new();
-            while let Some(chunk_result) = inner.next().await {
-                let chunk = chunk_result?;
-                accumulated.push(chunk.clone());
-                yield chunk;
+
+            if let Some(mut inner) = stream_handle {
+                while let Some(chunk_result) = inner.next().await {
+                    // STREAM-003 (sync): enforce global_deadline between chunks.
+                    if let Some(deadline) = setup.context.global_deadline {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+                        if now >= deadline {
+                            Err(ModuleError::new(
+                                ErrorCode::ModuleTimeout,
+                                format!(
+                                    "Module '{module_id_owned}' streaming aborted: global deadline exceeded"
+                                ),
+                            ))?;
+                            return;
+                        }
+                    }
+                    let chunk = chunk_result?;
+                    accumulated.push(chunk.clone());
+                    yield chunk;
+                }
+            } else {
+                // Fallback: module doesn't support streaming. Run execute() and
+                // yield its result as a single chunk.
+                let output = setup
+                    .module
+                    .execute(setup.inputs.clone(), &setup.context)
+                    .await?;
+                accumulated.push(output.clone());
+                yield output;
             }
 
             // Phase 3: post-stream validation + middleware_after on the merged
@@ -1239,6 +1260,49 @@ mod tests {
             .register("test_mod", Box::new(module), descriptor)
             .unwrap();
         Executor::new(registry, Config::default())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // deep_merge depth cap (sync STREAM-001)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Build a chain of N nested objects: {"a": {"a": {"a": {... value}}}}.
+    fn build_nested(depth: usize, leaf_key: &str, leaf_val: &serde_json::Value) -> Value {
+        let mut current = serde_json::json!({ leaf_key: leaf_val });
+        for _ in 0..depth {
+            current = serde_json::json!({ "a": current });
+        }
+        current
+    }
+
+    #[test]
+    fn test_deep_merge_depth_cap_is_32_aligned_with_python_typescript() {
+        // Confirm constant value matches spec (sync STREAM-001).
+        assert_eq!(DEEP_MERGE_MAX_DEPTH, 32);
+    }
+
+    #[test]
+    fn test_deep_merge_caps_recursion_at_max_depth() {
+        // Two chunks, each 33 levels deep, with conflicting leaves. Once the
+        // merge crosses DEEP_MERGE_MAX_DEPTH (32), the second chunk's value
+        // replaces the first wholesale instead of recursing further. This
+        // guarantees no stack overflow on adversarial inputs.
+        let chunk_a = build_nested(33, "x", &serde_json::json!(1));
+        let chunk_b = build_nested(33, "y", &serde_json::json!(2));
+        // Should not stack-overflow; the deeper merge replaces rather than recurses.
+        let merged = deep_merge_chunks(&[chunk_a, chunk_b]);
+        // Walking 32 levels of "a" should still yield an object (the cap node).
+        let mut cursor = &merged;
+        for _ in 0..32 {
+            cursor = cursor.get("a").expect("nested 'a' should exist within cap");
+        }
+        // At/above the cap, the second chunk replaces the first verbatim, so
+        // the leaf key from chunk_b dominates.
+        let inner_str = cursor.to_string();
+        assert!(
+            inner_str.contains("\"y\""),
+            "at depth >= cap, the later chunk should fully replace the earlier one; got {inner_str}"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════
