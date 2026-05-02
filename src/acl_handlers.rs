@@ -105,12 +105,21 @@ impl ACLConditionHandler for RolesHandler {
 }
 
 /// Check call chain length does not exceed threshold.
+///
+/// Accepts both the bare-integer form `max_call_depth: 5` and the dict form
+/// `max_call_depth: { lte: 5 }`, mirroring apcore-python and apcore-typescript
+/// (sync finding A-D-024). Other forms are rejected (fail-closed) per spec.
 pub struct MaxCallDepthHandler;
 
 #[async_trait]
 impl ACLConditionHandler for MaxCallDepthHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
-        match value.as_u64() {
+        let threshold = match value {
+            Value::Number(n) => n.as_u64(),
+            Value::Object(map) => map.get("lte").and_then(|v| v.as_u64()),
+            _ => None,
+        };
+        match threshold {
             Some(max) => (ctx.call_chain.len() as u64) <= max,
             None => false,
         }

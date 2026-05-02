@@ -92,23 +92,31 @@ impl RefResolver {
                         seen.insert(ref_str.to_string());
 
                         let resolved = self.lookup_ref(ref_str, root)?;
+                        // Sync finding A-D-028: increment `depth` ONLY when
+                        // following a $ref (this is the recursion the spec's
+                        // max_depth=32 cap targets). Apcore-python and
+                        // apcore-typescript also bump depth only on $ref
+                        // dereferencing — Rust previously incremented on every
+                        // child object/array element, so a flat 33-property
+                        // schema with no $refs threw SCHEMA_MAX_DEPTH_EXCEEDED.
                         let result = self.resolve_inner(&resolved, root, seen, depth + 1)?;
                         seen.remove(ref_str);
                         return Ok(result);
                     }
                 }
 
-                // Otherwise walk all children
+                // Otherwise walk all children — same `depth`. Tree traversal
+                // through map/array children does not consume the $ref budget.
                 let mut new_map = serde_json::Map::new();
                 for (k, v) in map {
-                    new_map.insert(k.clone(), self.resolve_inner(v, root, seen, depth + 1)?);
+                    new_map.insert(k.clone(), self.resolve_inner(v, root, seen, depth)?);
                 }
                 Ok(serde_json::Value::Object(new_map))
             }
             serde_json::Value::Array(arr) => {
                 let resolved: Result<Vec<_>, _> = arr
                     .iter()
-                    .map(|v| self.resolve_inner(v, root, seen, depth + 1))
+                    .map(|v| self.resolve_inner(v, root, seen, depth))
                     .collect();
                 Ok(serde_json::Value::Array(resolved?))
             }

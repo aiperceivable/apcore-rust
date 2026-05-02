@@ -253,6 +253,29 @@ fn test_bind_unknown_namespace_returns_error() {
     assert_eq!(result.unwrap_err().code, ErrorCode::ConfigBindError);
 }
 
+// Regression: sync finding A-D-018 — bind() on a missing namespace must
+// silently bind into an empty object (so `T`'s serde defaults take effect),
+// matching apcore-python's `_instantiate_model(model, {}, namespace)` and
+// apcore-typescript's `new schema({})`. Previously Rust returned
+// ConfigBindError("namespace not found"), breaking portable code that
+// relied on default-fill behavior.
+#[derive(Debug, Deserialize, PartialEq, Default)]
+struct AllDefaultsConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    max_workers: u32,
+}
+
+#[test]
+fn test_bind_missing_namespace_uses_empty_object_for_serde_defaults() {
+    let config = Config::from_defaults();
+    let result: AllDefaultsConfig = config
+        .bind("totally_unknown_ns_with_defaults")
+        .expect("bind into all-default struct must succeed when namespace is missing");
+    assert_eq!(result, AllDefaultsConfig::default());
+}
+
 #[test]
 fn test_get_typed_returns_value() {
     let mut config = Config::from_defaults();

@@ -22,6 +22,47 @@ pub fn to_strict_schema(schema: &Value) -> Value {
     result
 }
 
+/// Replace `description` with `x-llm-description` (when present) at every
+/// node in the schema tree. Returns a deep clone with the substitution
+/// applied; the original schema is unmodified.
+///
+/// Sync finding A-D-030: spec §schema-system says adapters SHOULD prefer
+/// `x-llm-description` over `description` when exporting. apcore-python's
+/// `_apply_llm_descriptions` and apcore-typescript's `applyLlmDescriptions`
+/// both run this substitution before `to_strict_schema` / `strip_extensions`
+/// in the OpenAI/Anthropic export paths so the LLM-tuned description
+/// survives the strip. Rust previously had no equivalent step — the x-*
+/// keys were silently dropped without copy-down.
+#[must_use]
+pub fn apply_llm_descriptions(schema: &Value) -> Value {
+    let mut result = schema.clone();
+    apply_llm_descriptions_in_place(&mut result);
+    result
+}
+
+fn apply_llm_descriptions_in_place(node: &mut Value) {
+    if let Some(obj) = node.as_object_mut() {
+        // Both keys present: substitute description with x-llm-description.
+        // (Apcore-python parity — Python requires both to be present;
+        // apcore-typescript injects description even if absent. We follow
+        // Python's stricter rule to avoid silently fabricating descriptions
+        // that the spec did not declare.)
+        if obj.contains_key("description") && obj.contains_key("x-llm-description") {
+            if let Some(llm_desc) = obj.get("x-llm-description").cloned() {
+                obj.insert("description".to_string(), llm_desc);
+            }
+        }
+        // Recurse into all nested values.
+        for (_, v) in obj.iter_mut() {
+            apply_llm_descriptions_in_place(v);
+        }
+    } else if let Some(arr) = node.as_array_mut() {
+        for v in arr.iter_mut() {
+            apply_llm_descriptions_in_place(v);
+        }
+    }
+}
+
 /// Remove all `x-*` keys and `default` keys recursively. Mutates in place.
 fn strip_extensions(node: &mut Value) {
     let Some(obj) = node.as_object_mut() else {

@@ -146,6 +146,39 @@ async fn test_max_call_depth_exceeds_limit() {
     assert!(!handler.evaluate(&json!(3), &ctx).await);
 }
 
+// Regression: sync finding A-D-024 — `max_call_depth` MUST accept the dict
+// form `{"lte": N}` for cross-language parity with apcore-python and
+// apcore-typescript. Previously Rust accepted only the bare integer form
+// and silently fail-closed on the dict form.
+#[tokio::test]
+async fn test_max_call_depth_accepts_lte_dict_within_limit() {
+    let handler = MaxCallDepthHandler;
+    let ctx = make_context("user", vec![], vec!["a".to_string(), "b".to_string()]);
+    assert!(handler.evaluate(&json!({"lte": 5}), &ctx).await);
+}
+
+#[tokio::test]
+async fn test_max_call_depth_accepts_lte_dict_exceeds_limit() {
+    let handler = MaxCallDepthHandler;
+    let ctx = make_context(
+        "user",
+        vec![],
+        vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
+    );
+    assert!(!handler.evaluate(&json!({"lte": 3}), &ctx).await);
+}
+
+#[tokio::test]
+async fn test_max_call_depth_rejects_unrecognized_form() {
+    // Other dict shapes (e.g. {"max": N}, {"gte": N}) are NOT spec-supported
+    // and remain fail-closed. Only the {"lte": N} form is honored.
+    let handler = MaxCallDepthHandler;
+    let ctx = make_context("user", vec![], vec!["a".to_string()]);
+    assert!(!handler.evaluate(&json!({"max": 5}), &ctx).await);
+    assert!(!handler.evaluate(&json!("string-value"), &ctx).await);
+    assert!(!handler.evaluate(&json!(null), &ctx).await);
+}
+
 // ---------------------------------------------------------------------------
 // Compound Handlers (via full check)
 // ---------------------------------------------------------------------------

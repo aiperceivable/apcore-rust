@@ -151,6 +151,26 @@ pub struct MetricsConfig {
 /// **v0.18.0 BREAKING CHANGE.** Prior versions accepted root-level
 /// `max_call_depth`, `default_timeout_ms`, etc. The custom `Deserialize` impl
 /// now rejects these with a hard error pointing at `MIGRATION-v0.18.md`.
+/// **Note (sync finding A-D-016).** Apcore-python and apcore-typescript
+/// register the built-in `observability` and `sys_modules` namespaces at
+/// module-load time, so every code path observes them. Rust has no cheap
+/// equivalent (no implicit module-init hook without the `ctor` crate), so
+/// the SDK uses an idempotent `OnceLock`-guarded `init_builtin_namespaces()`
+/// that runs from the user-facing entry points: `Config::from_yaml_file`,
+/// `Config::from_json_file`, `Config::from_defaults`, and
+/// `Config::load_or_discover`.
+///
+/// `Config::default()` (`#[derive(Default)]`) is the low-level constructor
+/// and intentionally does NOT trigger initialization — it is meant for
+/// internal/test code that wants a bare struct without touching the
+/// process-global namespace registry. **User code should call
+/// `Config::from_defaults()` for canonical defaults**, which mirrors Python
+/// and TypeScript behavior. Calling either `from_yaml_file`/`from_json_file`
+/// also initializes the built-ins.
+///
+/// This is a documented Rust-specific divergence rather than a behavioral
+/// bug; cross-language conformance fixtures rely on `from_yaml_file` /
+/// `from_defaults` and therefore see consistent behavior.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,6 +320,23 @@ impl Config {
                 // Default to YAML
                 Self::from_yaml_file(path)
             }
+        }
+    }
+
+    /// No-arg load: discover the config file via the canonical search order
+    /// and load it, falling back to `Config::from_defaults()` if none is
+    /// found. Equivalent to apcore-python's `Config.load(path=None)` and
+    /// apcore-typescript's `Config.discover()`.
+    ///
+    /// Sync finding A-D-013: spec contract is `Config.load(path?)`. Rust
+    /// previously required a path on `load()` and exposed `discover()` as a
+    /// separate method. This helper restores no-arg load parity for portable
+    /// cross-language code without changing the strict-typed `load(&Path)`
+    /// signature for callers that already know the path.
+    pub fn load_or_discover() -> Result<Self, ModuleError> {
+        match discover_config_file() {
+            Some(path) => Self::load(&path),
+            None => Ok(Self::from_defaults()),
         }
     }
 
@@ -646,10 +683,20 @@ impl Config {
             _ => {}
         }
 
-        let value = self
-            .user_namespaces
-            .get(namespace)
-            .ok_or_else(|| ModuleError::config_bind_error(namespace, "namespace not found"))?;
+        // Sync finding A-D-018: when the namespace has no data registered,
+        // bind into an empty object so `T`'s serde defaults take effect —
+        // matching apcore-python's `_instantiate_model(model, {}, namespace)`
+        // and apcore-typescript's `new schema({})`. Previously Rust returned
+        // ConfigBindError("namespace not found"), which broke portable code
+        // that relied on default-fill behavior across SDKs.
+        let owned;
+        let value: &serde_json::Value = match self.user_namespaces.get(namespace) {
+            Some(v) => v,
+            None => {
+                owned = serde_json::Value::Object(serde_json::Map::new());
+                &owned
+            }
+        };
         serde_json::from_value(value.clone())
             .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
     }

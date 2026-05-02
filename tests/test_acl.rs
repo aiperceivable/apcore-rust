@@ -403,6 +403,40 @@ fn test_acl_load_propagates_invalid_default_effect_as_result() {
     );
 }
 
+// Regression: sync finding A-D-022 — structural ACL parse/validation
+// errors carry `ErrorCode::ACLRuleError` per spec contract (apcore-python
+// and apcore-typescript both raise `ACLRuleError`). Previously Rust used
+// `ErrorCode::ConfigInvalid`, which broke cross-language fixtures
+// asserting on the error code.
+#[test]
+fn test_acl_load_uses_acl_rule_error_for_parse_failures() {
+    use apcore::errors::ErrorCode;
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    // Malformed YAML: stray colon in a scalar context
+    writeln!(tmp, "rules: : :\n").expect("write tempfile");
+    let path = tmp.path().to_str().expect("utf8 path").to_string();
+    let err = ACL::load(&path).expect_err("load must error on malformed YAML");
+    assert_eq!(
+        err.code,
+        ErrorCode::ACLRuleError,
+        "structural ACL parse errors must surface as ACLRuleError, got {:?}",
+        err.code
+    );
+}
+
+#[test]
+fn test_acl_load_uses_acl_rule_error_for_missing_rules_key() {
+    use apcore::errors::ErrorCode;
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    // Valid YAML but no `rules` key.
+    writeln!(tmp, "default_effect: deny\n").expect("write tempfile");
+    let path = tmp.path().to_str().expect("utf8 path").to_string();
+    let err = ACL::load(&path).expect_err("load must error on missing rules key");
+    assert_eq!(err.code, ErrorCode::ACLRuleError);
+}
+
 // ---------------------------------------------------------------------------
 // A-D-303: ACL::reload doesn't deadlock (borrow scope released before file IO)
 // ---------------------------------------------------------------------------

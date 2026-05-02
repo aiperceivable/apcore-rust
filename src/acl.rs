@@ -319,9 +319,14 @@ impl ACL {
             )
         })?;
 
+        // Sync finding A-D-022: structural ACL parse/validation errors carry
+        // `ErrorCode::ACLRuleError` per spec contract — apcore-python and
+        // apcore-typescript both raise `ACLRuleError`. Previously Rust used
+        // `ErrorCode::ConfigInvalid`, which broke cross-language fixtures
+        // asserting on the error code.
         let raw: serde_json::Value = serde_yaml::from_str(&content).map_err(|e| {
             ModuleError::new(
-                ErrorCode::ConfigInvalid,
+                ErrorCode::ACLRuleError,
                 format!("Failed to parse ACL file '{path}': {e}"),
             )
         })?;
@@ -329,14 +334,14 @@ impl ACL {
         // Expect top-level "rules" key.
         let rules_val = raw.get("rules").ok_or_else(|| {
             ModuleError::new(
-                ErrorCode::ConfigInvalid,
+                ErrorCode::ACLRuleError,
                 format!("ACL file '{path}' missing 'rules' key"),
             )
         })?;
 
         let rules: Vec<ACLRule> = serde_json::from_value(rules_val.clone()).map_err(|e| {
             ModuleError::new(
-                ErrorCode::ConfigInvalid,
+                ErrorCode::ACLRuleError,
                 format!("Invalid ACL rules in '{path}': {e}"),
             )
         })?;
@@ -351,7 +356,7 @@ impl ACL {
         // — YAML errors must not crash the host process (sync finding A-D-302).
         let mut acl = Self::try_new(rules, default_effect, None).map_err(|e| {
             ModuleError::new(
-                ErrorCode::ConfigInvalid,
+                ErrorCode::ACLRuleError,
                 format!("Invalid ACL config in '{path}': {}", e.message),
             )
         })?;

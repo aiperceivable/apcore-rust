@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::strict::to_strict_schema;
+use super::strict::{apply_llm_descriptions, to_strict_schema};
 use super::SchemaDefinition;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::module::{ModuleAnnotations, ModuleExample};
@@ -165,7 +165,13 @@ impl SchemaExporter {
     ) -> serde_json::Value {
         let resolved_name =
             name.map_or_else(|| schema_def.module_id.replace('.', "_"), str::to_string);
-        let strict_parameters = to_strict_schema(&schema_def.input_schema);
+        // Sync finding A-D-030: substitute `description` with
+        // `x-llm-description` at every node BEFORE strict-mode strips x-*
+        // keys, so the LLM-tuned descriptions survive the export. Mirrors
+        // apcore-python's `_apply_llm_descriptions` and apcore-typescript's
+        // `applyLlmDescriptions`.
+        let with_llm = apply_llm_descriptions(&schema_def.input_schema);
+        let strict_parameters = to_strict_schema(&with_llm);
         serde_json::json!({
             "type": "function",
             "function": {
@@ -184,10 +190,13 @@ impl SchemaExporter {
     ) -> serde_json::Value {
         let resolved_name =
             name.map_or_else(|| schema_def.module_id.replace('.', "_"), str::to_string);
+        // A-D-030: substitute description with x-llm-description before
+        // emitting the input_schema so Anthropic sees the LLM-tuned text.
+        let input_schema_with_llm = apply_llm_descriptions(&schema_def.input_schema);
         let mut envelope = serde_json::json!({
             "name": resolved_name,
             "description": schema_def.description,
-            "input_schema": schema_def.input_schema,
+            "input_schema": input_schema_with_llm,
         });
         if let Some(exs) = examples {
             if !exs.is_empty() {
