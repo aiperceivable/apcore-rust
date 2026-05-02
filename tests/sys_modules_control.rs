@@ -10,7 +10,7 @@ use apcore::events::emitter::EventEmitter;
 use apcore::executor::Executor;
 use apcore::module::{Module, ModuleAnnotations};
 use apcore::registry::registry::{ModuleDescriptor, Registry};
-use apcore::sys_modules::control::ToggleFeatureModule;
+use apcore::sys_modules::control::{ReloadModule, ToggleFeatureModule};
 use apcore::sys_modules::{
     check_module_disabled, is_module_disabled, register_sys_modules, ToggleState,
 };
@@ -365,4 +365,101 @@ fn test_register_sys_modules_registers_control_modules_into_caller_registry() {
         registry.has("system.control.toggle_feature"),
         "toggle_feature should be in caller's registry"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sync SM-006 — ReloadModule full discover pipeline
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_reload_module_captures_actual_previous_version_from_descriptor() {
+    use apcore::events::emitter::EventEmitter;
+
+    struct Demo;
+    #[async_trait::async_trait]
+    impl Module for Demo {
+        fn description(&self) -> &'static str {
+            "demo"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn output_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _i: serde_json::Value,
+            _c: &Context<serde_json::Value>,
+        ) -> Result<serde_json::Value, apcore::errors::ModuleError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    let registry = Arc::new(Registry::new());
+    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+
+    // Register a dummy module with a non-default version. The descriptor's
+    // version field is what reload_module should capture as previous_version.
+    let descriptor = ModuleDescriptor {
+        module_id: "demo.mod".to_string(),
+        name: None,
+        description: String::new(),
+        documentation: None,
+        input_schema: serde_json::json!({}),
+        output_schema: serde_json::json!({}),
+        version: "2.4.7".to_string(),
+        tags: vec![],
+        annotations: Some(ModuleAnnotations::default()),
+        examples: vec![],
+        metadata: std::collections::HashMap::new(),
+        display: None,
+        sunset_date: None,
+        dependencies: vec![],
+        enabled: true,
+    };
+    registry
+        .register_internal("demo.mod", Box::new(Demo), descriptor)
+        .unwrap();
+
+    let reload = ReloadModule::new(Arc::clone(&registry), Arc::clone(&emitter));
+    let result = reload
+        .execute(
+            serde_json::json!({
+                "module_id": "demo.mod",
+                "reason": "test reload",
+            }),
+            &dummy_ctx(),
+        )
+        .await
+        .expect("reload should succeed");
+
+    // SM-006: previous_version is captured from the descriptor, not "unknown".
+    assert_eq!(
+        result["previous_version"], "2.4.7",
+        "reload_module should capture the actual version, got {result:#?}"
+    );
+    assert_eq!(result["success"], true);
+    // After reload (with no discoverer attached), the module is unregistered.
+    assert!(!registry.has("demo.mod"));
+}
+
+#[tokio::test]
+async fn test_reload_module_unknown_module_returns_module_not_found() {
+    use apcore::events::emitter::EventEmitter;
+
+    let registry = Arc::new(Registry::new());
+    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let reload = ReloadModule::new(registry, emitter);
+    let err = reload
+        .execute(
+            serde_json::json!({
+                "module_id": "no.such.module",
+                "reason": "x",
+            }),
+            &dummy_ctx(),
+        )
+        .await
+        .expect_err("unknown module must error");
+    assert_eq!(err.code, ErrorCode::ModuleNotFound);
 }

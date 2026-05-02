@@ -277,12 +277,28 @@ impl ReloadModule {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        clippy::single_match_else,
+        clippy::map_unwrap_or
+    )]
     async fn execute_single(
         &self,
         module_id: String,
         reason: &str,
         ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError> {
+        // Sync SM-006: implement the 8-step reload pipeline aligned with
+        // apcore-python (sys_modules/control.py:412-458) and apcore-typescript
+        // (sys-modules/control.ts:186-254).
+        //   1. capture_previous_version
+        //   2. on_suspend (best-effort)
+        //   3. safe_unregister
+        //   4. registry.discover_internal() (re-discover modules)
+        //   5. register_internal (no-op when discoverer reinstates)
+        //   6. on_resume (best-effort)
+        //   7. emit_reloaded event with actual previous + new versions
+        //   8. log
         let start = std::time::Instant::now();
 
         if !self.registry.has(&module_id) {
@@ -291,13 +307,85 @@ impl ReloadModule {
                 format!("Module '{module_id}' not found"),
             ));
         }
-        // W-1: version is not tracked in the Rust registry descriptor; "unknown"
-        // matches the placeholder used pre-hardening.
-        self.registry.safe_unregister(&module_id, 5000).await?;
-        let previous_version = "unknown".to_string();
 
+        // (1) Capture previous version from the registry descriptor.
+        let previous_version = self
+            .registry
+            .get_definition(&module_id)
+            .map(|d| d.version)
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // (2) on_suspend (best-effort) — capture state for handoff to on_resume.
+        // Panics inside the user-supplied trait method are caught so a faulty
+        // hook cannot abort the reload.
+        let suspended_state = match self.registry.get(&module_id) {
+            Ok(Some(module)) => {
+                let module_for_panic = Arc::clone(&module);
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    module_for_panic.on_suspend()
+                })) {
+                    Ok(state) => state,
+                    Err(_) => {
+                        tracing::warn!(
+                            module_id = %module_id,
+                            "Module on_suspend panicked; continuing reload"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        // (3) Safe unregister — drains in-flight calls.
+        self.registry.safe_unregister(&module_id, 5000).await?;
+
+        // (4) Re-run the configured discoverer to repopulate the registry.
+        // Best-effort: if no discoverer is attached (NoDiscovererConfigured)
+        // or discovery fails, log and continue — the SDK still emits the
+        // reload event so observers are notified.
+        match self.registry.discover_internal().await {
+            Ok(count) => tracing::debug!(
+                module_id = %module_id,
+                count,
+                "Reload: discover_internal repopulated registry"
+            ),
+            Err(e) => tracing::warn!(
+                module_id = %module_id,
+                error = %e.message,
+                "Reload: discover_internal returned error (best-effort, continuing)"
+            ),
+        }
+
+        // (5) register_internal: in Rust we don't carry stand-alone factory
+        // closures, so re-registration is delegated to the discoverer in step
+        // 4. This branch is intentionally a no-op for cross-language parity.
+
+        // (6) on_resume (best-effort) — handoff state to the freshly loaded module.
+        let new_version = self
+            .registry
+            .get_definition(&module_id)
+            .map(|d| d.version)
+            .unwrap_or_else(|| previous_version.clone());
+
+        if let Some(state) = suspended_state {
+            if let Ok(Some(module)) = self.registry.get(&module_id) {
+                let module_for_panic = Arc::clone(&module);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    module_for_panic.on_resume(state);
+                }))
+                .is_err()
+                {
+                    tracing::warn!(
+                        module_id = %module_id,
+                        "Module on_resume panicked; reload still considered successful"
+                    );
+                }
+            }
+        }
+
+        // (7) Emit the reloaded event with actual versions.
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let new_version = previous_version.clone();
         let timestamp = chrono::Utc::now().to_rfc3339();
         emit_event(
             &self.emitter,
@@ -311,6 +399,7 @@ impl ReloadModule {
         )
         .await;
 
+        // (8) Structured log.
         tracing::info!(
             module_id = %module_id,
             previous_version = %previous_version,
