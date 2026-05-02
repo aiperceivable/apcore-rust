@@ -1094,6 +1094,44 @@ mod on_load_rollback_tests {
 }
 
 // ---------------------------------------------------------------------------
+// A-D-005: DefaultDiscoverer wires the 8-stage pipeline through Registry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn default_discoverer_via_registry_raises_config_not_found_on_missing_root() {
+    use std::sync::Arc;
+    let registry = Arc::new(Registry::new());
+    registry.set_extension_roots(vec!["/this/does/not/exist".to_string()]);
+    registry.set_discoverer(Box::new(apcore::DefaultDiscoverer::new()));
+
+    let err = registry
+        .discover_internal()
+        .await
+        .expect_err("missing root should error");
+    assert_eq!(err.code, apcore::errors::ErrorCode::ConfigNotFound);
+}
+
+#[tokio::test]
+async fn default_discoverer_via_registry_registers_factory_modules() {
+    use std::sync::Arc;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("greet.rs"), "// stub").unwrap();
+
+    let factory: apcore::ModuleFactory =
+        Arc::new(|_file, _entry_point| Ok(Some(Arc::new(StubModule) as Arc<dyn Module>)));
+
+    let registry = Arc::new(Registry::new());
+    registry.set_extension_roots(vec![tmp.path().to_string_lossy().into_owned()]);
+    registry.set_discoverer(Box::new(
+        apcore::DefaultDiscoverer::new().with_factory(factory),
+    ));
+
+    let count = registry.discover_internal().await.unwrap();
+    assert_eq!(count, 1, "exactly one module discovered");
+    assert!(registry.get("greet").unwrap().is_some());
+}
+
+// ---------------------------------------------------------------------------
 // A-D-009: acquire() bumps ref_counts for safe_unregister drain
 // ---------------------------------------------------------------------------
 

@@ -142,8 +142,8 @@ pub use registry::registry::{
 };
 pub use registry::{
     class_name_to_segment, compute_base_id, derive_module_ids, detect_id_conflicts, ConflictResult,
-    ConflictSeverity, ConflictType, DiscoveredClass, DiscoveryConfig, MultiClassEntry,
-    MAX_MODULE_ID_LEN,
+    ConflictSeverity, ConflictType, DefaultDiscoverer, DiscoveredClass, DiscoveryConfig,
+    ModuleFactory, MultiClassEntry, MAX_MODULE_ID_LEN,
 };
 pub use schema::{
     to_strict_schema, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader,
