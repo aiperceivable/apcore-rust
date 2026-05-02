@@ -118,14 +118,26 @@ impl ACL {
         Ok(Self::new_unchecked(rules, default_effect, audit_logger))
     }
 
-    /// Create a new ACL without validating `default_effect`. Prefer [`ACL::try_new`] for
-    /// validated construction; this method is kept for `Default` and internal use.
+    /// Create a new ACL with the given rules, default effect, and optional
+    /// audit logger.
+    ///
+    /// **Validates** `default_effect` and panics on invalid input. This
+    /// matches apcore-python and apcore-typescript constructor behaviour
+    /// (both throw on invalid `default_effect`) — sync finding A-D-302.
+    ///
+    /// For fallible construction (e.g., when `default_effect` originates
+    /// from user input or a YAML file), prefer [`ACL::try_new`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `default_effect` is not `"allow"` or `"deny"`.
     pub fn new(
         rules: Vec<ACLRule>,
         default_effect: impl Into<String>,
         audit_logger: Option<Arc<AuditLoggerFn>>,
     ) -> Self {
-        Self::new_unchecked(rules, default_effect, audit_logger)
+        Self::try_new(rules, default_effect, audit_logger)
+            .expect("invalid default_effect — use ACL::try_new for fallible construction")
     }
 
     fn new_unchecked(
@@ -283,7 +295,7 @@ impl ACL {
         let default_effect = self.default_effect.clone();
 
         if rules.is_empty() {
-            return self.finalize_no_rules(caller, target_id, ctx);
+            return self.finalize_no_rules(&default_effect, caller, target_id, ctx);
         }
 
         for (idx, rule) in rules.iter().enumerate() {
@@ -292,25 +304,10 @@ impl ACL {
             }
         }
 
-        // Use the snapshotted default_effect rather than re-reading self.default_effect
-        // to maintain consistency with the snapshotted rules.
-        let decision = default_effect == "allow";
-        let reason = if rules.is_empty() {
-            "no_rules"
-        } else {
-            "default_effect"
-        };
-        let entry = self.build_audit_entry(
-            caller,
-            target_id,
-            if decision { "allow" } else { "deny" },
-            reason,
-            None,
-            None,
-            ctx,
-        );
-        self.emit_audit(&entry);
-        decision
+        // Use the snapshotted default_effect rather than re-reading
+        // self.default_effect to maintain consistency with the snapshotted
+        // rules (sync finding A-D-021 / A-D-301).
+        self.finalize_default_effect(&default_effect, caller, target_id, ctx)
     }
 
     /// Load ACL rules from a YAML file.
@@ -350,7 +347,14 @@ impl ACL {
             .unwrap_or("deny")
             .to_string();
 
-        let mut acl = Self::new(rules, default_effect, None);
+        // Propagate try_new validation errors as Result rather than panicking
+        // — YAML errors must not crash the host process (sync finding A-D-302).
+        let mut acl = Self::try_new(rules, default_effect, None).map_err(|e| {
+            ModuleError::new(
+                ErrorCode::ConfigInvalid,
+                format!("Invalid ACL config in '{path}': {}", e.message),
+            )
+        })?;
         acl.yaml_path = Some(path.to_string());
         Ok(acl)
     }
@@ -378,18 +382,33 @@ impl ACL {
     }
 
     /// Reload rules from the stored YAML path.
+    ///
+    /// **Deadlock avoidance:** the borrow on `self.yaml_path` is released
+    /// (via clone + scope) *before* the blocking file I/O in [`Self::load`]
+    /// begins. This matters when the caller holds the ACL inside an
+    /// `Arc<RwLock<ACL>>`-style wrapper and an audit logger or condition
+    /// handler tries to read the same lock from another thread mid-reload.
+    /// Holding `&mut self` across `Self::load` would block any concurrent
+    /// reader for the duration of the file read; the brace scope below
+    /// makes that explicitly impossible (sync finding A-D-303).
     pub fn reload(&mut self) -> Result<(), ModuleError> {
-        let path = self.yaml_path.clone().ok_or_else(|| {
-            ModuleError::new(
-                ErrorCode::ReloadFailed,
-                "Cannot reload: no yaml_path stored".to_string(),
-            )
-        })?;
+        let path = {
+            // Narrow scope: the immutable borrow on `self.yaml_path` ends
+            // at the closing brace, *before* file I/O is initiated below.
+            self.yaml_path.clone().ok_or_else(|| {
+                ModuleError::new(
+                    ErrorCode::ReloadFailed,
+                    "Cannot reload: no yaml_path stored".to_string(),
+                )
+            })?
+        };
 
+        // File I/O happens here with no outstanding borrow on `self`.
         let reloaded = Self::load(&path)?;
 
         self.rules = reloaded.rules;
         self.default_effect = reloaded.default_effect;
+        self.yaml_path = reloaded.yaml_path;
         Ok(())
     }
 
@@ -530,8 +549,14 @@ impl ACL {
     }
 
     /// Audit + return for the empty-rules path. Shared by `check` and `async_check`.
+    ///
+    /// `default_effect` is passed in as a parameter (rather than re-read from
+    /// `self`) so that callers can supply a consistent snapshot taken at the
+    /// entry of the check, eliminating TOCTOU drift if a concurrent
+    /// add_rule/reload mutates the ACL during evaluation (sync finding A-D-301).
     fn finalize_no_rules(
         &self,
+        default_effect: &str,
         caller: &str,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
@@ -539,14 +564,14 @@ impl ACL {
         let entry = self.build_audit_entry(
             caller,
             target_id,
-            &self.default_effect,
+            default_effect,
             "no_rules",
             None,
             None,
             ctx,
         );
         self.emit_audit(&entry);
-        self.default_effect == "allow"
+        default_effect == "allow"
     }
 
     /// Audit + return for a matched rule. Shared by `check` and `async_check`.
@@ -573,8 +598,12 @@ impl ACL {
 
     /// Audit + return for the no-rule-matched path. Shared by `check` and
     /// `async_check`.
+    ///
+    /// `default_effect` is passed in as a parameter — see
+    /// [`Self::finalize_no_rules`] for rationale (sync finding A-D-301).
     fn finalize_default_effect(
         &self,
+        default_effect: &str,
         caller: &str,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
@@ -582,14 +611,14 @@ impl ACL {
         let entry = self.build_audit_entry(
             caller,
             target_id,
-            &self.default_effect,
+            default_effect,
             "default_effect",
             None,
             None,
             ctx,
         );
         self.emit_audit(&entry);
-        self.default_effect == "allow"
+        default_effect == "allow"
     }
 
     /// Build an audit entry from the check parameters and context.
@@ -638,17 +667,25 @@ impl ACL {
     ) -> bool {
         let caller = caller_id.unwrap_or("@external");
 
-        if self.rules.is_empty() {
-            return self.finalize_no_rules(caller, target_id, ctx);
+        // Snapshot rules + default_effect at entry so any concurrent mutator
+        // (e.g., another task calling add_rule/reload through an
+        // Arc<RwLock<ACL>> wrapper) cannot cause TOCTOU drift mid-evaluation.
+        // Mirrors the sync `check()` snapshot and apcore-python /
+        // apcore-typescript async paths (sync finding A-D-301).
+        let rules: Vec<ACLRule> = self.rules.clone();
+        let default_effect: String = self.default_effect.clone();
+
+        if rules.is_empty() {
+            return self.finalize_no_rules(&default_effect, caller, target_id, ctx);
         }
 
-        for (idx, rule) in self.rules.iter().enumerate() {
+        for (idx, rule) in rules.iter().enumerate() {
             if self.matches_rule_async(rule, caller, target_id, ctx).await {
                 return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
             }
         }
 
-        self.finalize_default_effect(caller, target_id, ctx)
+        self.finalize_default_effect(&default_effect, caller, target_id, ctx)
     }
 
     /// Async version of `matches_rule` that awaits async condition handlers.

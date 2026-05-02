@@ -367,3 +367,115 @@ fn test_check_add_rule_inserts_at_front() {
     let result = acl.check(Some("user"), "resource", None);
     assert!(!result, "Newly added deny rule at front should win");
 }
+
+// ---------------------------------------------------------------------------
+// A-D-302: ACL::new validates default_effect
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "invalid default_effect")]
+fn test_acl_new_panics_on_invalid_default_effect() {
+    // ACL::new must validate default_effect — bogus value should panic,
+    // matching apcore-python and apcore-typescript constructor-throws
+    // behaviour (sync finding A-D-302).
+    let _ = ACL::new(vec![], "wrong_value", None);
+}
+
+#[test]
+fn test_acl_new_accepts_allow_and_deny() {
+    // Both legal values must construct successfully without panic.
+    let _ = ACL::new(vec![], "allow", None);
+    let _ = ACL::new(vec![], "deny", None);
+}
+
+#[test]
+fn test_acl_load_propagates_invalid_default_effect_as_result() {
+    // load() must propagate validation failures via Result rather than
+    // panicking — YAML errors must not crash the host.
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    writeln!(tmp, "default_effect: not_a_real_effect\nrules: []\n").expect("write tempfile");
+    let path = tmp.path().to_str().expect("utf8 path").to_string();
+    let result = ACL::load(&path);
+    assert!(
+        result.is_err(),
+        "load should error on invalid default_effect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A-D-303: ACL::reload doesn't deadlock (borrow scope released before file IO)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_acl_reload_succeeds_from_yaml_path() {
+    // Smoke test that reload() picks up changes to the file. The structural
+    // requirement for A-D-303 is that the borrow of self.yaml_path ends
+    // before Self::load is called; this test ensures the public behavior
+    // works end-to-end.
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    writeln!(
+        tmp,
+        "default_effect: deny\nrules:\n  - callers: [\"user\"]\n    targets: [\"r\"]\n    effect: allow\n"
+    )
+    .expect("write tempfile");
+    let path = tmp.path().to_str().expect("utf8").to_string();
+
+    let mut acl = ACL::load(&path).expect("initial load");
+    assert!(acl.check(Some("user"), "r", None));
+
+    // Replace file: now deny everything.
+    std::fs::write(
+        &path,
+        "default_effect: deny\nrules:\n  - callers: [\"user\"]\n    targets: [\"r\"]\n    effect: deny\n",
+    )
+    .expect("rewrite tempfile");
+
+    acl.reload().expect("reload");
+    assert!(!acl.check(Some("user"), "r", None));
+}
+
+// ---------------------------------------------------------------------------
+// A-D-301: async_check snapshots rules + default_effect at entry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_async_check_uses_snapshot_consistent_with_sync() {
+    // async_check must snapshot rules + default_effect at entry, mirroring
+    // the sync check() snapshot. This test exercises the basic
+    // first-match-wins behaviour through async_check to verify the
+    // snapshot path produces the same decisions.
+    let rules = vec![
+        ACLRule {
+            callers: vec!["user".to_string()],
+            targets: vec!["resource".to_string()],
+            effect: "deny".to_string(),
+            description: Some("first deny".to_string()),
+            conditions: None,
+        },
+        ACLRule {
+            callers: vec!["user".to_string()],
+            targets: vec!["resource".to_string()],
+            effect: "allow".to_string(),
+            description: Some("second allow".to_string()),
+            conditions: None,
+        },
+    ];
+    let acl = ACL::new(rules, "deny", None);
+    let r = acl.async_check(Some("user"), "resource", None).await;
+    assert!(!r, "First-match deny should win in async_check");
+}
+
+#[tokio::test]
+async fn test_async_check_no_rules_path() {
+    // No-rules path through async_check should also use the snapshotted
+    // default_effect.
+    let acl = ACL::new(vec![], "allow", None);
+    let r = acl.async_check(Some("user"), "resource", None).await;
+    assert!(r);
+
+    let acl_deny = ACL::new(vec![], "deny", None);
+    let r2 = acl_deny.async_check(Some("user"), "resource", None).await;
+    assert!(!r2);
+}
