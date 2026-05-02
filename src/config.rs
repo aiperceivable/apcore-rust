@@ -304,6 +304,14 @@ impl Config {
     }
 
     /// Validate config constraints. Returns an error listing all violations.
+    ///
+    /// Sync CB-001: validates the spec-mandated field set beyond
+    /// executor-only knobs — mirrors apcore-python `_REQUIRED_FIELDS` and
+    /// `_CONSTRAINTS` (config.py). Constraints checked include:
+    ///   - `acl.default_effect` ∈ {`allow`, `deny`}
+    ///   - `observability.tracing.sampling_rate` ∈ [0.0, 1.0]
+    ///   - executor numeric ranges (`max_call_depth`, `max_module_repeat`,
+    ///     `default_timeout`, `global_timeout`)
     pub fn validate(&self) -> Result<(), ModuleError> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -322,6 +330,50 @@ impl Config {
                 "executor.global_timeout ({}) must be >= executor.default_timeout ({})",
                 self.executor.global_timeout, self.executor.default_timeout
             ));
+        }
+
+        // Sync CB-001: cross-language constraint set.
+        if let Some(de) = self.get("acl.default_effect") {
+            match de.as_str() {
+                Some("allow" | "deny") => {}
+                Some(other) => {
+                    errors.push(format!(
+                        "acl.default_effect must be 'allow' or 'deny' (got '{other}')"
+                    ));
+                }
+                None => {
+                    errors.push("acl.default_effect must be a string".to_string());
+                }
+            }
+        }
+
+        if let Some(rate) = self.get("observability.tracing.sampling_rate") {
+            let rate_ok = rate.as_f64().is_some_and(|f| (0.0..=1.0).contains(&f));
+            if !rate_ok {
+                errors.push(format!(
+                    "observability.tracing.sampling_rate must be a number in [0.0, 1.0] (got {rate})"
+                ));
+            }
+        }
+
+        if let Some(threshold) = self.get("sys_modules.events.thresholds.error_rate") {
+            let ok = threshold
+                .as_f64()
+                .is_some_and(|f| (0.0..=1.0).contains(&f));
+            if !ok {
+                errors.push(format!(
+                    "sys_modules.events.thresholds.error_rate must be a number in [0.0, 1.0] (got {threshold})"
+                ));
+            }
+        }
+
+        if let Some(latency) = self.get("sys_modules.events.thresholds.latency_p99_ms") {
+            let ok = latency.as_f64().is_some_and(|f| f > 0.0);
+            if !ok {
+                errors.push(format!(
+                    "sys_modules.events.thresholds.latency_p99_ms must be a positive number (got {latency})"
+                ));
+            }
         }
 
         if errors.is_empty() {
@@ -556,8 +608,20 @@ impl Config {
             .entry(namespace.to_string())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if let (Some(target), Some(source_map)) = (entry.as_object_mut(), data.as_object()) {
+            // Sync CB-002: deep-merge so peer keys in nested objects are
+            // preserved rather than overwritten. Mirrors apcore-python's
+            // `_deep_merge_dicts` (config.py) and apcore-typescript's
+            // `deepMerge`. Without this, `mount({db:{host:'a'}})` over
+            // `{db:{port:5432}}` would discard `port`.
             for (k, v) in source_map {
-                target.insert(k.clone(), v.clone());
+                match target.get_mut(k) {
+                    Some(existing) => {
+                        deep_merge_value(existing, v);
+                    }
+                    None => {
+                        target.insert(k.clone(), v.clone());
+                    }
+                }
             }
         }
         Ok(())
@@ -1022,6 +1086,27 @@ fn discover_config_file() -> Option<std::path::PathBuf> {
 
 fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var("HOME").ok().map(std::path::PathBuf::from)
+}
+
+/// Recursively merge `overlay` into `base`, preserving peer keys in nested
+/// objects. Used by `Config::mount` (sync CB-002) to mirror Python's
+/// `_deep_merge_dicts` semantics.
+fn deep_merge_value(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                match base_map.get_mut(k) {
+                    Some(existing) => deep_merge_value(existing, v),
+                    None => {
+                        base_map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (slot, value) => {
+            *slot = value.clone();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -520,3 +520,105 @@ fn test_namespace_env_map() {
     std::env::remove_var(&redis_key);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Sync CB-001 — validate() spec-required field constraints
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_validate_rejects_invalid_acl_default_effect() {
+    let mut cfg = Config::from_defaults();
+    cfg.set("acl.default_effect", serde_json::json!("maybe"));
+    let err = cfg
+        .validate()
+        .expect_err("invalid acl.default_effect must be rejected");
+    assert_eq!(err.code, ErrorCode::ConfigInvalid);
+    assert!(
+        err.message.contains("acl.default_effect"),
+        "error must mention acl.default_effect: {}",
+        err.message
+    );
+}
+
+#[test]
+fn test_validate_accepts_allow_or_deny_for_default_effect() {
+    let mut cfg = Config::from_defaults();
+    cfg.set("acl.default_effect", serde_json::json!("allow"));
+    cfg.validate().unwrap();
+    cfg.set("acl.default_effect", serde_json::json!("deny"));
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn test_validate_rejects_sampling_rate_out_of_range() {
+    let mut cfg = Config::from_defaults();
+    cfg.set(
+        "observability.tracing.sampling_rate",
+        serde_json::json!(1.5),
+    );
+    let err = cfg
+        .validate()
+        .expect_err("sampling_rate > 1.0 must be rejected");
+    assert!(err.message.contains("sampling_rate"));
+}
+
+#[test]
+fn test_validate_accepts_sampling_rate_in_unit_interval() {
+    let mut cfg = Config::from_defaults();
+    cfg.set(
+        "observability.tracing.sampling_rate",
+        serde_json::json!(0.0),
+    );
+    cfg.validate().unwrap();
+    cfg.set(
+        "observability.tracing.sampling_rate",
+        serde_json::json!(0.5),
+    );
+    cfg.validate().unwrap();
+    cfg.set(
+        "observability.tracing.sampling_rate",
+        serde_json::json!(1.0),
+    );
+    cfg.validate().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Sync CB-002 — mount() deep-merge
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mount_deep_merges_nested_objects() {
+    let mut cfg = Config::from_defaults();
+    cfg.user_namespaces
+        .insert("db".to_string(), serde_json::json!({"port": 5432}));
+    cfg.mount("db", MountSource::Dict(serde_json::json!({"host": "a"})))
+        .unwrap();
+    let db = cfg.namespace("db").unwrap();
+    assert_eq!(db["host"], "a");
+    assert_eq!(
+        db["port"], 5432,
+        "peer key 'port' must be preserved by deep-merge"
+    );
+}
+
+#[test]
+fn test_mount_deep_merges_recursively_under_nested_keys() {
+    let mut cfg = Config::from_defaults();
+    cfg.user_namespaces.insert(
+        "services".to_string(),
+        serde_json::json!({
+            "auth": { "host": "auth.local", "port": 8080 }
+        }),
+    );
+    cfg.mount(
+        "services",
+        MountSource::Dict(serde_json::json!({
+            "auth": { "tls": true }
+        })),
+    )
+    .unwrap();
+    let auth = cfg.namespace("services").unwrap()["auth"].clone();
+    assert_eq!(auth["host"], "auth.local", "peer key preserved at depth 2");
+    assert_eq!(auth["port"], 8080);
+    assert_eq!(auth["tls"], true);
+}
