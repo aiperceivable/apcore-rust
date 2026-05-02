@@ -6,6 +6,40 @@ use async_trait::async_trait;
 use crate::context::Context;
 use crate::errors::ModuleError;
 
+/// Return value from `Middleware::on_error_outcome` requesting a retry.
+///
+/// Distinct from a plain `Recovery(value)` — `Recovery` is the *final
+/// recovery output* of the call. `RetrySignal` instead asks the executor
+/// to re-run the module with `inputs`; no recovery output is produced.
+///
+/// Cross-language parity with apcore-python `apcore.middleware.RetrySignal`
+/// and apcore-typescript `apcore-js.RetrySignal` (sync finding A-D-017).
+#[derive(Debug, Clone)]
+pub struct RetrySignal {
+    pub inputs: serde_json::Value,
+}
+
+impl RetrySignal {
+    #[must_use]
+    pub fn new(inputs: serde_json::Value) -> Self {
+        Self { inputs }
+    }
+}
+
+/// Outcome of a middleware's `on_error_outcome` hook.
+///
+/// - `Recovery(value)` — the middleware produced a recovery output; the
+///   executor returns this value to the caller and skips the rest of the
+///   error path.
+/// - `Retry(signal)` — the middleware asks for a pipeline retry with new
+///   inputs (only honored by the unary `Executor::call` path; ignored for
+///   streaming, where mid-flight retry is not well-defined).
+#[derive(Debug, Clone)]
+pub enum OnErrorOutcome {
+    Recovery(serde_json::Value),
+    Retry(RetrySignal),
+}
+
 /// Core middleware trait with `before/after/on_error` hooks.
 ///
 /// All hooks return `Option<Value>`:
@@ -49,8 +83,11 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
 
     /// Called when module execution fails.
     /// `inputs` is the original (post-before) input for correlation.
-    /// Return `Ok(Some(v))` to signal recovery (retry with those inputs),
-    /// or `Ok(None)` to let the error propagate.
+    /// Return `Ok(Some(v))` to signal a recovery output, or `Ok(None)` to
+    /// let the error propagate.
+    ///
+    /// To request a pipeline retry instead of a recovery, override
+    /// [`Self::on_error_outcome`] and return `OnErrorOutcome::Retry(...)`.
     async fn on_error(
         &self,
         module_id: &str,
@@ -58,6 +95,27 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
         error: &ModuleError,
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError>;
+
+    /// Extended on_error hook that can request a pipeline retry via
+    /// [`OnErrorOutcome::Retry`] in addition to producing a recovery output.
+    ///
+    /// Default implementation delegates to [`Self::on_error`] and wraps any
+    /// returned value as `OnErrorOutcome::Recovery` — existing middlewares
+    /// work unchanged. Override this method to opt into retry semantics
+    /// (cross-language parity with apcore-python and apcore-typescript
+    /// `Middleware.on_error` returning `RetrySignal`; sync finding A-D-017).
+    async fn on_error_outcome(
+        &self,
+        module_id: &str,
+        inputs: serde_json::Value,
+        error: &ModuleError,
+        ctx: &Context<serde_json::Value>,
+    ) -> Result<Option<OnErrorOutcome>, ModuleError> {
+        Ok(self
+            .on_error(module_id, inputs, error, ctx)
+            .await?
+            .map(OnErrorOutcome::Recovery))
+    }
 }
 
 #[cfg(test)]

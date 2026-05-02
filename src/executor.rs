@@ -529,64 +529,86 @@ impl Executor {
             pipe_ctx.version_hint = Some(hint.to_string());
         }
         self.inject_resources(&mut pipe_ctx);
-        match PipelineEngine::run(&self.strategy, &mut pipe_ctx).await {
-            Ok((output, trace)) => {
-                if !trace.success {
-                    let (aborted_step, explanation) = trace
-                        .steps
-                        .iter()
-                        .find_map(|s| {
-                            if s.result.action == "abort" {
-                                Some((s.name.as_str(), s.result.explanation.as_deref()))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(("unknown", None));
-                    return Err(ModuleError::pipeline_abort(aborted_step, explanation));
-                }
-                Ok(output.unwrap_or(serde_json::Value::Null))
-            }
-            Err(e) => {
-                // §1.1 fail-fast: PipelineEngine wraps step failures in a
-                // `PipelineStepError`. Unwrap to the original typed error so
-                // public callers (and middleware on_error handlers) see the
-                // underlying cause — matches Python `Executor.call`.
-                let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
-                // §1.2 fail-fast: MiddlewareManager.execute_before wraps a
-                // failing middleware's error as MiddlewareChainError preserving
-                // the original in details["inner_error"]. Unwrap so callers
-                // can dispatch on the original error class (e.g.
-                // ApprovalDeniedError) — matches apcore-python and
-                // apcore-typescript MiddlewareChainError.original semantics
-                // (sync finding A-D-015).
-                let underlying = underlying
-                    .unwrap_middleware_chain_error()
-                    .unwrap_or(underlying);
-                // Algorithm A11: decorate with trace_id + module_id before
-                // middleware.on_error and final re-raise — matches
-                // apcore-python executor.py:781-782 and apcore-typescript
-                // executor.ts:352 (sync finding A-D-016).
-                let underlying = propagate_module_error(underlying, module_id, &pipe_ctx.context);
-                // Run middleware on_error hooks in reverse so any registered
-                // recovery middleware can intercept the error.
-                let executed = pipe_ctx.executed_middlewares.clone();
-                if !executed.is_empty() {
-                    if let Some(recovery) = self
-                        .middleware_manager
-                        .execute_on_error(
-                            module_id,
-                            pipe_ctx.inputs,
-                            &underlying,
-                            &pipe_ctx.context,
-                            &executed,
-                        )
-                        .await
-                    {
-                        return Ok(recovery);
+
+        // Loop iterates only when a RetrySignal is returned from middleware
+        // on_error_outcome; every other path returns or errors on the first
+        // attempt (sync finding A-D-017).
+        loop {
+            match PipelineEngine::run(&self.strategy, &mut pipe_ctx).await {
+                Ok((output, trace)) => {
+                    if !trace.success {
+                        let (aborted_step, explanation) = trace
+                            .steps
+                            .iter()
+                            .find_map(|s| {
+                                if s.result.action == "abort" {
+                                    Some((s.name.as_str(), s.result.explanation.as_deref()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(("unknown", None));
+                        return Err(ModuleError::pipeline_abort(aborted_step, explanation));
                     }
+                    return Ok(output.unwrap_or(serde_json::Value::Null));
                 }
-                Err(underlying)
+                Err(e) => {
+                    // §1.1 fail-fast: PipelineEngine wraps step failures in a
+                    // `PipelineStepError`. Unwrap to the original typed error so
+                    // public callers (and middleware on_error handlers) see the
+                    // underlying cause — matches Python `Executor.call`.
+                    let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+                    // §1.2 fail-fast: MiddlewareManager.execute_before wraps a
+                    // failing middleware's error as MiddlewareChainError preserving
+                    // the original in details["inner_error"]. Unwrap so callers
+                    // can dispatch on the original error class (e.g.
+                    // ApprovalDeniedError) — matches apcore-python and
+                    // apcore-typescript MiddlewareChainError.original semantics
+                    // (sync finding A-D-015).
+                    let underlying = underlying
+                        .unwrap_middleware_chain_error()
+                        .unwrap_or(underlying);
+                    // Algorithm A11: decorate with trace_id + module_id before
+                    // middleware.on_error and final re-raise — matches
+                    // apcore-python executor.py:781-782 and apcore-typescript
+                    // executor.ts:352 (sync finding A-D-016).
+                    let underlying =
+                        propagate_module_error(underlying, module_id, &pipe_ctx.context);
+                    // Run middleware on_error hooks in reverse so any registered
+                    // recovery / retry middleware can intercept the error.
+                    let executed = pipe_ctx.executed_middlewares.clone();
+                    if !executed.is_empty() {
+                        let outcome = self
+                            .middleware_manager
+                            .execute_on_error_outcome(
+                                module_id,
+                                pipe_ctx.inputs.clone(),
+                                &underlying,
+                                &pipe_ctx.context,
+                                &executed,
+                            )
+                            .await;
+                        match outcome {
+                            Some(crate::middleware::base::OnErrorOutcome::Recovery(value)) => {
+                                return Ok(value);
+                            }
+                            Some(crate::middleware::base::OnErrorOutcome::Retry(signal)) => {
+                                // Reset per-run pipeline state so the next
+                                // iteration starts clean (matches Python's
+                                // _reset_pipe_ctx_for_retry — sync A-D-017).
+                                pipe_ctx.inputs = signal.inputs;
+                                pipe_ctx.validated_inputs = None;
+                                pipe_ctx.module = None;
+                                pipe_ctx.output = None;
+                                pipe_ctx.validated_output = None;
+                                pipe_ctx.executed_middlewares.clear();
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
+                    return Err(underlying);
+                }
             }
         }
     }

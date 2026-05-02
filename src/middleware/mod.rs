@@ -12,7 +12,7 @@ pub mod retry;
 pub mod yaml_config;
 
 pub use adapters::{AfterMiddleware, BeforeMiddleware};
-pub use base::Middleware;
+pub use base::{Middleware, OnErrorOutcome, RetrySignal};
 pub use circuit_breaker::{
     CircuitBreakerBuilder, CircuitBreakerConfig, CircuitBreakerMiddleware, CircuitBreakerState,
     DEFAULT_MIN_SAMPLES as CB_DEFAULT_MIN_SAMPLES,

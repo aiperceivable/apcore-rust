@@ -198,6 +198,29 @@ impl MiddlewareManager {
         ctx: &Context<serde_json::Value>,
         executed: &[usize],
     ) -> Option<serde_json::Value> {
+        // Backward-compatible variant: only returns recovery values, drops
+        // any RetrySignal request. Use [`Self::execute_on_error_outcome`] to
+        // observe RetrySignals from middleware (sync finding A-D-017).
+        match self
+            .execute_on_error_outcome(module_id, inputs, error, ctx, executed)
+            .await
+        {
+            Some(crate::middleware::base::OnErrorOutcome::Recovery(v)) => Some(v),
+            Some(crate::middleware::base::OnErrorOutcome::Retry(_)) | None => None,
+        }
+    }
+
+    /// Run the `on_error_outcome` hooks in reverse order. Returns the first
+    /// non-None outcome (Recovery or Retry) — Recovery becomes the call's
+    /// return value; Retry tells the executor to re-run the pipeline.
+    pub async fn execute_on_error_outcome(
+        &self,
+        module_id: &str,
+        inputs: serde_json::Value,
+        error: &ModuleError,
+        ctx: &Context<serde_json::Value>,
+        executed: &[usize],
+    ) -> Option<crate::middleware::base::OnErrorOutcome> {
         // Clone Arc pointers so the mutex is not held across .await points.
         let mws: Vec<Arc<dyn Middleware>> = {
             let guard = self.middlewares.lock();
@@ -206,13 +229,16 @@ impl MiddlewareManager {
 
         for &i in executed.iter().rev() {
             if let Some(mw) = mws.get(i) {
-                match mw.on_error(module_id, inputs.clone(), error, ctx).await {
-                    Ok(Some(value)) => {
-                        // Early-return on first recovery (matches Python/TS semantics).
-                        return Some(value);
+                match mw
+                    .on_error_outcome(module_id, inputs.clone(), error, ctx)
+                    .await
+                {
+                    Ok(Some(outcome)) => {
+                        // Early-return on first non-None outcome (matches Python/TS).
+                        return Some(outcome);
                     }
                     Ok(None) => {
-                        // No recovery from this middleware — continue
+                        // No recovery / retry from this middleware — continue
                     }
                     Err(e) => {
                         tracing::error!("Middleware '{}' on_error failed: {}", mw.name(), e);
