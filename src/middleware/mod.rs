@@ -11,7 +11,7 @@ pub mod otel_tracing;
 pub mod retry;
 pub mod yaml_config;
 
-pub use adapters::{AfterMiddleware, BeforeMiddleware};
+pub use adapters::{AfterAdapter, AfterMiddleware, BeforeAdapter, BeforeMiddleware};
 pub use base::{Middleware, OnErrorOutcome, RetrySignal};
 pub use circuit_breaker::{
     CircuitBreakerBuilder, CircuitBreakerConfig, CircuitBreakerMiddleware, CircuitBreakerState,

@@ -242,3 +242,85 @@ fn test_middleware_manager_remove() {
     assert!(!mgr.remove("alpha")); // already removed
     assert_eq!(mgr.snapshot(), vec!["beta"]);
 }
+
+// ---------------------------------------------------------------------------
+// A-D-402: BeforeAdapter + AfterAdapter let closures be registered as Middleware
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_before_adapter_registers_and_runs_in_manager() {
+    use apcore::middleware::adapters::BeforeAdapter;
+    use apcore::middleware::MiddlewareManager;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    let captured: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let captured_clone = Arc::clone(&captured);
+
+    let adapter = BeforeAdapter::new(
+        "my-before",
+        move |module_id: String, inputs: Value, _ctx: Context<Value>| {
+            let captured = Arc::clone(&captured_clone);
+            async move {
+                captured.lock().unwrap().push(module_id);
+                // Modify inputs by injecting a marker.
+                let mut obj = inputs.as_object().cloned().unwrap_or_default();
+                obj.insert("via_adapter".into(), json!(true));
+                Ok(Some(serde_json::Value::Object(obj)))
+            }
+        },
+    );
+
+    let mgr = MiddlewareManager::new();
+    mgr.add(Box::new(adapter)).expect("register adapter");
+
+    let ctx = Context::<Value>::new(Identity::new(
+        "tester".into(),
+        "test".into(),
+        vec![],
+        HashMap::default(),
+    ));
+    let (modified, _executed) = mgr
+        .execute_before("my.module", json!({"x": 1}), &ctx)
+        .await
+        .expect("execute_before");
+
+    assert_eq!(
+        captured.lock().unwrap().as_slice(),
+        &["my.module".to_string()]
+    );
+    assert_eq!(modified.get("via_adapter"), Some(&json!(true)));
+    assert_eq!(modified.get("x"), Some(&json!(1)));
+}
+
+#[tokio::test]
+async fn test_after_adapter_registers_and_runs_in_manager() {
+    use apcore::middleware::adapters::AfterAdapter;
+    use apcore::middleware::MiddlewareManager;
+
+    let adapter = AfterAdapter::new(
+        "my-after",
+        |_module_id: String, _inputs: Value, output: Value, _ctx: Context<Value>| async move {
+            let mut obj = output.as_object().cloned().unwrap_or_default();
+            obj.insert("after_marker".into(), json!("seen"));
+            Ok(Some(serde_json::Value::Object(obj)))
+        },
+    );
+
+    let mgr = MiddlewareManager::new();
+    mgr.add(Box::new(adapter)).expect("register adapter");
+
+    let ctx = Context::<Value>::new(Identity::new(
+        "tester".into(),
+        "test".into(),
+        vec![],
+        HashMap::default(),
+    ));
+    let modified = mgr
+        .execute_after("my.module", json!({"in": 1}), json!({"out": 2}), &ctx)
+        .await
+        .expect("execute_after");
+
+    assert_eq!(modified.get("after_marker"), Some(&json!("seen")));
+    assert_eq!(modified.get("out"), Some(&json!(2)));
+}
