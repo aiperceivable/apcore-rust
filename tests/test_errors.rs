@@ -25,6 +25,16 @@ fn test_error_code_deserialization() {
     assert_eq!(code, ErrorCode::ACLDenied);
 }
 
+/// Regression for sync ERR-001: CircuitBreakerOpen must serialize as
+/// `CIRCUIT_BREAKER_OPEN` to align with apcore-python and apcore-typescript.
+#[test]
+fn test_circuit_breaker_open_serde_rename_aligns_cross_language() {
+    let json = serde_json::to_value(ErrorCode::CircuitBreakerOpen).unwrap();
+    assert_eq!(json, serde_json::json!("CIRCUIT_BREAKER_OPEN"));
+    let parsed: ErrorCode = serde_json::from_str("\"CIRCUIT_BREAKER_OPEN\"").unwrap();
+    assert_eq!(parsed, ErrorCode::CircuitBreakerOpen);
+}
+
 #[test]
 fn test_all_error_codes_defined() {
     // Verify the full set matches the protocol spec (37 codes).

@@ -153,8 +153,8 @@ pub enum ErrorCode {
     /// Issue #42 (middleware-system.md §1.2): the `CircuitBreakerMiddleware`
     /// short-circuited a call because the circuit for the (`module_id`,
     /// `caller_id`) pair is `OPEN`. Details carry `module_id` and `caller_id`.
-    /// Cross-language: Python/TS `CIRCUIT_OPEN`.
-    #[serde(rename = "CIRCUIT_OPEN")]
+    /// Cross-language: Python/TS `CIRCUIT_BREAKER_OPEN`.
+    #[serde(rename = "CIRCUIT_BREAKER_OPEN")]
     CircuitBreakerOpen,
     /// Issue #45 (system-modules.md §1.4): `system.control.reload_module` was
     /// called with both `module_id` and `path_filter` set. Cross-language:
