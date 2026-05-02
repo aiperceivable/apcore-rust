@@ -1122,6 +1122,68 @@ async fn acquire_bumps_ref_count_and_release_decrements() {
     registry.release("never.acquired");
 }
 
+// ---------------------------------------------------------------------------
+// A-D-010: Registry::watch() triggers debounced re-discover on file changes
+// ---------------------------------------------------------------------------
+
+struct CountingDiscoverer {
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl apcore::registry::registry::Discoverer for CountingDiscoverer {
+    async fn discover(
+        &self,
+        _roots: &[String],
+    ) -> Result<Vec<apcore::registry::registry::DiscoveredModule>, ModuleError> {
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn watch_with_no_extension_roots_is_noop() {
+    use std::sync::Arc;
+    let registry = Arc::new(Registry::new());
+    // No extension roots set — watch() should return Ok without spawning
+    registry.watch().await.unwrap();
+    registry.unwatch();
+}
+
+#[tokio::test]
+async fn watch_re_runs_discover_on_file_change() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let registry = Arc::new(Registry::new());
+    registry.set_extension_roots(vec![tmp.path().to_string_lossy().into_owned()]);
+    registry.set_discoverer(Box::new(CountingDiscoverer {
+        counter: Arc::clone(&counter),
+    }));
+
+    registry.watch().await.unwrap();
+
+    // Touch a file to trigger an event
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    std::fs::write(tmp.path().join("foo.txt"), "hello").unwrap();
+
+    // Wait past the 300ms debounce + filesystem event propagation
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let count = counter.load(Ordering::SeqCst);
+    assert!(
+        count >= 1,
+        "discover_internal should have fired at least once, got {count}"
+    );
+
+    registry.unwatch();
+}
+
 #[tokio::test]
 async fn safe_unregister_waits_for_acquire_drain() {
     use std::sync::Arc;

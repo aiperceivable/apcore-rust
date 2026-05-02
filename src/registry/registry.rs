@@ -360,6 +360,12 @@ pub struct Registry {
     /// [`set_extension_roots`](Self::set_extension_roots); passed verbatim to
     /// `Discoverer::discover(roots)` in `discover_internal()`.
     extension_roots: RwLock<Vec<String>>,
+    /// Live filesystem watcher (sync finding A-D-010). `None` when
+    /// `watch()` has not been called or has been stopped via `unwatch()`.
+    watcher: parking_lot::Mutex<Option<notify::RecommendedWatcher>>,
+    /// Background task handle that consumes notify events and triggers
+    /// debounced re-discovery. Cleared on `unwatch()`.
+    watch_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// RAII guard that restores a taken-out `Discoverer` back into the registry's
@@ -433,6 +439,8 @@ impl Registry {
             discoverer: RwLock::new(None),
             validator: RwLock::new(None),
             extension_roots: RwLock::new(Vec::new()),
+            watcher: parking_lot::Mutex::new(None),
+            watch_handle: parking_lot::Mutex::new(None),
         }
     }
 
@@ -970,20 +978,138 @@ impl Registry {
 
     /// Filesystem watching (stub — filesystem watching is not implemented on apcore-rust).
     ///
-    /// Always returns `Ok(())` but emits a `tracing::warn!` so callers know the feature is
-    /// unavailable. Use [`Self::reload`] or `APCore::discover()` to trigger rediscovery instead.
-    #[allow(clippy::unused_async)] // API stub for cross-language parity; real impl needs platform-specific deps
-    pub async fn watch(&self) -> Result<(), ModuleError> {
-        tracing::warn!(
-            "Registry::watch() called but filesystem watching is not implemented on apcore-rust; \
-             use Registry::reload() or APCore::discover() to trigger rediscovery instead"
-        );
+    /// Watches every path in `extension_roots` recursively. File create / modify
+    /// / remove events trigger a debounced (300ms) call to
+    /// [`Self::discover_internal`]. Cross-language parity with apcore-python's
+    /// `watchdog`-based watcher and apcore-typescript's `fs.watch` watcher
+    /// (sync finding A-D-010).
+    ///
+    /// # Caller obligations
+    ///
+    /// `watch()` requires `&Arc<Self>` because the spawned background task
+    /// holds a `Weak<Registry>` to drive re-discovery; the registry must
+    /// already live behind `Arc`. Calling on a non-Arc Registry is a
+    /// compile-time error.
+    ///
+    /// # Errors
+    ///
+    /// - `Err(ModuleError(code=ReloadFailed))` if the platform watcher cannot
+    ///   be created (kernel resource exhaustion, missing permissions, etc.)
+    ///
+    /// # Idempotency
+    ///
+    /// Calling `watch()` while already watching is a no-op (returns `Ok(())`).
+    /// Use [`Self::unwatch`] to stop and re-call `watch()` to pick up new
+    /// `extension_roots`.
+    #[allow(clippy::unused_async)] // async kept for cross-language API parity (Python/TS use await registry.watch())
+    pub async fn watch(self: &Arc<Self>) -> Result<(), ModuleError> {
+        use notify::{RecursiveMode, Watcher};
+
+        {
+            let watcher_slot = self.watcher.lock();
+            if watcher_slot.is_some() {
+                return Ok(()); // already watching
+            }
+        }
+
+        let extension_roots: Vec<String> = self.extension_roots.read().clone();
+        if extension_roots.is_empty() {
+            tracing::warn!(
+                "Registry::watch() called with no extension_roots — call set_extension_roots() first"
+            );
+            return Ok(());
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            // Best-effort send; if the receiver is gone, the watcher will be
+            // dropped shortly after.
+            let _ = tx.send(res);
+        })
+        .map_err(|e| {
+            ModuleError::new(
+                crate::errors::ErrorCode::ReloadFailed,
+                format!("Failed to create file watcher: {e}"),
+            )
+        })?;
+
+        for root in &extension_roots {
+            let path = std::path::Path::new(root);
+            if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
+                tracing::warn!(
+                    root = %root,
+                    error = %e,
+                    "Registry::watch failed for root, skipping"
+                );
+            }
+        }
+
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(Self::watch_loop(rx, weak));
+
+        *self.watcher.lock() = Some(watcher);
+        *self.watch_handle.lock() = Some(handle);
+
         Ok(())
     }
 
-    /// Stop filesystem watching (no-op).
+    /// Background task body that consumes notify events and triggers a
+    /// debounced re-discovery. Exits when the receiver channel closes or the
+    /// `Weak<Registry>` can no longer be upgraded.
+    async fn watch_loop(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+        weak: std::sync::Weak<Self>,
+    ) {
+        use std::time::{Duration, Instant};
+
+        const DEBOUNCE: Duration = Duration::from_millis(300);
+        let mut last_trigger = Instant::now()
+            .checked_sub(DEBOUNCE)
+            .unwrap_or_else(Instant::now);
+
+        while let Some(res) = rx.recv().await {
+            let Ok(event) = res else {
+                continue;
+            };
+            // Only react to lifecycle-relevant events
+            match event.kind {
+                notify::EventKind::Create(_)
+                | notify::EventKind::Modify(_)
+                | notify::EventKind::Remove(_) => {}
+                _ => continue,
+            }
+
+            // Per-event debounce — collapse rapid bursts (editors writing
+            // through temp file + rename) into a single re-discovery.
+            if last_trigger.elapsed() < DEBOUNCE {
+                continue;
+            }
+            last_trigger = Instant::now();
+
+            let Some(reg) = weak.upgrade() else {
+                break;
+            };
+            if let Err(e) = reg.discover_internal().await {
+                tracing::warn!(
+                    error = %e.message,
+                    "Registry watch: discover_internal failed during hot-reload"
+                );
+            }
+        }
+    }
+
+    /// Stop filesystem watching. The background task is aborted and the
+    /// platform watcher is dropped. Idempotent — calling on a non-watching
+    /// Registry is a no-op.
     pub fn unwatch(&self) {
-        // No-op: filesystem watching is not implemented on apcore-rust.
+        // Drop the watcher first so notify stops sending; the spawned task
+        // will end naturally when the channel closes. We also abort the task
+        // explicitly in case the Drop implementation is delayed.
+        self.watcher.lock().take();
+        if let Some(handle) = self.watch_handle.lock().take() {
+            handle.abort();
+        }
     }
 
     /// Discover modules using the internally-set discoverer.
