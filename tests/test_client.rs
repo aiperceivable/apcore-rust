@@ -6,6 +6,7 @@
 //! APIs that neither of those cover: plain construction, register + call, error
 //! propagation for unknown modules, and `list_modules` filtering.
 
+use apcore::config::Config;
 use apcore::context::Context;
 use apcore::errors::{ErrorCode, ModuleError};
 use apcore::module::Module;
@@ -110,4 +111,35 @@ async fn test_apcore_list_modules_prefix_filter() {
 
     let all_modules = apcore.list_modules(None, None);
     assert!(all_modules.contains(&"other.module".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// A-003: APCore::disable / enable accept reason: Option<&str> and return
+// a status payload routed through system.control.toggle_feature.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_apcore_disable_enable_signature_takes_reason() {
+    // disable/enable route through `system.control.toggle_feature`, which is
+    // only auto-registered when sys_modules.events.enabled=true.
+    let mut config = Config::default();
+    config.set("sys_modules.events.enabled", json!(true));
+    let apcore = APCore::with_config(config);
+
+    apcore
+        .register("demo.toggle", Box::new(Echo))
+        .expect("register");
+
+    // None reason path — must succeed (default reason injected by client).
+    let res = apcore.disable("demo.toggle", None).await;
+    assert!(res.is_ok(), "disable(None) should succeed: {:?}", res.err());
+
+    // Some reason path — must succeed and return a status payload.
+    let res = apcore
+        .enable("demo.toggle", Some("operator request"))
+        .await
+        .expect("enable should succeed");
+    // Returned payload should be an object (concrete shape is set by
+    // sys_modules.control.toggle_feature; we just verify it's structured).
+    assert!(res.is_object(), "enable should return an object payload");
 }

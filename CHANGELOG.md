@@ -12,6 +12,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Cross-Language Sync — Review-Mode Hardening
+
+This release applies the next batch of cross-language audit findings, focused
+on ACL TOCTOU correctness, middleware closure ergonomics, event-emitter
+fire-and-forget semantics, and documentation cleanup.
+
+#### Added
+
+- **`ACL::try_new`** is now the only fallible constructor; **`ACL::new`**
+  panics on invalid `default_effect`, matching the constructor-throws
+  behaviour of apcore-python and apcore-typescript (sync finding A-D-302).
+  YAML loading still surfaces validation failures as `Result` via
+  `ACL::load`.
+- **`middleware::adapters::BeforeAdapter` / `AfterAdapter`** — closure-based
+  middleware adapters that implement the `Middleware` trait, allowing
+  before-only and after-only async closures to be registered directly via
+  `MiddlewareManager::add(Box::new(BeforeAdapter::new(...)))` without
+  defining a struct (sync finding A-D-402).
+- **`EventEmitter::emit_spawn`** — fire-and-forget event dispatch that
+  spawns one `tokio::task` per matching subscriber and returns
+  immediately. Use this for the canonical fire-and-forget path; the
+  existing `emit` method remains for sequential / deterministic test
+  ordering (sync finding A-D-501).
+- **`EventEmitter::shutdown` / `is_shutdown`** — idempotent shutdown
+  that flushes pending work and turns subsequent `emit` / `emit_spawn`
+  calls into no-ops (sync finding A-D-502).
+
+#### Changed
+
+- **`APCore::disable` / `APCore::enable`** signatures are
+  `async fn (&self, name: &str, reason: Option<&str>) -> Result<Value, ModuleError>`,
+  routing through `system.control.toggle_feature` and returning a status
+  payload. **This is a breaking change** relative to pre-0.20 releases
+  that exposed `disable(&mut self, name, reason) -> Result<(), ModuleError>`;
+  cross-language parity is now restored with apcore-python and
+  apcore-typescript (sync finding A-003).
+- **`ACL::async_check`** now snapshots `rules` and `default_effect` at
+  entry, eliminating a TOCTOU race where a concurrent `add_rule` /
+  `reload` could mutate the rule list mid-evaluation. Mirrors the sync
+  `check()` snapshot and matches apcore-python's `_snapshot()` and
+  apcore-typescript's `rules.slice()` (sync finding A-D-301).
+- **`ACL::reload`** restructured so the `&mut self` borrow on
+  `self.yaml_path` ends *before* the blocking file read in `load()`,
+  closing a deadlock window when the ACL is held in an
+  `Arc<RwLock<ACL>>` wrapper and a reader hits the lock concurrently
+  (sync finding A-D-303).
+- **`EventEmitter` internal storage** changed from
+  `Vec<Box<dyn EventSubscriber>>` to `Vec<Arc<dyn EventSubscriber>>` so
+  subscribers can be cloned into `tokio::spawn` tasks for `emit_spawn`.
+  No public-API surface change — `subscribe(Box<dyn ...>)` continues to
+  work via `Arc::from`.
+
+#### Documentation
+
+- **`MiddlewareManager::remove`** doc clarified: name-based, not
+  identity-based. Two middlewares registered with the same name cannot
+  be removed independently (sync finding A-D-401).
+- **README install pin** bumped from `apcore = "0.19"` to
+  `apcore = "0.20"` (sync finding B-001).
+
+---
+
 ## [0.20.0] - 2026-04-30
 
 ### System Modules Hardening (Issue #45, system-modules.md §1.1–§1.5)
