@@ -357,9 +357,7 @@ impl Config {
         }
 
         if let Some(threshold) = self.get("sys_modules.events.thresholds.error_rate") {
-            let ok = threshold
-                .as_f64()
-                .is_some_and(|f| (0.0..=1.0).contains(&f));
+            let ok = threshold.as_f64().is_some_and(|f| (0.0..=1.0).contains(&f));
             if !ok {
                 errors.push(format!(
                     "sys_modules.events.thresholds.error_rate must be a number in [0.0, 1.0] (got {threshold})"
