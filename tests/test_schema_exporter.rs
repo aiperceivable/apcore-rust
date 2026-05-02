@@ -35,8 +35,15 @@ fn test_schema_exporter_mcp_format() {
     assert_eq!(parsed["name"], "get_weather");
     assert!(parsed["inputSchema"].is_object());
     assert_eq!(parsed["inputSchema"]["required"][0], "location");
-    // MCP format should NOT include description at top level
-    assert!(parsed.get("description").is_none());
+    // Sync SCHEMA-004: MCP envelope MUST carry description, annotations, and
+    // _meta blocks aligned with apcore-python and apcore-typescript.
+    assert_eq!(
+        parsed["description"],
+        "Get the current weather for a location"
+    );
+    assert!(parsed["annotations"].is_object());
+    assert!(parsed["_meta"].is_object());
+    assert_eq!(parsed["_meta"]["paginationStyle"], "cursor");
 }
 
 #[test]
@@ -106,9 +113,15 @@ fn test_schema_exporter_openai_uses_parameters_key_fallback() {
     let parsed = exporter
         .export(&schema, ExportProfile::OpenAi, None)
         .unwrap();
+    // Sync SCHEMA-003: the fallback `parameters` key still feeds A23 strict
+    // transform; previously-optional properties become nullable arrays.
     assert_eq!(
         parsed["function"]["parameters"]["properties"]["x"]["type"],
-        "integer"
+        json!(["integer", "null"])
+    );
+    assert_eq!(
+        parsed["function"]["parameters"]["additionalProperties"],
+        json!(false)
     );
 }
 
@@ -297,4 +310,169 @@ fn test_schema_exporter_export_with_annotations() {
         .export(&schema, ExportProfile::Generic, Some(&opts))
         .unwrap();
     assert_eq!(parsed["x-custom"], "value");
+}
+
+// ---------------------------------------------------------------------------
+// SCHEMA-003 — A23 strict transform on OpenAI envelope
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_exporter_openai_strict_transform_marks_additional_properties_false() {
+    let exporter = SchemaExporter::new();
+    let schema = json!({
+        "name": "weather",
+        "description": "Get weather",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "location": { "type": "string" }
+            },
+            "required": ["location"]
+        }
+    });
+    let parsed = exporter
+        .export(&schema, ExportProfile::OpenAi, None)
+        .unwrap();
+    // After A23: additionalProperties:false on the parameters object
+    assert_eq!(
+        parsed["function"]["parameters"]["additionalProperties"],
+        json!(false)
+    );
+    // All properties become required
+    let required = parsed["function"]["parameters"]["required"]
+        .as_array()
+        .expect("required must be an array");
+    assert!(required.iter().any(|v| v == "location"));
+}
+
+#[test]
+fn test_schema_exporter_openai_strict_transform_makes_optional_nullable() {
+    let exporter = SchemaExporter::new();
+    let schema = json!({
+        "name": "tool",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name":    { "type": "string" },
+                "comment": { "type": "string" }
+            },
+            "required": ["name"]
+        }
+    });
+    let parsed = exporter
+        .export(&schema, ExportProfile::OpenAi, None)
+        .unwrap();
+    let parameters = &parsed["function"]["parameters"];
+    // "name" stayed required → unchanged type.
+    assert_eq!(parameters["properties"]["name"]["type"], "string");
+    // "comment" was optional → becomes nullable array.
+    assert_eq!(
+        parameters["properties"]["comment"]["type"],
+        json!(["string", "null"])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SCHEMA-004 — MCP / Anthropic envelope completeness via SchemaDefinition
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_exporter_export_def_mcp_includes_full_envelope() {
+    use apcore::module::ModuleAnnotations;
+    use apcore::schema::SchemaDefinition;
+
+    let exporter = SchemaExporter::new();
+    let def = SchemaDefinition {
+        module_id: "weather.get".to_string(),
+        description: "Get the current weather".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": { "location": { "type": "string" } }
+        }),
+        output_schema: json!({}),
+        error_schema: None,
+        definitions: None,
+        version: None,
+    };
+    let ann = ModuleAnnotations {
+        cacheable: true,
+        cache_ttl: 60,
+        idempotent: true,
+        paginated: true,
+        pagination_style: "cursor".to_string(),
+        ..ModuleAnnotations::default()
+    };
+
+    let envelope = exporter
+        .export_def(&def, ExportProfile::Mcp, Some(&ann), None, None)
+        .unwrap();
+    assert_eq!(envelope["name"], "weather.get");
+    assert_eq!(envelope["description"], "Get the current weather");
+    assert!(envelope["inputSchema"].is_object());
+    // annotations block
+    assert_eq!(envelope["annotations"]["idempotentHint"], true);
+    assert_eq!(envelope["annotations"]["readOnlyHint"], false);
+    assert_eq!(envelope["annotations"]["openWorldHint"], true);
+    // _meta block
+    assert_eq!(envelope["_meta"]["cacheable"], true);
+    assert_eq!(envelope["_meta"]["cacheTtl"], 60);
+    assert_eq!(envelope["_meta"]["paginated"], true);
+    assert_eq!(envelope["_meta"]["paginationStyle"], "cursor");
+}
+
+#[test]
+fn test_schema_exporter_export_def_anthropic_includes_input_examples() {
+    use apcore::module::ModuleExample;
+    use apcore::schema::SchemaDefinition;
+
+    let exporter = SchemaExporter::new();
+    let def = SchemaDefinition {
+        module_id: "tools.echo".to_string(),
+        description: "Echo".to_string(),
+        input_schema: json!({"type": "object"}),
+        output_schema: json!({}),
+        error_schema: None,
+        definitions: None,
+        version: None,
+    };
+    let examples = vec![ModuleExample {
+        title: "hello".to_string(),
+        description: None,
+        inputs: json!({"text": "hi"}),
+        output: json!({"text": "hi"}),
+    }];
+    let envelope = exporter
+        .export_def(&def, ExportProfile::Anthropic, None, Some(&examples), None)
+        .unwrap();
+    assert_eq!(envelope["name"], "tools_echo");
+    assert!(envelope["input_examples"].is_array());
+    assert_eq!(envelope["input_examples"][0]["text"], "hi");
+}
+
+#[test]
+fn test_schema_exporter_export_def_openai_uses_strict_transform() {
+    use apcore::schema::SchemaDefinition;
+
+    let exporter = SchemaExporter::new();
+    let def = SchemaDefinition {
+        module_id: "ns.tool".to_string(),
+        description: "desc".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": { "x": { "type": "integer" } },
+            "required": ["x"]
+        }),
+        output_schema: json!({}),
+        error_schema: None,
+        definitions: None,
+        version: None,
+    };
+    let envelope = exporter
+        .export_def(&def, ExportProfile::OpenAi, None, None, None)
+        .unwrap();
+    assert_eq!(envelope["function"]["name"], "ns_tool");
+    assert_eq!(
+        envelope["function"]["parameters"]["additionalProperties"],
+        json!(false)
+    );
 }
