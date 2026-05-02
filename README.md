@@ -51,7 +51,7 @@ source, plus the corresponding tests at `tests/test_async_task.rs` and
 | Type | Description |
 |------|-------------|
 | `APCore` | High-level client — register modules, call, stream, validate |
-| `Registry` | Module storage — discover, register, get, list (`watch()` is a no-op stub; use `reload()` or `discover()` instead) |
+| `Registry` | Module storage — discover, register, get, list, plus `watch()` for filesystem hot-reload (parity with apcore-python `Registry.watch`) and `reload()` for explicit re-discovery |
 | `Executor` | Execution engine — call with middleware pipeline, ACL, approval |
 | `Context` | Request context — trace ID, identity, call chain, cancel token |
 | `Config` | Configuration — from_defaults with env overrides, load YAML/JSON, get/set dot-path, validate, reload |
@@ -260,6 +260,10 @@ impl Module for GetUserModule {
 
 ### Add middleware
 
+> Rust reserves `use` as a keyword, so the middleware-attachment method is
+> named `use_middleware()` rather than `use()` as in apcore-python and
+> apcore-typescript. Functionally equivalent.
+
 ```rust
 use apcore::observability::{ContextLogger, ObsLoggingMiddleware};
 
@@ -337,7 +341,16 @@ construct `ModuleAnnotations` via `serde`:
 let yaml: serde_json::Value = serde_yaml_ng::from_reader(file)?;
 let annotations: ModuleAnnotations = serde_json::from_value(yaml)?;
 let descriptor = ModuleDescriptor { annotations: Some(annotations), ..default_descriptor };
-registry.register("my.module", module, descriptor)?;
+
+// 3-arg form: pass an explicit ModuleDescriptor. This is a Rust-only signature
+// — apcore-python and apcore-typescript use `register(module_id, module,
+// version?, metadata?)`. Use `Some(descriptor)` to attach the descriptor or
+// `None` to fall back to the auto-built one.
+registry.register("my.module", module, Some(descriptor))?;
+
+// 2-arg convenience form for parity with Python/TS examples — equivalent to
+// passing `None` for the descriptor:
+//   registry.register_module("my.module", another_module)?;
 ```
 
 ## Examples

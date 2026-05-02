@@ -276,6 +276,52 @@ fn test_bind_missing_namespace_uses_empty_object_for_serde_defaults() {
     assert_eq!(result, AllDefaultsConfig::default());
 }
 
+// Regression: sync finding A-D-017 — Config::get must perform longest-prefix
+// match against registered namespaces so hyphenated names route correctly.
+// Apcore-python and apcore-typescript both sort registered names by length
+// descending and match the longest prefix.
+#[test]
+fn test_get_supports_hyphenated_namespace_via_longest_prefix_match() {
+    use apcore::{EnvStyle, NamespaceRegistration};
+
+    // Use a unique name to avoid global-state collisions across tests.
+    let ns_name = format!(
+        "apcore-test-hyphenated-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _ = Config::register_namespace(NamespaceRegistration {
+        name: ns_name.clone(),
+        env_prefix: None,
+        defaults: None,
+        schema: None,
+        env_style: EnvStyle::Auto,
+        max_depth: 5,
+        env_map: None,
+    });
+
+    let mut config = Config::from_defaults();
+    config.mode = ConfigMode::Namespace;
+    config.user_namespaces.insert(
+        ns_name.clone(),
+        serde_json::json!({"transport": {"endpoint": "https://example.com"}}),
+    );
+
+    // Naive `key.split('.')` would route `<ns>.transport.endpoint` to
+    // `user_namespaces.get("apcore-test-hyphenated-...")` only if the split
+    // happens to leave the hyphenated prefix intact. The longest-prefix
+    // match guarantees it.
+    let key = format!("{ns_name}.transport.endpoint");
+    let value = config.get(&key);
+    assert_eq!(
+        value,
+        Some(serde_json::json!("https://example.com")),
+        "Config::get must resolve hyphenated namespace prefixes via longest-match"
+    );
+}
+
 #[test]
 fn test_get_typed_returns_value() {
     let mut config = Config::from_defaults();

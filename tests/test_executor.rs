@@ -504,3 +504,28 @@ async fn test_validate_accepts_optional_context() {
         "context shape should not change the number of preflight checks executed"
     );
 }
+
+// Regression for sync finding A-D-010 — Executor::validate() is a NON-THROWING
+// preflight: a malformed module_id MUST surface as a failed `module_id` check
+// in the returned PreflightResult, not bubble up as a `ModuleError`. Aligns
+// Rust with apcore-python and apcore-typescript.
+#[tokio::test]
+async fn test_validate_returns_preflight_failure_for_invalid_module_id() {
+    let client = APCore::new();
+    let result = client
+        .validate("INVALID_UPPERCASE_ID", &json!({}), None)
+        .await
+        .expect("validate must NOT throw on malformed module_id (sync A-D-010)");
+    assert!(
+        !result.valid,
+        "PreflightResult.valid must be false for a malformed module_id"
+    );
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.check == "module_id" && !c.passed),
+        "checks must include a failed `module_id` entry, got {:?}",
+        result.checks
+    );
+}

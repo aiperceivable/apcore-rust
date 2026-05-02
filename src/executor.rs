@@ -626,7 +626,26 @@ impl Executor {
         inputs: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> Result<PreflightResult, ModuleError> {
-        Self::validate_module_id(module_id)?;
+        // Sync finding A-D-010: validate() is a NON-THROWING preflight —
+        // a malformed module_id MUST be reported as a failed check, not
+        // bubble up as a `ModuleError`. apcore-python and apcore-typescript
+        // return a structured PreflightResult with `valid=false` for the
+        // module_id check; previously Rust used `?` on validate_module_id
+        // which broke that contract for callers expecting validate() to
+        // never throw on input-shape errors.
+        if let Err(err) = Self::validate_module_id(module_id) {
+            let check = PreflightCheckResult {
+                check: "module_id".to_string(),
+                passed: false,
+                error: Some(err.to_dict()),
+                warnings: vec![],
+            };
+            return Ok(PreflightResult {
+                valid: false,
+                checks: vec![check],
+                requires_approval: false,
+            });
+        }
         let context = ctx.cloned().unwrap_or_else(|| {
             Context::<serde_json::Value>::new(Identity::new(
                 "@external".to_string(),

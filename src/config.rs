@@ -446,6 +446,13 @@ impl Config {
     /// namespaces. Per spec §9.1, all keys MUST use the canonical
     /// `<namespace>.<field>` form. Legacy v0.17.x short-form aliases
     /// (e.g. bare `max_call_depth`) are NOT accepted.
+    ///
+    /// Sync finding A-D-017: namespace resolution uses longest-prefix match
+    /// against registered names, mirroring apcore-python's
+    /// `_split_namespace_key` and apcore-typescript's `resolveNamespacePath`.
+    /// Hyphenated namespace names (e.g. `apcore-mcp.transport.endpoint`)
+    /// route correctly even though `.split('.')` would otherwise strand the
+    /// hyphenated prefix on the first segment.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<serde_json::Value> {
         // Check canonical typed fields first.
@@ -453,7 +460,23 @@ impl Config {
             return Some(val);
         }
 
-        // Fall back to user namespaces with dot-path traversal.
+        // Longest-prefix match against the registered namespaces, then fall
+        // back to dot-split on the first segment. Hyphenated names like
+        // `apcore-mcp` cannot be reached by naive `split('.')`.
+        if let Some((ns_name, rest)) = self.match_registered_namespace(key) {
+            let top = self.user_namespaces.get(&ns_name)?;
+            if rest.is_empty() {
+                return Some(top.clone());
+            }
+            let mut current = top;
+            for part in rest.split('.') {
+                current = current.get(part)?;
+            }
+            return Some(current.clone());
+        }
+
+        // Fall back to user namespaces with dot-path traversal on the first
+        // segment (covers namespaces that were not explicitly registered).
         let parts: Vec<&str> = key.split('.').collect();
         if parts.is_empty() {
             return None;
@@ -467,6 +490,27 @@ impl Config {
             current = current.get(*part)?;
         }
         Some(current.clone())
+    }
+
+    /// Match `key` against the longest registered namespace name that is a
+    /// prefix-with-`.` (or exact-match) of the key. Returns `(namespace_name,
+    /// remainder_after_namespace_dot)`. Used by `get()` to support
+    /// hyphenated namespaces (sync finding A-D-017).
+    fn match_registered_namespace(&self, key: &str) -> Option<(String, String)> {
+        let registry = global_ns_registry().read();
+        // Sort registered names by length descending so longer matches win.
+        let mut names: Vec<&String> = registry.keys().collect();
+        names.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        for name in names {
+            if key == name.as_str() {
+                return Some((name.clone(), String::new()));
+            }
+            let dotted = format!("{name}.");
+            if key.starts_with(&dotted) {
+                return Some((name.clone(), key[dotted.len()..].to_string()));
+            }
+        }
+        None
     }
 
     /// Set a config value by dot-path key.
