@@ -65,6 +65,17 @@ fire-and-forget semantics, and documentation cleanup.
   subscribers can be cloned into `tokio::spawn` tasks for `emit_spawn`.
   No public-API surface change — `subscribe(Box<dyn ...>)` continues to
   work via `Arc::from`.
+- **`CancelToken::check`** return type changed from
+  `Result<(), ModuleError>` to `Result<(), ExecutionCancelledError>`
+  (sync finding CANCEL-001). The typed variant matches Python's
+  `ExecutionCancelledError(ModuleError)` subclass and TypeScript's
+  `ExecutionCancelledError extends ModuleError` hierarchy, letting
+  callers `match` on cancellation specifically. A `From<ExecutionCancelledError>
+  for ModuleError` impl plus an `ExecutionCancelledError::to_module_error()`
+  helper are provided for ergonomic widening, so most callers (`?` against
+  a `ModuleError` context) need no changes. A new
+  `CancelToken::check_for(&str)` method preserves the caller-supplied
+  module ID in the typed error.
 
 #### Documentation
 

@@ -60,3 +60,46 @@ fn test_multiple_clones_share_state() {
     assert!(t2.is_cancelled());
     assert!(t3.is_cancelled());
 }
+
+// ---------------------------------------------------------------------------
+// Sync CANCEL-001 — typed Result from check()
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_check_returns_typed_execution_cancelled_error() {
+    use apcore::cancel::ExecutionCancelledError;
+    use apcore::errors::{ErrorCode, ModuleError};
+
+    let token = CancelToken::new();
+    // Before cancellation: Ok.
+    assert!(token.check().is_ok());
+
+    token.cancel();
+    // After cancellation: a typed ExecutionCancelledError that we can match on
+    // — pattern proves the return type is `Result<(), ExecutionCancelledError>`.
+    match token.check() {
+        Err(ExecutionCancelledError {
+            ref message,
+            ref module_id,
+        }) => {
+            assert!(!message.is_empty());
+            assert!(!module_id.is_empty());
+        }
+        Ok(()) => panic!("expected typed cancel error after cancel()"),
+    }
+
+    // Widening back to ModuleError must work via the From impl.
+    let cancelled = token.check().unwrap_err();
+    let me: ModuleError = cancelled.into();
+    assert_eq!(me.code, ErrorCode::ExecutionCancelled);
+}
+
+#[test]
+fn test_check_for_carries_module_id() {
+    use apcore::cancel::ExecutionCancelledError;
+
+    let token = CancelToken::new();
+    token.cancel();
+    let err: ExecutionCancelledError = token.check_for("ns.target").unwrap_err();
+    assert_eq!(err.module_id, "ns.target");
+}
