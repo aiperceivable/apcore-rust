@@ -239,13 +239,20 @@ pub fn build_strategy_from_config(
 ) -> Result<ExecutionStrategy, ModuleError> {
     let mut strategy = build_standard_strategy();
 
-    // (1) Remove steps
+    // (1) Remove steps — Issue #33 §1.2: fail-fast when YAML refers to a
+    // nonexistent step rather than emitting a tracing::warn! and proceeding.
     if let Some(remove_list) = pipeline_config.get("remove").and_then(|v| v.as_array()) {
         for entry in remove_list {
             if let Some(step_name) = entry.as_str() {
-                if let Err(e) = strategy.remove(step_name) {
-                    tracing::warn!(step = step_name, error = %e, "Cannot remove step");
-                }
+                strategy.remove(step_name).map_err(|e| {
+                    ModuleError::new(
+                        ErrorCode::PipelineConfigInvalid,
+                        format!(
+                            "pipeline.remove: cannot remove step '{step_name}': {}",
+                            e.message
+                        ),
+                    )
+                })?;
             }
         }
     }
@@ -284,23 +291,30 @@ pub fn build_strategy_from_config(
                 }
 
                 // Wrap the existing step with a ConfiguredStep overlay.
-                if let Err(e) = strategy.replace_with(step_name_str, |inner| {
-                    Box::new(ConfiguredStep {
-                        name_override: None,
-                        match_modules: match_modules
-                            .or_else(|| inner.match_modules().map(<[std::string::String]>::to_vec)),
-                        ignore_errors: ignore_errors.unwrap_or_else(|| inner.ignore_errors()),
-                        pure: pure_val.unwrap_or_else(|| inner.pure()),
-                        timeout_ms: timeout_ms.unwrap_or_else(|| inner.timeout_ms()),
-                        inner,
+                // Issue #33 §1.2: configuring a nonexistent step is a hard
+                // configuration error, not a warning.
+                strategy
+                    .replace_with(step_name_str, |inner| {
+                        Box::new(ConfiguredStep {
+                            name_override: None,
+                            match_modules: match_modules.or_else(|| {
+                                inner.match_modules().map(<[std::string::String]>::to_vec)
+                            }),
+                            ignore_errors: ignore_errors.unwrap_or_else(|| inner.ignore_errors()),
+                            pure: pure_val.unwrap_or_else(|| inner.pure()),
+                            timeout_ms: timeout_ms.unwrap_or_else(|| inner.timeout_ms()),
+                            inner,
+                        })
                     })
-                }) {
-                    tracing::warn!(
-                        step = step_name_str,
-                        error = %e,
-                        "Cannot configure step"
-                    );
-                }
+                    .map_err(|e| {
+                        ModuleError::new(
+                            ErrorCode::PipelineConfigInvalid,
+                            format!(
+                                "pipeline.configure: cannot configure step '{step_name_str}': {}",
+                                e.message
+                            ),
+                        )
+                    })?;
             }
         }
     }
@@ -317,14 +331,17 @@ pub fn build_strategy_from_config(
             } else if let Some(anchor) = before {
                 strategy.insert_before(anchor, step)?;
             } else {
+                // Issue #33 §1.2: fail-fast on YAML configuration errors.
                 let name = step_def
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tracing::warn!(
-                    step = name,
-                    "Step has neither 'after' nor 'before' — skipping"
-                );
+                return Err(ModuleError::new(
+                    ErrorCode::PipelineConfigInvalid,
+                    format!(
+                        "pipeline.steps: step '{name}' has neither 'after' nor 'before' anchor"
+                    ),
+                ));
             }
         }
     }
