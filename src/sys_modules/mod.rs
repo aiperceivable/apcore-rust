@@ -175,6 +175,38 @@ pub(crate) async fn emit_event(
     }
 }
 
+/// Default `caller_id` when the `Context` has none (Issue #45.2 — contextual
+/// auditing). Cross-language parity: `apcore-python` and `apcore-typescript`
+/// both fall back to the literal `"@external"` string.
+pub(crate) const DEFAULT_EXTERNAL_CALLER: &str = "@external";
+
+/// Augment an audit-event payload with caller identity extracted from the
+/// `Context` (Issue #45.2). Adds:
+///   * `caller_id` — taken from `ctx.caller_id`, defaulted to `"@external"`.
+///   * `actor_id` / `actor_type` — taken from `ctx.identity` when present.
+///
+/// The `data` argument is mutated in place and returned for ergonomic chaining.
+pub(crate) fn augment_with_context_identity(
+    mut data: serde_json::Value,
+    ctx: &crate::context::Context<serde_json::Value>,
+) -> serde_json::Value {
+    if let Some(obj) = data.as_object_mut() {
+        let caller_id = ctx
+            .caller_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_EXTERNAL_CALLER.to_string());
+        obj.insert("caller_id".to_string(), serde_json::json!(caller_id));
+        if let Some(identity) = ctx.identity.as_ref() {
+            obj.insert("actor_id".to_string(), serde_json::json!(identity.id()));
+            obj.insert(
+                "actor_type".to_string(),
+                serde_json::json!(identity.identity_type()),
+            );
+        }
+    }
+    data
+}
+
 // ---------------------------------------------------------------------------
 // SysModuleError — strict registration failure (Issue #45 §1.5)
 // ---------------------------------------------------------------------------
@@ -541,18 +573,77 @@ pub fn register_sys_modules_with_options(
         }
     }
 
-    // Step 5d: Bridge registry events to tracing logs.
+    // Step 5d: Bridge registry events to ApCoreEvents (Issue #36).
+    //
+    // Each registry hook dual-emits the canonical
+    // `apcore.registry.<event>` name AND the legacy bare-name event
+    // (`module_registered`, `module_unregistered`) so existing subscribers
+    // continue to fire while consumers migrate to the canonical names. The
+    // legacy event payload includes `deprecated: true`.
+    //
+    // Registry callbacks are synchronous, so each hook spawns a task to
+    // dispatch the async emit — fire-and-forget, error-isolated.
     if events_enabled {
+        let emitter_for_register = Arc::clone(&emitter_arc);
         registry.on(
             "register",
             Box::new(move |module_id: &str, _module: &dyn Module| {
                 tracing::info!(module_id = %module_id, "module_registered");
+                let emitter = Arc::clone(&emitter_for_register);
+                let module_id_owned = module_id.to_string();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let canonical = ApCoreEvent::with_module(
+                            "apcore.registry.module_registered",
+                            json!({}),
+                            &module_id_owned,
+                            "info",
+                        );
+                        let legacy = ApCoreEvent::with_module(
+                            "module_registered",
+                            json!({
+                                "deprecated": true,
+                                "canonical_event": "apcore.registry.module_registered",
+                            }),
+                            &module_id_owned,
+                            "info",
+                        );
+                        let em = emitter.lock().await;
+                        let _ = em.emit(&canonical).await;
+                        let _ = em.emit(&legacy).await;
+                    });
+                }
             }),
         );
+        let emitter_for_unregister = Arc::clone(&emitter_arc);
         registry.on(
             "unregister",
             Box::new(move |module_id: &str, _module: &dyn Module| {
                 tracing::info!(module_id = %module_id, "module_unregistered");
+                let emitter = Arc::clone(&emitter_for_unregister);
+                let module_id_owned = module_id.to_string();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let canonical = ApCoreEvent::with_module(
+                            "apcore.registry.module_unregistered",
+                            json!({}),
+                            &module_id_owned,
+                            "info",
+                        );
+                        let legacy = ApCoreEvent::with_module(
+                            "module_unregistered",
+                            json!({
+                                "deprecated": true,
+                                "canonical_event": "apcore.registry.module_unregistered",
+                            }),
+                            &module_id_owned,
+                            "info",
+                        );
+                        let em = emitter.lock().await;
+                        let _ = em.emit(&canonical).await;
+                        let _ = em.emit(&legacy).await;
+                    });
+                }
             }),
         );
     }

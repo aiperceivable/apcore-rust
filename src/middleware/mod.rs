@@ -52,10 +52,17 @@ use crate::observability::metrics::{estimate_p99_from_histogram, MetricsCollecto
 /// Platform notification middleware — monitors error rates and latency,
 /// emits threshold events with hysteresis.
 ///
-/// Emits `error_threshold_exceeded` when a module's error rate crosses the
-/// configured threshold, `latency_threshold_exceeded` when p99 latency
-/// exceeds the limit, and `module_health_changed` when a previously alerted
-/// module recovers below `threshold * 0.5`.
+/// Emits `apcore.health.error_threshold_exceeded` when a module's error rate
+/// crosses the configured threshold, `apcore.health.latency_threshold_exceeded`
+/// when p99 latency exceeds the limit, and `apcore.health.recovered` when a
+/// previously alerted module recovers below `threshold * 0.5`.
+///
+/// **Issue #36 — canonical event-name standardization:** every threshold
+/// event is dual-emitted under both the canonical `apcore.health.*` name and
+/// its legacy bare-name alias (e.g. `error_threshold_exceeded`) so that
+/// existing subscribers continue to fire while consumers migrate to the
+/// canonical names. The legacy event payload carries a `deprecated: true`
+/// marker.
 ///
 /// Hysteresis prevents repeated alerts until recovery is observed.
 #[derive(Debug)]
@@ -137,15 +144,20 @@ impl PlatformNotifyMiddleware {
         errors / total
     }
 
-    /// Check error rate threshold; returns an event to emit if threshold exceeded (with hysteresis).
-    fn check_error_rate_threshold(&self, module_id: &str) -> Option<ApCoreEvent> {
+    /// Check error rate threshold; returns the canonical + legacy event pair
+    /// to emit if threshold exceeded (with hysteresis).
+    ///
+    /// Issue #36 — canonical events use the `apcore.<subsystem>.<event>` form;
+    /// the legacy bare-name event is dual-emitted with a `deprecated: true`
+    /// marker so existing subscribers continue to fire during migration.
+    fn check_error_rate_threshold(&self, module_id: &str) -> Vec<ApCoreEvent> {
         let error_rate = self.compute_error_rate(module_id);
         let mut alerted = self.alerted.lock();
         let module_alerts = alerted.entry(module_id.to_string()).or_default();
 
         if error_rate >= self.error_rate_threshold && !module_alerts.contains("error_rate") {
-            let event = ApCoreEvent::with_module(
-                "error_threshold_exceeded",
+            let canonical = ApCoreEvent::with_module(
+                "apcore.health.error_threshold_exceeded",
                 serde_json::json!({
                     "error_rate": error_rate,
                     "threshold": self.error_rate_threshold,
@@ -153,36 +165,61 @@ impl PlatformNotifyMiddleware {
                 module_id,
                 "error",
             );
+            // Legacy alias — kept for one major release per Issue #36
+            // deprecation policy.
+            let legacy = ApCoreEvent::with_module(
+                "error_threshold_exceeded",
+                serde_json::json!({
+                    "error_rate": error_rate,
+                    "threshold": self.error_rate_threshold,
+                    "deprecated": true,
+                    "canonical_event": "apcore.health.error_threshold_exceeded",
+                }),
+                module_id,
+                "error",
+            );
             module_alerts.insert("error_rate".to_string());
-            Some(event)
+            vec![canonical, legacy]
         } else {
-            None
+            vec![]
         }
     }
 
-    /// Check latency threshold; returns an event to emit if p99 exceeds limit.
-    fn check_latency_threshold(&self, module_id: &str) -> Option<ApCoreEvent> {
-        let collector = self.metrics_collector.as_ref()?;
+    /// Check latency threshold; returns canonical + legacy events if p99
+    /// exceeds the configured limit (Issue #36 — dual emission).
+    fn check_latency_threshold(&self, module_id: &str) -> Vec<ApCoreEvent> {
+        let Some(collector) = self.metrics_collector.as_ref() else {
+            return vec![];
+        };
         let snap = collector.snapshot();
 
-        let histograms = snap.get("histograms")?.as_object()?;
+        let Some(histograms) = snap.get("histograms").and_then(|v| v.as_object()) else {
+            return vec![];
+        };
         let hist_key = format!("apcore_module_duration_seconds|module_id={module_id}");
-        let data = histograms.get(&hist_key)?;
+        let Some(data) = histograms.get(&hist_key) else {
+            return vec![];
+        };
 
-        let count = data.get("count")?.as_u64().unwrap_or(0);
+        let count = data
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         if count == 0 {
-            return None;
+            return vec![];
         }
 
         // Estimate p99 from cumulative histogram buckets.
-        let buckets = data.get("buckets")?.as_array()?;
+        let Some(buckets) = data.get("buckets").and_then(|v| v.as_array()) else {
+            return vec![];
+        };
         let p99_ms = estimate_p99_from_histogram(buckets, count);
 
         let mut alerted = self.alerted.lock();
         let module_alerts = alerted.entry(module_id.to_string()).or_default();
         if p99_ms >= self.latency_p99_threshold_ms && !module_alerts.contains("latency") {
-            let event = ApCoreEvent::with_module(
-                "latency_threshold_exceeded",
+            let canonical = ApCoreEvent::with_module(
+                "apcore.health.latency_threshold_exceeded",
                 serde_json::json!({
                     "p99_latency_ms": p99_ms,
                     "threshold": self.latency_p99_threshold_ms,
@@ -190,10 +227,21 @@ impl PlatformNotifyMiddleware {
                 module_id,
                 "warn",
             );
+            let legacy = ApCoreEvent::with_module(
+                "latency_threshold_exceeded",
+                serde_json::json!({
+                    "p99_latency_ms": p99_ms,
+                    "threshold": self.latency_p99_threshold_ms,
+                    "deprecated": true,
+                    "canonical_event": "apcore.health.latency_threshold_exceeded",
+                }),
+                module_id,
+                "warn",
+            );
             module_alerts.insert("latency".to_string());
-            return Some(event);
+            return vec![canonical, legacy];
         }
-        None
+        vec![]
     }
 
     /// Check if error rate has recovered; returns an event to emit if recovered.
@@ -253,7 +301,7 @@ impl Middleware for PlatformNotifyMiddleware {
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Check latency threshold and error-rate recovery after execution.
-        if let Some(event) = self.check_latency_threshold(module_id) {
+        for event in self.check_latency_threshold(module_id) {
             let _ = self.emitter.emit(&event).await;
         }
         if let Some(event) = self.check_error_recovery(module_id) {
@@ -270,7 +318,7 @@ impl Middleware for PlatformNotifyMiddleware {
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Check error rate threshold on error.
-        if let Some(event) = self.check_error_rate_threshold(module_id) {
+        for event in self.check_error_rate_threshold(module_id) {
             let _ = self.emitter.emit(&event).await;
         }
         Ok(None)

@@ -27,7 +27,8 @@ use crate::registry::types::DepInfo;
 use super::audit::{build_audit_entry, record_audit, AuditAction, AuditChange, AuditStore};
 use super::overrides::write_override;
 use super::{
-    emit_event, is_sensitive_key, missing_field_error, require_string, ToggleState, RESTRICTED_KEYS,
+    augment_with_context_identity, emit_event, is_sensitive_key, missing_field_error,
+    require_string, ToggleState, RESTRICTED_KEYS,
 };
 
 // ---------------------------------------------------------------------------
@@ -150,11 +151,17 @@ impl Module for UpdateConfigModule {
         };
 
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let event_data = json!({
-            "key": key,
-            "old_value": redacted_old,
-            "new_value": redacted_new,
-        });
+        // Issue #45.2 — contextual auditing: augment payload with caller_id
+        // (defaulted to "@external") and identity from the Context.
+        let event_data = augment_with_context_identity(
+            json!({
+                "key": key,
+                "old_value": redacted_old,
+                "new_value": redacted_new,
+                "reason": reason,
+            }),
+            ctx,
+        );
 
         emit_event(
             &self.emitter,
@@ -387,15 +394,21 @@ impl ReloadModule {
         // (7) Emit the reloaded event with actual versions.
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let timestamp = chrono::Utc::now().to_rfc3339();
+        // Issue #45.2 — augment with caller_id / identity from the Context.
+        let event_data = augment_with_context_identity(
+            json!({
+                "previous_version": previous_version,
+                "new_version": new_version,
+                "reason": reason,
+            }),
+            ctx,
+        );
         emit_event(
             &self.emitter,
             "apcore.module.reloaded",
             &module_id,
             &timestamp,
-            json!({
-                "previous_version": previous_version,
-                "new_version": new_version,
-            }),
+            event_data,
         )
         .await;
 
@@ -460,12 +473,20 @@ impl ReloadModule {
             match self.registry.safe_unregister(&mid, 5000).await {
                 Ok(_) => {
                     let timestamp = chrono::Utc::now().to_rfc3339();
+                    let event_data = augment_with_context_identity(
+                        json!({
+                            "previous_version": "unknown",
+                            "new_version": "unknown",
+                            "reason": reason,
+                        }),
+                        ctx,
+                    );
                     emit_event(
                         &self.emitter,
                         "apcore.module.reloaded",
                         &mid,
                         &timestamp,
-                        json!({"previous_version": "unknown", "new_version": "unknown"}),
+                        event_data,
                     )
                     .await;
                     reloaded.push(mid);
@@ -695,12 +716,20 @@ impl Module for ToggleFeatureModule {
         }
 
         let timestamp = chrono::Utc::now().to_rfc3339();
+        // Issue #45.2 — augment with caller_id / identity from the Context.
+        let event_data = augment_with_context_identity(
+            json!({
+                "enabled": enabled,
+                "reason": reason,
+            }),
+            ctx,
+        );
         emit_event(
             &self.emitter,
             "apcore.module.toggled",
             &module_id,
             &timestamp,
-            json!({"enabled": enabled}),
+            event_data,
         )
         .await;
 
