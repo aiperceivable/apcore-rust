@@ -131,7 +131,7 @@ pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware}
 pub use observability::usage::{UsageCollector, UsageMiddleware, UsageStats};
 pub use pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineState, PipelineTrace, RunOptions,
-    RunUntilPredicate, Step, StepResult, StepTrace, StrategyInfo,
+    RunUntilPredicate, Step, StepMiddleware, StepResult, StepTrace, StrategyInfo,
 };
 pub use pipeline_config::{
     build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,

@@ -111,6 +111,12 @@ pub enum ErrorCode {
     /// targeted a step name that does not exist in the strategy.
     /// Cross-language: Python/TS `PIPELINE_STEP_NOT_FOUND`.
     PipelineStepNotFound,
+    /// Issue #33 §2.1: a strategy was constructed in which a step's
+    /// `requires` list referenced a field not produced by any preceding
+    /// step's `provides`. Strategies MUST fail fast at construction rather
+    /// than warn at runtime. Details carry `step_name` and `requires`.
+    /// Cross-language: Python/TS `PIPELINE_DEPENDENCY_ERROR`.
+    PipelineDependencyError,
     StepNotFound,
     StepNotRemovable,
     StepNotReplaceable,

@@ -14,6 +14,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Pipeline StepMiddleware + fail-fast configuration (Issue #33)
+
+#### Added
+
+- **`StepMiddleware` trait** — formal step-scoped interceptor with default-method
+  async hooks `before_step`, `after_step`, and `on_step_error`. Multiple
+  middlewares run in registration order in the before phase and may recover
+  from a step failure by returning `Ok(Some(value))` from `on_step_error`.
+  Register via `ExecutionStrategy::add_step_middleware(Arc::new(...))`. Mirrors
+  apcore-python `step_middleware` (Issue #33 §2.2). The trait is re-exported
+  from the crate root.
+- **`ErrorCode::PipelineDependencyError`** — new error variant returned from
+  `ExecutionStrategy::new` / `insert_after` / `insert_before` when a step's
+  declared `requires` field is not produced by any preceding step's `provides`
+  (Issue #33 §2.1). Cross-language: Python/TS `PIPELINE_DEPENDENCY_ERROR`.
+
+#### Changed
+
+- **`ExecutionStrategy` dependency validation** is now **fail-fast at
+  construction** rather than emitting a `tracing::warn!`. Strategies with
+  unmet `requires`/`provides` declarations now return
+  `Err(PipelineDependencyError)` from the constructor. Pipelines that already
+  satisfy their declarations are unaffected (Issue #33 §2.1).
+- **`build_strategy_from_config`** now returns
+  `Err(PipelineConfigInvalid)` when the YAML `pipeline.remove`,
+  `pipeline.configure`, or `pipeline.steps` section references a step that
+  does not exist or omits both `after`/`before` anchors. Previously these
+  conditions logged a warning and silently dropped the directive (Issue #33
+  §1.2). This is a behaviour change: configurations that previously
+  surfaced only a log warning will now refuse to construct the strategy.
+
 ### Cross-Language Sync — Review-Mode Hardening
 
 This release applies the next batch of cross-language audit findings, focused

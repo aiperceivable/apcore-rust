@@ -22,6 +22,67 @@ use crate::utils::helpers::match_pattern;
 pub type RunUntilPredicate = Box<dyn Fn(&PipelineState) -> bool + Send + Sync>;
 
 // ---------------------------------------------------------------------------
+// StepMiddleware
+// ---------------------------------------------------------------------------
+
+/// Step-scoped interceptor invoked around every step in an [`ExecutionStrategy`].
+///
+/// `StepMiddleware` complements the global [`crate::middleware::Middleware`] trait,
+/// which wraps the entire module call. `StepMiddleware` instead wraps each
+/// pipeline step individually and is the Rust counterpart of Python/TS
+/// step-level middleware (Issue #33 §2.2).
+///
+/// Hook semantics:
+/// - [`Self::before_step`] runs before every step. Returning `Err` aborts the
+///   pipeline immediately with the returned error wrapped in `PipelineStepError`.
+/// - [`Self::after_step`] runs after a step succeeds. Errors propagate the same
+///   way as `before_step`.
+/// - [`Self::on_step_error`] runs when a step's `execute()` returns `Err` and
+///   the step is **not** marked `ignore_errors`. Returning `Ok(Some(value))`
+///   recovers — `ctx.output` is replaced with `value`, the failure is treated
+///   as a successful continue, and `after_step` is NOT invoked for the recovered
+///   step. Returning `Ok(None)` lets the original error propagate.
+///
+/// Multiple middlewares run in registration order during the before phase and
+/// reverse order during the after phase, mirroring the global middleware
+/// chain semantics.
+#[async_trait]
+pub trait StepMiddleware: Send + Sync {
+    /// Called before each step's `execute()` method.
+    async fn before_step(
+        &self,
+        _step_name: &str,
+        _state: &PipelineState<'_>,
+    ) -> Result<(), ModuleError> {
+        Ok(())
+    }
+
+    /// Called after each step's `execute()` method completes successfully.
+    /// `result` is a snapshot of `ctx.output` taken right after the step ran;
+    /// when the step did not set an output it is `Value::Null`.
+    async fn after_step(
+        &self,
+        _step_name: &str,
+        _state: &PipelineState<'_>,
+        _result: &serde_json::Value,
+    ) -> Result<(), ModuleError> {
+        Ok(())
+    }
+
+    /// Called when a step's `execute()` returns `Err`. Returning `Ok(Some(value))`
+    /// recovers the failure: `ctx.output` is set to `value` and the pipeline
+    /// continues. `Ok(None)` lets the original error propagate.
+    async fn on_step_error(
+        &self,
+        _step_name: &str,
+        _state: &PipelineState<'_>,
+        _error: &ModuleError,
+    ) -> Result<Option<serde_json::Value>, ModuleError> {
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Step trait
 // ---------------------------------------------------------------------------
 
@@ -347,6 +408,7 @@ pub struct ExecutionStrategy {
     name: String,
     steps: Vec<Box<dyn Step>>,
     name_to_idx: HashMap<String, usize>,
+    step_middlewares: Vec<Arc<dyn StepMiddleware>>,
 }
 
 impl std::fmt::Debug for ExecutionStrategy {
@@ -356,6 +418,7 @@ impl std::fmt::Debug for ExecutionStrategy {
             .field("step_names", &self.step_names())
             .field("step_count", &self.steps.len())
             .field("name_to_idx_len", &self.name_to_idx.len())
+            .field("step_middleware_count", &self.step_middlewares.len())
             .finish()
     }
 }
@@ -406,9 +469,11 @@ impl ExecutionStrategy {
             name,
             steps,
             name_to_idx: HashMap::new(),
+            step_middlewares: Vec::new(),
         };
         strategy.rebuild_index();
-        strategy.validate_dependencies();
+        // §2.1: fail-fast on unmet requires/provides at construction.
+        strategy.validate_dependencies()?;
         Ok(strategy)
     }
 
@@ -429,25 +494,48 @@ impl ExecutionStrategy {
         &self.name_to_idx
     }
 
-    /// Warn if any step's requires are not provided by a preceding step.
-    fn validate_dependencies(&self) {
+    /// Validate `requires`/`provides` declarations across the strategy.
+    ///
+    /// Issue #33 §2.1: rather than logging a `tracing::warn!` and proceeding
+    /// (the previous behaviour), an unmet `requires` reference now causes
+    /// strategy construction to fail with [`ErrorCode::PipelineDependencyError`].
+    /// This makes pipeline misconfiguration a startup-time error rather than
+    /// a latent runtime hazard.
+    fn validate_dependencies(&self) -> Result<(), ModuleError> {
         let mut provided = std::collections::HashSet::new();
         for step in &self.steps {
             for req in step.requires() {
                 if !provided.contains(*req) {
-                    tracing::warn!(
-                        step = step.name(),
-                        requires = *req,
-                        "Step requires '{}', but no preceding step provides it. \
-                         This may cause runtime errors.",
-                        req,
-                    );
+                    return Err(ModuleError::new(
+                        ErrorCode::PipelineDependencyError,
+                        format!(
+                            "Step '{}' in strategy '{}' requires '{}', but no preceding step \
+                             provides it",
+                            step.name(),
+                            self.name,
+                            req,
+                        ),
+                    ));
                 }
             }
             for p in step.provides() {
                 provided.insert(*p);
             }
         }
+        Ok(())
+    }
+
+    /// Register a [`StepMiddleware`] for this strategy. Middlewares execute in
+    /// registration order during the before phase and reverse order during the
+    /// after phase. See [`StepMiddleware`] (Issue #33 §2.2).
+    pub fn add_step_middleware(&mut self, mw: Arc<dyn StepMiddleware>) {
+        self.step_middlewares.push(mw);
+    }
+
+    /// Read-only access to the registered step middlewares.
+    #[must_use]
+    pub fn step_middlewares(&self) -> &[Arc<dyn StepMiddleware>] {
+        &self.step_middlewares
     }
 
     /// Strategy name.
@@ -479,7 +567,7 @@ impl ExecutionStrategy {
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx + 1, step);
         self.rebuild_index();
-        self.validate_dependencies();
+        self.validate_dependencies()?;
         Ok(())
     }
 
@@ -489,7 +577,7 @@ impl ExecutionStrategy {
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx, step);
         self.rebuild_index();
-        self.validate_dependencies();
+        self.validate_dependencies()?;
         Ok(())
     }
 
@@ -756,6 +844,35 @@ impl PipelineEngine {
                 continue;
             }
 
+            // (3a) StepMiddleware: before_step hooks run in registration order.
+            //      A failure here aborts the pipeline like any step error.
+            let step_name_for_hooks = step.name().to_string();
+            let middlewares = strategy.step_middlewares();
+            let mut before_err: Option<ModuleError> = None;
+            for mw in middlewares {
+                let state = PipelineState {
+                    step_name: &step_name_for_hooks,
+                    outputs: &step_outputs,
+                    context: ctx,
+                };
+                if let Err(e) = mw.before_step(&step_name_for_hooks, &state).await {
+                    before_err = Some(e);
+                    break;
+                }
+            }
+            if let Some(err) = before_err {
+                ctx.trace.steps.push(StepTrace {
+                    name: step_name_for_hooks.clone(),
+                    duration_ms: 0.0,
+                    result: StepResult::abort(&err.to_string()),
+                    skipped: false,
+                    decision_point: false,
+                    skip_reason: None,
+                });
+                ctx.trace.total_duration_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+                return Err(ModuleError::pipeline_step_error(&step_name_for_hooks, &err));
+            }
+
             // (3) Execute with per-step timeout
             let step_start = std::time::Instant::now();
             let exec_result = if step_timeout_ms > 0 {
@@ -784,6 +901,61 @@ impl PipelineEngine {
             let result = match exec_result {
                 Ok(r) => r,
                 Err(err) => {
+                    // (3b) StepMiddleware: on_step_error hooks may recover by
+                    // returning Some(value). The first middleware to return a
+                    // recovery value wins; remaining middlewares are skipped.
+                    let mut recovery: Option<serde_json::Value> = None;
+                    let mut hook_err: Option<ModuleError> = None;
+                    for mw in middlewares {
+                        let state = PipelineState {
+                            step_name: &step_name_for_hooks,
+                            outputs: &step_outputs,
+                            context: ctx,
+                        };
+                        match mw.on_step_error(&step_name_for_hooks, &state, &err).await {
+                            Ok(Some(v)) => {
+                                recovery = Some(v);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                hook_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = hook_err {
+                        ctx.trace.steps.push(StepTrace {
+                            name: step_name_for_hooks.clone(),
+                            duration_ms,
+                            result: StepResult::abort(&e.to_string()),
+                            skipped: false,
+                            decision_point: false,
+                            skip_reason: None,
+                        });
+                        ctx.trace.total_duration_ms =
+                            pipeline_start.elapsed().as_secs_f64() * 1000.0;
+                        return Err(ModuleError::pipeline_step_error(&step_name_for_hooks, &e));
+                    }
+                    if let Some(value) = recovery {
+                        ctx.output = Some(value);
+                        ctx.trace.steps.push(StepTrace {
+                            name: step_name_for_hooks.clone(),
+                            duration_ms,
+                            result: StepResult {
+                                action: "continue".into(),
+                                explanation: Some(format!("recovered from: {err}")),
+                                ..Default::default()
+                            },
+                            skipped: false,
+                            decision_point: false,
+                            skip_reason: Some("error_recovered".to_string()),
+                        });
+                        step_outputs.insert(step_name_for_hooks.clone(), ctx.output.clone());
+                        idx += 1;
+                        continue;
+                    }
+
                     // (4) ignore_errors: log and continue (§1.1)
                     if step_ignore_errors {
                         tracing::warn!(
@@ -823,6 +995,37 @@ impl PipelineEngine {
                     return Err(ModuleError::pipeline_step_error(step.name(), &err));
                 }
             };
+
+            // (3c) StepMiddleware: after_step hooks run after a successful step.
+            //      Snapshot of ctx.output is passed; null when step did not set output.
+            let after_result_value = ctx.output.clone().unwrap_or(serde_json::Value::Null);
+            let mut after_err: Option<ModuleError> = None;
+            for mw in middlewares {
+                let state = PipelineState {
+                    step_name: &step_name_for_hooks,
+                    outputs: &step_outputs,
+                    context: ctx,
+                };
+                if let Err(e) = mw
+                    .after_step(&step_name_for_hooks, &state, &after_result_value)
+                    .await
+                {
+                    after_err = Some(e);
+                    break;
+                }
+            }
+            if let Some(err) = after_err {
+                ctx.trace.steps.push(StepTrace {
+                    name: step_name_for_hooks.clone(),
+                    duration_ms,
+                    result: StepResult::abort(&err.to_string()),
+                    skipped: false,
+                    decision_point: false,
+                    skip_reason: None,
+                });
+                ctx.trace.total_duration_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+                return Err(ModuleError::pipeline_step_error(&step_name_for_hooks, &err));
+            }
 
             let action = result.action.clone();
             let skip_target = result.skip_to.clone();
