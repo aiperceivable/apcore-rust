@@ -1,5 +1,15 @@
 // APCore Protocol — Context-aware logging
-// Spec reference: Structured logging with execution context
+// Spec reference: Structured logging with execution context.
+//
+// Sync finding D-28 — schema alignment with apcore-python and apcore-typescript:
+//   1. The emitted `level` field is the lowercase level name ("info"), not
+//      uppercase ("INFO"). Cross-language log shipping pipelines key off this
+//      field; an uppercase outlier breaks dashboards.
+//   2. User-supplied extras are nested under a single `extra` key rather
+//      than flattened to top-level. This prevents user keys from colliding
+//      with the canonical fields (`level`, `timestamp`, `trace_id`, ...).
+//   3. The obs-logging middleware emits `module_id` (not `module`) and
+//      `inputs` (not `input`) — both names are protocol-canonical.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -33,8 +43,11 @@ pub enum LogFormat {
     Text,
 }
 
+/// Trait object the logger writes to. Defaults to stderr; tests can substitute
+/// an in-memory buffer to inspect emitted records without touching stderr.
+type LoggerWriter = Box<dyn Write + Send + Sync>;
+
 /// Logger that injects execution context into log records.
-#[derive(Debug)]
 pub struct ContextLogger {
     pub name: String,
     pub level: String,
@@ -42,6 +55,26 @@ pub struct ContextLogger {
     pub trace_id: Option<String>,
     pub module_id: Option<String>,
     pub caller_id: Option<String>,
+    /// Output sink. `None` ⇒ stderr (default). Writes are mutex-guarded so
+    /// `ContextLogger` remains `Send + Sync` even with a mutable writer.
+    writer: Option<Mutex<LoggerWriter>>,
+}
+
+impl std::fmt::Debug for ContextLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextLogger")
+            .field("name", &self.name)
+            .field("level", &self.level)
+            .field("format", &self.format)
+            .field("trace_id", &self.trace_id)
+            .field("module_id", &self.module_id)
+            .field("caller_id", &self.caller_id)
+            .field(
+                "writer",
+                &self.writer.as_ref().map_or("stderr", |_| "<custom>"),
+            )
+            .finish()
+    }
 }
 
 impl ContextLogger {
@@ -54,6 +87,7 @@ impl ContextLogger {
             trace_id: None,
             module_id: None,
             caller_id: None,
+            writer: None,
         }
     }
 
@@ -68,6 +102,7 @@ impl ContextLogger {
             trace_id: Some(ctx.trace_id.clone()),
             module_id,
             caller_id,
+            writer: None,
         }
     }
 
@@ -81,7 +116,25 @@ impl ContextLogger {
         self.format = format;
     }
 
+    /// Substitute the output sink (default: stderr). Useful for tests that
+    /// need to inspect emitted records.
+    pub fn set_writer(&mut self, writer: LoggerWriter) {
+        self.writer = Some(Mutex::new(writer));
+    }
+
+    fn write_line(&self, line: &str) {
+        if let Some(ref w) = self.writer {
+            let mut guard = w.lock();
+            let _ = writeln!(*guard, "{line}");
+        } else {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+    }
+
     /// Emit a log record if level meets threshold.
+    ///
+    /// `extra` keys go under a nested `extra` object (D-28). Any
+    /// `_secret_*`-prefixed key inside `extra` is redacted in place.
     pub fn emit(
         &self,
         level_name: &str,
@@ -101,9 +154,10 @@ impl ContextLogger {
                     "timestamp".to_string(),
                     serde_json::Value::String(Utc::now().to_rfc3339()),
                 );
+                // D-28: lowercase level name (matches Python+TS).
                 record.insert(
                     "level".to_string(),
-                    serde_json::Value::String(level_name.to_uppercase()),
+                    serde_json::Value::String(level_name.to_lowercase()),
                 );
                 record.insert(
                     "logger".to_string(),
@@ -131,21 +185,25 @@ impl ContextLogger {
                         serde_json::Value::String(caller_id.clone()),
                     );
                 }
+                // D-28: nest user-supplied extras under a single `extra` key
+                // so they cannot collide with the canonical top-level fields.
                 if let Some(extra_map) = extra {
+                    let mut nested = serde_json::Map::new();
                     for (k, v) in extra_map {
                         if k.starts_with("_secret_") {
-                            record.insert(
+                            nested.insert(
                                 k.clone(),
                                 serde_json::Value::String(REDACTED_VALUE.to_string()),
                             );
                         } else {
-                            record.insert(k.clone(), v.clone());
+                            nested.insert(k.clone(), v.clone());
                         }
                     }
+                    record.insert("extra".to_string(), serde_json::Value::Object(nested));
                 }
                 let json_str =
                     serde_json::to_string(&serde_json::Value::Object(record)).unwrap_or_default();
-                let _ = writeln!(std::io::stderr(), "{json_str}");
+                self.write_line(&json_str);
             }
             LogFormat::Text => {
                 let ts = Utc::now().to_rfc3339();
@@ -155,15 +213,14 @@ impl ContextLogger {
                     (None, Some(mid)) => format!(" [module={mid}]"),
                     (None, None) => String::new(),
                 };
-                let _ = writeln!(
-                    std::io::stderr(),
+                self.write_line(&format!(
                     "{} {} {}{} {}",
                     ts,
                     level_name.to_uppercase(),
                     self.name,
                     ctx_str,
                     message
-                );
+                ));
             }
         }
     }
@@ -284,18 +341,25 @@ impl Middleware for ObsLoggingMiddleware {
         }
 
         let mut extra = HashMap::new();
+        // D-28: protocol-canonical names are `module_id` / `inputs`.
         extra.insert(
-            "module".to_string(),
+            "module_id".to_string(),
             serde_json::Value::String(module_id.to_string()),
         );
         extra.insert(
             "trace_id".to_string(),
             serde_json::Value::String(ctx.trace_id.clone()),
         );
+        if let Some(ref cid) = ctx.caller_id {
+            extra.insert(
+                "caller_id".to_string(),
+                serde_json::Value::String(cid.clone()),
+            );
+        }
         if self.log_inputs {
             let mut payload = inputs.clone();
             self.apply_redaction(&mut payload);
-            extra.insert("input".to_string(), payload);
+            extra.insert("inputs".to_string(), payload);
         }
         self.logger
             .emit("info", &format!("Starting {module_id}"), Some(&extra));
@@ -320,7 +384,7 @@ impl Middleware for ObsLoggingMiddleware {
 
         let mut extra = HashMap::new();
         extra.insert(
-            "module".to_string(),
+            "module_id".to_string(),
             serde_json::Value::String(module_id.to_string()),
         );
         extra.insert(
@@ -359,7 +423,7 @@ impl Middleware for ObsLoggingMiddleware {
 
         let mut extra = HashMap::new();
         extra.insert(
-            "module".to_string(),
+            "module_id".to_string(),
             serde_json::Value::String(module_id.to_string()),
         );
         extra.insert(

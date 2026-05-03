@@ -14,6 +14,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cross-Language Sync — Storage Backend & Multi-Alignment Fixes
+
+This batch introduces the protocol-canonical `StorageBackend` abstraction
+(Issue #43 §1), wires it through the three observability collectors as an
+optional persistence surface, and resolves five additional cross-language
+alignment findings (D-14, D-19, D-25, D-27, D-28). Behavior of the streaming
+chunk-merge path now surfaces a structured `STREAM_CHUNK_NOT_OBJECT` error,
+the runtime config-key policy emits a distinct `CONFIG_KEY_RESTRICTED`
+ErrorCode, and `ContextLogger`/`ObsLoggingMiddleware` align on lowercase
+levels, nested-`extra` schema, and the `module_id` / `inputs` field names.
+
+#### Added
+
+- **`observability::storage::StorageBackend`** trait + `InMemoryStorageBackend`
+  default — namespace/key/value persistence surface for cross-process
+  durability, per observability.md §1 (Issue #43 §1). The default in-memory
+  implementation is thread-safe (`RwLock`-guarded), namespace-isolated, and
+  treats `delete` as idempotent. Re-exported from the crate root.
+- **`ErrorHistory::with_storage_backend(per_module, total, backend)`** and
+  **`ErrorHistory::with_storage(backend)`** — optional `StorageBackend`
+  wiring; every recorded `ErrorEntry` is also persisted under namespace
+  `"error_history"` keyed by fingerprint when the backend is supplied.
+- **`UsageCollector::with_storage_backend(backend)`** — same pattern; usage
+  records persist under namespace `"usage"`.
+- **`MetricsCollector::with_storage_backend(backend)` / `.with_storage(...)`**
+  — metric points persist under namespace `"metrics"` with a key derived
+  from `(name, timestamp)`.
+- **`UsageCollector::record_at(...)`** and
+  **`UsageCollector::get_summary_for_period(period)`** (D-27) — `record_at`
+  honors an explicit `DateTime<Utc>` timestamp, and `get_summary_for_period`
+  filters records by recency. Trend is now derived from current-vs-previous
+  sample counts (`stable` / `rising` / `declining` / `new` / `inactive`),
+  matching `apcore-python` and `apcore-typescript` exactly.
+- **`executor::deep_merge_chunks_checked(chunks)`** (D-19) — public helper
+  that merges streaming chunks while enforcing each chunk is a JSON object;
+  a non-object chunk yields `ModuleError::GeneralInvalidInput` with
+  `details["code"] = "STREAM_CHUNK_NOT_OBJECT"` (cross-language: Python's
+  `_deep_merge` AttributeError, TypeScript's TypeError). The streaming
+  pipeline now uses this checked helper in Phase 3.
+- **`ErrorCode::ConfigKeyRestricted`** (D-25) — distinct wire-format
+  `CONFIG_KEY_RESTRICTED` code so callers can match the policy-deny case
+  separately from value-shape errors. Emitted by
+  `system.control.update_config` for keys in `RESTRICTED_KEYS`.
+- **`ContextLogger::set_writer(...)`** — substitute the output sink (default
+  stderr) so tests can capture emitted records.
+
+#### Changed
+
+- **`RetryConfig::default().max_retries`** is now `0` (was `3`) (D-14) —
+  retries are explicitly opt-in, matching `apcore-python` and
+  `apcore-typescript`. Behavior change: callers that were relying on the
+  silent `3` default must now opt in by setting `max_retries` explicitly.
+- **`ContextLogger`** JSON output schema (D-28):
+  * `level` field is now lowercase (`"info"`), not uppercase (`"INFO"`).
+  * User-supplied extras are nested under a single `"extra"` object instead
+    of flattened to the top level.
+- **`ObsLoggingMiddleware`** extras (D-28):
+  * `module_id` (was `module`).
+  * `inputs` (was `input`).
+- **`UsageRecord.timestamp`** is now `DateTime<Utc>` (was `String`); the
+  field was crate-private so the public surface is unaffected.
+
 ### Cross-Language Sync — Review-Mode Hardening
 
 This release applies the next batch of cross-language audit findings, focused

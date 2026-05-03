@@ -126,6 +126,9 @@ pub use observability::processor::{
 pub use observability::prometheus_exporter::PrometheusExporter;
 pub use observability::redaction::{RedactionConfig, RedactionConfigBuilder, RedactionConfigError};
 pub use observability::span::{Span, SpanExporter};
+pub use observability::storage::{
+    default_storage_backend, InMemoryStorageBackend, StorageBackend, StorageError,
+};
 pub use observability::store::{InMemoryObservabilityStore, MetricPoint, ObservabilityStore};
 pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use observability::usage::{UsageCollector, UsageMiddleware, UsageStats};

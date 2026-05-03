@@ -170,6 +170,11 @@ pub enum ErrorCode {
     /// `ModuleError` with this code rather than panicking, matching idiomatic
     /// Rust error handling.
     SysModulesDisabled,
+    /// Sync finding D-25: `system.control.update_config` was called with a key
+    /// listed in `RESTRICTED_KEYS`. Cross-language: Python/TS
+    /// `CONFIG_KEY_RESTRICTED`. Distinct from `ConfigInvalid` so consumers
+    /// can match the policy-deny case separately from value-shape errors.
+    ConfigKeyRestricted,
 }
 
 /// Structured error returned by module execution.

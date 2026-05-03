@@ -191,9 +191,14 @@ pub struct RetryConfig {
 }
 
 impl Default for RetryConfig {
+    /// Spec-aligned default (D-14): `max_retries = 0` matches both
+    /// `apcore-python` and `apcore-typescript`. Retries are explicitly opt-in;
+    /// this prevents the SDK from silently re-running failed tasks behind the
+    /// caller's back. The 1s base delay / 2.0× backoff / 60s ceiling stay
+    /// useful when callers DO opt into retries, so they're preserved.
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            max_retries: 0,
             retry_delay_ms: 1000,
             backoff_multiplier: 2.0,
             max_retry_delay_ms: 60_000,
