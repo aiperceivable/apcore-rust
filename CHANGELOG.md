@@ -40,6 +40,29 @@ fire-and-forget semantics, and documentation cleanup.
 - **`EventEmitter::shutdown` / `is_shutdown`** — idempotent shutdown
   that flushes pending work and turns subsequent `emit` / `emit_spawn`
   calls into no-ops (sync finding A-D-502).
+- **`TraceContext::inject_with_options`** — extended W3C inject API
+  accepting an optional 16-hex `parent_id` override, an optional
+  propagated `trace_flags` byte, and an optional `tracestate` slice.
+  When a tracestate is supplied (and non-empty) it is emitted as the
+  `tracestate` header alongside `traceparent`. Invalid `parent_id`
+  values fall back to a freshly generated random span ID. The
+  zero-argument `TraceContext::inject` retains its existing public
+  signature and is now a thin shim over `inject_with_options`
+  (issue #35).
+- **`TraceContext::extract_context`** — returns a full `TraceContext`
+  parsed from an inbound header map, populating `tracestate` from
+  the `tracestate` header per W3C §3.3.1 (comma-separated, capped at
+  32 entries, malformed entries silently dropped) (issue #35).
+
+#### Fixed
+
+- **`TraceContext::extract` case-insensitive header KEY lookup**
+  (issue #35) — RFC 7230 §3.2 requires HTTP header field names to be
+  treated case-insensitively. `extract` and `extract_context` now
+  match `traceparent` / `tracestate` header keys regardless of map
+  key casing (`traceparent`, `Traceparent`, `TRACEPARENT`, etc.) via
+  a new internal `lookup_header_ci` helper. Previously the `extract`
+  path required exact lowercase keys.
 
 #### Changed
 
