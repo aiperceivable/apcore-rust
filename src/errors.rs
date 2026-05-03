@@ -100,6 +100,14 @@ pub enum ErrorCode {
     ErrorFormatterDuplicate,
     PipelineAbort,
     PipelineConfigInvalid,
+    /// Sync alignment (W-7): pipeline-configuration errors that are NOT
+    /// dependency-graph violations (`requires`/`provides`) — for example
+    /// removing a non-existent step, configuring a non-existent step, or
+    /// declaring a custom step without a valid `after`/`before` anchor.
+    /// Distinct from [`Self::PipelineDependencyError`] so callers can match
+    /// the structural-config case independently of dependency-graph failures.
+    /// Cross-language: Python/TS `CONFIGURATION_ERROR`.
+    ConfigurationError,
     PipelineHandlerNotSupported,
     PipelineStepInsertionAmbiguous,
     /// Issue #33 (core-executor.md §Pipeline Hardening §1.1): a pipeline step's

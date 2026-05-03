@@ -14,6 +14,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cross-SDK Sync Alignment
+
+#### Added
+
+- **`OverridesStore` trait + `InMemoryOverridesStore` / `FileOverridesStore`
+  reference impls** (sync finding CRITICAL #1). The runtime overrides layer
+  is now a pluggable async trait with `load()` and `save()` methods, allowing
+  callers to swap in custom backends (Redis, S3, in-memory test fakes).
+  `SysModulesOptions::overrides_store: Option<Arc<dyn OverridesStore>>` is
+  threaded through `register_sys_modules_with_options` and wired into
+  `UpdateConfigModule` / `ToggleFeatureModule`. When set, the store takes
+  precedence over the legacy `overrides_path`. Aligns with `apcore-python`
+  and `apcore-typescript`. Re-exported from the crate root as
+  `OverridesStore`, `InMemoryOverridesStore`, `FileOverridesStore`,
+  `OverridesError`.
+- **`RetryConfig::compute_delay_ms`** (sync finding CRITICAL #2 / D-08).
+  Canonical name for the retry-delay calculation, matching PY/TS. The legacy
+  `delay_for_attempt` is retained as a `#[deprecated(since = "0.21.0")]`
+  alias that delegates to `compute_delay_ms`; it will be removed in the next
+  minor.
+- **`TraceContext::inject_checked`** (sync finding W-6). Validating variant
+  of `inject_with_options` that returns `ErrorCode::GeneralInvalidInput` when
+  a caller-supplied `parent_id` does not match `^[0-9a-f]{16}$`, instead of
+  silently falling back to a random value. Matches PY/TS behaviour.
+- **`TRACE_FLAGS_KEY` constant** (sync finding CRITICAL #3). Public string
+  constant `"_apcore.trace.flags"` that names the context-data slot used for
+  inbound `trace-flags` propagation.
+- **`ErrorCode::ConfigurationError`** (sync finding W-7). Distinct error
+  code for structural pipeline-configuration errors (missing-step in
+  `remove`/`configure`, missing `after`/`before` anchor) — keeps these cases
+  disambiguated from `PipelineDependencyError` (reserved for `requires` /
+  `provides` graph violations).
+
+#### Changed
+
+- **`TraceContext::inject` propagates inbound `trace-flags`** (sync finding
+  CRITICAL #3). When `context.data` carries a value at `TRACE_FLAGS_KEY`
+  (e.g. `"00"` or `"01"`), `inject` uses that as the outbound `trace-flags`
+  byte instead of always emitting `0x01`. The default of `0x01` (sampled) is
+  preserved when no inbound flags are present. `ContextBuilder::build` seeds
+  the key automatically when a `trace_parent` is supplied, so transports
+  that build contexts via the canonical builder get propagation for free.
+  Matches `apcore-python._TRACE_FLAGS_KEY` semantics.
+- **Pipeline configuration errors use `ConfigurationError`** instead of
+  `PipelineConfigInvalid` for missing-step / missing-anchor cases (sync
+  finding W-7). Tests that previously matched `PipelineConfigInvalid` should
+  also accept `ConfigurationError`.
+
 ### Event-Naming Standardization & Contextual Auditing
 
 #### Changed

@@ -234,6 +234,7 @@ fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
 ///   ]
 /// }
 /// ```
+#[allow(clippy::too_many_lines)] // declarative-config dispatcher; splitting hurts readability more than length helps
 pub fn build_strategy_from_config(
     pipeline_config: &Value,
 ) -> Result<ExecutionStrategy, ModuleError> {
@@ -245,8 +246,11 @@ pub fn build_strategy_from_config(
         for entry in remove_list {
             if let Some(step_name) = entry.as_str() {
                 strategy.remove(step_name).map_err(|e| {
+                    // Sync alignment W-7: missing-step is a structural
+                    // configuration error, distinct from a dependency-graph
+                    // violation. ConfigurationError mirrors PY/TS.
                     ModuleError::new(
-                        ErrorCode::PipelineConfigInvalid,
+                        ErrorCode::ConfigurationError,
                         format!(
                             "pipeline.remove: cannot remove step '{step_name}': {}",
                             e.message
@@ -307,8 +311,11 @@ pub fn build_strategy_from_config(
                         })
                     })
                     .map_err(|e| {
+                        // Sync alignment W-7: configuring a non-existent step
+                        // is a structural configuration error, not a
+                        // dependency violation.
                         ModuleError::new(
-                            ErrorCode::PipelineConfigInvalid,
+                            ErrorCode::ConfigurationError,
                             format!(
                                 "pipeline.configure: cannot configure step '{step_name_str}': {}",
                                 e.message
@@ -327,17 +334,47 @@ pub fn build_strategy_from_config(
             let before = step_def.get("before").and_then(|v| v.as_str());
 
             if let Some(anchor) = after {
-                strategy.insert_after(anchor, step)?;
+                strategy.insert_after(anchor, step).map_err(|e| {
+                    // Re-classify missing-anchor as a structural configuration
+                    // error (sync alignment W-7). The underlying find_step_index
+                    // returns GeneralInvalidInput, which is too broad for
+                    // pipeline-config callers.
+                    if matches!(e.code, ErrorCode::GeneralInvalidInput) {
+                        ModuleError::new(
+                            ErrorCode::ConfigurationError,
+                            format!(
+                                "pipeline.steps: 'after' anchor '{anchor}' not found: {}",
+                                e.message
+                            ),
+                        )
+                    } else {
+                        e
+                    }
+                })?;
             } else if let Some(anchor) = before {
-                strategy.insert_before(anchor, step)?;
+                strategy.insert_before(anchor, step).map_err(|e| {
+                    if matches!(e.code, ErrorCode::GeneralInvalidInput) {
+                        ModuleError::new(
+                            ErrorCode::ConfigurationError,
+                            format!(
+                                "pipeline.steps: 'before' anchor '{anchor}' not found: {}",
+                                e.message
+                            ),
+                        )
+                    } else {
+                        e
+                    }
+                })?;
             } else {
                 // Issue #33 §1.2: fail-fast on YAML configuration errors.
+                // Sync alignment W-7: structural configuration errors use
+                // ConfigurationError rather than PipelineConfigInvalid.
                 let name = step_def
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 return Err(ModuleError::new(
-                    ErrorCode::PipelineConfigInvalid,
+                    ErrorCode::ConfigurationError,
                     format!(
                         "pipeline.steps: step '{name}' has neither 'after' nor 'before' anchor"
                     ),

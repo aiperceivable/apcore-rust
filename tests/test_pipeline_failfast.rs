@@ -111,9 +111,11 @@ async fn build_strategy_from_config_remove_unknown_step_returns_error() {
     assert!(
         matches!(
             err.code,
-            ErrorCode::PipelineConfigInvalid | ErrorCode::PipelineStepNotFound
+            ErrorCode::PipelineConfigInvalid
+                | ErrorCode::PipelineStepNotFound
+                | ErrorCode::ConfigurationError
         ),
-        "expected PipelineConfigInvalid or PipelineStepNotFound, got {:?}",
+        "expected PipelineConfigInvalid, PipelineStepNotFound, or ConfigurationError, got {:?}",
         err.code
     );
     assert!(err.message.contains("__nonexistent_step__"));
@@ -131,9 +133,11 @@ async fn build_strategy_from_config_configure_unknown_step_returns_error() {
     assert!(
         matches!(
             err.code,
-            ErrorCode::PipelineConfigInvalid | ErrorCode::PipelineStepNotFound
+            ErrorCode::PipelineConfigInvalid
+                | ErrorCode::PipelineStepNotFound
+                | ErrorCode::ConfigurationError
         ),
-        "expected PipelineConfigInvalid or PipelineStepNotFound, got {:?}",
+        "expected PipelineConfigInvalid, PipelineStepNotFound, or ConfigurationError, got {:?}",
         err.code
     );
     assert!(err.message.contains("__nonexistent_step__"));

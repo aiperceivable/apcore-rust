@@ -265,8 +265,17 @@ pub struct SysModulesContext {
 #[derive(Default, Clone)]
 pub struct SysModulesOptions {
     /// When set, runtime overrides are loaded from this YAML path on startup
-    /// and persisted on every `update_config` / `toggle_feature` call.
+    /// and persisted on every `update_config` / `toggle_feature` call. Use
+    /// [`Self::overrides_store`] for non-file-backed persistence.
     pub overrides_path: Option<PathBuf>,
+    /// Pluggable [`OverridesStore`] backend. When set, takes precedence over
+    /// `overrides_path` and is wired into `UpdateConfigModule` /
+    /// `ToggleFeatureModule` for read-modify-write persistence. Cross-language:
+    /// matches the `overrides_store` parameter in `apcore-python` and
+    /// `apcore-typescript`.
+    ///
+    /// [`OverridesStore`]: overrides::OverridesStore
+    pub overrides_store: Option<Arc<dyn overrides::OverridesStore>>,
     /// When set, every state-changing control call appends an `AuditEntry`.
     /// When `None`, audit entries are logged at INFO level and discarded.
     pub audit_store: Option<Arc<dyn AuditStore>>,
@@ -325,6 +334,7 @@ pub fn register_sys_modules_with_options(
 ) -> Result<SysModulesContext, SysModuleError> {
     let SysModulesOptions {
         overrides_path,
+        overrides_store,
         audit_store,
         fail_on_error,
     } = options;
@@ -388,15 +398,19 @@ pub fn register_sys_modules_with_options(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // §1.1 + §1.2 wire `overrides_path` and `audit_store` through the control
-    // modules — but control modules are only registered when events are
-    // enabled. Surface a warning instead of silently dropping the options so
-    // misconfiguration shows up at startup, not as missing audit entries.
-    if !events_enabled && (overrides_path.is_some() || audit_store.is_some()) {
+    // §1.1 + §1.2 wire `overrides_path` / `overrides_store` / `audit_store`
+    // through the control modules — but control modules are only registered
+    // when events are enabled. Surface a warning instead of silently dropping
+    // the options so misconfiguration shows up at startup, not as missing
+    // audit entries.
+    if !events_enabled
+        && (overrides_path.is_some() || overrides_store.is_some() || audit_store.is_some())
+    {
         tracing::warn!(
             overrides_path_set = overrides_path.is_some(),
+            overrides_store_set = overrides_store.is_some(),
             audit_store_set = audit_store.is_some(),
-            "SysModulesOptions.overrides_path / audit_store are set but \
+            "SysModulesOptions overrides/audit options set but \
              sys_modules.events.enabled=false — control modules are not \
              registered, so these options have no effect. Enable events to \
              activate runtime overrides and audit trails."
@@ -499,6 +513,7 @@ pub fn register_sys_modules_with_options(
             Box::new(
                 UpdateConfigModule::new(Arc::clone(&config_arc), Arc::clone(&emitter_arc))
                     .with_overrides_path(overrides_path.clone())
+                    .with_overrides_store(overrides_store.clone())
                     .with_audit_store(audit_store.clone()),
             ),
             vec!["system".into(), "control".into()],
@@ -520,6 +535,7 @@ pub fn register_sys_modules_with_options(
                     Arc::clone(&toggle_state),
                 )
                 .with_overrides_path(overrides_path.clone())
+                .with_overrides_store(overrides_store.clone())
                 .with_audit_store(audit_store.clone()),
             ),
             vec!["system".into(), "control".into()],
