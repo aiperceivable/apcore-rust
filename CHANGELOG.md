@@ -14,6 +14,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Event-Naming Standardization & Contextual Auditing
+
+#### Changed
+
+- **Canonical event names (Issue #36).** The four threshold / registry
+  events that previously emitted under bare names now also emit under their
+  canonical `apcore.<subsystem>.<event>` names. Both names are dispatched on
+  every occurrence so existing subscribers continue to fire while consumers
+  migrate; the legacy events carry `deprecated: true` and a
+  `canonical_event` pointer in their payload.
+  | Legacy (still emitted)         | Canonical                                       |
+  | ------------------------------ | ----------------------------------------------- |
+  | `module_registered`            | `apcore.registry.module_registered`             |
+  | `module_unregistered`          | `apcore.registry.module_unregistered`           |
+  | `error_threshold_exceeded`     | `apcore.health.error_threshold_exceeded`        |
+  | `latency_threshold_exceeded`   | `apcore.health.latency_threshold_exceeded`      |
+- **Registry hooks now emit `ApCoreEvent`s.** `module_registered` /
+  `module_unregistered` were previously logged via `tracing::info!` only;
+  they are now full `ApCoreEvent`s dispatched through the `EventEmitter`,
+  so subscribers can pattern-match against `apcore.registry.*` (Issue #36).
+- **Audit-event payloads include caller identity (Issue #45.2).** The
+  `apcore.config.updated`, `apcore.module.toggled`, and
+  `apcore.module.reloaded` events now embed `caller_id` (defaulted to
+  `"@external"` when absent) and `actor_id` / `actor_type` extracted from
+  the `Context`. Aligns the Rust SDK with `apcore-python` and
+  `apcore-typescript`'s contextual-audit behaviour.
+
 ### Cross-Language Sync — Review-Mode Hardening
 
 This release applies the next batch of cross-language audit findings, focused
