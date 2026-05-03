@@ -14,6 +14,70 @@ static TRACEPARENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$").unwrap()
 });
 
+/// Pre-compiled regex matching a 16-char lowercase hex parent_id (W3C span id).
+static PARENT_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9a-f]{16}$").unwrap());
+
+/// W3C tracestate hard-cap on entry count.
+const TRACESTATE_MAX_ENTRIES: usize = 32;
+
+/// Case-insensitive header-key lookup helper.
+///
+/// HTTP header field names are case-insensitive (RFC 7230 §3.2). Many transport
+/// shims hand us a `HashMap<String, String>` whose keys retain whatever casing
+/// the upstream layer used (e.g. "Traceparent", "TRACEPARENT"). This helper
+/// scans the map once with an `eq_ignore_ascii_case` comparison and returns the
+/// first matching value.
+fn lookup_header_ci<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+/// Parse the W3C `tracestate` header value into ordered key/value pairs.
+///
+/// Per W3C Trace Context §3.3.1:
+/// * Entries are comma-separated.
+/// * Each entry is `key=value`; whitespace around the entry MUST be trimmed.
+/// * The list MUST be capped at 32 entries; entries beyond the cap are dropped.
+/// * Malformed entries (missing `=`, empty key, empty value) are silently dropped.
+fn parse_tracestate(raw: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in raw.split(',') {
+        if out.len() >= TRACESTATE_MAX_ENTRIES {
+            break;
+        }
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let value = v.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        out.push((key.to_string(), value.to_string()));
+    }
+    out
+}
+
+/// Serialize an ordered tracestate list into a header value.
+fn format_tracestate(entries: &[(String, String)]) -> String {
+    entries
+        .iter()
+        .take(TRACESTATE_MAX_ENTRIES)
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Parsed W3C traceparent header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceParent {
@@ -144,24 +208,68 @@ impl TraceContext {
     /// produce 32 lowercase hex characters) and generates a random 8-byte
     /// parent span ID. Returns a header map containing the `"traceparent"` key.
     /// This mirrors `TraceContext.inject(context)` in the Python and TypeScript SDKs.
+    ///
+    /// New roots default to `trace_flags = 0x01` (sampled) and emit only the
+    /// `traceparent` header. To override the parent span ID, set non-default
+    /// trace flags, or attach a tracestate, use [`inject_with_options`].
+    ///
+    /// [`inject_with_options`]: TraceContext::inject_with_options
     pub fn inject<T: serde::Serialize>(context: &Context<T>) -> HashMap<String, String> {
+        Self::inject_with_options(context, None, None, None)
+    }
+
+    /// Build a W3C `traceparent` (and optional `tracestate`) header map from
+    /// an apcore [`Context`], with optional overrides.
+    ///
+    /// Arguments:
+    /// * `parent_id` — when `Some`, must match `^[0-9a-f]{16}$`. Invalid values
+    ///   are ignored and a fresh random parent_id is used instead. When `None`,
+    ///   a fresh 16-hex random parent_id is generated.
+    /// * `trace_flags` — propagated W3C flag byte. When `None`, defaults to
+    ///   `0x01` (sampled) for new roots. Callers that extracted an inbound
+    ///   traceparent SHOULD pass that header's `trace_flags` here so the flag
+    ///   is propagated rather than hardcoded.
+    /// * `tracestate` — when present and non-empty, emitted as the `tracestate`
+    ///   header. Capped at 32 entries per W3C §3.3.1.
+    pub fn inject_with_options<T: serde::Serialize>(
+        context: &Context<T>,
+        parent_id: Option<&str>,
+        trace_flags: Option<u8>,
+        tracestate: Option<&[(String, String)]>,
+    ) -> HashMap<String, String> {
         // Strip dashes: context.trace_id may be a standard UUID string
         // (36 chars with dashes) or already a 32-char hex string.
         let trace_id_hex = context.trace_id.replace('-', "");
-        // Use a random parent_id — the context does not carry an active span ref.
-        let parent_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
-        let traceparent = format!("00-{trace_id_hex}-{parent_id}-01");
+
+        let parent_id_hex = match parent_id {
+            Some(p) if PARENT_ID_RE.is_match(p) => p.to_string(),
+            _ => uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
+        };
+
+        let flags = trace_flags.unwrap_or(0x01);
+        let traceparent = format!("00-{trace_id_hex}-{parent_id_hex}-{flags:02x}");
+
         let mut headers = HashMap::new();
         headers.insert("traceparent".to_string(), traceparent);
+        if let Some(entries) = tracestate {
+            if !entries.is_empty() {
+                let value = format_tracestate(entries);
+                if !value.is_empty() {
+                    headers.insert("tracestate".to_string(), value);
+                }
+            }
+        }
         headers
     }
 
     /// Parse the `traceparent` header from a header map.
     ///
+    /// Header KEY lookup is case-insensitive (RFC 7230 §3.2): the map may use
+    /// any casing for the key (`traceparent`, `Traceparent`, `TRACEPARENT`).
     /// Returns `None` if the header is missing or malformed, matching the
     /// behaviour of `TraceContext.extract(headers)` in Python and TypeScript SDKs.
     pub fn extract(headers: &HashMap<String, String>) -> Option<TraceParent> {
-        let raw = headers.get("traceparent")?;
+        let raw = lookup_header_ci(headers, "traceparent")?;
         let lower = raw.trim().to_lowercase();
         let caps = TRACEPARENT_RE.captures(&lower)?;
         let version = u8::from_str_radix(&caps[1], 16).ok()?;
@@ -181,6 +289,25 @@ impl TraceContext {
             trace_id,
             parent_id,
             trace_flags,
+        })
+    }
+
+    /// Parse both `traceparent` and `tracestate` headers into a full
+    /// [`TraceContext`].
+    ///
+    /// Header KEY lookup is case-insensitive. Returns `None` if the
+    /// `traceparent` header is missing or malformed; the `tracestate` header
+    /// is optional, and malformed entries within it are silently dropped per
+    /// W3C §3.3.1.
+    pub fn extract_context(headers: &HashMap<String, String>) -> Option<TraceContext> {
+        let traceparent = Self::extract(headers)?;
+        let tracestate = lookup_header_ci(headers, "tracestate")
+            .map(|v| parse_tracestate(v))
+            .unwrap_or_default();
+        Some(TraceContext {
+            traceparent,
+            tracestate,
+            baggage: std::collections::HashMap::new(),
         })
     }
 }
