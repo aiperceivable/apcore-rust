@@ -116,7 +116,7 @@ impl ACLConditionHandler for MaxCallDepthHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
         let threshold = match value {
             Value::Number(n) => n.as_u64(),
-            Value::Object(map) => map.get("lte").and_then(|v| v.as_u64()),
+            Value::Object(map) => map.get("lte").and_then(serde_json::Value::as_u64),
             _ => None,
         };
         match threshold {

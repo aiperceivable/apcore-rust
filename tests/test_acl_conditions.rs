@@ -163,7 +163,12 @@ async fn test_max_call_depth_accepts_lte_dict_exceeds_limit() {
     let ctx = make_context(
         "user",
         vec![],
-        vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ],
     );
     assert!(!handler.evaluate(&json!({"lte": 3}), &ctx).await);
 }

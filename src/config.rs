@@ -463,7 +463,7 @@ impl Config {
         // Longest-prefix match against the registered namespaces, then fall
         // back to dot-split on the first segment. Hyphenated names like
         // `apcore-mcp` cannot be reached by naive `split('.')`.
-        if let Some((ns_name, rest)) = self.match_registered_namespace(key) {
+        if let Some((ns_name, rest)) = Self::match_registered_namespace(key) {
             let top = self.user_namespaces.get(&ns_name)?;
             if rest.is_empty() {
                 return Some(top.clone());
@@ -496,7 +496,7 @@ impl Config {
     /// prefix-with-`.` (or exact-match) of the key. Returns `(namespace_name,
     /// remainder_after_namespace_dot)`. Used by `get()` to support
     /// hyphenated namespaces (sync finding A-D-017).
-    fn match_registered_namespace(&self, key: &str) -> Option<(String, String)> {
+    fn match_registered_namespace(key: &str) -> Option<(String, String)> {
         let registry = global_ns_registry().read();
         // Sort registered names by length descending so longer matches win.
         let mut names: Vec<&String> = registry.keys().collect();
@@ -734,12 +734,11 @@ impl Config {
         // ConfigBindError("namespace not found"), which broke portable code
         // that relied on default-fill behavior across SDKs.
         let owned;
-        let value: &serde_json::Value = match self.user_namespaces.get(namespace) {
-            Some(v) => v,
-            None => {
-                owned = serde_json::Value::Object(serde_json::Map::new());
-                &owned
-            }
+        let value: &serde_json::Value = if let Some(v) = self.user_namespaces.get(namespace) {
+            v
+        } else {
+            owned = serde_json::Value::Object(serde_json::Map::new());
+            &owned
         };
         serde_json::from_value(value.clone())
             .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
