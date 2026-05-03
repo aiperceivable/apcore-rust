@@ -13,6 +13,7 @@ pub mod storage;
 pub mod store;
 pub mod tracing_middleware;
 pub mod usage;
+pub mod usage_exporter;
 
 pub use error_history::{
     compute_fingerprint, normalize_message, ErrorEntry, ErrorHistory, ErrorHistoryMiddleware,
@@ -33,3 +34,4 @@ pub use storage::{
 pub use store::{InMemoryObservabilityStore, MetricPoint, ObservabilityStore};
 pub use tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use usage::{UsageCollector, UsageMiddleware, UsageStats};
+pub use usage_exporter::{NoopUsageExporter, PeriodicUsageExporter, UsageExporter};

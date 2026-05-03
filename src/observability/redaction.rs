@@ -20,13 +20,26 @@ pub const NEVER_REDACT_FIELDS: &[&str] = &["trace_id", "caller_id", "module_id"]
 /// `observability.redaction.sensitive_keys` in their Config. Issue #43 §5.
 ///
 /// User-supplied entries are merged into this list rather than replacing it,
-/// matching apcore-python's `_DEFAULT_SENSITIVE_KEYS` semantics.
+/// matching apcore-python's `_DEFAULT_SENSITIVE_KEYS` semantics. Includes
+/// snake_case, camelCase, and lowercase parity (`api_key` / `apiKey` /
+/// `apikey`) so common framework conventions are covered out of the box.
 pub const DEFAULT_SENSITIVE_KEYS: &[&str] = &[
     "_secret_*",
-    "api_key",
-    "token",
-    "authorization",
     "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "apiKey",
+    "access_key",
+    "private_key",
+    "authorization",
+    "auth",
+    "credential",
+    "cookie",
+    "session",
+    "bearer",
 ];
 
 /// Runtime-configurable redaction rules layered on top of schema-level
@@ -62,8 +75,10 @@ impl RedactionConfig {
     /// Reads:
     ///   - `observability.redaction.sensitive_keys: Vec<String>` — glob
     ///     patterns applied to field NAMES. User entries are unioned with
-    ///     [`DEFAULT_SENSITIVE_KEYS`] (`_secret_*`, `api_key`, `token`,
-    ///     `authorization`, `password`).
+    ///     [`DEFAULT_SENSITIVE_KEYS`] (the canonical superset: `_secret_*`,
+    ///     `password`, `passwd`, `secret`, `token`, `api_key`, `apikey`,
+    ///     `apiKey`, `access_key`, `private_key`, `authorization`, `auth`,
+    ///     `credential`, `cookie`, `session`, `bearer`).
     ///   - `observability.redaction.regex_patterns: Vec<String>` — regular
     ///     expressions applied to string VALUES. Compiled with
     ///     [`RegexBuilder::case_insensitive(true)`].
