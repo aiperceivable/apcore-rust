@@ -621,18 +621,30 @@ impl<T: Default> ContextBuilder<T> {
     /// If a `trace_parent` was set, its trace_id is validated per
     /// PROTOCOL_SPEC §10.5 and either accepted verbatim or replaced with a
     /// freshly generated 32-char hex trace_id (with a WARN log on regen).
+    /// When the inbound `trace_parent` carries a `trace_flags` byte, it is
+    /// seeded into `data` under [`crate::trace_context::TRACE_FLAGS_KEY`] so
+    /// that `TraceContext::inject` propagates the inbound sampling decision
+    /// to outbound calls (cross-language parity with `apcore-python`).
     #[must_use]
     pub fn build(self) -> Context<T> {
         let trace_id = match self.trace_parent.as_ref() {
             Some(tp) => accept_or_regenerate_trace_id(&tp.trace_id),
             None => generate_trace_id(),
         };
+        let mut initial_data = self.data.unwrap_or_default();
+        if let Some(tp) = self.trace_parent.as_ref() {
+            // Stash inbound trace-flags as a 2-char hex string for symmetry
+            // with the W3C wire format; readers parse via `u8::from_str_radix`.
+            initial_data
+                .entry(crate::trace_context::TRACE_FLAGS_KEY.to_string())
+                .or_insert_with(|| serde_json::Value::String(format!("{:02x}", tp.trace_flags)));
+        }
         Context {
             trace_id,
             identity: self.identity,
             services: self.services.unwrap_or_default(),
             caller_id: self.caller_id,
-            data: Arc::new(RwLock::new(self.data.unwrap_or_default())),
+            data: Arc::new(RwLock::new(initial_data)),
             call_chain: vec![],
             redacted_inputs: None,
             redacted_output: None,

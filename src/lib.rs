@@ -158,6 +158,9 @@ pub use sys_modules::audit::{
     AuditStore as SysAuditStore, InMemoryAuditStore as SysInMemoryAuditStore,
 };
 pub use sys_modules::control::UpdateConfigModule;
+pub use sys_modules::overrides::{
+    FileOverridesStore, InMemoryOverridesStore, OverridesError, OverridesStore,
+};
 pub use sys_modules::{
     check_module_disabled, is_module_disabled, register_sys_modules,
     register_sys_modules_with_options, SysModuleError, SysModulesContext, SysModulesOptions,

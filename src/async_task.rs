@@ -210,8 +210,13 @@ impl RetryConfig {
     /// Compute the retry delay for the given attempt index (`0`-based).
     ///
     /// Formula: `min(retry_delay_ms * (backoff_multiplier ^ attempt), max_retry_delay_ms)`.
+    ///
+    /// Cross-language: this is the canonical name across `apcore-python` and
+    /// `apcore-typescript` (sync alignment D-08). The legacy
+    /// [`Self::delay_for_attempt`] alias delegates to this method and is
+    /// `#[deprecated]`; it will be removed in the next minor version.
     #[must_use]
-    pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
+    pub fn compute_delay_ms(&self, attempt: u32) -> u64 {
         // Use f64 arithmetic to apply the backoff factor, then clamp to the cap.
         // The `as f64` casts are intentional: retry delays are bounded small
         // integers in practice (sub-second to minutes), so precision loss is a
@@ -231,6 +236,15 @@ impl RetryConfig {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let out = capped as u64;
         out
+    }
+
+    /// Deprecated alias for [`Self::compute_delay_ms`] (sync alignment D-08).
+    ///
+    /// Kept for one minor version to allow callers a graceful migration.
+    #[must_use]
+    #[deprecated(since = "0.21.0", note = "use compute_delay_ms")]
+    pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
+        self.compute_delay_ms(attempt)
     }
 }
 
@@ -670,7 +684,7 @@ async fn run_task(
             Err(err) => {
                 if let Some(cfg) = retry.as_ref() {
                     if info.retry_count < max_retries {
-                        let delay_ms = cfg.delay_for_attempt(info.retry_count);
+                        let delay_ms = cfg.compute_delay_ms(info.retry_count);
                         info.retry_count += 1;
                         info.status = TaskStatus::Pending;
                         // `started_at` is intentionally NOT reset across retries:
@@ -793,12 +807,12 @@ mod tests {
             backoff_multiplier: 2.0,
             max_retry_delay_ms: 30_000,
         };
-        assert_eq!(cfg.delay_for_attempt(0), 1000);
-        assert_eq!(cfg.delay_for_attempt(1), 2000);
-        assert_eq!(cfg.delay_for_attempt(2), 4000);
-        assert_eq!(cfg.delay_for_attempt(3), 8000);
-        assert_eq!(cfg.delay_for_attempt(4), 16_000);
-        assert_eq!(cfg.delay_for_attempt(5), 30_000);
+        assert_eq!(cfg.compute_delay_ms(0), 1000);
+        assert_eq!(cfg.compute_delay_ms(1), 2000);
+        assert_eq!(cfg.compute_delay_ms(2), 4000);
+        assert_eq!(cfg.compute_delay_ms(3), 8000);
+        assert_eq!(cfg.compute_delay_ms(4), 16_000);
+        assert_eq!(cfg.compute_delay_ms(5), 30_000);
     }
 
     #[tokio::test]

@@ -9,6 +9,17 @@ use std::sync::LazyLock;
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 
+/// Canonical context-data key under which the inbound traceparent's
+/// `trace-flags` byte (as a 2-char lowercase hex string, e.g. `"01"` or
+/// `"00"`) is stashed when a [`Context`] is built from an inbound
+/// `TraceParent`.
+///
+/// Cross-language: matches `_TRACE_FLAGS_KEY = "_apcore.trace.flags"` in the
+/// Python SDK (`apcore-python/src/apcore/trace_context.py`). [`TraceContext::inject`]
+/// reads this key to propagate the inbound sampling decision through the
+/// outbound `traceparent` header rather than always emitting `"01"`.
+pub const TRACE_FLAGS_KEY: &str = "_apcore.trace.flags";
+
 /// Pre-compiled regex for traceparent header parsing.
 static TRACEPARENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$").unwrap()
@@ -17,6 +28,21 @@ static TRACEPARENT_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Pre-compiled regex matching a 16-char lowercase hex parent_id (W3C span id).
 static PARENT_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[0-9a-f]{16}$").unwrap());
+
+/// Read the inbound `trace-flags` byte from a [`Context`]'s shared data map.
+///
+/// Honors the [`TRACE_FLAGS_KEY`] convention: the value is expected to be a
+/// 2-char lowercase hex string (`"00"` or `"01"`). Returns `None` when the
+/// key is absent or malformed.
+fn read_inbound_flags<T>(context: &Context<T>) -> Option<u8> {
+    let data = context.data.read();
+    let raw = data.get(TRACE_FLAGS_KEY)?;
+    let s = raw.as_str()?;
+    if s.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(s, 16).ok()
+}
 
 /// W3C tracestate hard-cap on entry count.
 const TRACESTATE_MAX_ENTRIES: usize = 32;
@@ -209,11 +235,20 @@ impl TraceContext {
     /// parent span ID. Returns a header map containing the `"traceparent"` key.
     /// This mirrors `TraceContext.inject(context)` in the Python and TypeScript SDKs.
     ///
-    /// New roots default to `trace_flags = 0x01` (sampled) and emit only the
-    /// `traceparent` header. To override the parent span ID, set non-default
-    /// trace flags, or attach a tracestate, use [`inject_with_options`].
+    /// **Inbound flag propagation.** When `context.data` contains
+    /// [`TRACE_FLAGS_KEY`] (`"_apcore.trace.flags"`) set to a 2-char lowercase
+    /// hex string (`"00"` or `"01"`), that value is used as the outbound
+    /// `trace-flags`. Otherwise the default is `0x01` (sampled). The
+    /// [`crate::context::ContextBuilder`] seeds this key automatically when a
+    /// `trace_parent` is supplied; transports that build `Context`s by other
+    /// means SHOULD set the key explicitly so sampling decisions propagate.
+    ///
+    /// To override the parent span ID, set non-default trace flags, or attach
+    /// a tracestate, use [`inject_with_options`]. To validate caller-supplied
+    /// `parent_id` overrides up-front, use [`inject_checked`].
     ///
     /// [`inject_with_options`]: TraceContext::inject_with_options
+    /// [`inject_checked`]: TraceContext::inject_checked
     pub fn inject<T: serde::Serialize>(context: &Context<T>) -> HashMap<String, String> {
         Self::inject_with_options(context, None, None, None)
     }
@@ -225,12 +260,20 @@ impl TraceContext {
     /// * `parent_id` — when `Some`, must match `^[0-9a-f]{16}$`. Invalid values
     ///   are ignored and a fresh random parent_id is used instead. When `None`,
     ///   a fresh 16-hex random parent_id is generated.
-    /// * `trace_flags` — propagated W3C flag byte. When `None`, defaults to
-    ///   `0x01` (sampled) for new roots. Callers that extracted an inbound
-    ///   traceparent SHOULD pass that header's `trace_flags` here so the flag
-    ///   is propagated rather than hardcoded.
+    ///
+    ///   **Note**: silent fallback is preserved here for backward compatibility.
+    ///   New code should use [`inject_checked`] which returns an error on a
+    ///   malformed `parent_id` (matching apcore-python / apcore-typescript).
+    /// * `trace_flags` — propagated W3C flag byte. When `None`, the byte is
+    ///   read from `context.data[TRACE_FLAGS_KEY]` (parsed as a 2-char hex
+    ///   string); falling back to `0x01` (sampled) when absent. Callers that
+    ///   extracted an inbound traceparent SHOULD seed `TRACE_FLAGS_KEY` on
+    ///   the context (or pass the flag explicitly here) so the value is
+    ///   propagated rather than hardcoded.
     /// * `tracestate` — when present and non-empty, emitted as the `tracestate`
     ///   header. Capped at 32 entries per W3C §3.3.1.
+    ///
+    /// [`inject_checked`]: TraceContext::inject_checked
     pub fn inject_with_options<T: serde::Serialize>(
         context: &Context<T>,
         parent_id: Option<&str>,
@@ -246,7 +289,7 @@ impl TraceContext {
             _ => uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
         };
 
-        let flags = trace_flags.unwrap_or(0x01);
+        let flags = trace_flags.unwrap_or_else(|| read_inbound_flags(context).unwrap_or(0x01));
         let traceparent = format!("00-{trace_id_hex}-{parent_id_hex}-{flags:02x}");
 
         let mut headers = HashMap::new();
@@ -260,6 +303,42 @@ impl TraceContext {
             }
         }
         headers
+    }
+
+    /// Validating variant of [`inject_with_options`] (sync alignment W-6).
+    ///
+    /// Identical to [`inject_with_options`] except a `Some(parent_id)` that
+    /// does not match `^[0-9a-f]{16}$` is rejected with
+    /// [`ErrorCode::GeneralInvalidInput`] instead of being silently replaced
+    /// with a fresh random parent_id.
+    ///
+    /// Cross-language: matches `TraceContext.inject(parent_id=...)` in
+    /// `apcore-python` (raises `ValueError`) and `TraceContext.inject` in
+    /// `apcore-typescript` (throws `Error`).
+    ///
+    /// [`inject_with_options`]: TraceContext::inject_with_options
+    pub fn inject_checked<T: serde::Serialize>(
+        context: &Context<T>,
+        parent_id: Option<&str>,
+        trace_flags: Option<u8>,
+        tracestate: Option<&[(String, String)]>,
+    ) -> Result<HashMap<String, String>, ModuleError> {
+        if let Some(p) = parent_id {
+            if !PARENT_ID_RE.is_match(p) {
+                return Err(ModuleError::new(
+                    ErrorCode::GeneralInvalidInput,
+                    format!(
+                        "parent_id must be 16 lowercase hex chars, got {p:?}"
+                    ),
+                ));
+            }
+        }
+        Ok(Self::inject_with_options(
+            context,
+            parent_id,
+            trace_flags,
+            tracestate,
+        ))
     }
 
     /// Parse the `traceparent` header from a header map.

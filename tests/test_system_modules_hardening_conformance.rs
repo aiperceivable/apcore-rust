@@ -610,6 +610,7 @@ fn regression_options_warn_when_events_disabled() {
             None,
             SysModulesOptions {
                 overrides_path: Some(PathBuf::from("/tmp/should_not_be_written.yaml")),
+                overrides_store: None,
                 audit_store: Some(store),
                 fail_on_error: false,
             },
@@ -678,6 +679,7 @@ fn regression_no_warn_when_events_enabled() {
             None,
             SysModulesOptions {
                 overrides_path: None,
+                overrides_store: None,
                 audit_store: Some(store),
                 fail_on_error: false,
             },

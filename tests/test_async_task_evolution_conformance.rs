@@ -304,7 +304,7 @@ async fn case_retry_scheduled_on_failure() {
             assert_eq!(info.retry_count, 1);
             // The expected next retry delay is the base delay (attempt 0).
             assert_eq!(
-                retry.delay_for_attempt(0),
+                retry.compute_delay_ms(0),
                 case["expected"]["next_retry_delay_ms"].as_u64().unwrap()
             );
             return;
@@ -391,27 +391,27 @@ async fn case_backoff_multiplier_applied() {
     };
     let exp = &case["expected"];
     assert_eq!(
-        retry.delay_for_attempt(0),
+        retry.compute_delay_ms(0),
         exp["attempt_0_delay_ms"].as_u64().unwrap()
     );
     assert_eq!(
-        retry.delay_for_attempt(1),
+        retry.compute_delay_ms(1),
         exp["attempt_1_delay_ms"].as_u64().unwrap()
     );
     assert_eq!(
-        retry.delay_for_attempt(2),
+        retry.compute_delay_ms(2),
         exp["attempt_2_delay_ms"].as_u64().unwrap()
     );
     assert_eq!(
-        retry.delay_for_attempt(3),
+        retry.compute_delay_ms(3),
         exp["attempt_3_delay_ms"].as_u64().unwrap()
     );
     assert_eq!(
-        retry.delay_for_attempt(4),
+        retry.compute_delay_ms(4),
         exp["attempt_4_delay_ms"].as_u64().unwrap()
     );
     assert_eq!(
-        retry.delay_for_attempt(5),
+        retry.compute_delay_ms(5),
         exp["attempt_5_delay_ms"].as_u64().unwrap()
     );
 }
