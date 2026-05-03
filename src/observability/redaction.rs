@@ -2,8 +2,10 @@
 // Spec reference: observability.md §1.5 Configurable Redaction Rules
 
 use glob::Pattern;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
+
+use crate::config::Config;
 
 /// Default replacement string for redacted values.
 pub const DEFAULT_REPLACEMENT: &str = "***REDACTED***";
@@ -13,6 +15,19 @@ pub const DEFAULT_REPLACEMENT: &str = "***REDACTED***";
 /// `trace_id`, `caller_id`, and `module_id` are required for observability
 /// correlation and must always appear in logs unmodified.
 pub const NEVER_REDACT_FIELDS: &[&str] = &["trace_id", "caller_id", "module_id"];
+
+/// Default sensitive-key glob patterns applied when the user has not supplied
+/// `observability.redaction.sensitive_keys` in their Config. Issue #43 §5.
+///
+/// User-supplied entries are merged into this list rather than replacing it,
+/// matching apcore-python's `_DEFAULT_SENSITIVE_KEYS` semantics.
+pub const DEFAULT_SENSITIVE_KEYS: &[&str] = &[
+    "_secret_*",
+    "api_key",
+    "token",
+    "authorization",
+    "password",
+];
 
 /// Runtime-configurable redaction rules layered on top of schema-level
 /// (`x-sensitive`) annotations.
@@ -38,6 +53,87 @@ impl RedactionConfig {
     #[must_use]
     pub fn builder() -> RedactionConfigBuilder {
         RedactionConfigBuilder::default()
+    }
+
+    /// Build a redaction config from `observability.redaction.*` keys in a
+    /// loaded [`Config`]. Issue #43 §5 — replaces the legacy hardcoded
+    /// `_secret_` prefix with a fully Config-driven policy.
+    ///
+    /// Reads:
+    ///   - `observability.redaction.sensitive_keys: Vec<String>` — glob
+    ///     patterns applied to field NAMES. User entries are unioned with
+    ///     [`DEFAULT_SENSITIVE_KEYS`] (`_secret_*`, `api_key`, `token`,
+    ///     `authorization`, `password`).
+    ///   - `observability.redaction.regex_patterns: Vec<String>` — regular
+    ///     expressions applied to string VALUES. Compiled with
+    ///     [`RegexBuilder::case_insensitive(true)`].
+    ///   - `observability.redaction.replacement: String` — replacement string
+    ///     (defaults to [`DEFAULT_REPLACEMENT`]).
+    ///
+    /// Malformed patterns are logged at `warn` and skipped — a typo in one
+    /// rule MUST NOT disable redaction for every other rule.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        let mut field_patterns: Vec<Pattern> = Vec::new();
+
+        // Default sensitive keys are always applied.
+        for default in DEFAULT_SENSITIVE_KEYS {
+            match Pattern::new(default) {
+                Ok(p) => field_patterns.push(p),
+                Err(e) => tracing::warn!(
+                    pattern = %default,
+                    error = %e,
+                    "Skipping invalid default sensitive_keys glob"
+                ),
+            }
+        }
+
+        // User-supplied sensitive_keys (additive).
+        if let Some(value) = config.get("observability.redaction.sensitive_keys") {
+            if let Some(arr) = value.as_array() {
+                for entry in arr {
+                    if let Some(s) = entry.as_str() {
+                        match Pattern::new(s) {
+                            Ok(p) => field_patterns.push(p),
+                            Err(e) => tracing::warn!(
+                                pattern = %s,
+                                error = %e,
+                                "Skipping invalid sensitive_keys glob"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut value_patterns: Vec<Regex> = Vec::new();
+        if let Some(value) = config.get("observability.redaction.regex_patterns") {
+            if let Some(arr) = value.as_array() {
+                for entry in arr {
+                    if let Some(s) = entry.as_str() {
+                        match RegexBuilder::new(s).case_insensitive(true).build() {
+                            Ok(r) => value_patterns.push(r),
+                            Err(e) => tracing::warn!(
+                                pattern = %s,
+                                error = %e,
+                                "Skipping invalid regex_patterns entry"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
+        let replacement = config
+            .get("observability.redaction.replacement")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| DEFAULT_REPLACEMENT.to_string());
+
+        RedactionConfig {
+            field_patterns,
+            value_patterns,
+            replacement,
+        }
     }
 
     /// Apply both field-name and value-pattern rules to a JSON value in place.

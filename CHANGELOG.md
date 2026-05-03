@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Granular reload via `path_filter` input in `ReloadModule` (#45.4).
+- `Config::reload_from_disk()` for refreshing static config without binary restart (#45.5).
+- Error fingerprinting in `ErrorHistory` — dedup by (error_code, top-frame hash, sanitized template) (#43 §4).
+- Configurable redaction via `obs.redaction.regex_patterns` / `obs.redaction.sensitive_keys` Config keys (#43 §5).
+
 ### Cross-Language Sync — Review-Mode Hardening
 
 This release applies the next batch of cross-language audit findings, focused

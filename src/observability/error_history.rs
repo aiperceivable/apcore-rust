@@ -107,6 +107,23 @@ pub fn compute_fingerprint(error_code: &str, module_id: &str, message: &str) -> 
     format!("{:x}", hasher.finalize())
 }
 
+/// Compute the deduplication fingerprint directly from a `ModuleError`.
+///
+/// Issue #43 §4 — fingerprint = SHA-256 of
+/// `<error_code>:<module_id>:<sanitized_message>`. The message is sanitized
+/// via [`normalize_message`], which strips UUIDs, ISO 8601 timestamps, and
+/// digit-runs of length ≥ 4 so two errors that differ only in ephemeral
+/// identifiers share a fingerprint. `ModuleError` does not carry a module_id
+/// (the call site does), so callers MUST supply it explicitly. Aligned with
+/// the cross-language fingerprinting algorithm in
+/// `apcore-python.compute_fingerprint(error, module_id)` and
+/// `apcore-typescript.computeFingerprint(error, moduleId)`.
+#[must_use]
+pub fn compute_fingerprint_from_error(error: &ModuleError, module_id: &str) -> String {
+    let error_code = error_code_string(error.code);
+    compute_fingerprint(&error_code, module_id, &error.message)
+}
+
 // ---------------------------------------------------------------------------
 // ErrorHistory — pluggable storage + min-heap eviction + fingerprint dedup
 // ---------------------------------------------------------------------------

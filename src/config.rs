@@ -574,6 +574,24 @@ impl Config {
         Ok(())
     }
 
+    /// Re-read the original config file from disk, discarding any in-memory
+    /// `set()` mutations made since the last load. Issue #45.5.
+    ///
+    /// Rust cannot dynamically reload compiled module code (no `.so`/`.rlib`
+    /// hot-swap in the SDK), so the `system.control.reload_module` module
+    /// uses this method when invoked with `reload_config: true` to refresh
+    /// static configuration without a binary restart. The method requires
+    /// the Config to have been loaded from a file via
+    /// [`Config::from_yaml_file`] / [`Config::from_json_file`] / [`Config::load`];
+    /// configs built via [`Config::from_defaults`] return `ReloadFailed`.
+    ///
+    /// Equivalent to [`Config::reload`] — kept as a separate method so the
+    /// reload-module call site reads naturally and the spec terminology
+    /// (`reload_from_disk`) stays first-class in the public API.
+    pub fn reload_from_disk(&mut self) -> Result<(), ModuleError> {
+        self.reload()
+    }
+
     /// Return a `serde_json::Value` representing the full config as the
     /// canonical nested JSON object (`PROTOCOL_SPEC` §9.1 wire format).
     #[must_use]
