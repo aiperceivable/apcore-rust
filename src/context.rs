@@ -493,14 +493,11 @@ impl<T: Default> Context<T> {
     pub fn logger(&self) -> ContextLogger {
         let module_id = self.call_chain.last().cloned();
         let caller_id = self.caller_id.clone();
-        ContextLogger {
-            name: "apcore".to_string(),
-            level: "info".to_string(),
-            format: crate::observability::logging::LogFormat::Json,
-            trace_id: Some(self.trace_id.clone()),
-            module_id,
-            caller_id,
-        }
+        let mut logger = ContextLogger::new("apcore");
+        logger.trace_id = Some(self.trace_id.clone());
+        logger.module_id = module_id;
+        logger.caller_id = caller_id;
+        logger
     }
 
     /// Create a context from explicit parameters.

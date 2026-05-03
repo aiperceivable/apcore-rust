@@ -1,8 +1,13 @@
 // APCore Protocol — Usage tracking
 // Spec reference: Module usage statistics and middleware
+// Sync findings:
+//   * D-27 — `record()` honors an optional explicit timestamp;
+//            trend is computed from samples (current vs previous period
+//            counts); summary accepts a period filter.
+//   * Issue #43 §1 — optional `StorageBackend` for cross-process persistence.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -12,11 +17,12 @@ use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
 use crate::observability::metrics::estimate_p99_from_sorted;
+use crate::observability::storage::StorageBackend;
 
 /// A single usage record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UsageRecord {
-    pub timestamp: String,
+    pub timestamp: DateTime<Utc>,
     pub caller_id: Option<String>,
     pub latency_ms: f64,
     pub success: bool,
@@ -30,6 +36,9 @@ pub struct UsageStats {
     pub error_count: u64,
     pub avg_latency_ms: f64,
     pub unique_callers: usize,
+    /// D-27: derived from sample counts (current vs previous period).
+    /// Possible values: `"stable"`, `"rising"`, `"declining"`, `"new"`,
+    /// `"inactive"` — matches Python/TS exactly.
     pub trend: String,
 }
 
@@ -68,6 +77,11 @@ impl ModuleData {
 #[derive(Debug, Clone)]
 pub struct UsageCollector {
     data: Arc<Mutex<HashMap<String, ModuleData>>>,
+    /// Issue #43 §1: optional `StorageBackend` for persistence beyond process
+    /// lifetime. Each `record()` writes a serialized `UsageRecord` to the
+    /// backend under namespace `"usage"`; the in-memory aggregation still
+    /// drives the synchronous accessors so reads remain fast.
+    storage_backend: Option<Arc<dyn StorageBackend>>,
 }
 
 impl UsageCollector {
@@ -76,91 +90,225 @@ impl UsageCollector {
     pub fn new() -> Self {
         Self {
             data: Arc::new(Mutex::new(HashMap::new())),
+            storage_backend: None,
         }
     }
 
-    /// Generate hourly bucket key from current time: "YYYY-MM-DDTHH".
-    fn bucket_key() -> String {
-        Utc::now().format("%Y-%m-%dT%H").to_string()
+    /// Create with an optional `StorageBackend` (Issue #43 §1).
+    #[must_use]
+    pub fn with_storage_backend(storage_backend: Option<Arc<dyn StorageBackend>>) -> Self {
+        Self {
+            data: Arc::new(Mutex::new(HashMap::new())),
+            storage_backend,
+        }
     }
 
-    /// Record a module execution.
+    /// Generate hourly bucket key from a timestamp: "YYYY-MM-DDTHH".
+    fn bucket_key(ts: DateTime<Utc>) -> String {
+        ts.format("%Y-%m-%dT%H").to_string()
+    }
+
+    /// Record a module execution at the current time.
     pub fn record(&self, module_id: &str, caller_id: Option<&str>, latency_ms: f64, success: bool) {
+        self.record_at(module_id, caller_id, latency_ms, success, Utc::now());
+    }
+
+    /// Record a module execution at an explicit timestamp (D-27).
+    ///
+    /// Used by tests to drive trend computation deterministically and by
+    /// integrations that replay historical events. The timestamp is also the
+    /// hourly bucket key, so back-dated records sort correctly into past
+    /// buckets.
+    pub fn record_at(
+        &self,
+        module_id: &str,
+        caller_id: Option<&str>,
+        latency_ms: f64,
+        success: bool,
+        at: DateTime<Utc>,
+    ) {
         let record = UsageRecord {
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: at,
             caller_id: caller_id.map(std::string::ToString::to_string),
             latency_ms,
             success,
         };
 
-        let bucket = Self::bucket_key();
-        let mut data = self.data.lock();
-        let module = data
-            .entry(module_id.to_string())
-            .or_insert_with(ModuleData::new);
-        let bucket_records = module.records.entry(bucket).or_default();
-        bucket_records.push(record);
-        // Evict oldest records if bucket exceeds limit
-        if bucket_records.len() > MAX_RECORDS_PER_BUCKET {
-            let excess = bucket_records.len() - MAX_RECORDS_PER_BUCKET;
-            bucket_records.drain(..excess);
+        let bucket = Self::bucket_key(at);
+        {
+            let mut data = self.data.lock();
+            let module = data
+                .entry(module_id.to_string())
+                .or_insert_with(ModuleData::new);
+            let bucket_records = module.records.entry(bucket).or_default();
+            bucket_records.push(record.clone());
+            if bucket_records.len() > MAX_RECORDS_PER_BUCKET {
+                let excess = bucket_records.len() - MAX_RECORDS_PER_BUCKET;
+                bucket_records.drain(..excess);
+            }
+            module.evict_old_buckets();
         }
-        // Evict old hourly buckets if retention exceeded
-        module.evict_old_buckets();
+
+        // Forward to the optional storage backend (Issue #43 §1). Best-effort:
+        // when no tokio runtime is active or serialization fails the call is
+        // dropped silently. We deliberately do NOT block the in-memory path
+        // on backend latency.
+        if let Some(backend) = self.storage_backend.clone() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let module_id = module_id.to_string();
+                let key = format!("{module_id}:{}", at.timestamp_nanos_opt().unwrap_or(0));
+                handle.spawn(async move {
+                    if let Ok(value) = serde_json::to_value(&record) {
+                        let _ = backend.save("usage", &key, value).await;
+                    }
+                });
+            }
+        }
     }
 
-    /// Aggregate records for a single module into a `UsageStats`.
-    fn aggregate(module_id: &str, module_data: &ModuleData) -> UsageStats {
+    /// Aggregate a slice of records into a `UsageStats` (helper, no lock).
+    fn aggregate_records(module_id: &str, records: &[UsageRecord], trend: String) -> UsageStats {
         let mut call_count: u64 = 0;
         let mut error_count: u64 = 0;
         let mut total_latency: f64 = 0.0;
         let mut unique_callers: HashSet<String> = HashSet::new();
-
-        for records in module_data.records.values() {
-            for record in records {
-                call_count += 1;
-                if !record.success {
-                    error_count += 1;
-                }
-                total_latency += record.latency_ms;
-                if let Some(ref cid) = record.caller_id {
-                    unique_callers.insert(cid.clone());
-                }
+        for record in records {
+            call_count += 1;
+            if !record.success {
+                error_count += 1;
+            }
+            total_latency += record.latency_ms;
+            if let Some(ref cid) = record.caller_id {
+                unique_callers.insert(cid.clone());
             }
         }
-
         #[allow(clippy::cast_precision_loss)]
-        // intentional: call counts fit in f64 for realistic usage stats
         let avg_latency_ms = if call_count > 0 {
             total_latency / call_count as f64
         } else {
             0.0
         };
-
         UsageStats {
             module_id: module_id.to_string(),
             call_count,
             error_count,
             avg_latency_ms,
             unique_callers: unique_callers.len(),
-            trend: "stable".to_string(),
+            trend,
         }
     }
 
-    /// Get usage summary for a specific module.
+    /// Collect records for a module within `[start, end]`. Caller holds the lock.
+    fn collect_records_in_window(
+        module_data: &ModuleData,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<UsageRecord> {
+        let start_key = Self::bucket_key(start);
+        let end_key = Self::bucket_key(end);
+        let mut out: Vec<UsageRecord> = Vec::new();
+        for (bk, recs) in &module_data.records {
+            // Hourly bucket keys are lexicographically ordered, so we can prune
+            // buckets outside the window without parsing them.
+            if bk.as_str() < start_key.as_str() || bk.as_str() > end_key.as_str() {
+                continue;
+            }
+            for r in recs {
+                if r.timestamp >= start && r.timestamp <= end {
+                    out.push(r.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Compute the trend label by comparing sample counts (D-27).
+    ///
+    /// Mirrors Python `_compute_trend` exactly:
+    ///   - both 0 → `"stable"`
+    ///   - current 0 (with previous > 0) → `"inactive"`
+    ///   - previous 0 (with current > 0) → `"new"`
+    ///   - ratio > 1.2 → `"rising"`
+    ///   - ratio < 0.8 → `"declining"`
+    ///   - else → `"stable"`
+    #[must_use]
+    fn compute_trend(current: usize, previous: usize) -> &'static str {
+        if current == 0 && previous == 0 {
+            return "stable";
+        }
+        if current == 0 {
+            return "inactive";
+        }
+        if previous == 0 {
+            return "new";
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = current as f64 / previous as f64;
+        if ratio > 1.2 {
+            "rising"
+        } else if ratio < 0.8 {
+            "declining"
+        } else {
+            "stable"
+        }
+    }
+
+    /// Get usage summary for a specific module (all recorded data, no period filter).
     #[must_use]
     pub fn get_module_summary(&self, module_id: &str) -> Option<UsageStats> {
         let data = self.data.lock();
-        data.get(module_id).map(|md| Self::aggregate(module_id, md))
+        let md = data.get(module_id)?;
+        let records: Vec<UsageRecord> = md.records.values().flatten().cloned().collect();
+        // No period → trend is "stable" (no comparison window).
+        Some(Self::aggregate_records(
+            module_id,
+            &records,
+            "stable".to_string(),
+        ))
     }
 
-    /// Get all usage summaries.
+    /// Get all usage summaries (all recorded data, no period filter).
     #[must_use]
     pub fn get_all_summaries(&self) -> Vec<UsageStats> {
         let data = self.data.lock();
         data.iter()
-            .map(|(mid, md)| Self::aggregate(mid, md))
+            .map(|(mid, md)| {
+                let records: Vec<UsageRecord> = md.records.values().flatten().cloned().collect();
+                Self::aggregate_records(mid, &records, "stable".to_string())
+            })
             .collect()
+    }
+
+    /// Get summaries for all modules, optionally filtered to a recent
+    /// period (D-27). When `period` is `None`, the full history is summarised
+    /// and trend is `"stable"` (no window to compare against).
+    #[must_use]
+    pub fn get_summary_for_period(&self, period: Option<Duration>) -> Vec<UsageStats> {
+        let now = Utc::now();
+        let data = self.data.lock();
+        match period {
+            None => data
+                .iter()
+                .map(|(mid, md)| {
+                    let records: Vec<UsageRecord> =
+                        md.records.values().flatten().cloned().collect();
+                    Self::aggregate_records(mid, &records, "stable".to_string())
+                })
+                .collect(),
+            Some(delta) => {
+                let cutoff = now - delta;
+                let prev_cutoff = cutoff - delta;
+                data.iter()
+                    .map(|(mid, md)| {
+                        let current = Self::collect_records_in_window(md, cutoff, now);
+                        let previous = Self::collect_records_in_window(md, prev_cutoff, cutoff);
+                        let trend =
+                            Self::compute_trend(current.len(), previous.len()).to_string();
+                        Self::aggregate_records(mid, &current, trend)
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// Get per-caller breakdown for a module.

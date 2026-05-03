@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::middleware::base::Middleware;
+use crate::observability::storage::StorageBackend;
 use crate::observability::store::{InMemoryObservabilityStore, MetricPoint, ObservabilityStore};
 
 /// Metric name for total module call count.
@@ -66,6 +67,10 @@ pub struct MetricsCollector {
     counters: Arc<Mutex<HashMap<MetricKey, f64>>>,
     histograms: Arc<Mutex<HashMap<MetricKey, HistogramData>>>,
     store: Arc<dyn ObservabilityStore>,
+    /// Issue #43 §1: optional `StorageBackend` for cross-process persistence.
+    /// When set, every counter/histogram observation is also persisted under
+    /// namespace `"metrics"` with a key derived from `(name, labels, ts)`.
+    storage_backend: Option<Arc<dyn StorageBackend>>,
 }
 
 impl MetricsCollector {
@@ -82,7 +87,28 @@ impl MetricsCollector {
             counters: Arc::new(Mutex::new(HashMap::new())),
             histograms: Arc::new(Mutex::new(HashMap::new())),
             store,
+            storage_backend: None,
         }
+    }
+
+    /// Create a new metrics collector with an optional `StorageBackend`
+    /// (Issue #43 §1). The internal `ObservabilityStore` is the default
+    /// in-memory one; the storage backend is purely additive.
+    #[must_use]
+    pub fn with_storage_backend(storage_backend: Option<Arc<dyn StorageBackend>>) -> Self {
+        Self {
+            counters: Arc::new(Mutex::new(HashMap::new())),
+            histograms: Arc::new(Mutex::new(HashMap::new())),
+            store: Arc::new(InMemoryObservabilityStore::new()),
+            storage_backend,
+        }
+    }
+
+    /// Attach an optional `StorageBackend` after construction.
+    #[must_use]
+    pub fn with_storage(mut self, storage_backend: Option<Arc<dyn StorageBackend>>) -> Self {
+        self.storage_backend = storage_backend;
+        self
     }
 
     /// Get a clone of the underlying store handle.
@@ -131,10 +157,24 @@ impl MetricsCollector {
             metric = metric.with_module_id(id);
         }
         let store = self.store.clone();
+        let backend = self.storage_backend.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let metric_for_backend = metric.clone();
             handle.spawn(async move {
                 store.record_metric(metric).await;
             });
+            if let Some(backend) = backend {
+                let key = format!(
+                    "{}:{}",
+                    metric_for_backend.name,
+                    metric_for_backend.timestamp.timestamp_nanos_opt().unwrap_or(0)
+                );
+                handle.spawn(async move {
+                    if let Ok(value) = serde_json::to_value(&metric_for_backend) {
+                        let _ = backend.save("metrics", &key, value).await;
+                    }
+                });
+            }
         } else {
             tracing::debug!(
                 metric = %name,

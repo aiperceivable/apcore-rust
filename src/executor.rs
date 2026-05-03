@@ -38,15 +38,71 @@ const DEEP_MERGE_MAX_DEPTH: usize = 32;
 
 /// Deep-merge a list of JSON Value chunks into a single accumulated Value.
 ///
-/// For objects: keys from later chunks overwrite earlier keys; nested objects
-/// are merged recursively up to `DEEP_MERGE_MAX_DEPTH` levels. For
-/// non-objects: returns the last chunk.
+/// Retained for tests that explicitly verify the unchecked merge behavior;
+/// the streaming pipeline now uses [`deep_merge_chunks_checked`] (D-19) so a
+/// non-object chunk surfaces a structured error rather than silently
+/// replacing the accumulator.
+#[cfg(test)]
 fn deep_merge_chunks(chunks: &[Value]) -> Value {
     let mut acc = Value::Null;
     for chunk in chunks {
         deep_merge_value(&mut acc, chunk, 0);
     }
     acc
+}
+
+/// Sync finding D-19: deep-merge chunks while *enforcing* that every chunk is
+/// a JSON object. A non-object chunk (string, number, array, etc.) yields
+/// `ModuleError::GeneralInvalidInput` with `details["code"] =
+/// "STREAM_CHUNK_NOT_OBJECT"`, mirroring Python's `_deep_merge` AttributeError
+/// and TypeScript's TypeError. The previous Rust path silently replaced the
+/// accumulator with a non-object, leaving downstream consumers staring at
+/// surprise scalars.
+///
+/// `chunks` may be empty; in that case the function returns an empty object
+/// (mirroring Python's `accumulated: dict[str, Any] = {}` initial state).
+pub fn deep_merge_chunks_checked(chunks: &[Value]) -> Result<Value, ModuleError> {
+    let mut acc: Value = Value::Object(serde_json::Map::new());
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if !chunk.is_object() {
+            let mut details = std::collections::HashMap::new();
+            details.insert(
+                "code".to_string(),
+                Value::String("STREAM_CHUNK_NOT_OBJECT".to_string()),
+            );
+            details.insert(
+                "chunk_index".to_string(),
+                Value::Number(serde_json::Number::from(idx)),
+            );
+            details.insert(
+                "actual_type".to_string(),
+                Value::String(json_type_name(chunk).to_string()),
+            );
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Streaming chunk at index {idx} is not a JSON object \
+                     (got {}); chunks must be objects so deep_merge can \
+                     accumulate them.",
+                    json_type_name(chunk)
+                ),
+            )
+            .with_details(details));
+        }
+        deep_merge_value(&mut acc, chunk, 0);
+    }
+    Ok(acc)
+}
+
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn deep_merge_value(base: &mut Value, overlay: &Value, depth: usize) {
@@ -847,7 +903,21 @@ impl Executor {
             // `apcore.stream.post_validation_failed` event and does not raise)
             // and apcore-typescript (console.warn + swallow) behavior
             // (sync finding A-D-012).
-            let merged = deep_merge_chunks(&accumulated);
+            // D-19: enforce that all chunks are objects before merging. A
+            // non-object chunk is logged and skips post-stream validation
+            // (chunks have already been delivered to the consumer).
+            let merged = match deep_merge_chunks_checked(&accumulated) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        module_id = %module_id_owned,
+                        error = %e.message,
+                        "stream phase-3 chunk shape check failed (chunks already delivered, swallowed)"
+                    );
+                    let _ = &mut setup;
+                    return;
+                }
+            };
             if let Err(e) = validate_against_schema(&merged, &setup.output_schema, "Output") {
                 tracing::warn!(
                     module_id = %module_id_owned,

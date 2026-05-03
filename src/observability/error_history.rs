@@ -16,6 +16,7 @@ use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::middleware::base::Middleware;
 
+use super::storage::StorageBackend;
 use super::store::{InMemoryObservabilityStore, ObservabilityStore};
 
 /// Canonical string representation of an `ErrorCode` (the SCREAMING_SNAKE_CASE
@@ -144,6 +145,12 @@ pub struct ErrorHistory {
     max_entries_per_module: usize,
     max_total_entries: usize,
     store: Arc<dyn ObservabilityStore>,
+    /// Issue #43 §1: optional `StorageBackend` for cross-process persistence.
+    /// When set, every `record()` is also forwarded to the backend under
+    /// namespace `"error_history"` keyed by fingerprint. The bundled
+    /// `ObservabilityStore` is independent of this — both are kept so existing
+    /// integrations don't have to change.
+    storage_backend: Option<Arc<dyn StorageBackend>>,
 }
 
 impl ErrorHistory {
@@ -185,7 +192,35 @@ impl ErrorHistory {
             max_entries_per_module,
             max_total_entries,
             store,
+            storage_backend: None,
         }
+    }
+
+    /// Create with explicit limits and an optional `StorageBackend` (Issue
+    /// #43 §1). The internal `ObservabilityStore` is the default in-memory
+    /// one; the storage backend is purely additive — when supplied, every
+    /// recorded `ErrorEntry` is also persisted under namespace
+    /// `"error_history"` so external consumers can read it.
+    #[must_use]
+    pub fn with_storage_backend(
+        max_entries_per_module: usize,
+        max_total_entries: usize,
+        storage_backend: Option<Arc<dyn StorageBackend>>,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ErrorHistoryState::default())),
+            max_entries_per_module,
+            max_total_entries,
+            store: Arc::new(InMemoryObservabilityStore::new()),
+            storage_backend,
+        }
+    }
+
+    /// Attach an optional `StorageBackend` after construction (builder-style).
+    #[must_use]
+    pub fn with_storage(mut self, storage_backend: Option<Arc<dyn StorageBackend>>) -> Self {
+        self.storage_backend = storage_backend;
+        self
     }
 
     /// Get a clone of the underlying store handle.
@@ -256,10 +291,20 @@ impl ErrorHistory {
         // do not panic; if no runtime is active the notification is dropped and
         // a debug log is emitted so production callers see the silent path.
         let store = self.store.clone();
+        let backend = self.storage_backend.clone();
+        let entry_clone = entry_to_notify.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 store.record_error(entry_to_notify).await;
             });
+            if let Some(backend) = backend {
+                let fp = entry_clone.fingerprint.clone();
+                handle.spawn(async move {
+                    if let Ok(value) = serde_json::to_value(&entry_clone) {
+                        let _ = backend.save("error_history", &fp, value).await;
+                    }
+                });
+            }
         } else {
             tracing::debug!(
                 "ErrorHistory::record called outside a tokio runtime; \

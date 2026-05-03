@@ -109,8 +109,11 @@ impl Module for UpdateConfigModule {
             .ok_or_else(|| missing_field_error("value"))?;
 
         if RESTRICTED_KEYS.contains(&key.as_str()) {
+            // D-25: emit a distinct CONFIG_KEY_RESTRICTED code so callers can
+            // match the policy-deny case independently of value-shape errors
+            // (Python/TS already do this).
             return Err(ModuleError::new(
-                ErrorCode::ConfigInvalid,
+                ErrorCode::ConfigKeyRestricted,
                 format!("Configuration key '{key}' cannot be changed at runtime"),
             )
             .with_details([("key".to_string(), json!(key))].into_iter().collect()));
