@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `UsageExporter` async trait + `NoopUsageExporter` + `PeriodicUsageExporter` for push-style usage summary export (#45 §3, parity with PY+TS).
+
+### Changed
+
+- `DEFAULT_SENSITIVE_KEYS` expanded to canonical 16-entry superset matching Python+TS (#43 §5, D-54).
+
 ### Cross-SDK Sync Alignment
 
 #### Added

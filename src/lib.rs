@@ -133,6 +133,9 @@ pub use observability::storage::{
 pub use observability::store::{InMemoryObservabilityStore, MetricPoint, ObservabilityStore};
 pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 pub use observability::usage::{UsageCollector, UsageMiddleware, UsageStats};
+pub use observability::usage_exporter::{
+    NoopUsageExporter, PeriodicUsageExporter, UsageExporter,
+};
 pub use pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineState, PipelineTrace, RunOptions,
     RunUntilPredicate, Step, StepMiddleware, StepResult, StepTrace, StrategyInfo,
