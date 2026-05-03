@@ -220,10 +220,18 @@ impl Module for UpdateConfigModule {
 /// When `path_filter` is supplied instead of `module_id`, every module ID
 /// matching the glob pattern is reloaded in dependency-topological order
 /// (leaves first). Supplying both inputs raises `MODULE_RELOAD_CONFLICT`.
+///
+/// When the input contains `reload_config: true`, the bound [`Config`] (if
+/// supplied via [`Self::with_config`]) is refreshed via
+/// [`Config::reload_from_disk`] and an `apcore.config.reloaded` event is
+/// emitted. Issue #45.5 — Rust cannot dynamically swap compiled module code
+/// (`.so`/`.rlib`), but static configuration MUST be reloadable without a
+/// binary restart.
 pub struct ReloadModule {
     registry: Arc<Registry>,
     emitter: Arc<Mutex<EventEmitter>>,
     audit_store: Option<Arc<dyn AuditStore>>,
+    config: Option<Arc<Mutex<Config>>>,
 }
 
 impl ReloadModule {
@@ -232,12 +240,22 @@ impl ReloadModule {
             registry,
             emitter,
             audit_store: None,
+            config: None,
         }
     }
 
     #[must_use]
     pub fn with_audit_store(mut self, audit_store: Option<Arc<dyn AuditStore>>) -> Self {
         self.audit_store = audit_store;
+        self
+    }
+
+    /// Bind a runtime [`Config`] so `reload_config: true` invocations can
+    /// refresh static configuration via [`Config::reload_from_disk`].
+    /// Issue #45.5.
+    #[must_use]
+    pub fn with_config(mut self, config: Option<Arc<Mutex<Config>>>) -> Self {
+        self.config = config;
         self
     }
 
@@ -542,6 +560,7 @@ impl Module for ReloadModule {
                 "module_id":         {"type": "string"},
                 "path_filter":       {"type": "string"},
                 "reload_dependents": {"type": "boolean", "default": false},
+                "reload_config":     {"type": "boolean", "default": false},
                 "reason":            {"type": "string"}
             }
         })
@@ -586,19 +605,80 @@ impl Module for ReloadModule {
             ));
         }
 
+        let reload_config_flag = inputs
+            .get("reload_config")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        // Issue #45.5: when reload_config is set, refresh static configuration
+        // from disk. This runs BEFORE module reload so any module that re-reads
+        // config during its on_resume sees the fresh values.
+        let mut config_reloaded = false;
+        if reload_config_flag {
+            if let Some(cfg_handle) = self.config.as_ref() {
+                let mut cfg = cfg_handle.lock().await;
+                match cfg.reload_from_disk() {
+                    Ok(()) => {
+                        config_reloaded = true;
+                        let timestamp = chrono::Utc::now().to_rfc3339();
+                        emit_event(
+                            &self.emitter,
+                            "apcore.config.reloaded",
+                            "system.control.reload_module",
+                            &timestamp,
+                            json!({"reason": reason}),
+                        )
+                        .await;
+                        tracing::info!(reason = %reason, "Config reloaded from disk");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e.message,
+                            "reload_config: Config::reload_from_disk failed (continuing)"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "reload_config: requested but no Config bound to ReloadModule \
+                     (use ReloadModule::with_config to enable)"
+                );
+            }
+        }
+
         if let Some(filter) = path_filter_input {
-            return self.execute_bulk(filter.to_string(), &reason, ctx).await;
+            let mut result = self.execute_bulk(filter.to_string(), &reason, ctx).await?;
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("config_reloaded".to_string(), json!(config_reloaded));
+            }
+            return Ok(result);
+        }
+
+        // If only reload_config was requested without a module target, return
+        // a config-only success response. This makes `reload_config: true`
+        // usable on its own without forcing the caller to nominate a module.
+        if module_id_input.is_none() && reload_config_flag {
+            return Ok(json!({
+                "success": true,
+                "module_id": serde_json::Value::Null,
+                "config_reloaded": config_reloaded,
+            }));
         }
 
         let module_id = module_id_input.ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::GeneralInvalidInput,
-                "'module_id' or 'path_filter' is required",
+                "'module_id', 'path_filter', or 'reload_config' is required",
             )
         })?;
 
-        self.execute_single(module_id.to_string(), &reason, ctx)
-            .await
+        let mut result = self
+            .execute_single(module_id.to_string(), &reason, ctx)
+            .await?;
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("config_reloaded".to_string(), json!(config_reloaded));
+        }
+        Ok(result)
     }
 }
 

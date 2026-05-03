@@ -112,7 +112,8 @@ pub use module::{
     ValidationResult, DEFAULT_ANNOTATIONS,
 };
 pub use observability::error_history::{
-    compute_fingerprint, normalize_message, ErrorEntry, ErrorHistory, ErrorHistoryMiddleware,
+    compute_fingerprint, compute_fingerprint_from_error, normalize_message, ErrorEntry,
+    ErrorHistory, ErrorHistoryMiddleware,
 };
 pub use observability::exporters::{InMemoryExporter, OTLPExporter, StdoutExporter};
 pub use observability::logging::{ContextLogger, ObsLoggingMiddleware};
