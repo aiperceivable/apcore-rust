@@ -471,6 +471,26 @@ fn test_acl_reload_succeeds_from_yaml_path() {
 }
 
 // ---------------------------------------------------------------------------
+// D10-001: ACL::reload without yaml_path raises ACLRuleError with spec message
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_acl_reload_without_yaml_path_raises_acl_rule_error() {
+    use apcore::errors::ErrorCode;
+    let mut acl = ACL::new(vec![], "deny", None);
+    let err = acl.reload().expect_err("reload without yaml_path must error");
+    assert_eq!(
+        err.code,
+        ErrorCode::ACLRuleError,
+        "code must be ACLRuleError to match Python/TS spec contract"
+    );
+    assert_eq!(
+        err.message, "Cannot reload: ACL was not loaded from a YAML file",
+        "message must match spec acl-system.md:314 verbatim"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A-D-301: async_check snapshots rules + default_effect at entry
 // ---------------------------------------------------------------------------
 

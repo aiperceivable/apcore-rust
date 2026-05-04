@@ -402,8 +402,8 @@ impl ACL {
             // at the closing brace, *before* file I/O is initiated below.
             self.yaml_path.clone().ok_or_else(|| {
                 ModuleError::new(
-                    ErrorCode::ReloadFailed,
-                    "Cannot reload: no yaml_path stored".to_string(),
+                    ErrorCode::ACLRuleError,
+                    "Cannot reload: ACL was not loaded from a YAML file".to_string(),
                 )
             })?
         };
