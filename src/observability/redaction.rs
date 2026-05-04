@@ -229,10 +229,8 @@ impl RedactionConfig {
                     self.redact_inner(item, None);
                 }
             }
-            Value::String(s) => {
-                if self.value_matches(s) {
-                    s.clone_from(&self.replacement);
-                }
+            Value::String(s) if self.value_matches(s) => {
+                s.clone_from(&self.replacement);
             }
             _ => {}
         }

@@ -621,7 +621,7 @@ mod tests {
         let ctx = ctx_with_caller("orchestrator.billing");
         let module = "executor.payment.charge";
         let opened_at = Instant::now()
-            .checked_sub(Duration::from_millis(35_000))
+            .checked_sub(Duration::from_secs(35))
             .expect("test clock far enough from epoch");
         mw.force_state(
             module,

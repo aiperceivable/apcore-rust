@@ -548,9 +548,7 @@ impl AsyncTaskManager {
 
     /// Total tracked task count across all states.
     pub fn task_count(&self) -> usize {
-        block_on_local(self.store.list(None))
-            .map(|v| v.len())
-            .unwrap_or(0)
+        block_on_local(self.store.list(None)).map_or(0, |v| v.len())
     }
 
     /// Start the opt-in background reaper. Returns a [`ReaperHandle`] used to
