@@ -180,10 +180,48 @@ pub(crate) async fn emit_event(
 /// both fall back to the literal `"@external"` string.
 pub(crate) const DEFAULT_EXTERNAL_CALLER: &str = "@external";
 
+/// Identity attribute names whose values are replaced with `<redacted>` in
+/// audit-event payloads. Mirrors `apcore-python._IDENTITY_SENSITIVE_SUBSTRINGS`
+/// (Issue #45.2). The list is intentionally a superset of the canonical
+/// `obs.redaction.sensitive_keys` so bearer tokens, signed cookies, and
+/// credentials can never leak through the contextual-audit channel even when
+/// global redaction is disabled.
+const IDENTITY_SENSITIVE_SUBSTRINGS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "key",
+    "auth",
+    "credential",
+    "cookie",
+    "session",
+    "bearer",
+];
+
+const IDENTITY_REDACTED_TOKEN: &str = "<redacted>";
+
+fn redact_identity_attr(name: &str, value: &serde_json::Value) -> serde_json::Value {
+    let lower = name.to_lowercase();
+    if IDENTITY_SENSITIVE_SUBSTRINGS
+        .iter()
+        .any(|sub| lower.contains(sub))
+    {
+        return serde_json::Value::String(IDENTITY_REDACTED_TOKEN.to_string());
+    }
+    value.clone()
+}
+
 /// Augment an audit-event payload with caller identity extracted from the
 /// `Context` (Issue #45.2). Adds:
-///   * `caller_id` — taken from `ctx.caller_id`, defaulted to `"@external"`.
-///   * `actor_id` / `actor_type` — taken from `ctx.identity` when present.
+///   * `caller_id` — taken from `ctx.caller_id`, defaulted to `"@external"`
+///     when the context is unauthenticated or the field is empty.
+///   * `identity` — a redaction-safe snapshot (`id`, `type`, optional `roles`,
+///     plus any non-sensitive `attrs` entries verbatim; sensitive attrs are
+///     replaced with `"<redacted>"`). Omitted entirely when `ctx.identity`
+///     is `None`.
+///   * `actor_id` / `actor_type` — flat aliases preserved for backward
+///     compatibility with pre-D-31 consumers.
 ///
 /// The `data` argument is mutated in place and returned for ergonomic chaining.
 pub(crate) fn augment_with_context_identity(
@@ -193,15 +231,37 @@ pub(crate) fn augment_with_context_identity(
     if let Some(obj) = data.as_object_mut() {
         let caller_id = ctx
             .caller_id
-            .clone()
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned()
             .unwrap_or_else(|| DEFAULT_EXTERNAL_CALLER.to_string());
         obj.insert("caller_id".to_string(), serde_json::json!(caller_id));
         if let Some(identity) = ctx.identity.as_ref() {
+            // Flat aliases (legacy).
             obj.insert("actor_id".to_string(), serde_json::json!(identity.id()));
             obj.insert(
                 "actor_type".to_string(),
                 serde_json::json!(identity.identity_type()),
             );
+
+            // Canonical nested snapshot.
+            let mut snapshot = serde_json::Map::new();
+            snapshot.insert("id".to_string(), serde_json::json!(identity.id()));
+            snapshot.insert(
+                "type".to_string(),
+                serde_json::json!(identity.identity_type()),
+            );
+            let roles = identity.roles();
+            if !roles.is_empty() {
+                snapshot.insert("roles".to_string(), serde_json::json!(roles));
+            }
+            for (key, value) in identity.attrs() {
+                if matches!(key.as_str(), "id" | "type" | "roles") {
+                    continue;
+                }
+                snapshot.insert(key.clone(), redact_identity_attr(key, value));
+            }
+            obj.insert("identity".to_string(), serde_json::Value::Object(snapshot));
         }
     }
     data

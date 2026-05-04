@@ -438,8 +438,12 @@ impl ReloadModule {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let timestamp = chrono::Utc::now().to_rfc3339();
         // Issue #45.2 — augment with caller_id / identity from the Context.
+        // Include `module_id` in the data payload for cross-language parity
+        // (Python/TS both inline it so subscribers reading only `data` see
+        // the affected target).
         let event_data = augment_with_context_identity(
             json!({
+                "module_id": module_id,
                 "previous_version": previous_version,
                 "new_version": new_version,
                 "reason": reason,
@@ -837,8 +841,12 @@ impl Module for ToggleFeatureModule {
 
         let timestamp = chrono::Utc::now().to_rfc3339();
         // Issue #45.2 — augment with caller_id / identity from the Context.
+        // Cross-language parity: Python/TS include `module_id` directly in the
+        // event data payload (alongside the outer ApCoreEvent.module_id field)
+        // so subscribers that only look at `data` still see the affected target.
         let event_data = augment_with_context_identity(
             json!({
+                "module_id": module_id,
                 "enabled": enabled,
                 "reason": reason,
             }),

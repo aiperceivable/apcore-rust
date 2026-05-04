@@ -10,11 +10,13 @@ use crate::config::Config;
 /// Default replacement string for redacted values.
 pub const DEFAULT_REPLACEMENT: &str = "***REDACTED***";
 
-/// Field names that MUST NEVER be redacted (observability.md §1.5).
+/// Field names that MUST NEVER be redacted (observability.md §1.5, D-54).
 ///
-/// `trace_id`, `caller_id`, and `module_id` are required for observability
-/// correlation and must always appear in logs unmodified.
-pub const NEVER_REDACT_FIELDS: &[&str] = &["trace_id", "caller_id", "module_id"];
+/// Correlation identifiers `trace_id`, `caller_id`, `target_id`, `module_id`,
+/// and `span_id` MUST always appear in logs unmodified, regardless of any
+/// `sensitive_keys` content.
+pub const NEVER_REDACT_FIELDS: &[&str] =
+    &["trace_id", "caller_id", "target_id", "module_id", "span_id"];
 
 /// Default sensitive-key glob patterns applied when the user has not supplied
 /// `observability.redaction.sensitive_keys` in their Config. Issue #43 §5.
@@ -46,9 +48,32 @@ pub const DEFAULT_SENSITIVE_KEYS: &[&str] = &[
 /// (`x-sensitive`) annotations.
 #[derive(Debug, Clone, Default)]
 pub struct RedactionConfig {
+    /// Compiled glob patterns (entries containing `*`/`?`/`[`).
     field_patterns: Vec<Pattern>,
+    /// Plain substring patterns, pre-normalized via [`normalize_key_for_match`].
+    field_substrings: Vec<String>,
     value_patterns: Vec<Regex>,
     replacement: String,
+}
+
+/// Normalize a key or pattern for cross-separator, case-insensitive substring
+/// matching (D-54). Lower-cases the input, treats `-` / `_` / whitespace as
+/// equivalent, and inserts an `_` at every `lowercase->uppercase` boundary so
+/// camelCase keys like `AccessKey` match the `access_key` substring pattern.
+#[must_use]
+pub fn normalize_key_for_match(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut prev_lower = false;
+    for ch in s.chars() {
+        if ch.is_ascii_uppercase() && prev_lower {
+            out.push('_');
+        }
+        out.push(ch);
+        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    out.to_lowercase()
+        .replace('-', "_")
+        .replace(char::is_whitespace, "_")
 }
 
 impl RedactionConfig {
@@ -57,8 +82,52 @@ impl RedactionConfig {
     pub fn new() -> Self {
         Self {
             field_patterns: Vec::new(),
+            field_substrings: Vec::new(),
             value_patterns: Vec::new(),
             replacement: DEFAULT_REPLACEMENT.to_string(),
+        }
+    }
+
+    /// Construct a redaction config seeded with the canonical default
+    /// `sensitive_keys` list (D-54). The 16-entry list is the spec-defined
+    /// superset shipped by every SDK when no operator override is supplied.
+    /// Operator overrides MUST replace this list, not merge.
+    #[must_use]
+    pub fn with_default_sensitive_keys() -> Self {
+        let mut cfg = Self::new();
+        for key in DEFAULT_SENSITIVE_KEYS {
+            cfg.add_sensitive_key(key);
+        }
+        cfg
+    }
+
+    /// Construct a redaction config with the canonical default sensitive_keys
+    /// list. Equivalent to [`Self::with_default_sensitive_keys`]; provided so
+    /// callers can write `RedactionConfig::default()` and get spec-canonical
+    /// behavior matching `apcore-python.RedactionConfig.default()`.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self::with_default_sensitive_keys()
+    }
+
+    /// Append one entry to the matcher. Glob patterns (containing `*`, `?`,
+    /// or `[`) compile to a [`glob::Pattern`]; bare strings are stored as
+    /// pre-normalized substrings.
+    fn add_sensitive_key(&mut self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        if key.contains(['*', '?', '[']) {
+            match Pattern::new(key) {
+                Ok(p) => self.field_patterns.push(p),
+                Err(e) => tracing::warn!(
+                    pattern = %key,
+                    error = %e,
+                    "Skipping invalid sensitive_keys glob"
+                ),
+            }
+        } else {
+            self.field_substrings.push(normalize_key_for_match(key));
         }
     }
 
@@ -89,33 +158,20 @@ impl RedactionConfig {
     /// rule MUST NOT disable redaction for every other rule.
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        let mut field_patterns: Vec<Pattern> = Vec::new();
+        let mut cfg = Self::new();
 
         // Default sensitive keys are always applied.
         for default in DEFAULT_SENSITIVE_KEYS {
-            match Pattern::new(default) {
-                Ok(p) => field_patterns.push(p),
-                Err(e) => tracing::warn!(
-                    pattern = %default,
-                    error = %e,
-                    "Skipping invalid default sensitive_keys glob"
-                ),
-            }
+            cfg.add_sensitive_key(default);
         }
 
-        // User-supplied sensitive_keys (additive).
+        // User-supplied sensitive_keys (additive — see D-54: operators that
+        // need replace-semantics should construct via the builder directly).
         if let Some(value) = config.get("observability.redaction.sensitive_keys") {
             if let Some(arr) = value.as_array() {
                 for entry in arr {
                     if let Some(s) = entry.as_str() {
-                        match Pattern::new(s) {
-                            Ok(p) => field_patterns.push(p),
-                            Err(e) => tracing::warn!(
-                                pattern = %s,
-                                error = %e,
-                                "Skipping invalid sensitive_keys glob"
-                            ),
-                        }
+                        cfg.add_sensitive_key(s);
                     }
                 }
             }
@@ -144,11 +200,9 @@ impl RedactionConfig {
             .and_then(|v| v.as_str().map(str::to_owned))
             .unwrap_or_else(|| DEFAULT_REPLACEMENT.to_string());
 
-        RedactionConfig {
-            field_patterns,
-            value_patterns,
-            replacement,
-        }
+        cfg.value_patterns = value_patterns;
+        cfg.replacement = replacement;
+        cfg
     }
 
     /// Apply both field-name and value-pattern rules to a JSON value in place.
@@ -200,10 +254,28 @@ impl RedactionConfig {
         }
     }
 
-    /// Check whether a field name matches any glob pattern.
+    /// Check whether a field name matches any sensitive-key entry. Glob
+    /// patterns are evaluated case-insensitively against the raw key; bare
+    /// substrings are evaluated against the normalized form (lower-cased,
+    /// `-`/whitespace mapped to `_`, and an `_` inserted at every
+    /// `lowercase->uppercase` boundary so `AccessKey` matches `access_key`).
     #[must_use]
     pub fn field_matches(&self, name: &str) -> bool {
-        self.field_patterns.iter().any(|p| p.matches(name))
+        if self.field_patterns.iter().any(|p| {
+            // Try the raw name and the lowered form so legacy globs like
+            // `_secret_*` still match `_secret_token` while case-insensitive
+            // operator entries like `password*` match `Password123`.
+            p.matches(name) || p.matches(&name.to_lowercase())
+        }) {
+            return true;
+        }
+        if self.field_substrings.is_empty() {
+            return false;
+        }
+        let normalized = normalize_key_for_match(name);
+        self.field_substrings
+            .iter()
+            .any(|sub| normalized.contains(sub))
     }
 
     /// Check whether a value matches any value regex.
@@ -223,6 +295,7 @@ impl RedactionConfig {
 #[derive(Debug, Default)]
 pub struct RedactionConfigBuilder {
     field_patterns: Vec<String>,
+    sensitive_keys: Vec<String>,
     value_patterns: Vec<String>,
     replacement: Option<String>,
 }
@@ -266,6 +339,22 @@ impl RedactionConfigBuilder {
         self
     }
 
+    /// Append `sensitive_keys` entries (D-54). Each entry is auto-detected:
+    /// strings containing `*`, `?`, or `[` are compiled as globs; bare
+    /// strings become case-insensitive substring matchers (with separator +
+    /// camelCase normalization). Operator-supplied lists MUST replace the
+    /// canonical default — call [`RedactionConfig::with_default_sensitive_keys`]
+    /// if you want both.
+    #[must_use]
+    pub fn sensitive_keys<I, S>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.sensitive_keys.extend(keys.into_iter().map(Into::into));
+        self
+    }
+
     #[must_use]
     pub fn replacement(mut self, replacement: impl Into<String>) -> Self {
         self.replacement = Some(replacement.into());
@@ -294,13 +383,18 @@ impl RedactionConfigBuilder {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(RedactionConfig {
+        let mut cfg = RedactionConfig {
             field_patterns,
+            field_substrings: Vec::new(),
             value_patterns,
             replacement: self
                 .replacement
                 .unwrap_or_else(|| DEFAULT_REPLACEMENT.to_string()),
-        })
+        };
+        for key in self.sensitive_keys {
+            cfg.add_sensitive_key(&key);
+        }
+        Ok(cfg)
     }
 
     /// Build, panicking on invalid patterns. Prefer [`Self::try_build`] when
