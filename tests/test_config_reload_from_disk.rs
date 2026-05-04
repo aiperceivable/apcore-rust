@@ -29,10 +29,7 @@ fn reload_from_disk_picks_up_file_changes() {
     assert_eq!(cfg.executor.max_call_depth, 8);
 
     // Mutate in memory — should be discarded by reload_from_disk.
-    cfg.set(
-        "executor.max_call_depth",
-        serde_json::Value::from(64u64),
-    );
+    cfg.set("executor.max_call_depth", serde_json::Value::from(64u64));
     assert_eq!(cfg.executor.max_call_depth, 64);
 
     // Rewrite file with a new value.

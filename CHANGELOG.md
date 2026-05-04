@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.20.0] - 2026-05-04
 
 ### Added
 
@@ -292,10 +292,6 @@ fire-and-forget semantics, and documentation cleanup.
   be removed independently (sync finding A-D-401).
 - **README install pin** bumped from `apcore = "0.19"` to
   `apcore = "0.20"` (sync finding B-001).
-
----
-
-## [0.20.0] - 2026-04-30
 
 ### System Modules Hardening (Issue #45, system-modules.md §1.1–§1.5)
 

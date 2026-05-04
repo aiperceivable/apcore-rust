@@ -52,7 +52,7 @@ fn inject_checked_accepts_valid_parent_id() {
 #[test]
 fn inject_checked_accepts_none_parent_id() {
     let ctx = make_context();
-    let headers = TraceContext::inject_checked(&ctx, None, None, None)
-        .expect("None parent_id must succeed");
+    let headers =
+        TraceContext::inject_checked(&ctx, None, None, None).expect("None parent_id must succeed");
     assert!(headers.contains_key("traceparent"));
 }

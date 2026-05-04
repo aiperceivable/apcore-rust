@@ -165,8 +165,7 @@ mod tests {
         let collector = Arc::new(UsageCollector::new());
         let counter = Arc::new(Counter::default());
         let exporter: Arc<dyn UsageExporter> = counter.clone();
-        let driver =
-            PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(25));
+        let driver = PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(25));
         driver.start().await;
         tokio::time::sleep(Duration::from_millis(120)).await;
         driver.stop().await;
@@ -179,8 +178,7 @@ mod tests {
         let collector = Arc::new(UsageCollector::new());
         let counter = Arc::new(Counter::default());
         let exporter: Arc<dyn UsageExporter> = counter.clone();
-        let driver =
-            PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(25));
+        let driver = PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(25));
         driver.start().await;
         driver.start().await; // must not spawn a second task
         driver.stop().await;

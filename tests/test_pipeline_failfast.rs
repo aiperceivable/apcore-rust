@@ -154,8 +154,5 @@ async fn build_strategy_from_config_step_without_anchor_returns_error() {
         }]
     });
     let result = build_strategy_from_config(&config);
-    assert!(
-        result.is_err(),
-        "step without anchor must surface an error"
-    );
+    assert!(result.is_err(), "step without anchor must surface an error");
 }

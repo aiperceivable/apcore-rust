@@ -124,8 +124,14 @@ fn test_extract_context_populates_tracestate() {
     );
     let tc = TraceContext::extract_context(&headers).expect("must extract");
     assert_eq!(tc.tracestate.len(), 2);
-    assert_eq!(tc.tracestate[0], ("vendor1".to_string(), "abc123".to_string()));
-    assert_eq!(tc.tracestate[1], ("vendor2".to_string(), "def456".to_string()));
+    assert_eq!(
+        tc.tracestate[0],
+        ("vendor1".to_string(), "abc123".to_string())
+    );
+    assert_eq!(
+        tc.tracestate[1],
+        ("vendor2".to_string(), "def456".to_string())
+    );
 }
 
 #[test]
@@ -168,13 +174,11 @@ fn test_inject_emits_tracestate_when_nonempty() {
         ("vendor1".to_string(), "abc123".to_string()),
         ("vendor2".to_string(), "def456".to_string()),
     ];
-    let headers = TraceContext::inject_with_options(
-        &ctx,
-        None,
-        None,
-        Some(&tracestate),
+    let headers = TraceContext::inject_with_options(&ctx, None, None, Some(&tracestate));
+    assert!(
+        headers.contains_key("tracestate"),
+        "tracestate header must be emitted"
     );
-    assert!(headers.contains_key("tracestate"), "tracestate header must be emitted");
     let value = &headers["tracestate"];
     assert_eq!(value, "vendor1=abc123,vendor2=def456");
 }
@@ -222,10 +226,7 @@ fn test_extract_context_case_insensitive_tracestate_key() {
         "Traceparent".to_string(),
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
     );
-    headers.insert(
-        "TraceState".to_string(),
-        "vendor1=abc123".to_string(),
-    );
+    headers.insert("TraceState".to_string(), "vendor1=abc123".to_string());
     let tc = TraceContext::extract_context(&headers).expect("must extract");
     assert_eq!(tc.tracestate.len(), 1);
     assert_eq!(tc.tracestate[0].0, "vendor1");
@@ -285,7 +286,9 @@ fn test_inject_with_options_rejects_invalid_parent_id_falls_back_to_random() {
     // The invalid value must not appear verbatim
     assert_ne!(parts[2], "ZZZ");
     // And must be valid hex
-    assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert!(parts[2]
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 }
 
 #[test]

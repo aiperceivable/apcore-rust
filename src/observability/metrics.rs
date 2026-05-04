@@ -167,7 +167,10 @@ impl MetricsCollector {
                 let key = format!(
                     "{}:{}",
                     metric_for_backend.name,
-                    metric_for_backend.timestamp.timestamp_nanos_opt().unwrap_or(0)
+                    metric_for_backend
+                        .timestamp
+                        .timestamp_nanos_opt()
+                        .unwrap_or(0)
                 );
                 handle.spawn(async move {
                     if let Ok(value) = serde_json::to_value(&metric_for_backend) {

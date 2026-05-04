@@ -233,8 +233,7 @@ async fn step_middleware_multiple_run_in_registration_order() {
     let log2 = Arc::clone(&mw2.log);
 
     let mut strategy =
-        ExecutionStrategy::new("test", vec![OkStep::boxed("only", serde_json::json!(1))])
-            .unwrap();
+        ExecutionStrategy::new("test", vec![OkStep::boxed("only", serde_json::json!(1))]).unwrap();
     strategy.add_step_middleware(mw1.clone() as Arc<dyn StepMiddleware>);
     strategy.add_step_middleware(mw2.clone() as Arc<dyn StepMiddleware>);
 

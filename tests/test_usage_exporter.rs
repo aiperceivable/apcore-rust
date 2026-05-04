@@ -94,8 +94,7 @@ async fn periodic_exporter_stop_is_idempotent_and_clean() {
     let recorder = Arc::new(RecordingExporter::default());
     let exporter: Arc<dyn UsageExporter> = recorder.clone();
 
-    let periodic =
-        PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(20));
+    let periodic = PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(20));
     periodic.start().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     periodic.stop().await;

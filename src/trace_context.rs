@@ -26,8 +26,7 @@ static TRACEPARENT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Pre-compiled regex matching a 16-char lowercase hex parent_id (W3C span id).
-static PARENT_ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[0-9a-f]{16}$").unwrap());
+static PARENT_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{16}$").unwrap());
 
 /// Read the inbound `trace-flags` byte from a [`Context`]'s shared data map.
 ///
@@ -54,10 +53,7 @@ const TRACESTATE_MAX_ENTRIES: usize = 32;
 /// the upstream layer used (e.g. "Traceparent", "TRACEPARENT"). This helper
 /// scans the map once with an `eq_ignore_ascii_case` comparison and returns the
 /// first matching value.
-fn lookup_header_ci<'a>(
-    headers: &'a HashMap<String, String>,
-    name: &str,
-) -> Option<&'a String> {
+fn lookup_header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -327,9 +323,7 @@ impl TraceContext {
             if !PARENT_ID_RE.is_match(p) {
                 return Err(ModuleError::new(
                     ErrorCode::GeneralInvalidInput,
-                    format!(
-                        "parent_id must be 16 lowercase hex chars, got {p:?}"
-                    ),
+                    format!("parent_id must be 16 lowercase hex chars, got {p:?}"),
                 ));
             }
         }

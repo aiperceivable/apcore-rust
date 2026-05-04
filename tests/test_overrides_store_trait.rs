@@ -7,9 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use apcore::sys_modules::overrides::{
-    FileOverridesStore, InMemoryOverridesStore, OverridesStore,
-};
+use apcore::sys_modules::overrides::{FileOverridesStore, InMemoryOverridesStore, OverridesStore};
 use serde_json::json;
 
 #[tokio::test]

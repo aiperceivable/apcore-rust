@@ -302,8 +302,7 @@ impl UsageCollector {
                     .map(|(mid, md)| {
                         let current = Self::collect_records_in_window(md, cutoff, now);
                         let previous = Self::collect_records_in_window(md, prev_cutoff, cutoff);
-                        let trend =
-                            Self::compute_trend(current.len(), previous.len()).to_string();
+                        let trend = Self::compute_trend(current.len(), previous.len()).to_string();
                         Self::aggregate_records(mid, &current, trend)
                     })
                     .collect()

@@ -34,7 +34,13 @@ fn trend_is_computed_from_samples_not_hardcoded() {
     let collector = UsageCollector::new();
     let now = Utc::now();
     // Previous 24h-period (24-48h ago): 1 call.
-    collector.record_at("executor.m", Some("@a"), 5.0, true, now - Duration::hours(36));
+    collector.record_at(
+        "executor.m",
+        Some("@a"),
+        5.0,
+        true,
+        now - Duration::hours(36),
+    );
     // Current 24h-period: 5 calls — should produce "rising" (ratio > 1.2).
     for i in 0..5 {
         collector.record_at(
@@ -74,7 +80,13 @@ fn trend_new_when_no_previous_samples() {
 fn period_filter_restricts_results() {
     let collector = UsageCollector::new();
     let now = Utc::now();
-    collector.record_at("executor.m", Some("@a"), 5.0, true, now - Duration::days(10));
+    collector.record_at(
+        "executor.m",
+        Some("@a"),
+        5.0,
+        true,
+        now - Duration::days(10),
+    );
     collector.record_at("executor.m", Some("@a"), 5.0, true, now);
 
     let summaries_1h = collector.get_summary_for_period(Some(Duration::hours(1)));

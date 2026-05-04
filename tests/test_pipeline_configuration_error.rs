@@ -14,7 +14,9 @@
 
 use apcore::errors::{ErrorCode, ModuleError};
 use apcore::pipeline::{PipelineContext, Step, StepResult};
-use apcore::pipeline_config::{build_strategy_from_config, register_step_type, unregister_step_type};
+use apcore::pipeline_config::{
+    build_strategy_from_config, register_step_type, unregister_step_type,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -41,9 +43,7 @@ impl Step for NoopStep {
 fn ensure_noop_type() {
     let _ = register_step_type(
         "noop_for_test",
-        Box::new(|_cfg: &Value| -> Result<Box<dyn Step>, ModuleError> {
-            Ok(Box::new(NoopStep))
-        }),
+        Box::new(|_cfg: &Value| -> Result<Box<dyn Step>, ModuleError> { Ok(Box::new(NoopStep)) }),
     );
 }
 

@@ -81,14 +81,8 @@ impl Module for DummyModule {
 }
 
 fn build_ctx_with_caller(caller_id: Option<String>, identity_id: Option<&str>) -> Context<Value> {
-    let identity = identity_id.map(|id| {
-        Identity::new(
-            id.to_string(),
-            "user".to_string(),
-            vec![],
-            HashMap::new(),
-        )
-    });
+    let identity = identity_id
+        .map(|id| Identity::new(id.to_string(), "user".to_string(), vec![], HashMap::new()));
     Context {
         trace_id: "trace-test".to_string(),
         identity,
@@ -201,7 +195,10 @@ async fn latency_threshold_emits_canonical_and_legacy_events() {
         .filter(|e| e.event_type == "latency_threshold_exceeded")
         .count();
     assert_eq!(canonical, 1, "expected canonical latency event");
-    assert_eq!(legacy, 1, "expected legacy latency event for backward compat");
+    assert_eq!(
+        legacy, 1,
+        "expected legacy latency event for backward compat"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -221,9 +218,14 @@ async fn registry_register_emits_apcore_event_canonical_and_legacy() {
     config.set("sys_modules.events.enabled", json!(true));
     let executor = Executor::new(Arc::clone(&registry), Config::default());
 
-    let ctx_result =
-        register_sys_modules_with_options(Arc::clone(&registry), &executor, &config, None, SysModulesOptions::default())
-            .expect("register_sys_modules");
+    let ctx_result = register_sys_modules_with_options(
+        Arc::clone(&registry),
+        &executor,
+        &config,
+        None,
+        SysModulesOptions::default(),
+    )
+    .expect("register_sys_modules");
 
     // Subscribe to both canonical glob and legacy literal name.
     let (canonical_sub, canonical_received) = RecordingSub::new("apcore.registry.*");
@@ -275,9 +277,14 @@ async fn registry_unregister_emits_apcore_event_canonical_and_legacy() {
     config.set("sys_modules.events.enabled", json!(true));
     let executor = Executor::new(Arc::clone(&registry), Config::default());
 
-    let ctx_result =
-        register_sys_modules_with_options(Arc::clone(&registry), &executor, &config, None, SysModulesOptions::default())
-            .expect("register_sys_modules");
+    let ctx_result = register_sys_modules_with_options(
+        Arc::clone(&registry),
+        &executor,
+        &config,
+        None,
+        SysModulesOptions::default(),
+    )
+    .expect("register_sys_modules");
 
     let (canonical_sub, canonical_received) = RecordingSub::new("apcore.registry.*");
     let (legacy_sub, legacy_received) = RecordingSub::new("module_unregistered");
@@ -308,10 +315,7 @@ async fn registry_unregister_emits_apcore_event_canonical_and_legacy() {
         canonical >= 1,
         "expected canonical apcore.registry.module_unregistered event"
     );
-    assert!(
-        legacy >= 1,
-        "expected legacy module_unregistered event"
-    );
+    assert!(legacy >= 1, "expected legacy module_unregistered event");
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +376,10 @@ async fn update_config_audit_event_includes_caller_id_from_context() {
         "value": false,
         "reason": "test2",
     });
-    module2.execute(inputs2, &ctx_anon).await.expect("update_config2");
+    module2
+        .execute(inputs2, &ctx_anon)
+        .await
+        .expect("update_config2");
 
     let later_events = received.lock().clone();
     let anon_event = later_events

@@ -23,7 +23,9 @@ fn make_context() -> Context<serde_json::Value> {
 fn inject_defaults_to_01_when_no_inbound_flags() {
     let ctx = make_context();
     let headers = TraceContext::inject(&ctx);
-    let tp = headers.get("traceparent").expect("traceparent must be present");
+    let tp = headers
+        .get("traceparent")
+        .expect("traceparent must be present");
     assert!(tp.ends_with("-01"), "expected default flags 01, got {tp}");
 }
 
@@ -31,12 +33,13 @@ fn inject_defaults_to_01_when_no_inbound_flags() {
 fn inject_propagates_inbound_flags_zero_when_present() {
     // Stash inbound flag in context.data under the canonical key.
     let ctx = make_context();
-    ctx.data.write().insert(
-        TRACE_FLAGS_KEY.to_string(),
-        json!("00"),
-    );
+    ctx.data
+        .write()
+        .insert(TRACE_FLAGS_KEY.to_string(), json!("00"));
     let headers = TraceContext::inject(&ctx);
-    let tp = headers.get("traceparent").expect("traceparent must be present");
+    let tp = headers
+        .get("traceparent")
+        .expect("traceparent must be present");
     assert!(
         tp.ends_with("-00"),
         "expected propagated flags 00, got {tp}"
@@ -50,7 +53,9 @@ fn inject_propagates_inbound_flags_one_when_present() {
         .write()
         .insert(TRACE_FLAGS_KEY.to_string(), json!("01"));
     let headers = TraceContext::inject(&ctx);
-    let tp = headers.get("traceparent").expect("traceparent must be present");
+    let tp = headers
+        .get("traceparent")
+        .expect("traceparent must be present");
     assert!(tp.ends_with("-01"));
 }
 

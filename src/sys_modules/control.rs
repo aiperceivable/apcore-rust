@@ -828,9 +828,7 @@ impl Module for ToggleFeatureModule {
         let toggle_key = format!("toggle.{module_id}");
         let toggle_value = serde_json::Value::Bool(enabled);
         if let Some(store) = self.overrides_store.as_ref() {
-            if let Err(e) =
-                persist_one(store.as_ref(), &toggle_key, &toggle_value).await
-            {
+            if let Err(e) = persist_one(store.as_ref(), &toggle_key, &toggle_value).await {
                 tracing::warn!(error = %e, key = %toggle_key, "OverridesStore persist failed");
             }
         } else if let Some(path) = self.overrides_path.as_deref() {
