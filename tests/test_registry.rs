@@ -1313,6 +1313,61 @@ fn test_list_with_prefix_returns_sorted() {
 }
 
 // ---------------------------------------------------------------------------
+// D10-010: Registry::register_versioned — 4-arg canonical form matching
+// apcore-python `register(module_id, module, version?, metadata?)` and
+// apcore-typescript `register(moduleId, module, version?, metadata?)`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_register_versioned_with_version_and_metadata() {
+    let registry = apcore::registry::registry::Registry::new();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "x-team".to_string(),
+        serde_json::Value::String("platform".to_string()),
+    );
+    registry
+        .register_versioned(
+            "versioned.module",
+            Box::new(StubModule),
+            Some("2.5.0"),
+            Some(metadata),
+        )
+        .expect("register_versioned should succeed");
+
+    let definition = registry
+        .get_definition("versioned.module")
+        .expect("registered module has a descriptor");
+    assert_eq!(definition.version, "2.5.0", "version flows into descriptor");
+    assert_eq!(
+        definition.metadata.get("x-team"),
+        Some(&serde_json::Value::String("platform".to_string())),
+        "metadata flows into descriptor"
+    );
+}
+
+#[test]
+fn test_register_versioned_with_none_version_falls_back_to_default() {
+    let registry = apcore::registry::registry::Registry::new();
+    registry
+        .register_versioned("default.version", Box::new(StubModule), None, None)
+        .expect("register_versioned should succeed with None args");
+
+    let definition = registry
+        .get_definition("default.version")
+        .expect("registered module has a descriptor");
+    // DEFAULT_MODULE_VERSION matches what register_module would set.
+    assert!(
+        !definition.version.is_empty(),
+        "default version is non-empty"
+    );
+    assert!(
+        definition.metadata.is_empty(),
+        "None metadata yields empty map"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // D11-003: Registry::list tag filter unions descriptor.tags + module.tags()
 // ---------------------------------------------------------------------------
 //

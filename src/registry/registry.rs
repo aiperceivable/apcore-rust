@@ -507,6 +507,54 @@ impl Registry {
         self.register(name, module, descriptor)
     }
 
+    /// Register a module with explicit version and metadata — the
+    /// **canonical four-argument form** matching the spec layout
+    /// `register(module_id, module, version?, metadata?)` declared in
+    /// [`registry-system.md` §Contract.Registry.register]
+    /// and implemented natively by apcore-python and apcore-typescript.
+    ///
+    /// This is the cross-language-symmetric path: pass `version=None,
+    /// metadata=None` for default (latest, no metadata) and the result
+    /// matches `register_module`. Pass a non-`None` version to opt into
+    /// multi-version coexistence (the version is stored in the
+    /// descriptor and surfaces through `get_definition().version`);
+    /// pass non-`None` metadata to seed the descriptor's metadata map.
+    ///
+    /// All other descriptor fields are auto-derived from the module —
+    /// schemas from `input_schema()` / `output_schema()`, description
+    /// from `description()`, tags from the new `tags()` trait method
+    /// (D11-003), default annotations otherwise.
+    ///
+    /// Sync alignment: D10-010.
+    pub fn register_versioned(
+        &self,
+        name: &str,
+        module: Box<dyn Module>,
+        version: Option<&str>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), ModuleError> {
+        let descriptor = ModuleDescriptor {
+            module_id: name.to_string(),
+            name: None,
+            description: module.description().to_string(),
+            documentation: None,
+            input_schema: module.input_schema(),
+            output_schema: module.output_schema(),
+            version: version
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| DEFAULT_MODULE_VERSION.to_string()),
+            tags: module.tags(),
+            annotations: Some(ModuleAnnotations::default()),
+            examples: vec![],
+            metadata: metadata.unwrap_or_default(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        self.register(name, module, descriptor)
+    }
+
     /// Unregister a module by name.
     ///
     /// Returns `Ok(true)` if the module was found and removed, `Ok(false)` if
