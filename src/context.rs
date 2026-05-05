@@ -502,17 +502,25 @@ impl<T: Default> Context<T> {
 
     /// Create a context from explicit parameters.
     ///
+    /// `identity` is optional (D10-002, spec `core-executor.md` §Contract.Context.create):
+    /// when `None`, the resulting context's `identity` field is `None`. Downstream
+    /// consumers (e.g. `ACL::check`, `sys_modules`) map a `None` identity / caller_id
+    /// to the canonical `@external` sentinel at evaluation time, matching
+    /// apcore-python (`context.py:48-103`) and apcore-typescript (`context.ts:80-116`).
+    /// This API surface lets cross-language fixtures construct anonymous contexts
+    /// without fabricating an `Identity`.
+    ///
     /// For `trace_parent` (W3C trace-context propagation) or `global_deadline`
     /// support, use [`Context::builder`] instead.
     pub fn create(
-        identity: Identity,
+        identity: Option<Identity>,
         services: T,
         caller_id: Option<String>,
         data: Option<HashMap<String, serde_json::Value>>,
     ) -> Self {
         Self {
             trace_id: generate_trace_id(),
-            identity: Some(identity),
+            identity,
             services,
             caller_id,
             data: Arc::new(RwLock::new(data.unwrap_or_default())),
@@ -545,6 +553,7 @@ impl<T: Default> Context<T> {
 /// fresh trace_id and emits a `tracing::warn!` log.
 pub struct ContextBuilder<T> {
     trace_parent: Option<TraceParent>,
+    tracestate: Option<Vec<(String, String)>>,
     identity: Option<Identity>,
     services: Option<T>,
     caller_id: Option<String>,
@@ -556,6 +565,7 @@ impl<T> Default for ContextBuilder<T> {
     fn default() -> Self {
         Self {
             trace_parent: None,
+            tracestate: None,
             identity: None,
             services: None,
             caller_id: None,
@@ -575,6 +585,22 @@ impl<T> ContextBuilder<T> {
     #[must_use]
     pub fn trace_parent(mut self, trace_parent: Option<TraceParent>) -> Self {
         self.trace_parent = trace_parent;
+        self
+    }
+
+    /// Set the inbound W3C `tracestate` entries (vendor state) to carry
+    /// forward through the request lifecycle.
+    ///
+    /// The Rust [`TraceParent`] struct does not include `tracestate`
+    /// (see `crate::trace_context::TraceContext` for the wrapper that
+    /// pairs them). Transports parsing inbound headers should call this
+    /// method alongside [`Self::trace_parent`] so a downstream
+    /// `TraceContext::inject(&context)` propagates the inbound vendor
+    /// state instead of dropping it. Mirrors the Python SDK convention
+    /// of stashing tracestate under `_apcore.trace.state` (D11-002b).
+    #[must_use]
+    pub fn tracestate(mut self, entries: Vec<(String, String)>) -> Self {
+        self.tracestate = Some(entries);
         self
     }
 
@@ -638,6 +664,30 @@ impl<T: Default> ContextBuilder<T> {
             initial_data
                 .entry(crate::trace_context::TRACE_FLAGS_KEY.to_string())
                 .or_insert_with(|| serde_json::Value::String(format!("{:02x}", tp.trace_flags)));
+        }
+        // D11-002b: Stash inbound tracestate as a JSON array of 2-element
+        // arrays so `TraceContext::inject(&context)` can read it back without
+        // requiring the caller to pass it as an explicit argument. Mirrors
+        // apcore-python which stores tracestate under
+        // `_apcore.trace.state` (context.py:94 / trace_context.py:26).
+        if let Some(entries) = self.tracestate.as_ref() {
+            if !entries.is_empty() {
+                initial_data
+                    .entry(crate::trace_context::TRACE_STATE_KEY.to_string())
+                    .or_insert_with(|| {
+                        serde_json::Value::Array(
+                            entries
+                                .iter()
+                                .map(|(k, v)| {
+                                    serde_json::Value::Array(vec![
+                                        serde_json::Value::String(k.clone()),
+                                        serde_json::Value::String(v.clone()),
+                                    ])
+                                })
+                                .collect(),
+                        )
+                    });
+            }
         }
         Context {
             trace_id,

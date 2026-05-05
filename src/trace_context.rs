@@ -20,6 +20,18 @@ use crate::errors::{ErrorCode, ModuleError};
 /// outbound `traceparent` header rather than always emitting `"01"`.
 pub const TRACE_FLAGS_KEY: &str = "_apcore.trace.flags";
 
+/// Well-known key under which inbound W3C `tracestate` entries are stashed
+/// in [`Context::data`] when a [`Context`] is built from an inbound
+/// `TraceContext`. The value is a JSON array of two-element arrays
+/// `[["vendor1","value1"], ["vendor2","value2"]]`, preserving order.
+///
+/// Cross-language: matches `_TRACESTATE_KEY = "_apcore.trace.state"` in the
+/// Python SDK (`apcore-python/src/apcore/trace_context.py`).
+/// [`TraceContext::inject`] reads this key (when no explicit `tracestate`
+/// argument is supplied via [`TraceContext::inject_with_options`]) so the
+/// inbound vendor state propagates rather than being dropped (D11-002b).
+pub const TRACE_STATE_KEY: &str = "_apcore.trace.state";
+
 /// Pre-compiled regex for traceparent header parsing.
 static TRACEPARENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$").unwrap()
@@ -41,6 +53,34 @@ fn read_inbound_flags<T>(context: &Context<T>) -> Option<u8> {
         return None;
     }
     u8::from_str_radix(s, 16).ok()
+}
+
+/// Read the inbound W3C `tracestate` entries from a [`Context`]'s shared data
+/// map.
+///
+/// Honors the [`TRACE_STATE_KEY`] convention: the value is expected to be a
+/// JSON array of `[String, String]` pairs. Returns `None` when the key is
+/// absent or malformed; returns `Some(empty)` is filtered to `None` so the
+/// caller treats "no tracestate" and "empty tracestate" identically.
+fn read_inbound_tracestate<T>(context: &Context<T>) -> Option<Vec<(String, String)>> {
+    let data = context.data.read();
+    let raw = data.get(TRACE_STATE_KEY)?;
+    let arr = raw.as_array()?;
+    let mut entries = Vec::with_capacity(arr.len());
+    for item in arr {
+        let pair = item.as_array()?;
+        if pair.len() != 2 {
+            return None;
+        }
+        let k = pair[0].as_str()?.to_string();
+        let v = pair[1].as_str()?.to_string();
+        entries.push((k, v));
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
 }
 
 /// W3C tracestate hard-cap on entry count.
@@ -246,7 +286,15 @@ impl TraceContext {
     /// [`inject_with_options`]: TraceContext::inject_with_options
     /// [`inject_checked`]: TraceContext::inject_checked
     pub fn inject<T: serde::Serialize>(context: &Context<T>) -> HashMap<String, String> {
-        Self::inject_with_options(context, None, None, None)
+        // D11-002b: when the context carries inbound tracestate under
+        // [`TRACE_STATE_KEY`] (seeded by `ContextBuilder::tracestate`), surface
+        // it as the outbound `tracestate` header so vendor state propagates
+        // through the request lifecycle. This matches apcore-python which
+        // pulls tracestate from `_apcore.trace.state` in `TraceContext.inject`.
+        // Callers that want to override or suppress can still use
+        // [`Self::inject_with_options`].
+        let inbound_state = read_inbound_tracestate(context);
+        Self::inject_with_options(context, None, None, inbound_state.as_deref())
     }
 
     /// Build a W3C `traceparent` (and optional `tracestate`) header map from

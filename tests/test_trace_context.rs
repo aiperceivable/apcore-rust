@@ -194,6 +194,46 @@ fn test_inject_omits_tracestate_when_empty() {
 }
 
 // ---------------------------------------------------------------------------
+// D11-002b: ContextBuilder must carry inbound tracestate forward so
+// TraceContext::inject(context) propagates vendor state. Previously only
+// trace_flags was seeded into context.data; tracestate was lost across
+// the request boundary unless the caller used inject_with_options(...).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_context_builder_seeds_tracestate_into_context_data() {
+    use apcore::context::ContextBuilder;
+    let tp = make_traceparent("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
+    let entries = vec![
+        ("vendor1".to_string(), "abc123".to_string()),
+        ("vendor2".to_string(), "def456".to_string()),
+    ];
+    let ctx: apcore::context::Context<serde_json::Value> = ContextBuilder::new()
+        .trace_parent(Some(tp))
+        .tracestate(entries.clone())
+        .build();
+    let headers = TraceContext::inject(&ctx);
+    assert!(
+        headers.contains_key("tracestate"),
+        "inject() must emit tracestate header from inbound state"
+    );
+    assert_eq!(headers["tracestate"], "vendor1=abc123,vendor2=def456");
+}
+
+#[test]
+fn test_context_builder_no_tracestate_means_no_outbound_header() {
+    use apcore::context::ContextBuilder;
+    let tp = make_traceparent("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
+    let ctx: apcore::context::Context<serde_json::Value> =
+        ContextBuilder::new().trace_parent(Some(tp)).build();
+    let headers = TraceContext::inject(&ctx);
+    assert!(
+        !headers.contains_key("tracestate"),
+        "no inbound tracestate means inject() must not emit header"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Case-insensitive header KEY lookup (issue #35 — item 2)
 // ---------------------------------------------------------------------------
 

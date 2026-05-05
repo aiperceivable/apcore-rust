@@ -192,7 +192,7 @@ fn conformance_call_chain() {
             vec![],
             HashMap::new(),
         );
-        let mut ctx: Context<Value> = Context::create(identity, Value::Null, None, None);
+        let mut ctx: Context<Value> = Context::create(Some(identity), Value::Null, None, None);
         ctx.call_chain = call_chain;
 
         let result = guard_call_chain_with_repeat(&ctx, module_id, max_depth, max_repeat);
@@ -381,7 +381,7 @@ fn conformance_acl_evaluation() {
                 )
             };
 
-            let mut ctx: Context<Value> = Context::create(identity, Value::Null, None, None);
+            let mut ctx: Context<Value> = Context::create(Some(identity), Value::Null, None, None);
 
             let call_depth = tc
                 .get("call_depth")
@@ -437,20 +437,12 @@ fn build_context_from_input(input: &Value) -> Context<Value> {
         }
     });
 
-    let mut ctx: Context<Value> = if let Some(id_val) = identity {
-        Context::create(
-            id_val,
-            Value::Null,
-            input["caller_id"].as_str().map(String::from),
-            None,
-        )
-    } else {
-        let dummy = Identity::new("anon".into(), "user".into(), vec![], HashMap::new());
-        let mut c: Context<Value> = Context::create(dummy, Value::Null, None, None);
-        c.identity = None;
-        c.caller_id = input["caller_id"].as_str().map(String::from);
-        c
-    };
+    let mut ctx: Context<Value> = Context::create(
+        identity,
+        Value::Null,
+        input["caller_id"].as_str().map(String::from),
+        None,
+    );
 
     ctx.trace_id = input["trace_id"].as_str().unwrap().to_string();
     ctx.call_chain = input["call_chain"]
@@ -580,7 +572,7 @@ fn conformance_context_identity_types() {
                     HashMap::new(),
                 );
 
-                let ctx: Context<Value> = Context::create(identity, Value::Null, None, None);
+                let ctx: Context<Value> = Context::create(Some(identity), Value::Null, None, None);
                 let serialized = ctx.serialize();
 
                 assert_eq!(
@@ -1066,7 +1058,7 @@ fn conformance_identity_system() {
 
         // Verify identity propagates into a child context.
         if id == "identity_propagates_to_child_context" {
-            let ctx: Context<Value> = Context::create(identity, Value::Null, None, None);
+            let ctx: Context<Value> = Context::create(Some(identity), Value::Null, None, None);
             assert_eq!(
                 ctx.identity.as_ref().unwrap().id(),
                 &input_id,

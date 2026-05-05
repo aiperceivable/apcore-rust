@@ -123,6 +123,36 @@ fn test_anonymous_context_has_none_identity() {
     assert!(ctx.call_chain.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// D10-002: Context::create accepts Option<Identity> so the @external /
+// anonymous-caller path is reachable through the same constructor as
+// authenticated callers. Spec core-executor.md:148 declares identity
+// optional; apcore-python (context.py:48-103) and apcore-typescript
+// (context.ts:80-116) accept None/null. Previously Rust required Identity
+// outright, so cross-language fixtures could not call Context::create
+// without supplying a fabricated Identity.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_context_create_accepts_none_identity() {
+    let ctx: Context<Value> = Context::create(None, Value::Null, None, None);
+    assert!(
+        ctx.identity.is_none(),
+        "Context::create(None, ...) must leave identity as None — downstream consumers \
+         (ACL.check, sys_modules) map None to the @external sentinel at evaluation time, \
+         matching apcore-python and apcore-typescript."
+    );
+    assert!(ctx.call_chain.is_empty());
+    assert!(ctx.caller_id.is_none());
+}
+
+#[test]
+fn test_context_create_preserves_supplied_identity() {
+    let id = make_identity("alice", "Alice", &["admin"]);
+    let ctx: Context<Value> = Context::create(Some(id.clone()), Value::Null, None, None);
+    assert_eq!(ctx.identity.as_ref().map(|i| i.id()), Some("alice"));
+}
+
 #[test]
 fn test_shared_data_between_parent_and_child() {
     let id = make_identity("user-1", "Alice", &[]);

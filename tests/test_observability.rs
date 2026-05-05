@@ -955,12 +955,12 @@ async fn test_usage_middleware_caller_id_from_context() {
     let mw = UsageMiddleware::new(collector.clone());
     // Context::new sets caller_id to None; use Context::create to supply one.
     let ctx = Context::<Value>::create(
-        Identity::new(
+        Some(Identity::new(
             "test-caller".into(),
             "test-caller".into(),
             vec![],
             HashMap::default(),
-        ),
+        )),
         Value::Null,
         Some("explicit-caller".to_string()),
         None,
