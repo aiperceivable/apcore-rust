@@ -80,7 +80,6 @@ pub enum ErrorCode {
     BindingSchemaInferenceFailed,
     BindingSchemaModeConflict,
     BindingStrictSchemaIncompatible,
-    BindingPolicyViolation,
     BindingFileInvalid,
     CircularDependency,
     MiddlewareChainError,
