@@ -16,7 +16,7 @@ fn record_at_honors_explicit_timestamp() {
     let summaries_24h = collector.get_summary_for_period(Some(Duration::hours(24)));
     let m = summaries_24h.iter().find(|s| s.module_id == "executor.m");
     assert!(
-        m.is_none() || m.is_some_and(|s| s.call_count == 0),
+        m.is_none_or(|s| s.call_count == 0),
         "48h-old record must not appear in a 24h window"
     );
 

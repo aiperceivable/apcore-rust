@@ -562,11 +562,6 @@ async fn regression_update_config_does_not_redact_normal_keys() {
 /// `overrides_path` on `SysModulesOptions`, control modules are not registered
 /// — so the options are silent no-ops. The function must emit a `WARN`-level
 /// tracing event so the misconfiguration is observable.
-// Test captures the full `Result<SysModulesContext, SysModuleError>` for
-// assertion. `SysModuleError` wraps `ModuleError` and is intentionally rich
-// for diagnostic purposes; boxing it library-wide is out of scope for this
-// regression test. Newer clippy (>=1.95) flags the closure's Err size here.
-#[allow(clippy::result_large_err)]
 #[test]
 fn regression_options_warn_when_events_disabled() {
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
