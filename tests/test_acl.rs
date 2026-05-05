@@ -502,7 +502,9 @@ fn test_acl_add_rule_returns_unit_no_result_wrapper() {
 fn test_acl_reload_without_yaml_path_raises_acl_rule_error() {
     use apcore::errors::ErrorCode;
     let mut acl = ACL::new(vec![], "deny", None);
-    let err = acl.reload().expect_err("reload without yaml_path must error");
+    let err = acl
+        .reload()
+        .expect_err("reload without yaml_path must error");
     assert_eq!(
         err.code,
         ErrorCode::ACLRuleError,

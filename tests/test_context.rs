@@ -150,7 +150,10 @@ fn test_context_create_accepts_none_identity() {
 fn test_context_create_preserves_supplied_identity() {
     let id = make_identity("alice", "Alice", &["admin"]);
     let ctx: Context<Value> = Context::create(Some(id.clone()), Value::Null, None, None);
-    assert_eq!(ctx.identity.as_ref().map(|i| i.id()), Some("alice"));
+    assert_eq!(
+        ctx.identity.as_ref().map(apcore::Identity::id),
+        Some("alice")
+    );
 }
 
 #[test]

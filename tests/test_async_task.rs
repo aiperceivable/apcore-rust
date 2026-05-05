@@ -80,7 +80,9 @@ fn _make_ctx() -> Context<Value> {
 async fn submit_returns_non_empty_task_id() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
     let task_id = mgr
-        .submit("any.module", json!({}), None).await.expect("submit should succeed");
+        .submit("any.module", json!({}), None)
+        .await
+        .expect("submit should succeed");
     assert!(!task_id.is_empty(), "task_id must be a non-empty string");
 }
 
@@ -184,7 +186,10 @@ async fn completed_task_has_completed_status() {
 async fn failed_task_has_failed_status_and_error_message() {
     // Module is not registered — executor returns ModuleNotFound.
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    let task_id = mgr.submit("nonexistent.module", json!({}), None).await.unwrap();
+    let task_id = mgr
+        .submit("nonexistent.module", json!({}), None)
+        .await
+        .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
@@ -281,7 +286,9 @@ async fn cancel_running_task_sets_cancelled_status() {
     // Pending; either way the final status must be Cancelled.
     let mgr = AsyncTaskManager::new(make_executor(), 1, 100);
     let task_id = mgr
-        .submit("some.module.that.does.not.exist", json!({}), None).await.unwrap();
+        .submit("some.module.that.does.not.exist", json!({}), None)
+        .await
+        .unwrap();
 
     // Give the tokio runtime a tick to let the task acquire the semaphore and
     // mark itself Running before we cancel.
@@ -436,7 +443,9 @@ async fn submit_rejected_at_max_tasks_limit() {
     let _ = mgr.submit("m", json!({}), None).await.unwrap();
 
     let err = mgr
-        .submit("m", json!({}), None).await.expect_err("third submit should be rejected");
+        .submit("m", json!({}), None)
+        .await
+        .expect_err("third submit should be rejected");
     assert!(
         err.to_string().contains("Task limit"),
         "error message should mention task limit; got: {err}"

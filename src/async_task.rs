@@ -380,7 +380,8 @@ impl AsyncTaskManager {
         inputs: serde_json::Value,
         context: Option<Context<serde_json::Value>>,
     ) -> Result<String, ModuleError> {
-        self.submit_with_retry(module_id, inputs, context, None).await
+        self.submit_with_retry(module_id, inputs, context, None)
+            .await
     }
 
     /// Submit a module call with optional retry policy.

@@ -1,4 +1,4 @@
-.PHONY: setup check test lint fmt clean
+.PHONY: setup check check-chars fmt-check lint build test build-examples fmt clean
 
 # One-time dev environment setup
 setup:
@@ -10,8 +10,8 @@ setup:
 	@chmod +x .git/hooks/pre-commit
 	@echo "Done! Development environment is ready."
 
-# Run all checks (same as pre-commit hook)
-check: fmt-check lint check-chars test
+# Run all checks (same as pre-commit hook, mirrors CI)
+check: fmt-check lint check-chars build test build-examples
 
 check-chars:
 	apdev-rs check-chars src/
@@ -22,8 +22,14 @@ fmt-check:
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 
+build:
+	cargo build --all-features
+
 test:
 	cargo test --all-features
+
+build-examples:
+	cargo build --examples
 
 fmt:
 	cargo fmt --all

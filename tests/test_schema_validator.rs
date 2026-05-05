@@ -391,7 +391,10 @@ fn test_validate_input_returns_data_on_success() {
     let schema = json!({ "type": "string" });
     let data = json!("hello");
     let returned = v.validate_input(&data, &schema).expect("valid input");
-    assert_eq!(returned, data, "validate_input must return the input on success");
+    assert_eq!(
+        returned, data,
+        "validate_input must return the input on success"
+    );
 }
 
 #[test]

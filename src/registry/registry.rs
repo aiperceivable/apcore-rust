@@ -541,8 +541,7 @@ impl Registry {
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
             version: version
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| DEFAULT_MODULE_VERSION.to_string()),
+                .map_or_else(|| DEFAULT_MODULE_VERSION.to_string(), ToString::to_string),
             tags: module.tags(),
             annotations: Some(ModuleAnnotations::default()),
             examples: vec![],

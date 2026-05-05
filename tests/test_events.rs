@@ -341,15 +341,11 @@ async fn test_pattern_prefix_wildcard() {
     let mut emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
-    emitter
-        .emit(&ApCoreEvent::new("foo.bar", json!({})))
-        .await;
+    emitter.emit(&ApCoreEvent::new("foo.bar", json!({}))).await;
     emitter
         .emit(&ApCoreEvent::new("foo.baz.qux", json!({})))
         .await;
-    emitter
-        .emit(&ApCoreEvent::new("bar.foo", json!({})))
-        .await;
+    emitter.emit(&ApCoreEvent::new("bar.foo", json!({}))).await;
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 2);

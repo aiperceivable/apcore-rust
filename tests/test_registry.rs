@@ -1388,7 +1388,7 @@ impl apcore::module::Module for TaggedModule {
     fn output_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object"})
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Module that publishes tags via the trait method"
     }
     async fn execute(
