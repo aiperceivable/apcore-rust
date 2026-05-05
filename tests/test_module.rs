@@ -81,12 +81,24 @@ async fn test_failing_module_returns_error() {
 }
 
 #[test]
-fn test_module_preflight_passes_by_default() {
+fn test_module_preflight_returns_empty_warnings_by_default() {
+    // D11-009: Module::preflight signature aligned with apcore-python /
+    // apcore-typescript: takes (inputs, context) and returns a list of
+    // advisory warning strings. Default implementation returns an empty
+    // Vec (no warnings).
     let module = EchoModule;
-    let result = module.preflight();
-    assert!(result.valid);
-    assert!(result.checks.is_empty());
-    assert!(!result.requires_approval);
+    let warnings: Vec<String> = module.preflight(&json!({}), None);
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn test_module_default_tags_is_empty() {
+    // D11-003: Module::tags default returns an empty Vec; modules opt
+    // in by overriding (parity with Python `module.tags = [...]` and
+    // TypeScript `module['tags'] = [...]`).
+    let module = EchoModule;
+    let tags: Vec<String> = module.tags();
+    assert!(tags.is_empty());
 }
 
 #[test]

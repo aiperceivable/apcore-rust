@@ -759,35 +759,19 @@ impl Executor {
         }
 
         // Invoke module-level preflight — matches apcore-python executor.py:547-571
-        // and apcore-typescript executor.ts:632-653 (sync finding A-D-013).
-        // Only called when no pipeline step failed (matching Python/TS guard on
-        // pipe_ctx.module existing, which implies lookup succeeded).
-        let pipeline_ok = checks.iter().all(|c| c.passed);
-        if pipeline_ok {
-            if let Ok(Some(module)) = self.registry.get(module_id) {
-                let preflight_result = module.preflight();
-                let passed = preflight_result.valid;
-                let error = if passed {
-                    None
-                } else {
-                    preflight_result
-                        .checks
-                        .iter()
-                        .find(|c| !c.passed)
-                        .and_then(|c| c.error.clone())
-                };
-                let warnings: Vec<String> = preflight_result
-                    .checks
-                    .iter()
-                    .flat_map(|c| c.warnings.clone())
-                    .collect();
-                checks.push(PreflightCheckResult {
-                    check: "module_preflight".to_string(),
-                    passed,
-                    error,
-                    warnings,
-                });
-            }
+        // and apcore-typescript executor.ts:632-653 (D11-009 alignment).
+        // Gating: called whenever module lookup succeeded (mirrors Python/TS
+        // guard on `pipe_ctx.module` being non-null), regardless of whether
+        // earlier checks passed. Preflight returns advisory warnings only —
+        // it never fails the preflight pass.
+        if let Ok(Some(module)) = self.registry.get(module_id) {
+            let warnings = module.preflight(inputs, ctx);
+            checks.push(PreflightCheckResult {
+                check: "module_preflight".to_string(),
+                passed: true,
+                error: None,
+                warnings,
+            });
         }
 
         let valid = checks.iter().all(|c| c.passed);

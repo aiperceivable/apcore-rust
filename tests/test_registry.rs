@@ -1311,3 +1311,69 @@ fn test_list_with_prefix_returns_sorted() {
         "Registry::list(prefix) must return sorted IDs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// D11-003: Registry::list tag filter unions descriptor.tags + module.tags()
+// ---------------------------------------------------------------------------
+//
+// Python (registry.py:1027) and TypeScript (registry.ts:689) build the
+// filter set by unioning module-instance `tags` AND merged-meta tags.
+// Rust previously only inspected `descriptor.tags`, so a module ported
+// from Python/TS that exposes its tags via `fn tags(&self)` but is
+// registered with empty descriptor.tags was filtered OUT by Rust while
+// still appearing in Python/TS list(tags=...) results.
+
+struct TaggedModule;
+
+#[async_trait::async_trait]
+impl apcore::module::Module for TaggedModule {
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn output_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn description(&self) -> &str {
+        "Module that publishes tags via the trait method"
+    }
+    async fn execute(
+        &self,
+        _inputs: serde_json::Value,
+        _ctx: &apcore::context::Context<serde_json::Value>,
+    ) -> Result<serde_json::Value, apcore::errors::ModuleError> {
+        Ok(serde_json::json!({}))
+    }
+    fn tags(&self) -> Vec<String> {
+        vec!["alpha".to_string(), "beta".to_string()]
+    }
+}
+
+#[test]
+fn test_list_tag_filter_unions_module_instance_tags() {
+    let registry = apcore::registry::registry::Registry::new();
+    // register_module builds an empty descriptor.tags — only the trait
+    // method `tags()` advertises ["alpha", "beta"].
+    registry
+        .register_module("tagged.module", Box::new(TaggedModule))
+        .expect("register_module should succeed");
+
+    let with_alpha = registry.list(Some(&["alpha"]), None);
+    assert_eq!(
+        with_alpha,
+        vec!["tagged.module".to_string()],
+        "module-instance tags from `fn tags()` must participate in tag filter"
+    );
+
+    let with_alpha_and_beta = registry.list(Some(&["alpha", "beta"]), None);
+    assert_eq!(
+        with_alpha_and_beta,
+        vec!["tagged.module".to_string()],
+        "all required tags satisfied via module-instance tags"
+    );
+
+    let with_unknown = registry.list(Some(&["unknown"]), None);
+    assert!(
+        with_unknown.is_empty(),
+        "tag not declared on module instance must not match"
+    );
+}

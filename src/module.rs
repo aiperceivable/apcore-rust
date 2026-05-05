@@ -78,12 +78,43 @@ pub trait Module: Send + Sync {
     }
 
     /// Run preflight checks before execution.
-    fn preflight(&self) -> PreflightResult {
-        PreflightResult {
-            valid: true,
-            checks: vec![],
-            requires_approval: false,
-        }
+    ///
+    /// Cross-language alignment (D11-009): mirrors apcore-python
+    /// `Module.preflight(inputs, context) -> list[str]` and apcore-typescript
+    /// `preflight(inputs, context): string[]`. Returns a list of advisory
+    /// warning strings; an empty list means "no concerns". Modules that need
+    /// to gate execution should return errors from `execute()` directly
+    /// instead — preflight is non-fatal.
+    ///
+    /// `ctx` is `Option<&Context>` because `Executor::validate(module_id,
+    /// inputs, ctx)` accepts a `None` context for call-chain-free preflight
+    /// (matching Python's `executor.validate(..., context=None)`); modules
+    /// that need a context for their checks must handle the `None` case.
+    ///
+    /// The default implementation returns an empty warning list. Modules
+    /// override this to inspect inputs (e.g., flag oversize payloads, warn
+    /// on deprecated argument shapes) without rejecting the call.
+    fn preflight(
+        &self,
+        _inputs: &serde_json::Value,
+        _ctx: Option<&Context<serde_json::Value>>,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Module-instance tags (D11-003).
+    ///
+    /// Cross-language alignment with apcore-python (`registry.py:1027`,
+    /// reads `getattr(mod, 'tags', [])`) and apcore-typescript
+    /// (`registry.ts:689`, reads `mod['tags']`). Modules MAY override
+    /// this to participate in `Registry::list(tags=...)` filtering even
+    /// when registered without an explicit `ModuleDescriptor` (e.g. via
+    /// `register_module(name, module)`). The Rust `Registry::list`
+    /// unions these instance tags with `descriptor.tags`.
+    ///
+    /// The default returns an empty Vec.
+    fn tags(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Called after the module is registered.

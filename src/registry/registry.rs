@@ -602,15 +602,29 @@ impl Registry {
                     }
                 }
                 if let Some(required_tags) = tags {
-                    if let Some(desc) = core.descriptors.get(name.as_str()) {
-                        let module_tags = &desc.tags;
-                        if !required_tags
-                            .iter()
-                            .all(|t| module_tags.contains(&t.to_string()))
-                        {
-                            return false;
+                    // D11-003: union descriptor.tags with module.tags() so a
+                    // module declaring `fn tags(&self) -> vec!["a"]` registered
+                    // via register_module(name, module) (which builds an
+                    // empty descriptor.tags) is filtered IN by tag-match
+                    // queries — matches apcore-python (registry.py:1027) and
+                    // apcore-typescript (registry.ts:689) which both union
+                    // module-instance tags with merged-meta tags.
+                    let mut module_tags: Vec<String> = core
+                        .descriptors
+                        .get(name.as_str())
+                        .map(|desc| desc.tags.clone())
+                        .unwrap_or_default();
+                    if let Some(module) = core.modules.get(name.as_str()) {
+                        for t in module.tags() {
+                            if !module_tags.contains(&t) {
+                                module_tags.push(t);
+                            }
                         }
-                    } else {
+                    }
+                    if !required_tags
+                        .iter()
+                        .all(|t| module_tags.contains(&t.to_string()))
+                    {
                         return false;
                     }
                 }
