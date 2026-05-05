@@ -314,7 +314,13 @@ pub struct AsyncTaskManager {
     // The lock is held only for the synchronous `block_on_local` poll; we never
     // hold it across a real .await (the in-memory store resolves immediately,
     // and a yielding store would already panic in `block_on_local`).
-    admission_lock: Arc<Mutex<()>>,
+    /// Async-aware admission lock — held across `check_capacity_and_save.await`
+    /// so concurrent submitters serialize through the capacity check + save.
+    /// `tokio::sync::Mutex` (rather than `parking_lot::Mutex`) because the
+    /// guard is alive across an `.await` point in `submit_with_retry`; a
+    /// sync mutex's `!Send` guard would block `tokio::spawn` of any code
+    /// path that touches `submit` (D10-003 alignment).
+    admission_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AsyncTaskManager {
@@ -347,7 +353,7 @@ impl AsyncTaskManager {
             store,
             handles: Arc::new(Mutex::new(HashMap::new())),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            admission_lock: Arc::new(Mutex::new(())),
+            admission_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -363,13 +369,18 @@ impl AsyncTaskManager {
     }
 
     /// Submit a module call for background execution. See [`Self::submit_with_retry`].
-    pub fn submit(
+    ///
+    /// Async (D10-003): the spec async-tasks.md contract declares submit
+    /// async, matching apcore-python `async def submit` and apcore-typescript
+    /// `async submit`. Awaiting submit is required so the capacity check
+    /// + store.save are observed atomically before the task ID is returned.
+    pub async fn submit(
         &self,
         module_id: &str,
         inputs: serde_json::Value,
         context: Option<Context<serde_json::Value>>,
     ) -> Result<String, ModuleError> {
-        self.submit_with_retry(module_id, inputs, context, None)
+        self.submit_with_retry(module_id, inputs, context, None).await
     }
 
     /// Submit a module call with optional retry policy.
@@ -378,7 +389,7 @@ impl AsyncTaskManager {
     /// that will acquire a concurrency permit before invoking the executor.
     /// On failure, when `retry` is supplied, the task is rescheduled after
     /// the policy-derived backoff delay until `max_retries` is exhausted.
-    pub fn submit_with_retry(
+    pub async fn submit_with_retry(
         &self,
         module_id: &str,
         inputs: serde_json::Value,
@@ -404,19 +415,13 @@ impl AsyncTaskManager {
         };
 
         // Capacity check + persist must be atomic with respect to other
-        // concurrent submits, otherwise two submitters can both pass the
-        // `len < max_tasks` check before either saves. Hold `admission_lock`
-        // around the whole sequence. The lock is sync (parking_lot) and is
-        // only held for the single immediate poll of `block_on_local` — no
-        // real await happens while the guard is alive.
-        let store = Arc::clone(&self.store);
-        let max_tasks = self.max_tasks;
-        let info_clone = info.clone();
+        // concurrent submits. tokio::sync::Mutex's guard is `Send` so
+        // submit_with_retry is itself Send-safe and can be spawned via
+        // tokio::spawn — required for the async `pub async fn submit`
+        // entry point to compose with the broader async runtime.
         {
-            let _admit = self.admission_lock.lock();
-            block_on_local(async move {
-                check_capacity_and_save(&*store, max_tasks, &info_clone).await
-            })?;
+            let _admit = self.admission_lock.lock().await;
+            check_capacity_and_save(&*self.store, self.max_tasks, &info).await?;
         }
 
         let handles = Arc::clone(&self.handles);
@@ -482,9 +487,13 @@ impl AsyncTaskManager {
     }
 
     /// Cancel a pending or running task. Returns `true` if cancellation was applied.
-    pub fn cancel(&self, task_id: &str) -> bool {
-        let store = Arc::clone(&self.store);
-        let Some(info) = block_on_local(store.get(task_id)).ok().flatten() else {
+    ///
+    /// Async (D10-004): spec async-tasks.md cancel contract declares the
+    /// method async. Python (`async def cancel`) and TypeScript
+    /// (`async cancel`) already comply; Rust now matches via
+    /// `pub async fn cancel`. Drain semantics typically require await.
+    pub async fn cancel(&self, task_id: &str) -> bool {
+        let Some(info) = self.store.get(task_id).await.ok().flatten() else {
             return false;
         };
         if !info.status.is_active() {
@@ -500,21 +509,24 @@ impl AsyncTaskManager {
         if updated.status.is_active() {
             updated.status = TaskStatus::Cancelled;
             updated.completed_at = Some(now_secs());
-            let _ = block_on_local(self.store.save(&updated));
+            let _ = self.store.save(&updated).await;
         }
         true
     }
 
     /// Cancel all pending and running tasks.
-    pub fn shutdown(&self) {
-        let task_ids: Vec<String> = block_on_local(self.store.list(None))
+    pub async fn shutdown(&self) {
+        let task_ids: Vec<String> = self
+            .store
+            .list(None)
+            .await
             .unwrap_or_default()
             .into_iter()
             .filter_map(|info| info.status.is_active().then_some(info.task_id))
             .collect();
 
         for task_id in task_ids {
-            self.cancel(&task_id);
+            self.cancel(&task_id).await;
         }
     }
 

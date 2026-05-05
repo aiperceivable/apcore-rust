@@ -80,8 +80,7 @@ fn _make_ctx() -> Context<Value> {
 async fn submit_returns_non_empty_task_id() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
     let task_id = mgr
-        .submit("any.module", json!({}), None)
-        .expect("submit should succeed");
+        .submit("any.module", json!({}), None).await.expect("submit should succeed");
     assert!(!task_id.is_empty(), "task_id must be a non-empty string");
 }
 
@@ -89,17 +88,17 @@ async fn submit_returns_non_empty_task_id() {
 async fn submit_increments_task_count() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
     assert_eq!(mgr.task_count(), 0);
-    let _ = mgr.submit("m", json!({}), None).unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
     assert_eq!(mgr.task_count(), 1);
-    let _ = mgr.submit("m", json!({}), None).unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
     assert_eq!(mgr.task_count(), 2);
 }
 
 #[tokio::test]
 async fn submit_task_ids_are_unique() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    let id1 = mgr.submit("m", json!({}), None).unwrap();
-    let id2 = mgr.submit("m", json!({}), None).unwrap();
+    let id1 = mgr.submit("m", json!({}), None).await.unwrap();
+    let id2 = mgr.submit("m", json!({}), None).await.unwrap();
     assert_ne!(id1, id2, "each submitted task must receive a unique id");
 }
 
@@ -110,7 +109,7 @@ async fn submit_task_ids_are_unique() {
 #[tokio::test]
 async fn get_status_returns_some_after_submit() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
     // Task exists immediately after submit (may be Pending, Running, or Completed
     // depending on scheduling, but must be present).
     assert!(
@@ -128,7 +127,7 @@ async fn get_status_returns_none_for_unknown_id() {
 #[tokio::test]
 async fn task_info_contains_correct_module_id() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    let task_id = mgr.submit("echo.module", json!({}), None).unwrap();
+    let task_id = mgr.submit("echo.module", json!({}), None).await.unwrap();
     let info = mgr.get_status(&task_id).unwrap();
     assert_eq!(info.module_id, "echo.module");
 }
@@ -136,7 +135,7 @@ async fn task_info_contains_correct_module_id() {
 #[tokio::test]
 async fn task_info_submitted_at_is_set() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
     let info = mgr.get_status(&task_id).unwrap();
     assert!(
         info.submitted_at > 0.0,
@@ -149,7 +148,7 @@ async fn completed_task_has_completed_status() {
     // Use an executor that actually has the module so the task completes.
     let exec = make_executor_with_echo("echo.v1");
     let mgr = AsyncTaskManager::new(exec, 4, 100);
-    let task_id = mgr.submit("echo.v1", json!({"x": 1}), None).unwrap();
+    let task_id = mgr.submit("echo.v1", json!({"x": 1}), None).await.unwrap();
 
     // Poll for completion (up to 1 second).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -185,7 +184,7 @@ async fn completed_task_has_completed_status() {
 async fn failed_task_has_failed_status_and_error_message() {
     // Module is not registered — executor returns ModuleNotFound.
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    let task_id = mgr.submit("nonexistent.module", json!({}), None).unwrap();
+    let task_id = mgr.submit("nonexistent.module", json!({}), None).await.unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
@@ -220,17 +219,17 @@ async fn failed_task_has_failed_status_and_error_message() {
 async fn cancel_pending_task_returns_true() {
     // max_concurrent = 0 keeps all tasks in Pending state.
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
 
-    let result = mgr.cancel(&task_id);
+    let result = mgr.cancel(&task_id).await;
     assert!(result, "cancel should return true for a Pending task");
 }
 
 #[tokio::test]
 async fn cancel_pending_task_sets_cancelled_status() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
-    mgr.cancel(&task_id);
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
+    mgr.cancel(&task_id).await;
 
     let info = mgr.get_status(&task_id).unwrap();
     assert_eq!(info.status, TaskStatus::Cancelled);
@@ -239,8 +238,8 @@ async fn cancel_pending_task_sets_cancelled_status() {
 #[tokio::test]
 async fn cancel_pending_task_sets_completed_at() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
-    mgr.cancel(&task_id);
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
+    mgr.cancel(&task_id).await;
 
     let info = mgr.get_status(&task_id).unwrap();
     assert!(
@@ -256,10 +255,10 @@ async fn cancel_pending_task_sets_completed_at() {
 #[tokio::test]
 async fn cancel_already_cancelled_task_returns_false() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
-    assert!(mgr.cancel(&task_id), "first cancel should succeed");
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
+    assert!(mgr.cancel(&task_id).await, "first cancel should succeed");
     assert!(
-        !mgr.cancel(&task_id),
+        !mgr.cancel(&task_id).await,
         "second cancel on an already-cancelled task should return false"
     );
 }
@@ -267,7 +266,7 @@ async fn cancel_already_cancelled_task_returns_false() {
 #[tokio::test]
 async fn cancel_unknown_task_returns_false() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    assert!(!mgr.cancel("ghost-task-id"));
+    assert!(!mgr.cancel("ghost-task-id").await);
 }
 
 // ---------------------------------------------------------------------------
@@ -282,15 +281,14 @@ async fn cancel_running_task_sets_cancelled_status() {
     // Pending; either way the final status must be Cancelled.
     let mgr = AsyncTaskManager::new(make_executor(), 1, 100);
     let task_id = mgr
-        .submit("some.module.that.does.not.exist", json!({}), None)
-        .unwrap();
+        .submit("some.module.that.does.not.exist", json!({}), None).await.unwrap();
 
     // Give the tokio runtime a tick to let the task acquire the semaphore and
     // mark itself Running before we cancel.
     tokio::task::yield_now().await;
 
     // Cancel regardless of whether it transitioned to Running yet.
-    let cancelled = mgr.cancel(&task_id);
+    let cancelled = mgr.cancel(&task_id).await;
 
     // The task may already be Failed (module not found) or Cancelled.
     let info = mgr.get_status(&task_id).unwrap();
@@ -316,8 +314,8 @@ async fn list_tasks_without_filter_returns_all() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     assert!(mgr.list_tasks(None).is_empty());
 
-    let id1 = mgr.submit("m1", json!({}), None).unwrap();
-    let id2 = mgr.submit("m2", json!({}), None).unwrap();
+    let id1 = mgr.submit("m1", json!({}), None).await.unwrap();
+    let id2 = mgr.submit("m2", json!({}), None).await.unwrap();
 
     let all = mgr.list_tasks(None);
     assert_eq!(all.len(), 2);
@@ -330,8 +328,8 @@ async fn list_tasks_without_filter_returns_all() {
 async fn list_tasks_with_pending_filter_returns_only_pending() {
     // max_concurrent = 0 → all tasks stay Pending.
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let _ = mgr.submit("m", json!({}), None).unwrap();
-    let _ = mgr.submit("m", json!({}), None).unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
 
     let pending = mgr.list_tasks(Some(TaskStatus::Pending));
     assert_eq!(pending.len(), 2, "both tasks should be Pending");
@@ -343,10 +341,10 @@ async fn list_tasks_with_pending_filter_returns_only_pending() {
 #[tokio::test]
 async fn list_tasks_with_cancelled_filter_returns_only_cancelled() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let id1 = mgr.submit("m", json!({}), None).unwrap();
-    let id2 = mgr.submit("m", json!({}), None).unwrap();
+    let id1 = mgr.submit("m", json!({}), None).await.unwrap();
+    let id2 = mgr.submit("m", json!({}), None).await.unwrap();
 
-    mgr.cancel(&id1);
+    mgr.cancel(&id1).await;
 
     let cancelled = mgr.list_tasks(Some(TaskStatus::Cancelled));
     assert_eq!(cancelled.len(), 1);
@@ -360,7 +358,7 @@ async fn list_tasks_with_cancelled_filter_returns_only_cancelled() {
 #[tokio::test]
 async fn list_tasks_empty_when_no_tasks_match_filter() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let _ = mgr.submit("m", json!({}), None).unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
 
     // No tasks have been completed — filter should yield nothing.
     let completed = mgr.list_tasks(Some(TaskStatus::Completed));
@@ -374,8 +372,8 @@ async fn list_tasks_empty_when_no_tasks_match_filter() {
 #[tokio::test]
 async fn cleanup_removes_cancelled_tasks_past_max_age() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
-    mgr.cancel(&task_id);
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
+    mgr.cancel(&task_id).await;
 
     // A negative max_age means every task is "old enough."
     let removed = mgr.cleanup(-1.0);
@@ -386,8 +384,8 @@ async fn cleanup_removes_cancelled_tasks_past_max_age() {
 #[tokio::test]
 async fn cleanup_keeps_tasks_within_max_age() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
-    mgr.cancel(&task_id);
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
+    mgr.cancel(&task_id).await;
 
     // Very large max_age — the task was just created, so it is not old enough.
     let removed = mgr.cleanup(9_999_999.0);
@@ -401,7 +399,7 @@ async fn cleanup_keeps_tasks_within_max_age() {
 #[tokio::test]
 async fn cleanup_does_not_remove_active_tasks() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let task_id = mgr.submit("m", json!({}), None).unwrap();
+    let task_id = mgr.submit("m", json!({}), None).await.unwrap();
     // Task is Pending, not terminal — cleanup with age=-1 must not remove it.
     let removed = mgr.cleanup(-1.0);
     assert_eq!(
@@ -414,12 +412,12 @@ async fn cleanup_does_not_remove_active_tasks() {
 #[tokio::test]
 async fn cleanup_removes_multiple_terminal_tasks() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let id1 = mgr.submit("m", json!({}), None).unwrap();
-    let id2 = mgr.submit("m", json!({}), None).unwrap();
-    let id3 = mgr.submit("m", json!({}), None).unwrap();
+    let id1 = mgr.submit("m", json!({}), None).await.unwrap();
+    let id2 = mgr.submit("m", json!({}), None).await.unwrap();
+    let id3 = mgr.submit("m", json!({}), None).await.unwrap();
 
-    mgr.cancel(&id1);
-    mgr.cancel(&id2);
+    mgr.cancel(&id1).await;
+    mgr.cancel(&id2).await;
     // id3 stays Pending
 
     let removed = mgr.cleanup(-1.0);
@@ -434,12 +432,11 @@ async fn cleanup_removes_multiple_terminal_tasks() {
 #[tokio::test]
 async fn submit_rejected_at_max_tasks_limit() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 2); // capacity = 2
-    let _ = mgr.submit("m", json!({}), None).unwrap();
-    let _ = mgr.submit("m", json!({}), None).unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
 
     let err = mgr
-        .submit("m", json!({}), None)
-        .expect_err("third submit should be rejected");
+        .submit("m", json!({}), None).await.expect_err("third submit should be rejected");
     assert!(
         err.to_string().contains("Task limit"),
         "error message should mention task limit; got: {err}"
@@ -449,19 +446,19 @@ async fn submit_rejected_at_max_tasks_limit() {
 #[tokio::test]
 async fn submit_allowed_after_cleanup_frees_space() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 2); // capacity = 2
-    let id1 = mgr.submit("m", json!({}), None).unwrap();
-    let _ = mgr.submit("m", json!({}), None).unwrap();
+    let id1 = mgr.submit("m", json!({}), None).await.unwrap();
+    let _ = mgr.submit("m", json!({}), None).await.unwrap();
 
     // At capacity — third submit should fail.
-    assert!(mgr.submit("m", json!({}), None).is_err());
+    assert!(mgr.submit("m", json!({}), None).await.is_err());
 
     // Cancel one task, cleanup it away.
-    mgr.cancel(&id1);
+    mgr.cancel(&id1).await;
     mgr.cleanup(-1.0);
 
     // Now there is room for one more.
     assert!(
-        mgr.submit("m", json!({}), None).is_ok(),
+        mgr.submit("m", json!({}), None).await.is_ok(),
         "submit should succeed once cleanup freed space"
     );
 }
@@ -476,8 +473,8 @@ async fn tasks_are_queued_when_max_concurrent_reached() {
     // start running — all tasks stay Pending indefinitely.
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
 
-    let id1 = mgr.submit("m", json!({}), None).unwrap();
-    let id2 = mgr.submit("m", json!({}), None).unwrap();
+    let id1 = mgr.submit("m", json!({}), None).await.unwrap();
+    let id2 = mgr.submit("m", json!({}), None).await.unwrap();
 
     // Yield so any tokio tasks get a chance to run.
     tokio::task::yield_now().await;
@@ -495,8 +492,8 @@ async fn max_concurrent_one_limits_parallelism() {
     // other must remain Pending until the first completes or is cancelled.
     let mgr = Arc::new(AsyncTaskManager::new(make_executor(), 1, 100));
 
-    let _id1 = mgr.submit("m1", json!({}), None).unwrap();
-    let _id2 = mgr.submit("m2", json!({}), None).unwrap();
+    let _id1 = mgr.submit("m1", json!({}), None).await.unwrap();
+    let _id2 = mgr.submit("m2", json!({}), None).await.unwrap();
 
     // The combined count must be exactly 2.
     assert_eq!(mgr.task_count(), 2);
@@ -516,9 +513,9 @@ async fn max_concurrent_one_limits_parallelism() {
 #[tokio::test]
 async fn shutdown_cancels_all_pending_tasks() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    let id1 = mgr.submit("m1", json!({}), None).unwrap();
-    let id2 = mgr.submit("m2", json!({}), None).unwrap();
-    mgr.shutdown();
+    let id1 = mgr.submit("m1", json!({}), None).await.unwrap();
+    let id2 = mgr.submit("m2", json!({}), None).await.unwrap();
+    mgr.shutdown().await;
 
     assert_eq!(mgr.get_status(&id1).unwrap().status, TaskStatus::Cancelled);
     assert_eq!(mgr.get_status(&id2).unwrap().status, TaskStatus::Cancelled);
@@ -552,8 +549,8 @@ async fn submit_max_tasks_holds_under_concurrent_load() {
         let mgr = Arc::clone(&mgr);
         let accepted = Arc::clone(&accepted);
         let rejected = Arc::clone(&rejected);
-        joins.push(tokio::task::spawn_blocking(move || {
-            match mgr.submit("m", json!({}), None) {
+        joins.push(tokio::spawn(async move {
+            match mgr.submit("m", json!({}), None).await {
                 Ok(_) => accepted.fetch_add(1, Ordering::SeqCst),
                 Err(_) => rejected.fetch_add(1, Ordering::SeqCst),
             };

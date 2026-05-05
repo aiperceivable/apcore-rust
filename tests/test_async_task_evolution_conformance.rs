@@ -287,6 +287,7 @@ async fn case_retry_scheduled_on_failure() {
             Some(make_ctx()),
             Some(retry),
         )
+        .await
         .expect("submit");
 
     // Poll briefly until retry_count increments to 1 (the first attempt has
@@ -340,6 +341,7 @@ async fn case_max_retries_exhausted_becomes_failed() {
             Some(make_ctx()),
             Some(retry),
         )
+        .await
         .expect("submit");
 
     // Wait for the task to reach a terminal state. Retries take 100ms each
