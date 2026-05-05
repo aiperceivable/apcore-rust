@@ -142,13 +142,13 @@ async fn test_retry_middleware_skips_non_retryable() {
 
 #[tokio::test]
 async fn test_retry_middleware_retries_retryable_error() {
-    let mw = RetryMiddleware::new(RetryConfig {
-        max_retries: 2,
-        strategy: "fixed".to_string(),
-        base_delay_ms: 1, // minimal delay for tests
-        max_delay_ms: 1,
-        jitter: false,
-    });
+    let mut retry_cfg = RetryConfig::default();
+    retry_cfg.max_retries = 2;
+    retry_cfg.strategy = "fixed".to_string();
+    retry_cfg.base_delay_ms = 1; // minimal delay for tests
+    retry_cfg.max_delay_ms = 1;
+    retry_cfg.jitter = false;
+    let mw = RetryMiddleware::new(retry_cfg);
     let ctx = Context::<Value>::new(Identity::new(
         "test".into(),
         "test".into(),
@@ -181,13 +181,13 @@ async fn test_retry_middleware_retries_retryable_error() {
 
 #[tokio::test]
 async fn test_retry_middleware_resets_on_success() {
-    let mw = RetryMiddleware::new(RetryConfig {
-        max_retries: 2,
-        strategy: "fixed".to_string(),
-        base_delay_ms: 1,
-        max_delay_ms: 1,
-        jitter: false,
-    });
+    let mut retry_cfg = RetryConfig::default();
+    retry_cfg.max_retries = 2;
+    retry_cfg.strategy = "fixed".to_string();
+    retry_cfg.base_delay_ms = 1;
+    retry_cfg.max_delay_ms = 1;
+    retry_cfg.jitter = false;
+    let mw = RetryMiddleware::new(retry_cfg);
     let ctx = Context::<Value>::new(Identity::new(
         "test".into(),
         "test".into(),

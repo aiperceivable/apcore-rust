@@ -11,7 +11,14 @@ use crate::module::ModuleAnnotations;
 
 /// Approval request sent before a sensitive operation.
 /// Spec §7.3.1: required fields are `module_id`, arguments, context, annotations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern. Note: `module_id` defaults
+/// to an empty string and SHOULD be set explicitly by the caller; `Default`
+/// is provided purely so consumers can use struct-update syntax.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ApprovalRequest {
     pub module_id: String,
     pub arguments: serde_json::Value,
@@ -29,7 +36,14 @@ pub struct ApprovalRequest {
 }
 
 /// Outcome of an approval request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern. Note: `status` defaults
+/// to an empty string and SHOULD be set explicitly by the caller (canonical
+/// values are `"approved"`, `"rejected"`, `"timeout"`, `"pending"`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ApprovalResult {
     /// "approved", "rejected", "timeout", or "pending"
     pub status: String,

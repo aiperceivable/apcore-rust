@@ -20,9 +20,10 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::executor::Executor;
 
 /// Status of an async task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    #[default]
     Pending,
     Running,
     Completed,
@@ -41,7 +42,13 @@ impl TaskStatus {
 }
 
 /// Metadata and result tracking for a submitted async task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern. `task_id` and `module_id`
+/// default to empty strings and SHOULD be set explicitly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TaskInfo {
     pub task_id: String,
     pub module_id: String,
@@ -178,7 +185,12 @@ impl TaskStore for InMemoryTaskStore {
 // ---------------------------------------------------------------------------
 
 /// Retry policy applied per task on failure.
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RetryConfig {
     /// Maximum number of retry attempts after the initial execution. `0` disables retry.
     pub max_retries: u32,
@@ -253,7 +265,12 @@ impl RetryConfig {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the [`AsyncTaskManager`] background reaper.
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ReaperConfig {
     /// Age threshold (seconds) before a terminal task becomes eligible for deletion.
     pub ttl_seconds: f64,

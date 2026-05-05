@@ -1188,17 +1188,18 @@ fn conformance_approval_gate() {
         let approval_result: Option<ApprovalResult> = if approval_result_data.is_null() {
             None
         } else {
-            Some(ApprovalResult {
-                status: approval_result_data["status"].as_str().unwrap().to_string(),
-                approved_by: approval_result_data["approved_by"]
+            {
+                let mut ar = ApprovalResult::default();
+                ar.status = approval_result_data["status"].as_str().unwrap().to_string();
+                ar.approved_by = approval_result_data["approved_by"]
                     .as_str()
-                    .map(String::from),
-                reason: approval_result_data["reason"].as_str().map(String::from),
-                approval_id: approval_result_data["approval_id"]
+                    .map(String::from);
+                ar.reason = approval_result_data["reason"].as_str().map(String::from);
+                ar.approval_id = approval_result_data["approval_id"]
                     .as_str()
-                    .map(String::from),
-                metadata: None,
-            })
+                    .map(String::from);
+                Some(ar)
+            }
         };
 
         // Simulate gate logic: gate fires only when handler is configured AND

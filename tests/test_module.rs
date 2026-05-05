@@ -173,12 +173,11 @@ fn test_annotations_serialization_round_trip() {
 
 #[test]
 fn test_module_example_fields() {
-    let ex = ModuleExample {
-        title: "Add two numbers".to_string(),
-        description: Some("Returns the sum".to_string()),
-        inputs: json!({"a": 1, "b": 2}),
-        output: json!({"result": 3}),
-    };
+    let mut ex = ModuleExample::default();
+    ex.title = "Add two numbers".to_string();
+    ex.description = Some("Returns the sum".to_string());
+    ex.inputs = json!({"a": 1, "b": 2});
+    ex.output = json!({"result": 3});
     assert_eq!(ex.title, "Add two numbers");
     assert_eq!(ex.inputs["a"], 1);
     assert_eq!(ex.output["result"], 3);
@@ -186,12 +185,10 @@ fn test_module_example_fields() {
 
 #[test]
 fn test_module_example_serialization() {
-    let ex = ModuleExample {
-        title: "Greet Alice".to_string(),
-        description: None,
-        inputs: json!({"name": "Alice"}),
-        output: json!({"message": "Hello, Alice!"}),
-    };
+    let mut ex = ModuleExample::default();
+    ex.title = "Greet Alice".to_string();
+    ex.inputs = json!({"name": "Alice"});
+    ex.output = json!({"message": "Hello, Alice!"});
     let json = serde_json::to_string(&ex).unwrap();
     let restored: ModuleExample = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.title, ex.title);
