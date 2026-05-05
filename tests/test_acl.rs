@@ -361,8 +361,7 @@ fn test_check_add_rule_inserts_at_front() {
         effect: "deny".to_string(),
         description: Some("Added deny".to_string()),
         conditions: None,
-    })
-    .unwrap();
+    });
 
     let result = acl.check(Some("user"), "resource", None);
     assert!(!result, "Newly added deny rule at front should win");
@@ -468,6 +467,31 @@ fn test_acl_reload_succeeds_from_yaml_path() {
 
     acl.reload().expect("reload");
     assert!(!acl.check(Some("user"), "r", None));
+}
+
+// ---------------------------------------------------------------------------
+// D10-005: ACL::add_rule has unit return type (no Result wrapper)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_acl_add_rule_returns_unit_no_result_wrapper() {
+    // The body of add_rule is infallible — vec.insert(0, _) cannot fail.
+    // Spec contract acl-system.md:259 declares On success: None, so the
+    // return type must be unit, not Result<(), ModuleError>. Callers
+    // should not need `?`/`.unwrap()` to use it.
+    let mut acl = ACL::new(vec![], "deny", None);
+    let rule = ACLRule {
+        callers: vec!["caller".to_string()],
+        targets: vec!["target".to_string()],
+        effect: "allow".to_string(),
+        description: None,
+        conditions: None,
+    };
+    // The next line would not compile if add_rule returned Result<(), _>
+    // because that requires `?` or explicit handling — the bare statement
+    // form proves the type is unit.
+    let _: () = acl.add_rule(rule);
+    assert_eq!(acl.rules().len(), 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -230,9 +230,11 @@ impl ACL {
     }
 
     /// Add a rule to the ACL (inserted at position 0, highest priority).
-    pub fn add_rule(&mut self, rule: ACLRule) -> Result<(), ModuleError> {
+    ///
+    /// Spec contract `acl-system.md` §Contract.ACL.add_rule declares
+    /// `On success: None` — the body is infallible, so no `Result` wrapper.
+    pub fn add_rule(&mut self, rule: ACLRule) {
         self.rules.insert(0, rule);
-        Ok(())
     }
 
     /// Remove the first rule matching the given callers and targets.
