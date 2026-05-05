@@ -122,9 +122,13 @@ impl EventEmitter {
     ///
     /// **Post-shutdown behaviour:** if [`Self::shutdown`] has been called,
     /// this method returns immediately as a no-op (sync finding A-D-502).
-    pub async fn emit(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
+    ///
+    /// Spec event-system.md:448 declares `No errors raised`. The body is
+    /// infallible — subscriber errors are caught and logged internally —
+    /// so the return type is unit, not `Result<(), ModuleError>` (D10-008).
+    pub async fn emit(&self, event: &ApCoreEvent) {
         if self.is_shutdown.load(Ordering::SeqCst) {
-            return Ok(());
+            return;
         }
         for subscriber in &self.subscribers {
             if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
@@ -138,7 +142,6 @@ impl EventEmitter {
                 }
             }
         }
-        Ok(())
     }
 
     /// Emit an event to subscribers matching both the caller's filter pattern
@@ -376,7 +379,7 @@ mod tests {
         emitter.subscribe(Box::new(sub));
 
         let event = ApCoreEvent::new("test.hello", json!({}));
-        emitter.emit(&event).await.unwrap();
+        emitter.emit(&event).await;
         assert_eq!(received.lock().len(), 1);
         assert_eq!(received.lock()[0], "test.hello");
     }
@@ -389,7 +392,7 @@ mod tests {
         emitter.subscribe(Box::new(sub));
 
         let event = ApCoreEvent::new("test.hello", json!({}));
-        emitter.emit(&event).await.unwrap();
+        emitter.emit(&event).await;
         assert!(received.lock().is_empty());
     }
 
@@ -401,7 +404,7 @@ mod tests {
         emitter.subscribe(Box::new(sub));
 
         let event = ApCoreEvent::new("anything.at.all", json!({}));
-        emitter.emit(&event).await.unwrap();
+        emitter.emit(&event).await;
         assert_eq!(received.lock().len(), 1);
     }
 
@@ -423,7 +426,7 @@ mod tests {
         emitter.unsubscribe(&sub);
 
         let event = ApCoreEvent::new("test", json!({}));
-        emitter.emit(&event).await.unwrap();
+        emitter.emit(&event).await;
         assert!(received.lock().is_empty());
     }
 
@@ -507,7 +510,7 @@ mod tests {
         emitter.subscribe(Box::new(good_sub));
 
         let event = ApCoreEvent::new("test", json!({}));
-        emitter.emit(&event).await.unwrap();
+        emitter.emit(&event).await;
         assert_eq!(received.lock().len(), 1);
     }
 }

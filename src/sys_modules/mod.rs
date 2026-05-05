@@ -170,9 +170,7 @@ pub(crate) async fn emit_event(
         severity: "info".to_string(),
     };
     let em = emitter.lock().await;
-    if let Err(e) = em.emit(&event).await {
-        tracing::warn!(error = %e, event_type = %event_type, "Event emit failed");
-    }
+    em.emit(&event).await;
 }
 
 /// Default `caller_id` when the `Context` has none (Issue #45.2 — contextual
@@ -685,8 +683,8 @@ pub fn register_sys_modules_with_options(
                             "info",
                         );
                         let em = emitter.lock().await;
-                        let _ = em.emit(&canonical).await;
-                        let _ = em.emit(&legacy).await;
+                        em.emit(&canonical).await;
+                        em.emit(&legacy).await;
                     });
                 }
             }),
@@ -716,8 +714,8 @@ pub fn register_sys_modules_with_options(
                             "info",
                         );
                         let em = emitter.lock().await;
-                        let _ = em.emit(&canonical).await;
-                        let _ = em.emit(&legacy).await;
+                        em.emit(&canonical).await;
+                        em.emit(&legacy).await;
                     });
                 }
             }),

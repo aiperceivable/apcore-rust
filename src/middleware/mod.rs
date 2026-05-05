@@ -302,10 +302,10 @@ impl Middleware for PlatformNotifyMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Check latency threshold and error-rate recovery after execution.
         for event in self.check_latency_threshold(module_id) {
-            let _ = self.emitter.emit(&event).await;
+            self.emitter.emit(&event).await;
         }
         if let Some(event) = self.check_error_recovery(module_id) {
-            let _ = self.emitter.emit(&event).await;
+            self.emitter.emit(&event).await;
         }
         Ok(None)
     }
@@ -319,7 +319,7 @@ impl Middleware for PlatformNotifyMiddleware {
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Check error rate threshold on error.
         for event in self.check_error_rate_threshold(module_id) {
-            let _ = self.emitter.emit(&event).await;
+            self.emitter.emit(&event).await;
         }
         Ok(None)
     }

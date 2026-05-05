@@ -354,13 +354,9 @@ impl CircuitBreakerMiddleware {
 
     async fn emit(&self, event: ApCoreEvent) {
         if let Some(emitter) = &self.emitter {
-            if let Err(e) = emitter.emit(&event).await {
-                tracing::warn!(
-                    event_type = %event.event_type,
-                    error = %e,
-                    "failed to emit circuit breaker event"
-                );
-            }
+            // EventEmitter::emit returns unit (D10-008) — error isolation
+            // happens internally; nothing to handle here.
+            emitter.emit(&event).await;
         }
     }
 }

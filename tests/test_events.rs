@@ -138,7 +138,7 @@ async fn test_emitter_subscribe_and_emit() {
     emitter.subscribe(Box::new(sub));
 
     let event = ApCoreEvent::new("test.ping", json!({}));
-    emitter.emit(&event).await.expect("emit should succeed");
+    emitter.emit(&event).await;
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 1);
@@ -162,16 +162,13 @@ async fn test_emitter_pattern_filtering() {
 
     emitter
         .emit(&ApCoreEvent::new("module.loaded", json!({})))
-        .await
-        .unwrap();
+        .await;
     emitter
         .emit(&ApCoreEvent::new("module.error", json!({})))
-        .await
-        .unwrap();
+        .await;
     emitter
         .emit(&ApCoreEvent::new("registry.changed", json!({})))
-        .await
-        .unwrap();
+        .await;
 
     assert_eq!(recv_all.lock().unwrap().len(), 3);
     assert_eq!(recv_mod.lock().unwrap().len(), 2);
@@ -192,8 +189,7 @@ async fn test_emitter_unsubscribe_by_id() {
 
     emitter
         .emit(&ApCoreEvent::new("post.remove", json!({})))
-        .await
-        .unwrap();
+        .await;
 
     assert!(received.lock().unwrap().is_empty());
 }
@@ -230,20 +226,34 @@ async fn test_emitter_error_isolation() {
     }));
     emitter.subscribe(Box::new(good));
 
-    let result = emitter.emit(&ApCoreEvent::new("err.test", json!({}))).await;
-
-    // emit itself should still succeed (errors are logged, not propagated).
-    assert!(result.is_ok());
+    // emit() returns unit (D10-008) — error isolation happens internally.
+    // The good subscriber still receives despite the failing one.
+    emitter.emit(&ApCoreEvent::new("err.test", json!({}))).await;
     assert_eq!(received.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn test_emitter_no_subscribers_is_ok() {
     let emitter = EventEmitter::new();
-    let result = emitter
+    emitter
         .emit(&ApCoreEvent::new("lonely.event", json!({})))
         .await;
-    assert!(result.is_ok());
+    // No subscribers means a silent no-op — emit returns unit (D10-008).
+}
+
+// ---------------------------------------------------------------------------
+// D10-008: EventEmitter::emit returns unit (no Result wrapper)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_emit_returns_unit_no_result_wrapper() {
+    // Spec event-system.md:448 declares "No errors raised" — the body is
+    // infallible (subscriber errors are caught and logged internally).
+    // Pinning the return type via `let _: () = ...` proves the wrapper
+    // was dropped (D10-008).
+    let emitter = EventEmitter::new();
+    let event = ApCoreEvent::new("anything", serde_json::json!({}));
+    let _: () = emitter.emit(&event).await;
 }
 
 #[tokio::test]
@@ -301,8 +311,7 @@ async fn test_pattern_wildcard_matches_everything() {
 
     emitter
         .emit(&ApCoreEvent::new("anything.at.all", json!({})))
-        .await
-        .unwrap();
+        .await;
     assert_eq!(received.lock().unwrap().len(), 1);
 }
 
@@ -315,12 +324,10 @@ async fn test_pattern_exact_match() {
 
     emitter
         .emit(&ApCoreEvent::new("exact.match", json!({})))
-        .await
-        .unwrap();
+        .await;
     emitter
         .emit(&ApCoreEvent::new("exact.match.extra", json!({})))
-        .await
-        .unwrap();
+        .await;
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 1);
@@ -336,16 +343,13 @@ async fn test_pattern_prefix_wildcard() {
 
     emitter
         .emit(&ApCoreEvent::new("foo.bar", json!({})))
-        .await
-        .unwrap();
+        .await;
     emitter
         .emit(&ApCoreEvent::new("foo.baz.qux", json!({})))
-        .await
-        .unwrap();
+        .await;
     emitter
         .emit(&ApCoreEvent::new("bar.foo", json!({})))
-        .await
-        .unwrap();
+        .await;
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 2);
@@ -360,8 +364,7 @@ async fn test_pattern_no_match() {
 
     emitter
         .emit(&ApCoreEvent::new("gamma.delta", json!({})))
-        .await
-        .unwrap();
+        .await;
 
     assert!(received.lock().unwrap().is_empty());
 }
@@ -682,7 +685,7 @@ async fn test_emit_async_after_shutdown_is_dropped() {
     emitter.shutdown(100).await.expect("shutdown");
 
     let event = ApCoreEvent::new("dropped.async", json!({}));
-    emitter.emit(&event).await.expect("emit succeeds (no-op)");
+    emitter.emit(&event).await;
 
     assert!(
         received.lock().unwrap().is_empty(),
