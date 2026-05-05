@@ -375,6 +375,51 @@ fn test_schema_validator_validate_or_error_returns_module_error() {
 }
 
 // ---------------------------------------------------------------------------
+// D11-010: validate_input / validate_output cross-language parity
+// ---------------------------------------------------------------------------
+//
+// Python (`validator.py:69`) exposes `validate_input(data, model)` and
+// `validate_output(data, model)` returning the validated dict, raising
+// SchemaValidationError on failure. TypeScript (`validator.ts:78`) exposes
+// `validateInput` / `validateOutput` with the same role. Rust previously
+// only exposed `validate`, `validate_detailed`, `validate_or_error` — user
+// code calling the SDK validator directly could not port between languages.
+
+#[test]
+fn test_validate_input_returns_data_on_success() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "string" });
+    let data = json!("hello");
+    let returned = v.validate_input(&data, &schema).expect("valid input");
+    assert_eq!(returned, data, "validate_input must return the input on success");
+}
+
+#[test]
+fn test_validate_input_raises_on_failure() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "string" });
+    let err = v.validate_input(&json!(42), &schema).unwrap_err();
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaValidationError);
+}
+
+#[test]
+fn test_validate_output_returns_data_on_success() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "object", "required": ["ok"], "properties": { "ok": { "type": "boolean" } } });
+    let data = json!({"ok": true});
+    let returned = v.validate_output(&data, &schema).expect("valid output");
+    assert_eq!(returned, data);
+}
+
+#[test]
+fn test_validate_output_raises_on_failure() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "object", "required": ["ok"] });
+    let err = v.validate_output(&json!({}), &schema).unwrap_err();
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaValidationError);
+}
+
+// ---------------------------------------------------------------------------
 // Default impl
 // ---------------------------------------------------------------------------
 

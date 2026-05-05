@@ -98,6 +98,28 @@ impl SchemaValidator {
         }
     }
 
+    /// Validate inputs against a schema, returning the input value on success
+    /// or a [`ModuleError`] carrying the mapped apcore [`ErrorCode`] on failure.
+    ///
+    /// Cross-language parity with apcore-python `SchemaValidator.validate_input`
+    /// (`validator.py:69`) and apcore-typescript `SchemaValidator.validateInput`
+    /// (`validator.ts:78`). Those SDKs return the validated/normalized data;
+    /// Rust uses raw JSON Schema (no Pydantic-style normalization), so the
+    /// returned value is the input cloned. Provided for API surface symmetry —
+    /// user code porting between SDKs gets the same call shape (D11-010).
+    pub fn validate_input(&self, data: &Value, schema: &Value) -> Result<Value, ModuleError> {
+        self.validate_or_error(data, schema)?;
+        Ok(data.clone())
+    }
+
+    /// Validate outputs against a schema, returning the output value on success
+    /// or a [`ModuleError`] on failure. Mirror of [`Self::validate_input`] for
+    /// the executor's output-validation step (D11-010).
+    pub fn validate_output(&self, data: &Value, schema: &Value) -> Result<Value, ModuleError> {
+        self.validate_or_error(data, schema)?;
+        Ok(data.clone())
+    }
+
     /// Validate and return `Ok(())` on success, or a `ModuleError` carrying the
     /// mapped apcore [`ErrorCode`] and structured per-failure details.
     pub fn validate_or_error(&self, value: &Value, schema: &Value) -> Result<(), ModuleError> {
