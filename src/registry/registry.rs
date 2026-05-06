@@ -167,6 +167,46 @@ pub const RESERVED_WORDS: &[&str] = &[
     "system", "internal", "core", "apcore", "plugin", "schema", "acl",
 ];
 
+/// Namespace reserved for programmatically-registered modules synthesized at
+/// runtime.
+///
+/// Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md` (Accepted, target
+/// v0.21.0). IDs in this namespace MUST be registered through
+/// [`Registry::register`] / [`Registry::register_module`] only; the filesystem
+/// discoverer rejects matching IDs because the namespace has no
+/// directory-rooted source of truth, and [`Registry::register_internal`]
+/// rejects them so sys/internal modules cannot squat on the prefix.
+///
+/// The trailing dot is required so module IDs whose first segment merely
+/// *starts with* `ephemeral` (e.g. `ephemerals`) are not falsely classified.
+///
+/// Cross-language alignment: matches `EPHEMERAL_NAMESPACE_PREFIX` in
+/// apcore-python.
+pub const EPHEMERAL_NAMESPACE_PREFIX: &str = "ephemeral.";
+
+/// Return `true` when `module_id` belongs to the reserved `ephemeral.*`
+/// namespace (either the bare segment `ephemeral` or any descendant).
+///
+/// Aligned with apcore-python's `_is_ephemeral`.
+#[must_use]
+pub fn is_ephemeral_module_id(module_id: &str) -> bool {
+    module_id == "ephemeral" || module_id.starts_with(EPHEMERAL_NAMESPACE_PREFIX)
+}
+
+/// Return `true` if the descriptor's annotations declare `discoverable=true`
+/// (or if no annotations / no descriptor are present — default-discoverable).
+///
+/// Aligned with apcore-python's `Registry._is_discoverable`.
+fn descriptor_is_discoverable(descriptor: Option<&ModuleDescriptor>) -> bool {
+    match descriptor {
+        Some(desc) => desc
+            .annotations
+            .as_ref()
+            .is_none_or(|ann| ann.discoverable),
+        None => true,
+    }
+}
+
 /// Maximum allowed length for a module ID.
 ///
 /// Per `PROTOCOL_SPEC` §2.7 EBNF constraint #1. 192 is filesystem-safe
@@ -636,13 +676,38 @@ impl Registry {
     /// - `prefix`: if provided, only return modules whose name starts with the prefix.
     /// - When both are `None`, returns all registered module names.
     ///
+    /// Modules whose `ModuleAnnotations { discoverable: false, .. }` are
+    /// excluded. Use [`Self::list_full`] with `include_hidden=true` when the
+    /// full set is required (introspection, debug consoles).
+    ///
+    /// Aligned with apcore-python `Registry.list(...)` (default
+    /// `include_hidden=False`).
+    ///
     /// Returns owned `String` values because the storage is behind a lock.
     pub fn list(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<String> {
+        self.list_full(tags, prefix, false)
+    }
+
+    /// Same as [`Self::list`] but with explicit `include_hidden` control.
+    ///
+    /// Pass `include_hidden=true` to enumerate every registered module ID
+    /// including those annotated `discoverable: false` (RFC ephemeral-modules,
+    /// target v0.21.0). Aligned with apcore-python
+    /// `Registry.list(..., include_hidden=True)`.
+    pub fn list_full(
+        &self,
+        tags: Option<&[&str]>,
+        prefix: Option<&str>,
+        include_hidden: bool,
+    ) -> Vec<String> {
         let core = self.core.read();
         let mut result: Vec<String> = core
             .modules
             .keys()
             .filter(|name| {
+                if !include_hidden && !descriptor_is_discoverable(core.descriptors.get(name.as_str())) {
+                    return false;
+                }
                 if let Some(pfx) = prefix {
                     if !name.starts_with(pfx) {
                         return false;
@@ -715,13 +780,50 @@ impl Registry {
     /// like `system.health` or `system.control.toggle_feature` from
     /// `apcore::sys_modules`. Aligned with apcore-typescript
     /// `Registry.registerInternal`.
+    ///
+    /// Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md`, IDs in the
+    /// reserved `ephemeral.*` namespace are rejected at this entry point.
+    /// Agent-synthesized modules MUST go through [`Self::register`] /
+    /// [`Self::register_module`] so the audit-emit / soft-warn pilot fires.
     pub fn register_internal(
         &self,
         name: &str,
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
+        if is_ephemeral_module_id(name) {
+            return Err(ModuleError::new(
+                crate::errors::ErrorCode::GeneralInvalidInput,
+                format!(
+                    "ephemeral.* module IDs must be registered via Registry::register(), \
+                     not register_internal(). See apcore docs/spec/rfc-ephemeral-modules.md \
+                     for rationale. (offending id: '{name}')"
+                ),
+            ));
+        }
         self.register_core(name, module, descriptor, true, false)
+    }
+
+    /// Soft-warn when an `ephemeral.*` module is registered without
+    /// `requires_approval=true`.
+    ///
+    /// Per the apcore ephemeral-modules RFC pilot, agent-synthesized modules
+    /// SHOULD declare `requires_approval: true` so a human gates execution.
+    /// The registry only warns; it does not refuse the registration.
+    fn warn_if_missing_approval(name: &str, descriptor: &ModuleDescriptor) {
+        let requires_approval = descriptor
+            .annotations
+            .as_ref()
+            .is_some_and(|a| a.requires_approval);
+        if !requires_approval {
+            tracing::warn!(
+                module_id = %name,
+                "ephemeral.* module registered without requires_approval=true. \
+                 The apcore RFC docs/spec/rfc-ephemeral-modules.md recommends \
+                 setting ModuleAnnotations {{ requires_approval: true, .. }} so \
+                 agent-synthesized code does not run unattended."
+            );
+        }
     }
 
     /// Shared registration core for `register`, `register_internal`, and the
@@ -748,6 +850,13 @@ impl Registry {
         run_validator: bool,
     ) -> Result<(), ModuleError> {
         validate_module_id(name, allow_reserved)?;
+
+        // Ephemeral RFC pilot: emit a soft tracing::warn when an ephemeral.*
+        // module lacks requires_approval=true. Does NOT fail the registration —
+        // the audit-emit single-emit rule fires later via the sys_modules bridge.
+        if is_ephemeral_module_id(name) {
+            Self::warn_if_missing_approval(name, &descriptor);
+        }
 
         if run_validator {
             // Clone the validator Arc out of the lock so the user-supplied
@@ -1398,18 +1507,50 @@ impl Registry {
     }
 
     /// Return all module IDs, sorted alphabetically.
+    ///
+    /// Modules annotated `discoverable: false` are excluded by default per
+    /// the apcore RFC ephemeral-modules pilot. Use [`Self::module_ids_full`]
+    /// to include hidden modules.
     pub fn module_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.core.read().modules.keys().cloned().collect();
+        self.module_ids_full(false)
+    }
+
+    /// Return all module IDs sorted alphabetically, with explicit control
+    /// over whether hidden (`discoverable: false`) modules are included.
+    pub fn module_ids_full(&self, include_hidden: bool) -> Vec<String> {
+        let core = self.core.read();
+        let mut ids: Vec<String> = core
+            .modules
+            .keys()
+            .filter(|name| {
+                include_hidden
+                    || descriptor_is_discoverable(core.descriptors.get(name.as_str()))
+            })
+            .cloned()
+            .collect();
         ids.sort();
         ids
     }
 
     /// Return a snapshot of all registered (`module_id`, module) pairs.
+    ///
+    /// Modules annotated `discoverable: false` are excluded by default per
+    /// the apcore RFC ephemeral-modules pilot. Use [`Self::entries_full`] to
+    /// include hidden modules.
     pub fn entries(&self) -> Vec<(String, Arc<dyn Module>)> {
-        self.core
-            .read()
-            .modules
+        self.entries_full(false)
+    }
+
+    /// Return a snapshot of all registered (`module_id`, module) pairs with
+    /// explicit control over whether hidden (`discoverable: false`) modules
+    /// are included.
+    pub fn entries_full(&self, include_hidden: bool) -> Vec<(String, Arc<dyn Module>)> {
+        let core = self.core.read();
+        core.modules
             .iter()
+            .filter(|(k, _)| {
+                include_hidden || descriptor_is_discoverable(core.descriptors.get(k.as_str()))
+            })
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect()
     }

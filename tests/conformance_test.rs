@@ -1107,9 +1107,27 @@ fn conformance_annotations_extra_round_trip() {
             }
 
             // Re-serialize and compare with expected_serialized.
+            //
+            // Pilot-tolerant comparator for the v0.21.0 `discoverable` rollout:
+            // per RFC `apcore/docs/spec/rfc-ephemeral-modules.md`
+            // "Conformance plan / Transitional fixture handling", the canonical
+            // `annotations_extra_round_trip.json` fixture MUST NOT be updated
+            // to require `discoverable` until ALL three SDKs have shipped
+            // support. SDKs that have shipped the field strip it from actual
+            // serialized output before comparison so the suite stays green.
+            // Mirrors apcore-typescript's `stripDiscoverableForPilot`.
             if let Some(expected_ser) = tc.get("expected_serialized") {
-                let serialized = serde_json::to_value(&annotations)
+                let mut serialized = serde_json::to_value(&annotations)
                     .unwrap_or_else(|e| panic!("FAIL [{id}] serialize: {e}"));
+                if let (Some(actual_obj), Some(expected_obj)) =
+                    (serialized.as_object_mut(), expected_ser.as_object())
+                {
+                    if actual_obj.contains_key("discoverable")
+                        && !expected_obj.contains_key("discoverable")
+                    {
+                        actual_obj.remove("discoverable");
+                    }
+                }
                 assert_eq!(&serialized, expected_ser, "FAIL [{id}] serialized mismatch");
             }
 
@@ -1154,9 +1172,19 @@ fn conformance_annotations_extra_round_trip() {
             }
 
             // Re-serialize legacy-deserialized form must emit canonical nested form.
+            // Same pilot-tolerant comparator as above for `discoverable`.
             if let Some(expected_reser) = tc.get("expected_reserialized") {
-                let serialized = serde_json::to_value(&annotations)
+                let mut serialized = serde_json::to_value(&annotations)
                     .unwrap_or_else(|e| panic!("FAIL [{id}] reserialize: {e}"));
+                if let (Some(actual_obj), Some(expected_obj)) =
+                    (serialized.as_object_mut(), expected_reser.as_object())
+                {
+                    if actual_obj.contains_key("discoverable")
+                        && !expected_obj.contains_key("discoverable")
+                    {
+                        actual_obj.remove("discoverable");
+                    }
+                }
                 assert_eq!(
                     &serialized, expected_reser,
                     "FAIL [{id}] reserialized mismatch"

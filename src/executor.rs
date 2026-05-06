@@ -676,6 +676,7 @@ impl Executor {
     /// Aligned with `apcore-python.Executor.validate(module_id, inputs, context=None)`
     /// and `apcore-typescript.Executor.validate(moduleId, inputs?, context?)` per
     /// PROTOCOL_SPEC §12.2.
+    #[allow(clippy::too_many_lines)]
     pub async fn validate(
         &self,
         module_id: &str,
@@ -700,6 +701,7 @@ impl Executor {
                 valid: false,
                 checks: vec![check],
                 requires_approval: false,
+                predicted_changes: vec![],
             });
         }
         let context = ctx.cloned().unwrap_or_else(|| {
@@ -764,6 +766,7 @@ impl Executor {
         // guard on `pipe_ctx.module` being non-null), regardless of whether
         // earlier checks passed. Preflight returns advisory warnings only —
         // it never fails the preflight pass.
+        let mut predicted_changes: Vec<crate::module::Change> = Vec::new();
         if let Ok(Some(module)) = self.registry.get(module_id) {
             let warnings = module.preflight(inputs, ctx);
             checks.push(PreflightCheckResult {
@@ -772,6 +775,63 @@ impl Executor {
                 error: None,
                 warnings,
             });
+
+            // Module-level preview() (RFC `rfc-preview-method.md`, target v0.21.0).
+            // Invoked after preflight in cross-language alignment with
+            // apcore-python and apcore-typescript. Panics are treated as
+            // advisory and do NOT fail validation.
+            //
+            // Module trait methods are not UnwindSafe in general (they take
+            // `&self`); we deliberately use AssertUnwindSafe because:
+            // 1. preview() is contractually side-effect-free per RFC.
+            // 2. Even if a module unwinds across borrowed state, the
+            //    Registry's Arc<dyn Module> stays valid afterwards — the
+            //    panic only crosses the catch_unwind boundary.
+            let preview_panic_msg: Option<String> = {
+                use std::panic::{catch_unwind, AssertUnwindSafe};
+                let module_ref = module.as_ref();
+                let result = catch_unwind(AssertUnwindSafe(|| module_ref.preview(inputs, ctx)));
+                match result {
+                    Ok(Some(preview_result)) => {
+                        if !preview_result.changes.is_empty() {
+                            predicted_changes = preview_result.changes;
+                        }
+                        checks.push(PreflightCheckResult {
+                            check: crate::module::MODULE_PREVIEW_CHECK_NAME.to_string(),
+                            passed: true,
+                            error: None,
+                            warnings: vec![],
+                        });
+                        None
+                    }
+                    Ok(None) => {
+                        // Default trait impl returns None — record nothing.
+                        // This matches apcore-python's "method absent → no
+                        // module_preview check" semantics and keeps the
+                        // checks list small for modules that don't preview.
+                        None
+                    }
+                    Err(panic_payload) => {
+                        // Extract the panic message from the payload.
+                        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic payload>".to_string()
+                        };
+                        Some(msg)
+                    }
+                }
+            };
+            if let Some(msg) = preview_panic_msg {
+                checks.push(PreflightCheckResult {
+                    check: crate::module::MODULE_PREVIEW_CHECK_NAME.to_string(),
+                    passed: true,
+                    error: None,
+                    warnings: vec![format!("preview() panicked: {msg}")],
+                });
+            }
         }
 
         let valid = checks.iter().all(|c| c.passed);
@@ -779,6 +839,7 @@ impl Executor {
             valid,
             checks,
             requires_approval,
+            predicted_changes,
         })
     }
 

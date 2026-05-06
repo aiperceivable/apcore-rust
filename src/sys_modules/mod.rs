@@ -29,7 +29,7 @@ use crate::module::Module;
 use crate::observability::error_history::{ErrorHistory, ErrorHistoryMiddleware};
 use crate::observability::metrics::MetricsCollector;
 use crate::observability::usage::{UsageCollector, UsageMiddleware};
-use crate::registry::registry::{ModuleDescriptor, Registry};
+use crate::registry::registry::{is_ephemeral_module_id, ModuleDescriptor, Registry};
 
 pub use audit::{AuditAction, AuditChange, AuditEntry, AuditStore, InMemoryAuditStore};
 pub use control::UpdateConfigModule;
@@ -667,6 +667,28 @@ pub fn register_sys_modules_with_options(
                 let module_id_owned = module_id.to_string();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
+                        // Audit-event single-emit rule for ephemeral.* per
+                        // apcore RFC docs/spec/rfc-ephemeral-modules.md.
+                        // Ephemeral modules emit ONE canonical event with the
+                        // full contextual payload (namespace_class +
+                        // caller_id) and do NOT emit the legacy bare-name
+                        // event so downstream subscribers do not see dual
+                        // events for the same module_id.
+                        if is_ephemeral_module_id(&module_id_owned) {
+                            let payload = json!({
+                                "namespace_class": "ephemeral",
+                                "caller_id": "@external",
+                            });
+                            let canonical = ApCoreEvent::with_module(
+                                "apcore.registry.module_registered",
+                                payload,
+                                &module_id_owned,
+                                "info",
+                            );
+                            let em = emitter.lock().await;
+                            em.emit(&canonical).await;
+                            return;
+                        }
                         let canonical = ApCoreEvent::with_module(
                             "apcore.registry.module_registered",
                             json!({}),
@@ -698,6 +720,21 @@ pub fn register_sys_modules_with_options(
                 let module_id_owned = module_id.to_string();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
+                        if is_ephemeral_module_id(&module_id_owned) {
+                            let payload = json!({
+                                "namespace_class": "ephemeral",
+                                "caller_id": "@external",
+                            });
+                            let canonical = ApCoreEvent::with_module(
+                                "apcore.registry.module_unregistered",
+                                payload,
+                                &module_id_owned,
+                                "info",
+                            );
+                            let em = emitter.lock().await;
+                            em.emit(&canonical).await;
+                            return;
+                        }
                         let canonical = ApCoreEvent::with_module(
                             "apcore.registry.module_unregistered",
                             json!({}),

@@ -117,6 +117,29 @@ pub trait Module: Send + Sync {
         Vec::new()
     }
 
+    /// Optional preview hook — return a structured prediction of changes.
+    ///
+    /// Per the apcore RFC `docs/spec/rfc-preview-method.md` (Accepted, target
+    /// v0.21.0), called by `Executor::validate()` *after* the standard
+    /// validation pipeline has been processed. The default implementation
+    /// returns `None` (= the module declines to predict).
+    ///
+    /// **Contract (RFC §"Optional preview() method"):**
+    /// - MUST NOT have side effects.
+    /// - Returning `None` (or omitting the method) means "no predicted changes".
+    /// - Panicking is treated as advisory and does NOT fail validation; the
+    ///   error is surfaced as a warning via the `module_preview` check.
+    ///
+    /// Cross-language alignment: matches apcore-python `Module.preview` and
+    /// apcore-typescript `Module.preview?`.
+    fn preview(
+        &self,
+        _inputs: &serde_json::Value,
+        _ctx: Option<&Context<serde_json::Value>>,
+    ) -> Option<PreviewResult> {
+        None
+    }
+
     /// Called after the module is registered.
     ///
     /// Returns `Err` to signal that the module failed to initialise; the
@@ -164,6 +187,18 @@ pub struct ModuleAnnotations {
     pub cache_key_fields: Option<Vec<String>>,
     pub paginated: bool,
     pub pagination_style: String, // "cursor" | "offset" | "page"
+    /// Whether this module is enumerated by `Registry::list()` /
+    /// `Registry::iter()` / `Registry::module_ids()` by default.
+    ///
+    /// Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md` (Accepted,
+    /// target v0.21.0): defaults to `true`. Setting `discoverable: false`
+    /// hides the module from default enumeration without unregistering it;
+    /// callers that legitimately need to see every module ID can pass
+    /// `include_hidden=true` to the relevant Registry method.
+    ///
+    /// Cross-language alignment: matches `ModuleAnnotations.discoverable`
+    /// in apcore-python and apcore-typescript.
+    pub discoverable: bool,
     /// Extension map for ecosystem package metadata.
     /// Serialized as a nested `"extra"` object per spec §4.4.1.
     pub extra: HashMap<String, serde_json::Value>,
@@ -207,6 +242,7 @@ impl<'de> Deserialize<'de> for ModuleAnnotations {
                         "cache_key_fields" => ann.cache_key_fields = map.next_value()?,
                         "paginated" => ann.paginated = map.next_value()?,
                         "pagination_style" => ann.pagination_style = map.next_value()?,
+                        "discoverable" => ann.discoverable = map.next_value()?,
                         "extra" => {
                             // Tolerate `null` extra → empty map.
                             let v: serde_json::Value = map.next_value()?;
@@ -263,6 +299,7 @@ impl Default for ModuleAnnotations {
             cache_key_fields: None,
             paginated: false,
             pagination_style: "cursor".to_string(),
+            discoverable: true,
             extra: HashMap::new(),
         }
     }
@@ -325,9 +362,8 @@ pub struct PreflightCheckResult {
 /// Aggregated preflight results returned by `Executor::validate()` (spec §12.8.3).
 ///
 /// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields (e.g. `predicted_changes` per the upstream `preview()` RFC) without
-/// breaking downstream struct-literal construction. Construct via
-/// `..Default::default()` or a builder pattern.
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PreflightResult {
@@ -338,7 +374,139 @@ pub struct PreflightResult {
     /// True if the module has `requires_approval` annotation.
     #[serde(default)]
     pub requires_approval: bool,
+    /// Optional structured prediction of changes from the module's
+    /// `preview()` hook (RFC `docs/spec/rfc-preview-method.md`, target v0.21.0).
+    ///
+    /// - Empty when the module does not implement `preview()` or when
+    ///   `preview()` returned `None`.
+    /// - When `preview()` panics, this field is left empty and a
+    ///   `module_preview` advisory check carries the warning, mirroring
+    ///   `preflight()` semantics.
+    ///
+    /// Cross-language parity: matches `predicted_changes` /
+    /// `predictedChanges` in apcore-python and apcore-typescript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predicted_changes: Vec<Change>,
 }
+
+/// Structured prediction of a single side-effect produced by executing a
+/// module call.
+///
+/// Per the apcore RFC `docs/spec/rfc-preview-method.md` (Accepted, target
+/// v0.21.0). `action`, `target`, and `summary` are required; modules define
+/// their own free-form taxonomy for `action` (e.g. "write", "delete", "send",
+/// "charge", "publish") and `target` (e.g. "users.42", "smtp:user@example.com").
+///
+/// `before` / `after` are optional snapshots of prior / predicted state.
+///
+/// Extension fields with the `x-` prefix are permitted and round-trip via the
+/// `extra` map. Any unknown key on the wire that does NOT start with `x-` is
+/// rejected at deserialization time, matching the apcore-typescript TypeBox
+/// schema (which sets `additionalProperties: false`).
+///
+/// Marked `#[non_exhaustive]` so future spec extensions can add fields without
+/// breaking downstream struct-literal construction.
+#[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
+pub struct Change {
+    /// Free-form verb describing the kind of change (e.g. "write", "delete").
+    pub action: String,
+    /// Free-form identifier of what is changed (e.g. "users.42").
+    pub target: String,
+    /// Required, human-readable single-line summary of the change.
+    pub summary: String,
+    /// Optional. Snapshot of the prior state, when observable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<serde_json::Value>,
+    /// Optional. Predicted new state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<serde_json::Value>,
+    /// `x-*` extension fields (PROTOCOL_SPEC §4.4 / §4.6). Keys MUST start
+    /// with `x-`; deserialization rejects any other unknown keys.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for Change {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ChangeVisitor;
+
+        impl<'de> Visitor<'de> for ChangeVisitor {
+            type Value = Change;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a Change JSON object with action/target/summary and optional x-* extras")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Change, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut action: Option<String> = None;
+                let mut target: Option<String> = None;
+                let mut summary: Option<String> = None;
+                let mut before: Option<serde_json::Value> = None;
+                let mut after: Option<serde_json::Value> = None;
+                let mut extra: HashMap<String, serde_json::Value> = HashMap::new();
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "action" => action = Some(map.next_value()?),
+                        "target" => target = Some(map.next_value()?),
+                        "summary" => summary = Some(map.next_value()?),
+                        "before" => before = Some(map.next_value()?),
+                        "after" => after = Some(map.next_value()?),
+                        other => {
+                            // Per RFC `rfc-preview-method.md` (cross-SDK
+                            // schema-encoding table) any unknown key MUST
+                            // start with `x-`. Reject anything else.
+                            if !other.starts_with("x-") {
+                                return Err(serde::de::Error::custom(format!(
+                                    "Change has unknown key '{other}'; extension keys must start with 'x-'"
+                                )));
+                            }
+                            let v: serde_json::Value = map.next_value()?;
+                            extra.insert(other.to_string(), v);
+                        }
+                    }
+                }
+
+                Ok(Change {
+                    action: action.ok_or_else(|| serde::de::Error::missing_field("action"))?,
+                    target: target.ok_or_else(|| serde::de::Error::missing_field("target"))?,
+                    summary: summary.ok_or_else(|| serde::de::Error::missing_field("summary"))?,
+                    before,
+                    after,
+                    extra,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ChangeVisitor)
+    }
+}
+
+/// Module's structured prediction of the changes that calling `execute()`
+/// with the given inputs would produce. Returned by the optional
+/// [`Module::preview`] hook; folded into [`PreflightResult::predicted_changes`]
+/// by `Executor::validate()`.
+///
+/// Marked `#[non_exhaustive]` so future spec extensions can add fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PreviewResult {
+    /// Ordered list of predicted side-effects.
+    #[serde(default)]
+    pub changes: Vec<Change>,
+}
+
+/// Canonical name for the `module_preview` preflight check (PROTOCOL_SPEC
+/// §12.8.4 enum). Use this instead of the literal string to avoid drift with
+/// other SDKs.
+pub const MODULE_PREVIEW_CHECK_NAME: &str = "module_preview";
 
 impl PreflightResult {
     /// Computed view: failed checks as typed refs (idiomatic Rust accessor).

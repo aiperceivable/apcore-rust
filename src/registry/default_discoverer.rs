@@ -39,7 +39,8 @@ use crate::module::Module;
 use crate::registry::dependencies::resolve_dependencies;
 use crate::registry::metadata::{load_id_map, load_metadata, parse_dependencies};
 use crate::registry::registry::{
-    DiscoveredModule, Discoverer, ModuleDescriptor, MAX_MODULE_ID_LENGTH, RESERVED_WORDS,
+    is_ephemeral_module_id, DiscoveredModule, Discoverer, ModuleDescriptor,
+    EPHEMERAL_NAMESPACE_PREFIX, MAX_MODULE_ID_LENGTH, RESERVED_WORDS,
 };
 use crate::registry::scanner::scan_extensions;
 use crate::registry::types::{DepInfo, DiscoveredFile};
@@ -206,6 +207,36 @@ impl Discoverer for DefaultDiscoverer {
                 let meta = load_metadata(meta_path)?;
                 metadata_per_file.insert(file.file_path.clone(), meta);
             }
+        }
+
+        // Reject filesystem-derived IDs in the reserved ephemeral.* namespace.
+        //
+        // Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md` (target
+        // v0.21.0), `ephemeral.*` is reserved for programmatically-registered
+        // modules synthesized at runtime. Any filesystem layout that produces
+        // such an ID is a configuration error; we surface it as a hard
+        // ModuleError to match apcore-python's `_reject_ephemeral_discoveries`
+        // (which raises InvalidInputError).
+        let offenders: Vec<String> = discovered_files
+            .iter()
+            .filter(|dm| is_ephemeral_module_id(&dm.canonical_id))
+            .map(|dm| dm.canonical_id.clone())
+            .collect();
+        if !offenders.is_empty() {
+            let mut sorted = offenders;
+            sorted.sort();
+            sorted.dedup();
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Filesystem discovery produced module ID(s) in the reserved \
+                     '{EPHEMERAL_NAMESPACE_PREFIX}*' namespace: {sorted:?}. \
+                     The ephemeral.* namespace is reserved for \
+                     programmatically-registered modules and may only be used \
+                     via Registry::register(). Rename the offending directory \
+                     or extension namespace."
+                ),
+            ));
         }
 
         // Stage 4 + 5: resolve entry-point name, validate, and instantiate via

@@ -108,8 +108,9 @@ pub use middleware::{
     APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
 };
 pub use module::{
-    ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult, PreflightResult,
-    ValidationResult, DEFAULT_ANNOTATIONS,
+    Change, ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult,
+    PreflightResult, PreviewResult, ValidationResult, DEFAULT_ANNOTATIONS,
+    MODULE_PREVIEW_CHECK_NAME,
 };
 pub use observability::error_history::{
     compute_fingerprint, compute_fingerprint_from_error, normalize_message, ErrorEntry,
@@ -142,8 +143,9 @@ pub use pipeline_config::{
     build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,
 };
 pub use registry::registry::{
-    module_id_pattern, registry_events, Registry, RegistryEvents, DEFAULT_MODULE_VERSION,
-    MAX_MODULE_ID_LENGTH, MODULE_ID_PATTERN, REGISTRY_EVENTS, RESERVED_WORDS,
+    is_ephemeral_module_id, module_id_pattern, registry_events, Registry, RegistryEvents,
+    DEFAULT_MODULE_VERSION, EPHEMERAL_NAMESPACE_PREFIX, MAX_MODULE_ID_LENGTH, MODULE_ID_PATTERN,
+    REGISTRY_EVENTS, RESERVED_WORDS,
 };
 pub use registry::{
     class_name_to_segment, compute_base_id, derive_module_ids, detect_id_conflicts, ConflictResult,

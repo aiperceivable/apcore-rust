@@ -14,6 +14,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-05-06
+
+Aligns apcore-rust with PROTOCOL_SPEC.md v0.21.0 (apcore commit
+[`c191b85`](https://github.com/aiperceivable/apcore/commit/c191b85) — RFCs
+`docs/spec/rfc-preview-method.md` and `docs/spec/rfc-ephemeral-modules.md`
+promoted to `Accepted`). Mirrors the
+[apcore-python](https://github.com/aiperceivable/apcore-python) commit
+`203a9a6` (Stage 2 reference impl) and the
+[apcore-typescript](https://github.com/aiperceivable/apcore-typescript) commit
+`577b09b` (Stage 3 reference impl).
+
+### Added
+
+- **`Module::preview()` optional trait method (PROTOCOL_SPEC §5.6).** Returns
+  `Option<PreviewResult>` describing structured predictions of state changes
+  the call would produce. Default impl returns `None`. MUST NOT have side
+  effects. Mirrors `apcore-python Module.preview` and
+  `apcore-typescript Module.preview?`.
+- **`Change` and `PreviewResult` structs (PROTOCOL_SPEC §12.8).** Both
+  `#[non_exhaustive]` with `Default` impls. `Change` uses the Rust idiomatic
+  `^x-` extension encoding from RFC `rfc-preview-method.md`'s "Change.x-*
+  extension fields" cross-SDK table: `#[serde(flatten)] extra: HashMap<String,
+  Value>` paired with a constructor-time validator that rejects unknown
+  non-`x-` keys. `PreflightResult.predicted_changes: Vec<Change>` field
+  added; `PreflightCheckResult.check` enum extended with `module_preview`.
+- **`Executor::validate()` wiring of `preview()`.** Invoked after the
+  standard validation pipeline; the result is folded into
+  `PreflightResult.predicted_changes`. Panics during `preview()` are caught
+  via `catch_unwind` and surfaced as warnings on a `module_preview` check
+  entry — validation does NOT fail. Mirrors `preflight()` exception
+  semantics (RFC Open Question 1).
+- **`ephemeral.*` namespace reservation (PROTOCOL_SPEC §2.5 / RFC
+  `rfc-ephemeral-modules`).** New exported `EPHEMERAL_NAMESPACE_PREFIX`
+  constant and `is_ephemeral_module_id()` helper. Filesystem discovery
+  (`default_discoverer`) rejects any module ID falling under the
+  `ephemeral.*` namespace with a clear error pointing the caller to
+  `Registry::register()`. Reserved for programmatically-registered modules
+  synthesized at runtime (Agent-synthesized tools, on-the-fly composition).
+- **`ModuleAnnotations.discoverable: bool` (PROTOCOL_SPEC §4.4).** Defaults
+  to `true`. When `false` the module is hidden from `Registry::list()` /
+  `iter()` / `module_ids()` but remains callable by exact ID. Pass
+  `include_hidden=true` to enumerate every registered module. `ephemeral.*`
+  modules SHOULD set `discoverable: false`.
+- **Audit-event single-emit rule for `ephemeral.*` registrations.** For
+  `ephemeral.*` modules, exactly one canonical
+  `apcore.registry.module_registered` / `module_unregistered` event is
+  emitted with the D-35 contextual payload (`caller_id` defaulting to
+  `"@external"`, optional `identity` snapshot, `namespace_class:
+  "ephemeral"`). The `RegistryEvents` callback bridge short-circuits on
+  `ephemeral.*` IDs so the empty-payload bridge emit does not double-fire.
+  Non-ephemeral modules retain the existing empty-payload bridge behavior
+  verbatim.
+- **Soft-warning when an `ephemeral.*` module is registered without
+  `requires_approval: true`.** `tracing::warn!(...)` per the RFC
+  ("agent-synthesized modules SHOULD declare `requires_approval: true` so a
+  human gates execution"). Registration is never refused — warning only.
+- **`Registry::register_internal()` rejects `ephemeral.*` IDs.** Returns
+  `Err(ModuleError::InvalidInput)` pointing the caller to
+  `Registry::register()`. Per the RFC's "register_internal() interaction"
+  rule: namespace prefix → registration mechanism is a 1:1 mapping;
+  `system.*` only via `register_internal()`, `ephemeral.*` only via
+  `register()`.
+
+### Changed
+
+- **`PreflightResult` extended with `predicted_changes` field.** Already
+  marked `#[non_exhaustive]` in v0.20.x via [#24], so the addition is
+  forward-compatible: external callers using the
+  `Default::default()` + mutation pattern continue to compile unchanged.
+
+### Lifecycle
+
+- **Caller-managed.** `ephemeral.*` modules live until the caller explicitly
+  calls `Registry::unregister(module_id)`. There is no TTL sweeper or
+  background GC — TTL-driven cleanup is deferred to a v2 follow-up if
+  leakage is observed in practice.
+
+[apcore-c191b85]: https://github.com/aiperceivable/apcore/commit/c191b85
+[apcore-rfc-preview]: https://github.com/aiperceivable/apcore/blob/main/docs/spec/rfc-preview-method.md
+[apcore-rfc-ephemeral]: https://github.com/aiperceivable/apcore/blob/main/docs/spec/rfc-ephemeral-modules.md
+
 ### Changed
 
 - **Spec-derived public structs marked `#[non_exhaustive]`** ([#24]). The
