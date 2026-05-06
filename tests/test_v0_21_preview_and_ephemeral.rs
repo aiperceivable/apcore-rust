@@ -91,20 +91,14 @@ impl Module for PreviewingModule {
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         Ok(json!({"ok": true}))
     }
-    fn preview(
-        &self,
-        _inputs: &Value,
-        _ctx: Option<&Context<Value>>,
-    ) -> Option<PreviewResult> {
+    fn preview(&self, _inputs: &Value, _ctx: Option<&Context<Value>>) -> Option<PreviewResult> {
         let mut change = Change::default();
         change.action = "write".to_string();
         change.target = "users.42".to_string();
         change.summary = "Update user 42's email".to_string();
         change.before = Some(json!({"email": "old@example.com"}));
         change.after = Some(json!({"email": "new@example.com"}));
-        change
-            .extra
-            .insert("x-priority".to_string(), json!("high"));
+        change.extra.insert("x-priority".to_string(), json!("high"));
         let mut result = PreviewResult::default();
         result.changes = vec![change];
         Some(result)
@@ -128,11 +122,7 @@ impl Module for PanickyPreviewModule {
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         Ok(json!({}))
     }
-    fn preview(
-        &self,
-        _inputs: &Value,
-        _ctx: Option<&Context<Value>>,
-    ) -> Option<PreviewResult> {
+    fn preview(&self, _inputs: &Value, _ctx: Option<&Context<Value>>) -> Option<PreviewResult> {
         panic!("preview blew up");
     }
 }
@@ -221,10 +211,7 @@ async fn test_executor_validate_default_preview_returns_empty_predicted_changes(
     );
     // No module_preview check should be present when preview() returned None.
     assert!(
-        !result
-            .checks
-            .iter()
-            .any(|c| c.check == "module_preview"),
+        !result.checks.iter().any(|c| c.check == "module_preview"),
         "no module_preview check expected for default impl"
     );
 }

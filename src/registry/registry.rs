@@ -199,10 +199,7 @@ pub fn is_ephemeral_module_id(module_id: &str) -> bool {
 /// Aligned with apcore-python's `Registry._is_discoverable`.
 fn descriptor_is_discoverable(descriptor: Option<&ModuleDescriptor>) -> bool {
     match descriptor {
-        Some(desc) => desc
-            .annotations
-            .as_ref()
-            .is_none_or(|ann| ann.discoverable),
+        Some(desc) => desc.annotations.as_ref().is_none_or(|ann| ann.discoverable),
         None => true,
     }
 }
@@ -705,7 +702,9 @@ impl Registry {
             .modules
             .keys()
             .filter(|name| {
-                if !include_hidden && !descriptor_is_discoverable(core.descriptors.get(name.as_str())) {
+                if !include_hidden
+                    && !descriptor_is_discoverable(core.descriptors.get(name.as_str()))
+                {
                     return false;
                 }
                 if let Some(pfx) = prefix {
@@ -1523,8 +1522,7 @@ impl Registry {
             .modules
             .keys()
             .filter(|name| {
-                include_hidden
-                    || descriptor_is_discoverable(core.descriptors.get(name.as_str()))
+                include_hidden || descriptor_is_discoverable(core.descriptors.get(name.as_str()))
             })
             .cloned()
             .collect();

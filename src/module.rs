@@ -438,7 +438,9 @@ impl<'de> Deserialize<'de> for Change {
             type Value = Change;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a Change JSON object with action/target/summary and optional x-* extras")
+                f.write_str(
+                    "a Change JSON object with action/target/summary and optional x-* extras",
+                )
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Change, M::Error>
