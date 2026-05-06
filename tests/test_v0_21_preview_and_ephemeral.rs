@@ -326,7 +326,7 @@ fn test_register_internal_rejects_ephemeral_ids() {
         make_descriptor("ephemeral.agent.task", ModuleAnnotations::default()),
     );
     let err = result.expect_err("register_internal must reject ephemeral.* IDs");
-    let msg = format!("{}", err.message);
+    let msg = err.message.clone();
     assert!(
         msg.contains("ephemeral.*") && msg.contains("Registry::register"),
         "error message must reference ephemeral.* and the public register entry point: {msg}"
@@ -336,8 +336,10 @@ fn test_register_internal_rejects_ephemeral_ids() {
 #[test]
 fn test_register_accepts_ephemeral_ids() {
     let registry = Registry::new();
-    let mut ann = ModuleAnnotations::default();
-    ann.requires_approval = true;
+    let ann = ModuleAnnotations {
+        requires_approval: true,
+        ..ModuleAnnotations::default()
+    };
     let result = registry.register(
         "ephemeral.agent.draft_email",
         Box::new(PlainModule),
@@ -358,8 +360,10 @@ fn test_module_annotations_discoverable_default_is_true() {
 
 #[test]
 fn test_module_annotations_discoverable_round_trip() {
-    let mut ann = ModuleAnnotations::default();
-    ann.discoverable = false;
+    let ann = ModuleAnnotations {
+        discoverable: false,
+        ..ModuleAnnotations::default()
+    };
     let v = serde_json::to_value(&ann).unwrap();
     assert_eq!(v.get("discoverable"), Some(&json!(false)));
     let round_tripped: ModuleAnnotations = serde_json::from_value(v).unwrap();
@@ -399,8 +403,10 @@ fn test_registry_list_excludes_hidden_modules_by_default() {
         )
         .unwrap();
     // Hidden module
-    let mut hidden_ann = ModuleAnnotations::default();
-    hidden_ann.discoverable = false;
+    let hidden_ann = ModuleAnnotations {
+        discoverable: false,
+        ..ModuleAnnotations::default()
+    };
     registry
         .register(
             "secret.tool",
@@ -441,8 +447,10 @@ fn test_registry_list_excludes_hidden_modules_by_default() {
 fn test_registry_unregister_caller_managed_lifecycle() {
     // Per RFC: ephemeral.* lifecycle is caller-managed via Registry::unregister().
     let registry = Registry::new();
-    let mut ann = ModuleAnnotations::default();
-    ann.requires_approval = true;
+    let ann = ModuleAnnotations {
+        requires_approval: true,
+        ..ModuleAnnotations::default()
+    };
     registry
         .register(
             "ephemeral.task.x",
@@ -499,8 +507,7 @@ fn test_ephemeral_register_without_approval_succeeds_with_soft_warn() {
     );
     assert!(
         result.is_ok(),
-        "soft-warn must not fail registration: {:?}",
-        result
+        "soft-warn must not fail registration: {result:?}"
     );
     assert!(registry.has("ephemeral.unsafe.x"));
 }
