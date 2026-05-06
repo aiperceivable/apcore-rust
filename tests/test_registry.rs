@@ -602,11 +602,10 @@ mod discoverer_tests {
             _descriptor: Option<&ModuleDescriptor>,
         ) -> ValidationResult {
             self.called.fetch_add(1, Ordering::SeqCst);
-            ValidationResult {
-                valid: false,
-                errors: vec!["rejected by test validator".to_string()],
-                warnings: vec![],
-            }
+            let mut r = ValidationResult::default();
+            r.valid = false;
+            r.errors = vec!["rejected by test validator".to_string()];
+            r
         }
     }
 
@@ -973,11 +972,9 @@ mod lifecycle_tests {
                 // Re-entering the registry during validation must NOT deadlock.
                 // We replace the validator — this takes the validator write lock.
                 self.registry.set_validator(Box::new(PermissiveValidator));
-                ValidationResult {
-                    valid: true,
-                    errors: vec![],
-                    warnings: vec![],
-                }
+                let mut r = ValidationResult::default();
+                r.valid = true;
+                r
             }
         }
 
@@ -988,11 +985,9 @@ mod lifecycle_tests {
                 _module: &dyn Module,
                 _descriptor: Option<&ModuleDescriptor>,
             ) -> ValidationResult {
-                ValidationResult {
-                    valid: true,
-                    errors: vec![],
-                    warnings: vec![],
-                }
+                let mut r = ValidationResult::default();
+                r.valid = true;
+                r
             }
         }
 

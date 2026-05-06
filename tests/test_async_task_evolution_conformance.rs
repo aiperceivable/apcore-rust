@@ -268,12 +268,11 @@ async fn case_retry_scheduled_on_failure() {
     let fixture = load_fixture();
     let case = fixture_case(&fixture, "retry_scheduled_on_failure");
     let cfg = &case["retry_config"];
-    let retry = RetryConfig {
-        max_retries: u32::try_from(cfg["max_retries"].as_u64().unwrap()).unwrap(),
-        retry_delay_ms: cfg["retry_delay_ms"].as_u64().unwrap(),
-        backoff_multiplier: cfg["backoff_multiplier"].as_f64().unwrap(),
-        max_retry_delay_ms: cfg["max_retry_delay_ms"].as_u64().unwrap(),
-    };
+    let mut retry = RetryConfig::default();
+    retry.max_retries = u32::try_from(cfg["max_retries"].as_u64().unwrap()).unwrap();
+    retry.retry_delay_ms = cfg["retry_delay_ms"].as_u64().unwrap();
+    retry.backoff_multiplier = cfg["backoff_multiplier"].as_f64().unwrap();
+    retry.max_retry_delay_ms = cfg["max_retry_delay_ms"].as_u64().unwrap();
 
     // Use a long retry delay (1s per the fixture) so we can observe the
     // "scheduled retry" intermediate state before the retry sleep elapses.
@@ -324,12 +323,11 @@ async fn case_max_retries_exhausted_becomes_failed() {
     let fixture = load_fixture();
     let case = fixture_case(&fixture, "max_retries_exhausted_becomes_failed");
     let cfg = &case["retry_config"];
-    let retry = RetryConfig {
-        max_retries: u32::try_from(cfg["max_retries"].as_u64().unwrap()).unwrap(),
-        retry_delay_ms: cfg["retry_delay_ms"].as_u64().unwrap(),
-        backoff_multiplier: cfg["backoff_multiplier"].as_f64().unwrap(),
-        max_retry_delay_ms: cfg["max_retry_delay_ms"].as_u64().unwrap(),
-    };
+    let mut retry = RetryConfig::default();
+    retry.max_retries = u32::try_from(cfg["max_retries"].as_u64().unwrap()).unwrap();
+    retry.retry_delay_ms = cfg["retry_delay_ms"].as_u64().unwrap();
+    retry.backoff_multiplier = cfg["backoff_multiplier"].as_f64().unwrap();
+    retry.max_retry_delay_ms = cfg["max_retry_delay_ms"].as_u64().unwrap();
 
     let (executor, calls) =
         make_executor_with_failing_module("worker.always_fails", "persistent_error");
@@ -385,12 +383,11 @@ async fn case_backoff_multiplier_applied() {
     let fixture = load_fixture();
     let case = fixture_case(&fixture, "backoff_multiplier_applied");
     let cfg = &case["retry_config"];
-    let retry = RetryConfig {
-        max_retries: 100, // not exercised
-        retry_delay_ms: cfg["retry_delay_ms"].as_u64().unwrap(),
-        backoff_multiplier: cfg["backoff_multiplier"].as_f64().unwrap(),
-        max_retry_delay_ms: cfg["max_retry_delay_ms"].as_u64().unwrap(),
-    };
+    let mut retry = RetryConfig::default();
+    retry.max_retries = 100; // not exercised
+    retry.retry_delay_ms = cfg["retry_delay_ms"].as_u64().unwrap();
+    retry.backoff_multiplier = cfg["backoff_multiplier"].as_f64().unwrap();
+    retry.max_retry_delay_ms = cfg["max_retry_delay_ms"].as_u64().unwrap();
     let exp = &case["expected"];
     assert_eq!(
         retry.compute_delay_ms(0),
@@ -568,21 +565,14 @@ async fn case_reaper_skips_running_tasks() {
 async fn reaper_handle_starts_and_stops_gracefully() {
     let store = Arc::new(InMemoryTaskStore::new());
     // Seed one expired terminal task.
-    store
-        .save(&TaskInfo {
-            task_id: "stale".into(),
-            module_id: "m".into(),
-            status: TaskStatus::Completed,
-            submitted_at: 0.0,
-            started_at: Some(0.0),
-            completed_at: Some(0.0),
-            result: None,
-            error: None,
-            retry_count: 0,
-            max_retries: 0,
-        })
-        .await
-        .unwrap();
+    let mut stale = TaskInfo::default();
+    stale.task_id = "stale".into();
+    stale.module_id = "m".into();
+    stale.status = TaskStatus::Completed;
+    stale.submitted_at = 0.0;
+    stale.started_at = Some(0.0);
+    stale.completed_at = Some(0.0);
+    store.save(&stale).await.unwrap();
 
     let mgr = AsyncTaskManager::with_store(
         make_bare_executor(),
@@ -590,10 +580,10 @@ async fn reaper_handle_starts_and_stops_gracefully() {
         100,
         store.clone() as Arc<dyn TaskStore>,
     );
-    let handle = mgr.start_reaper(ReaperConfig {
-        ttl_seconds: 1.0,
-        sweep_interval_ms: 50,
-    });
+    let mut reaper_cfg = ReaperConfig::default();
+    reaper_cfg.ttl_seconds = 1.0;
+    reaper_cfg.sweep_interval_ms = 50;
+    let handle = mgr.start_reaper(reaper_cfg);
 
     // Allow at least one sweep to run.
     tokio::time::sleep(Duration::from_millis(200)).await;

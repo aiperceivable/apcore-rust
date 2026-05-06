@@ -87,8 +87,13 @@ const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
 /// Executor namespace configuration (`PROTOCOL_SPEC` §9.1).
 ///
 /// All timeouts are in milliseconds.
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct ExecutorConfig {
     /// Per-module execution timeout (milliseconds). 0 means no per-module timeout.
     pub default_timeout: u64,
@@ -112,21 +117,36 @@ impl Default for ExecutorConfig {
 }
 
 /// Observability namespace configuration (`PROTOCOL_SPEC` §9.1).
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct ObservabilityConfig {
     pub tracing: TracingConfig,
     pub metrics: MetricsConfig,
 }
 
+/// Tracing sub-config of `ObservabilityConfig` (`PROTOCOL_SPEC` §9.1).
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct TracingConfig {
     pub enabled: bool,
 }
 
+/// Metrics sub-config of `ObservabilityConfig` (`PROTOCOL_SPEC` §9.1).
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct MetricsConfig {
     pub enabled: bool,
 }

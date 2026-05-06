@@ -435,12 +435,11 @@ fn test_schema_exporter_export_def_anthropic_includes_input_examples() {
         definitions: None,
         version: None,
     };
-    let examples = vec![ModuleExample {
-        title: "hello".to_string(),
-        description: None,
-        inputs: json!({"text": "hi"}),
-        output: json!({"text": "hi"}),
-    }];
+    let mut ex = ModuleExample::default();
+    ex.title = "hello".to_string();
+    ex.inputs = json!({"text": "hi"});
+    ex.output = json!({"text": "hi"});
+    let examples = vec![ex];
     let envelope = exporter
         .export_def(&def, ExportProfile::Anthropic, None, Some(&examples), None)
         .unwrap();

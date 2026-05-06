@@ -273,7 +273,12 @@ pub static DEFAULT_ANNOTATIONS: LazyLock<ModuleAnnotations> =
     LazyLock::new(ModuleAnnotations::default);
 
 /// An example input/output pair for documentation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ModuleExample {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -283,7 +288,12 @@ pub struct ModuleExample {
 }
 
 /// Result of validating a single aspect (used by `SchemaValidator` and `ModuleValidator`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ValidationResult {
     pub valid: bool,
     #[serde(default)]
@@ -293,7 +303,12 @@ pub struct ValidationResult {
 }
 
 /// Result of a single preflight check (spec §12.8.4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PreflightCheckResult {
     /// Check name (e.g., "`module_id`", "`module_lookup`", "`call_chain`", "acl", "schema", "`module_preflight`").
     pub check: String,
@@ -308,7 +323,13 @@ pub struct PreflightCheckResult {
 }
 
 /// Aggregated preflight results returned by `Executor::validate()` (spec §12.8.3).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields (e.g. `predicted_changes` per the upstream `preview()` RFC) without
+/// breaking downstream struct-literal construction. Construct via
+/// `..Default::default()` or a builder pattern.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PreflightResult {
     /// True only if ALL checks passed.
     pub valid: bool,

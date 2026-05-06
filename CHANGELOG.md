@@ -12,6 +12,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **Spec-derived public structs marked `#[non_exhaustive]`** ([#24]). The
+  following protocol-derived public structs are now `#[non_exhaustive]` so the
+  SDK can add fields in future minor versions (e.g. the `predicted_changes`
+  field proposed in the upstream `preview()` RFC) without breaking downstream
+  consumers. **No behavior change** — this is forward-compatibility hygiene
+  only. All affected structs now also implement `Default` so callers can
+  construct them via mutation.
+
+  Marked structs:
+
+  - `apcore::module::PreflightResult` (`src/module.rs`)
+  - `apcore::module::PreflightCheckResult` (`src/module.rs`)
+  - `apcore::module::ValidationResult` (`src/module.rs`)
+  - `apcore::module::ModuleExample` (`src/module.rs`)
+  - `apcore::approval::ApprovalRequest` (`src/approval.rs`)
+  - `apcore::approval::ApprovalResult` (`src/approval.rs`)
+  - `apcore::config::ExecutorConfig` (`src/config.rs`)
+  - `apcore::config::ObservabilityConfig` (`src/config.rs`)
+  - `apcore::config::TracingConfig` (`src/config.rs`)
+  - `apcore::config::MetricsConfig` (`src/config.rs`)
+  - `apcore::async_task::RetryConfig` (`src/async_task.rs`)
+  - `apcore::async_task::ReaperConfig` (`src/async_task.rs`)
+  - `apcore::async_task::TaskInfo` (`src/async_task.rs`)
+  - `apcore::middleware::RetryConfig` (`src/middleware/retry.rs`)
+
+  **Migration for downstream consumers.** Per Rust's `#[non_exhaustive]`
+  semantics, struct-literal construction from outside this crate is no longer
+  permitted (E0639), even with functional record update (`..Default::default()`)
+  syntax. Use `Default` + mutation instead:
+
+  ```rust
+  // Before:
+  let r = PreflightResult { valid: true, checks: vec![], requires_approval: false };
+
+  // After:
+  let mut r = PreflightResult::default();
+  r.valid = true;
+  // r.checks and r.requires_approval default to empty / false
+  ```
+
+  Pattern matching against these structs from outside the crate must also use
+  a trailing `..` rest pattern.
+
+  `ApprovalRequest::module_id`, `ApprovalResult::status`, `TaskInfo::task_id`,
+  and `TaskInfo::module_id` default to empty strings — callers SHOULD set them
+  explicitly. `Default` is provided purely so downstream code can use the
+  mutation-after-default construction pattern.
+
+[#24]: https://github.com/aiperceivable/apcore-rust/issues/24
+
+---
+
 ## [0.20.0] - 2026-05-05
 
 ### Added

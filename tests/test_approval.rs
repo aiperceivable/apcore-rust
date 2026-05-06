@@ -6,7 +6,6 @@ use serde_json::json;
 use apcore::approval::{
     AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,
 };
-use apcore::module::ModuleAnnotations;
 
 // ---------------------------------------------------------------------------
 // ApprovalRequest construction and serialization
@@ -14,14 +13,9 @@ use apcore::module::ModuleAnnotations;
 
 #[test]
 fn test_approval_request_minimal() {
-    let req = ApprovalRequest {
-        module_id: "executor.email.send".to_string(),
-        arguments: json!({"to": "user@example.com"}),
-        context: None,
-        annotations: ModuleAnnotations::default(),
-        description: None,
-        tags: vec![],
-    };
+    let mut req = ApprovalRequest::default();
+    req.module_id = "executor.email.send".to_string();
+    req.arguments = json!({"to": "user@example.com"});
     assert_eq!(req.module_id, "executor.email.send");
     assert!(req.description.is_none());
     assert!(req.tags.is_empty());
@@ -29,28 +23,22 @@ fn test_approval_request_minimal() {
 
 #[test]
 fn test_approval_request_with_description_and_tags() {
-    let req = ApprovalRequest {
-        module_id: "executor.fs.delete".to_string(),
-        arguments: json!({"path": "/tmp/data"}),
-        context: None,
-        annotations: ModuleAnnotations::default(),
-        description: Some("Delete temporary data".to_string()),
-        tags: vec!["destructive".to_string(), "filesystem".to_string()],
-    };
+    let mut req = ApprovalRequest::default();
+    req.module_id = "executor.fs.delete".to_string();
+    req.arguments = json!({"path": "/tmp/data"});
+    req.description = Some("Delete temporary data".to_string());
+    req.tags = vec!["destructive".to_string(), "filesystem".to_string()];
     assert_eq!(req.description.as_deref(), Some("Delete temporary data"));
     assert_eq!(req.tags.len(), 2);
 }
 
 #[test]
 fn test_approval_request_serialization_roundtrip() {
-    let req = ApprovalRequest {
-        module_id: "mod.a".to_string(),
-        arguments: json!({"x": 1}),
-        context: None,
-        annotations: ModuleAnnotations::default(),
-        description: Some("test".to_string()),
-        tags: vec!["tag1".to_string()],
-    };
+    let mut req = ApprovalRequest::default();
+    req.module_id = "mod.a".to_string();
+    req.arguments = json!({"x": 1});
+    req.description = Some("test".to_string());
+    req.tags = vec!["tag1".to_string()];
     let json_str = serde_json::to_string(&req).expect("serialize");
     let restored: ApprovalRequest = serde_json::from_str(&json_str).expect("deserialize");
     assert_eq!(restored.module_id, "mod.a");
@@ -66,13 +54,10 @@ fn test_approval_request_serialization_roundtrip() {
 
 #[test]
 fn test_approval_result_approved() {
-    let result = ApprovalResult {
-        status: "approved".to_string(),
-        approved_by: Some("admin".to_string()),
-        reason: None,
-        approval_id: Some("apr-123".to_string()),
-        metadata: None,
-    };
+    let mut result = ApprovalResult::default();
+    result.status = "approved".to_string();
+    result.approved_by = Some("admin".to_string());
+    result.approval_id = Some("apr-123".to_string());
     assert_eq!(result.status, "approved");
     assert_eq!(result.approved_by.as_deref(), Some("admin"));
     assert_eq!(result.approval_id.as_deref(), Some("apr-123"));
@@ -80,26 +65,17 @@ fn test_approval_result_approved() {
 
 #[test]
 fn test_approval_result_rejected() {
-    let result = ApprovalResult {
-        status: "rejected".to_string(),
-        approved_by: None,
-        reason: Some("Policy violation".to_string()),
-        approval_id: None,
-        metadata: None,
-    };
+    let mut result = ApprovalResult::default();
+    result.status = "rejected".to_string();
+    result.reason = Some("Policy violation".to_string());
     assert_eq!(result.status, "rejected");
     assert_eq!(result.reason.as_deref(), Some("Policy violation"));
 }
 
 #[test]
 fn test_approval_result_serialization_omits_none() {
-    let result = ApprovalResult {
-        status: "approved".to_string(),
-        approved_by: None,
-        reason: None,
-        approval_id: None,
-        metadata: None,
-    };
+    let mut result = ApprovalResult::default();
+    result.status = "approved".to_string();
     let v = serde_json::to_value(&result).expect("serialize");
     assert!(v.get("approved_by").is_none());
     assert!(v.get("reason").is_none());
@@ -114,14 +90,9 @@ fn test_approval_result_serialization_omits_none() {
 #[tokio::test]
 async fn test_auto_approve_handler_request_approval() {
     let handler = AutoApproveHandler;
-    let req = ApprovalRequest {
-        module_id: "test.mod".to_string(),
-        arguments: json!({}),
-        context: None,
-        annotations: ModuleAnnotations::default(),
-        description: None,
-        tags: vec![],
-    };
+    let mut req = ApprovalRequest::default();
+    req.module_id = "test.mod".to_string();
+    req.arguments = json!({});
     let result = handler
         .request_approval(&req)
         .await
@@ -148,14 +119,9 @@ async fn test_auto_approve_handler_check_approval() {
 #[tokio::test]
 async fn test_always_deny_handler_request_approval() {
     let handler = AlwaysDenyHandler;
-    let req = ApprovalRequest {
-        module_id: "test.mod".to_string(),
-        arguments: json!({}),
-        context: None,
-        annotations: ModuleAnnotations::default(),
-        description: None,
-        tags: vec![],
-    };
+    let mut req = ApprovalRequest::default();
+    req.module_id = "test.mod".to_string();
+    req.arguments = json!({});
     let result = handler
         .request_approval(&req)
         .await
@@ -185,14 +151,9 @@ async fn test_handler_as_trait_object() {
     let handlers: Vec<Box<dyn ApprovalHandler>> =
         vec![Box::new(AutoApproveHandler), Box::new(AlwaysDenyHandler)];
 
-    let req = ApprovalRequest {
-        module_id: "test.mod".to_string(),
-        arguments: json!({}),
-        context: None,
-        annotations: ModuleAnnotations::default(),
-        description: None,
-        tags: vec![],
-    };
+    let mut req = ApprovalRequest::default();
+    req.module_id = "test.mod".to_string();
+    req.arguments = json!({});
 
     let approve_result = handlers[0].request_approval(&req).await.unwrap();
     assert_eq!(approve_result.status, "approved");

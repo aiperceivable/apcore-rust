@@ -48,12 +48,11 @@ async fn test_function_module_with_description_preserves_metadata() {
     let mut metadata = HashMap::new();
     metadata.insert("owner".to_string(), json!("platform-team"));
 
-    let examples = vec![ModuleExample {
-        title: "basic".to_string(),
-        description: None,
-        inputs: json!({ "x": 1 }),
-        output: json!({ "echoed": { "x": 1 } }),
-    }];
+    let mut ex = ModuleExample::default();
+    ex.title = "basic".to_string();
+    ex.inputs = json!({ "x": 1 });
+    ex.output = json!({ "echoed": { "x": 1 } });
+    let examples = vec![ex];
 
     let fm = FunctionModule::with_description(
         ModuleAnnotations::default(),

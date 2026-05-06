@@ -13,7 +13,12 @@ use crate::context::Context;
 use crate::errors::ModuleError;
 
 /// Configuration for retry behavior.
+///
+/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
+/// fields without breaking downstream struct-literal construction. Construct
+/// via `..Default::default()` or a builder pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RetryConfig {
     pub max_retries: u32,
     /// Backoff strategy: "exponential" or "fixed".
