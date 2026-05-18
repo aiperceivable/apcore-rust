@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 
+## [0.22.0] - 2026-05-18
+
+### Added
+
+- **`Config::reserved_namespaces()` associated function + `pub const RESERVED_NAMESPACES` (PROTOCOL_SPEC §9.9.5, [apcore#60](https://github.com/aiperceivable/apcore/issues/60)).** Implements the new normative requirement that all SDKs MUST expose a public, read-only query API returning the set of reserved top-level namespace names. The private `const RESERVED_NAMESPACES: &[&str]` is promoted to `pub const` and re-exported from the crate root; the new associated function returns it via `&'static [&'static str]`. Single source of truth — `Config::register_namespace` continues to consult the same slice and return `ErrorCode::ConfigNamespaceReserved` for any name it contains. Callable without a `Config` instance. Intended for third-party consumers (custom CLIs, framework integrations) that accept user-supplied namespace names and need fail-fast pre-validation. Idiomatic Rust slice (not `HashSet`) — the small compile-time-known set makes `.contains(&name)` trivially efficient and avoids runtime initialisation overhead.
+
+---
+
 ## [0.21.0] - 2026-05-06
 
 Aligns apcore-rust with PROTOCOL_SPEC.md v0.21.0 (apcore commit

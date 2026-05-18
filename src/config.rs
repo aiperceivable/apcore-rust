@@ -82,7 +82,21 @@ fn env_map_claimed() -> &'static RwLock<HashMap<String, String>> {
     ENV_MAP_CLAIMED.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
+/// Top-level namespace names reserved by the apcore framework.
+///
+/// External callers **MUST NOT** register a namespace whose name appears in
+/// this slice. Attempts to do so via [`Config::register_namespace`] fail with
+/// `CONFIG_NAMESPACE_RESERVED`.
+///
+/// This is the single source of truth referenced by both
+/// [`Config::register_namespace`] (enforcement) and
+/// [`Config::reserved_namespaces`] (public query API). See
+/// `PROTOCOL_SPEC` §9.5.1 (rules 3 and 4) and §9.9.5 for the normative
+/// definition.
+///
+/// The slice is `'static` and inherently immutable from the caller's
+/// perspective, satisfying §9.9.5 requirement (3).
+pub const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
 
 /// Executor namespace configuration (`PROTOCOL_SPEC` §9.1).
 ///
@@ -688,6 +702,20 @@ impl Config {
                 has_schema: r.schema.is_some(),
             })
             .collect()
+    }
+
+    /// Return the set of top-level namespace names reserved by the apcore
+    /// framework (`PROTOCOL_SPEC` §9.9.5).
+    ///
+    /// The returned slice is the single source of truth referenced by
+    /// [`Config::register_namespace`] to enforce `CONFIG_NAMESPACE_RESERVED`
+    /// (§9.5.1 rules 3 and 4). It is callable without instantiating a
+    /// `Config`, so third-party consumers (custom CLIs, framework
+    /// integrations) can fail-fast on user-supplied namespace names before
+    /// invoking [`Config::register_namespace`].
+    #[must_use]
+    pub fn reserved_namespaces() -> &'static [&'static str] {
+        RESERVED_NAMESPACES
     }
 
     // --- Namespace instance methods ---

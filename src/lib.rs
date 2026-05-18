@@ -70,7 +70,7 @@ pub use cancel::{CancelToken, ExecutionCancelledError};
 pub use client::APCore;
 pub use config::{
     Config, ConfigMode, EnvStyle, ExecutorConfig, MetricsConfig, MountSource, NamespaceInfo,
-    NamespaceRegistration, ObservabilityConfig, TracingConfig,
+    NamespaceRegistration, ObservabilityConfig, TracingConfig, RESERVED_NAMESPACES,
 };
 pub use context::{Context, ContextFactory, Identity};
 pub use context_key::ContextKey;

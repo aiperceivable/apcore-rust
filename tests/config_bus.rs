@@ -42,6 +42,55 @@ fn test_register_namespace_reserved_config_name_returns_error() {
     assert_eq!(result.unwrap_err().code, ErrorCode::ConfigNamespaceReserved);
 }
 
+// PROTOCOL_SPEC §9.9.5 — Reserved namespace public query API.
+#[test]
+fn test_reserved_namespaces_contains_apcore_and_config() {
+    let reserved = Config::reserved_namespaces();
+    assert!(reserved.contains(&"apcore"));
+    assert!(reserved.contains(&"_config"));
+}
+
+#[test]
+fn test_reserved_namespaces_matches_public_const() {
+    // Single source of truth (§9.9.5 req 2): the query API and the public
+    // const MUST yield the same set of names. We compare by value because
+    // Rust may inline `const` items at each use site (slice descriptors are
+    // not guaranteed pointer-equal even when referring to the same data).
+    let from_fn = Config::reserved_namespaces();
+    let from_const: &'static [&'static str] = apcore::RESERVED_NAMESPACES;
+    assert_eq!(from_fn, from_const);
+}
+
+#[test]
+fn test_reserved_namespaces_drive_register_namespace_enforcement() {
+    // Behavioural single-source-of-truth: every name returned by the query
+    // API MUST be rejected by `register_namespace`. This is the contract
+    // §9.9.5 req 2 actually cares about.
+    for name in Config::reserved_namespaces() {
+        let result = Config::register_namespace(NamespaceRegistration {
+            name: (*name).to_string(),
+            env_prefix: None,
+            defaults: None,
+            schema: None,
+            env_style: EnvStyle::Nested,
+            max_depth: DEFAULT_MAX_DEPTH,
+            env_map: None,
+        });
+        assert!(result.is_err(), "register_namespace({name:?}) should fail");
+        assert_eq!(
+            result.unwrap_err().code,
+            ErrorCode::ConfigNamespaceReserved,
+            "register_namespace({name:?}) should return CONFIG_NAMESPACE_RESERVED",
+        );
+    }
+}
+
+#[test]
+fn test_reserved_namespaces_callable_without_instance() {
+    // Associated function — no `Config` instance constructed.
+    let _ = Config::reserved_namespaces();
+}
+
 #[test]
 fn test_register_namespace_env_prefix_duplicate_raises() {
     // Duplicate env_prefix should raise ConfigEnvPrefixConflict.
