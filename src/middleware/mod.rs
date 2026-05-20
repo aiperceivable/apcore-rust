@@ -25,7 +25,7 @@ pub use context_namespace::{
     APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
 };
 pub use logging::LoggingMiddleware;
-pub use manager::MiddlewareManager;
+pub use manager::{MiddlewareManager, MiddlewareRegistration};
 pub use otel_tracing::{
     TracingBuilder as OtelTracingBuilder, TracingConfig as OtelTracingConfig,
     TracingMiddleware as OtelTracingMiddleware, TRACING_ATTRIBUTES_KEY, TRACING_SPAN_NAME_KEY,

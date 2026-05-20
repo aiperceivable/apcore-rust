@@ -1,6 +1,7 @@
 // APCore Protocol — Middleware manager
 // Spec reference: Middleware pipeline execution
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -8,6 +9,44 @@ use parking_lot::Mutex;
 use super::base::Middleware;
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
+
+/// Options for registering a middleware with identity-based duplicate detection.
+pub struct MiddlewareRegistration<M: Middleware + 'static> {
+    /// The middleware instance to register.
+    pub middleware: M,
+    /// When `true`, skips the duplicate-identity warning entirely.
+    /// Default: `false`.
+    pub allow_duplicate: bool,
+    /// Override the identity key used for duplicate detection.
+    /// Default: `std::any::type_name::<M>()`.
+    pub identity_key: Option<String>,
+}
+
+impl<M: Middleware + 'static> MiddlewareRegistration<M> {
+    /// Create a new registration with default options (duplicate warning enabled,
+    /// identity derived from the type name).
+    pub fn new(middleware: M) -> Self {
+        Self {
+            middleware,
+            allow_duplicate: false,
+            identity_key: None,
+        }
+    }
+
+    /// Set whether duplicate-identity warnings are suppressed.
+    #[must_use]
+    pub fn allow_duplicate(mut self, v: bool) -> Self {
+        self.allow_duplicate = v;
+        self
+    }
+
+    /// Override the identity key used for duplicate detection.
+    #[must_use]
+    pub fn identity_key(mut self, k: impl Into<String>) -> Self {
+        self.identity_key = Some(k.into());
+        self
+    }
+}
 
 /// Manages an ordered pipeline of middleware.
 ///
@@ -17,6 +56,8 @@ use crate::errors::{ErrorCode, ModuleError};
 #[derive(Debug)]
 pub struct MiddlewareManager {
     middlewares: Mutex<Vec<Arc<dyn Middleware>>>,
+    /// Tracks identity -> first registration location hint for duplicate detection.
+    registered_identities: Mutex<HashMap<String, String>>,
 }
 
 impl MiddlewareManager {
@@ -25,6 +66,7 @@ impl MiddlewareManager {
     pub fn new() -> Self {
         Self {
             middlewares: Mutex::new(vec![]),
+            registered_identities: Mutex::new(HashMap::new()),
         }
     }
 
@@ -69,6 +111,44 @@ impl MiddlewareManager {
             .unwrap_or(mws.len());
         mws.insert(pos, arc);
         Ok(())
+    }
+
+    /// Register a middleware with duplicate-detection options.
+    ///
+    /// If the same identity (type name or explicit key) is registered twice and
+    /// `allow_duplicate` is `false`, a `tracing::warn!` is emitted. Registration
+    /// always succeeds; the chain is not otherwise modified.
+    ///
+    /// The identity is captured generically via `std::any::type_name::<M>()` so
+    /// two distinct instances of the same type are treated as duplicates by default.
+    /// Use `identity_key` to distinguish them (e.g. `"auth-primary"` vs
+    /// `"auth-secondary"`).
+    #[track_caller]
+    pub fn add_with_opts<M: Middleware + 'static>(
+        &self,
+        opts: MiddlewareRegistration<M>,
+    ) -> Result<(), ModuleError> {
+        let location = std::panic::Location::caller().to_string();
+        let identity = opts
+            .identity_key
+            .clone()
+            .unwrap_or_else(|| std::any::type_name::<M>().to_string());
+
+        if !opts.allow_duplicate {
+            let mut ids = self.registered_identities.lock();
+            if let Some(first_site) = ids.get(&identity) {
+                tracing::warn!(
+                    identity = %identity,
+                    first_registration = %first_site,
+                    duplicate_registration = %location,
+                    "duplicate middleware registration detected"
+                );
+            } else {
+                ids.insert(identity, location);
+            }
+        }
+
+        self.add(Box::new(opts.middleware))
     }
 
     /// Remove the first middleware whose `name()` matches `name`.
