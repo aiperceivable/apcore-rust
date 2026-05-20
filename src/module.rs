@@ -163,6 +163,33 @@ pub trait Module: Send + Sync {
     /// Called after hot-reload to restore state from `on_suspend()`.
     /// Default: no-op.
     fn on_resume(&self, _state: serde_json::Value) {}
+
+    /// Return a typed streaming handle for adapter/bridge code.
+    ///
+    /// Returns `None` for non-streaming modules (default). Streaming modules
+    /// override this to return `Some(self)`.
+    ///
+    /// **Consistency invariant:** `Some(_)` here IFF `stream()` returns `Some(_)`.
+    /// `Registry::register` enforces this by returning
+    /// `Err(StreamingInterfaceMismatch)` when `annotations.streaming = true`
+    /// but `as_streaming()` returns `None`.
+    fn as_streaming(&self) -> Option<&dyn StreamingModule> {
+        None
+    }
+}
+
+/// Typed streaming interface for modules that support incremental output.
+///
+/// **Consistency invariant:** a module implementing `StreamingModule` MUST also
+/// return `Some(_)` from `Module::stream()`. `Registry::register` enforces this
+/// by returning `Err(StreamingInterfaceMismatch)` when `annotations.streaming =
+/// true` but `as_streaming()` returns `None`.
+pub trait StreamingModule: Module {
+    fn stream_typed(
+        &self,
+        inputs: serde_json::Value,
+        context: &crate::context::Context<serde_json::Value>,
+    ) -> ChunkStream;
 }
 
 /// Metadata annotations attached to a module.

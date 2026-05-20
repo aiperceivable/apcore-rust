@@ -857,6 +857,17 @@ impl Registry {
             Self::warn_if_missing_approval(name, &descriptor);
         }
 
+        // Issue #62: if annotations declare streaming=true, the module MUST implement
+        // StreamingModule (i.e. as_streaming() must return Some(_)).
+        if let Some(ann) = descriptor.annotations.as_ref() {
+            if ann.streaming && module.as_streaming().is_none() {
+                return Err(ModuleError::streaming_interface_mismatch(
+                    name,
+                    "missing_marker: module declares streaming=true but does not implement StreamingModule",
+                ));
+            }
+        }
+
         if run_validator {
             // Clone the validator Arc out of the lock so the user-supplied
             // `validate()` call happens without any Registry lock held.
