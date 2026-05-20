@@ -89,6 +89,7 @@ pub use events::circuit_breaker::{
     DEFAULT_RECOVERY_WINDOW_MS, DEFAULT_TIMEOUT_MS,
 };
 pub use events::emitter::{ApCoreEvent, EventEmitter};
+pub use events::retry::EventRetryConfig;
 pub use events::subscribers::{
     register_subscriber_type, reset_subscriber_registry, unregister_subscriber_type, A2ASubscriber,
     EventSubscriber, FileSubscriber, FilterSubscriber, OutputFormat, StdoutSubscriber,

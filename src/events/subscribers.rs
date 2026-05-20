@@ -84,6 +84,25 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Retry configuration for delivery of events to this subscriber.
+    ///
+    /// Defaults to single-attempt (no retry). Override to opt into exponential
+    /// backoff with DLQ emission on exhaustion.
+    fn retry(&self) -> crate::events::retry::EventRetryConfig {
+        crate::events::retry::EventRetryConfig::default()
+    }
+
+    /// Called after all retry attempts are exhausted for a single event.
+    ///
+    /// Default no-op. Override to implement dead-letter handling, metrics, etc.
+    async fn on_failure(
+        &self,
+        _event: &ApCoreEvent,
+        _error: &crate::errors::ModuleError,
+        _attempt_count: u32,
+    ) {
+    }
+
     /// Handle an incoming event.
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError>;
 }

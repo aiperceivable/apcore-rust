@@ -3,11 +3,12 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use super::subscribers::EventSubscriber;
-use crate::errors::ModuleError;
+use crate::errors::{ErrorCode, ModuleError};
 
 /// An event emitted by the `APCore` system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +258,110 @@ impl EventEmitter {
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
         self.is_shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Fire-and-forget dispatch with full delivery semantics (retry + DLQ).
+    ///
+    /// For each matching subscriber, spawns a `tokio::task` running the full
+    /// per-subscriber retry loop. On exhaustion:
+    /// - If `max_attempts > 1`: a `apcore.event.delivery_failed` DLQ event is
+    ///   delivered to any subscriber whose pattern matches that event type.
+    /// - If `max_attempts == 1` (single-attempt default): logs a `warn!` only.
+    /// - `on_failure` is called in both cases.
+    ///
+    /// **Post-shutdown:** drops the event as a no-op.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn emit_delivery_semantics(&self, event: ApCoreEvent) {
+        if self.is_shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        // Capture a snapshot for both the delivery loop and DLQ delivery.
+        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
+
+        for subscriber in &self.subscribers {
+            if !Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+                continue;
+            }
+            let sub = Arc::clone(subscriber);
+            let evt = event.clone();
+            let dlq_subs = all_subscribers.clone();
+            tokio::spawn(async move {
+                Self::deliver_with_dlq(sub, evt, dlq_subs).await;
+            });
+        }
+    }
+
+    /// Deliver an event to one subscriber with retry + optional DLQ emission.
+    async fn deliver_with_dlq(
+        subscriber: Arc<dyn EventSubscriber>,
+        event: ApCoreEvent,
+        all_subscribers: Vec<Arc<dyn EventSubscriber>>,
+    ) {
+        let retry = subscriber.retry();
+        let mut last_error: Option<ModuleError> = None;
+
+        for attempt in 0..retry.max_attempts {
+            match subscriber.on_event(&event).await {
+                Ok(()) => return,
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt + 1 < retry.max_attempts {
+                        tokio::time::sleep(Duration::from_millis(retry.compute_delay_ms(attempt)))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        let err = last_error.unwrap_or_else(|| {
+            ModuleError::new(ErrorCode::GeneralInternalError, "unknown delivery failure")
+        });
+
+        if retry.max_attempts > 1 {
+            // Emit a DLQ event — single attempt, no retry.
+            let sub_id = subscriber.subscriber_id().to_string();
+            let subscriber_type = sub_id.split('-').next().unwrap_or("unknown").to_string();
+            let dlq_event = ApCoreEvent::new(
+                "apcore.event.delivery_failed",
+                serde_json::json!({
+                    "subscriber_type": subscriber_type,
+                    "subscriber_id": sub_id,
+                    "original_event": {
+                        "event_type": event.event_type,
+                        "data": event.data,
+                        "timestamp": event.timestamp,
+                    },
+                    "error": {
+                        "type": format!("{:?}", err.code),
+                        "message": err.message,
+                    },
+                    "attempt_count": retry.max_attempts,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }),
+            );
+            for dlq_sub in &all_subscribers {
+                if Self::matches_pattern(dlq_sub.event_pattern(), "apcore.event.delivery_failed") {
+                    if let Err(e) = dlq_sub.on_event(&dlq_event).await {
+                        tracing::error!(
+                            subscriber_id = %dlq_sub.subscriber_id(),
+                            error = %e,
+                            "DLQ subscriber on_event failed (discarded, not retried)"
+                        );
+                    }
+                }
+            }
+        } else {
+            tracing::warn!(
+                subscriber_id = %subscriber.subscriber_id(),
+                event_type = %event.event_type,
+                error = %err,
+                "event delivery failed (single-attempt, no DLQ)"
+            );
+        }
+
+        subscriber
+            .on_failure(&event, &err, retry.max_attempts)
+            .await;
     }
 
     /// Simple glob-style pattern matching with `*` wildcard.
