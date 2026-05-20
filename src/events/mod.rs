@@ -3,6 +3,7 @@
 
 pub mod circuit_breaker;
 pub mod emitter;
+pub mod retry;
 pub mod subscribers;
 
 pub use circuit_breaker::{
@@ -10,6 +11,7 @@ pub use circuit_breaker::{
     DEFAULT_RECOVERY_WINDOW_MS, DEFAULT_TIMEOUT_MS,
 };
 pub use emitter::{ApCoreEvent, EventEmitter};
+pub use retry::EventRetryConfig;
 pub use subscribers::{
     EventSubscriber, FileSubscriber, FilterSubscriber, OutputFormat, StdoutSubscriber,
     WebhookSubscriber,

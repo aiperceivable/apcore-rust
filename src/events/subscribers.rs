@@ -84,6 +84,25 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Retry configuration for delivery of events to this subscriber.
+    ///
+    /// Defaults to single-attempt (no retry). Override to opt into exponential
+    /// backoff with DLQ emission on exhaustion.
+    fn retry(&self) -> crate::events::retry::EventRetryConfig {
+        crate::events::retry::EventRetryConfig::default()
+    }
+
+    /// Called after all retry attempts are exhausted for a single event.
+    ///
+    /// Default no-op. Override to implement dead-letter handling, metrics, etc.
+    async fn on_failure(
+        &self,
+        _event: &ApCoreEvent,
+        _error: &crate::errors::ModuleError,
+        _attempt_count: u32,
+    ) {
+    }
+
     /// Handle an incoming event.
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError>;
 }
@@ -206,8 +225,9 @@ pub enum A2AAuth {
 
 /// Delivers events via the A2A protocol to the platform.
 ///
-/// Payload: `{ "skillId": "apevo.event_receiver", "event": <serialized> }`.
-/// Single attempt (no retries). Errors logged, not raised.
+/// Payload: `{ "skillId": "<skill_id>", "event": <serialized> }`.
+/// The `skill_id` field defaults to `"apevo.event_receiver"` and can be
+/// overridden per-subscriber. Errors logged, not raised.
 #[derive(Debug, Clone)]
 pub struct A2ASubscriber {
     pub id: String,
@@ -215,6 +235,9 @@ pub struct A2ASubscriber {
     pub auth: Option<A2AAuth>,
     pub event_pattern: String,
     pub timeout_ms: u64,
+    /// The A2A skill ID included in the outgoing payload.
+    /// Default: `"apevo.event_receiver"` (per apcore A2A spec).
+    pub skill_id: String,
 }
 
 impl A2ASubscriber {
@@ -229,7 +252,15 @@ impl A2ASubscriber {
             auth: None,
             event_pattern: event_pattern.into(),
             timeout_ms: 5000,
+            skill_id: "apevo.event_receiver".to_string(),
         }
+    }
+
+    /// Override the A2A skill ID used in the outgoing payload.
+    #[must_use]
+    pub fn with_skill_id(mut self, skill_id: impl Into<String>) -> Self {
+        self.skill_id = skill_id.into();
+        self
     }
 }
 
@@ -246,7 +277,7 @@ impl EventSubscriber for A2ASubscriber {
     #[cfg(feature = "events")]
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
         let payload = json!({
-            "skillId": "apevo.event_receiver",
+            "skillId": self.skill_id,
             "event": {
                 "event_type": event.event_type,
                 "module_id": event.module_id,

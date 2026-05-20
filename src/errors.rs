@@ -188,6 +188,16 @@ pub enum ErrorCode {
     /// `CONFIG_KEY_RESTRICTED`. Distinct from `ConfigInvalid` so consumers
     /// can match the policy-deny case separately from value-shape errors.
     ConfigKeyRestricted,
+    /// Issue #62 (streaming.md §"Streaming Module Interface"): a module declares
+    /// `annotations.streaming = true` but does not implement `StreamingModule`
+    /// (i.e. `as_streaming()` returns `None`). The registry rejects the registration.
+    /// Cross-language: Python/TS `STREAMING_INTERFACE_MISMATCH`.
+    StreamingInterfaceMismatch,
+    /// Issue #65 (registry-system.md §"Registration Ordering Invariants"): two
+    /// concurrent register() calls for the same module_id — the second is rejected
+    /// because the first is still in the in-flight loading set.
+    /// Cross-language: Python/TS `DUPLICATE_MODULE_ID`.
+    DuplicateModuleId,
 }
 
 /// Structured error returned by module execution.
@@ -516,6 +526,39 @@ impl ModuleError {
             "The downstream module is temporarily unavailable. The circuit will probe \
              after the recovery window elapses; retry the request after a short delay.",
         )
+    }
+
+    /// Builder for `STREAMING_INTERFACE_MISMATCH` (Issue #62).
+    #[must_use]
+    pub fn streaming_interface_mismatch(
+        module_id: impl Into<String>,
+        mismatch_reason: impl Into<String>,
+    ) -> Self {
+        let module_id = module_id.into();
+        let mismatch_reason = mismatch_reason.into();
+        let mut details = HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
+        details.insert(
+            "mismatch_reason".to_string(),
+            serde_json::json!(mismatch_reason),
+        );
+        Self::new(
+            ErrorCode::StreamingInterfaceMismatch,
+            format!("Module '{module_id}' streaming interface mismatch: {mismatch_reason}"),
+        )
+        .with_details(details)
+    }
+
+    /// Builder for `DUPLICATE_MODULE_ID` (Issue #65).
+    #[must_use]
+    pub fn duplicate_module_id(module_id: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
+        Self::new(
+            ErrorCode::DuplicateModuleId,
+            format!("Module '{module_id}' is already registered or registration is in progress"),
+        )
+        .with_details(details)
     }
 
     /// Builder for `ID_TOO_LONG` (Issue #32, PROTOCOL_SPEC §2.1.1, §2.7).

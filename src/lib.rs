@@ -89,6 +89,7 @@ pub use events::circuit_breaker::{
     DEFAULT_RECOVERY_WINDOW_MS, DEFAULT_TIMEOUT_MS,
 };
 pub use events::emitter::{ApCoreEvent, EventEmitter};
+pub use events::retry::EventRetryConfig;
 pub use events::subscribers::{
     register_subscriber_type, reset_subscriber_registry, unregister_subscriber_type, A2ASubscriber,
     EventSubscriber, FileSubscriber, FilterSubscriber, OutputFormat, StdoutSubscriber,
@@ -103,13 +104,13 @@ pub use middleware::{
     CircuitBreakerMiddleware, CircuitBreakerMiddlewareConfig, CircuitBreakerState, ContextWriter,
     CustomMiddlewareConfig, CustomMiddlewareFactory, LoggingMiddleware, LoggingMiddlewareConfig,
     Middleware, MiddlewareChainConfig, MiddlewareConfig, MiddlewareFactory, MiddlewareManager,
-    NamespaceCheck, OnErrorOutcome, OtelTracingBuilder, OtelTracingConfig, OtelTracingMiddleware,
-    PlatformNotifyMiddleware, RetryConfig, RetryMiddleware, RetrySignal, TracingMiddlewareConfig,
-    APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
+    MiddlewareRegistration, NamespaceCheck, OnErrorOutcome, OtelTracingBuilder, OtelTracingConfig,
+    OtelTracingMiddleware, PlatformNotifyMiddleware, RetryConfig, RetryMiddleware, RetrySignal,
+    TracingMiddlewareConfig, APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
 };
 pub use module::{
     Change, ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult,
-    PreflightResult, PreviewResult, ValidationResult, DEFAULT_ANNOTATIONS,
+    PreflightResult, PreviewResult, StreamingModule, ValidationResult, DEFAULT_ANNOTATIONS,
     MODULE_PREVIEW_CHECK_NAME,
 };
 pub use observability::error_history::{

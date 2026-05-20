@@ -2,7 +2,7 @@
 // Spec reference: Module registration, discovery, validation, and descriptors
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingLotMutex, RwLock};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -13,7 +13,7 @@ use std::sync::{
 
 use crate::errors::ModuleError;
 use crate::module::{Module, ModuleAnnotations, ModuleExample, ValidationResult};
-use crate::registry::conflicts::{detect_id_conflicts, ConflictSeverity};
+use crate::registry::conflicts::{detect_id_conflicts, ConflictSeverity, ConflictType};
 
 /// Cross-language compatible module descriptor.
 ///
@@ -159,6 +159,9 @@ pub trait ModuleValidator: Send + Sync {
 /// Type alias for the event callback closure.
 pub type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
 type CallbackMap = HashMap<String, Vec<(u64, Arc<ModuleCallbackFn>)>>;
+
+/// Type alias for the on_load_failed callback closure (Issue #65).
+type LoadFailedCallbackFn = dyn Fn(&str, &ModuleError) + Send + Sync;
 
 /// Reserved words that cannot be used as the first segment of a module ID.
 ///
@@ -403,6 +406,12 @@ pub struct Registry {
     /// Background task handle that consumes notify events and triggers
     /// debounced re-discovery. Cleared on `unwatch()`.
     watch_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Issue #65: module IDs whose on_load is currently in progress.
+    /// A module in in_flight is NOT visible via get()/list().
+    /// Prevents concurrent duplicate registration of the same ID.
+    in_flight: ParkingLotMutex<HashSet<String>>,
+    /// Issue #65: callbacks invoked when any module's on_load fails.
+    load_failed_callbacks: RwLock<Vec<Arc<LoadFailedCallbackFn>>>,
 }
 
 /// RAII guard that restores a taken-out `Discoverer` back into the registry's
@@ -434,11 +443,19 @@ impl Drop for DiscovererRestoreGuard<'_> {
 impl std::fmt::Debug for Registry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let core = self.core.read();
+        // Use try_lock for in_flight so Debug never deadlocks when called while
+        // in_flight is already held by a concurrent register() call.
+        let in_flight_snapshot: Vec<String> = self
+            .in_flight
+            .try_lock()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
         f.debug_struct("Registry")
             .field("modules", &core.modules.keys().collect::<Vec<_>>())
             .field("descriptors", &core.descriptors)
             .field("ref_counts", &core.ref_counts)
             .field("draining", &core.draining)
+            .field("in_flight", &in_flight_snapshot)
             .field(
                 "drain_events_keys",
                 &self.drain_events.read().keys().cloned().collect::<Vec<_>>(),
@@ -478,7 +495,16 @@ impl Registry {
             extension_roots: RwLock::new(Vec::new()),
             watcher: parking_lot::Mutex::new(None),
             watch_handle: parking_lot::Mutex::new(None),
+            in_flight: ParkingLotMutex::new(HashSet::new()),
+            load_failed_callbacks: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Register a callback invoked when any module's on_load fails.
+    ///
+    /// The callback receives the module_id and the error from on_load.
+    pub fn on_load_failed(&self, callback: Arc<LoadFailedCallbackFn>) {
+        self.load_failed_callbacks.write().push(callback);
     }
 
     /// Snapshot the callbacks for a given event name so they can be invoked
@@ -828,18 +854,27 @@ impl Registry {
     /// Shared registration core for `register`, `register_internal`, and the
     /// per-entry path of `register_discovered`.
     ///
-    /// Ordering (aligned with `apcore-python.Registry.register`):
+    /// Ordering — deferred-publish pattern (Issue #65):
     /// 1. `validate_module_id` (syntactic, no lock).
     /// 2. Snapshot the validator `Arc` out of `self.validator` and invoke it
     ///    WITHOUT holding any lock (prevents parking_lot non-reentrant
     ///    deadlock if the validator calls back into the registry).
-    /// 3. Take `core.write()`, run `detect_id_conflicts` (surfaces duplicate,
-    ///    reserved-word, and case-collision conflicts at once), insert the
-    ///    module into all maps, drop the lock.
-    /// 4. Call `on_load` OUTSIDE the lock and only AFTER a successful insert,
-    ///    so duplicated registrations never trigger `on_load` side effects
-    ///    that `on_unload` would then never unwind.
-    /// 5. Fire `"register"` callbacks outside any lock.
+    /// 3. Acquire `core.read()`, run `detect_id_conflicts` (surfaces duplicate,
+    ///    reserved-word, and case-collision conflicts), release the lock.
+    /// 4. Acquire `in_flight.lock()`, atomically check + insert the ID so
+    ///    concurrent same-ID registrations are rejected, release the lock.
+    /// 5. Call `on_load` WITHOUT any lock held and WITHOUT the module in
+    ///    `core.modules` (deferred-publish: module is NOT yet discoverable).
+    /// 6. On success: acquire `core.write()`, insert into all visible maps,
+    ///    release, then remove from `in_flight`. Fire `"register"` callbacks.
+    /// 7. On failure: remove from `in_flight`, fire `load_failed` callbacks,
+    ///    re-raise the error unchanged.
+    ///
+    /// # Lock ordering invariant
+    ///
+    /// Always acquire `core` before `in_flight`. Never hold `in_flight.lock()`
+    /// while trying to acquire `core.read()` or `core.write()`. Violations
+    /// create deadlock cycles.
     fn register_core(
         &self,
         name: &str,
@@ -855,6 +890,17 @@ impl Registry {
         // the audit-emit single-emit rule fires later via the sys_modules bridge.
         if is_ephemeral_module_id(name) {
             Self::warn_if_missing_approval(name, &descriptor);
+        }
+
+        // Issue #62: if annotations declare streaming=true, the module MUST implement
+        // StreamingModule (i.e. as_streaming() must return Some(_)).
+        if let Some(ann) = descriptor.annotations.as_ref() {
+            if ann.streaming && module.as_streaming().is_none() {
+                return Err(ModuleError::streaming_interface_mismatch(
+                    name,
+                    "missing_marker: module declares streaming=true but does not implement StreamingModule",
+                ));
+            }
         }
 
         if run_validator {
@@ -876,21 +922,14 @@ impl Registry {
             }
         }
 
-        let module_arc: Arc<dyn Module> = module.into();
-        let module_clone = Arc::clone(&module_arc);
-
+        // Issue #65: deferred-publish — run conflict detection first (under
+        // core.read() to avoid holding write for long), then atomically reserve
+        // the slot in in_flight so concurrent same-ID registrations are rejected.
+        //
+        // LOCK ORDER: acquire core before in_flight (see invariant in doc comment).
         {
-            let mut core = self.core.write();
-
+            let core = self.core.read();
             // Full conflict detection (duplicate / reserved / case-collision).
-            // Aligned with `apcore-python.Registry.register`, which invokes
-            // `detect_id_conflicts` on every register call — a prior audit
-            // flagged a cross-language drift where only exact duplicates
-            // were caught by the Rust path.
-            //
-            // When `allow_reserved` is true (sys-module internal path), the
-            // reserved-word check is suppressed by passing an empty slice;
-            // duplicate + case-collision detection still applies.
             let reserved: &[&str] = if allow_reserved { &[] } else { RESERVED_WORDS };
             let existing_ids: HashSet<String> = core.modules.keys().cloned().collect();
             if let Some(conflict) =
@@ -898,10 +937,14 @@ impl Registry {
             {
                 match conflict.severity {
                     ConflictSeverity::Error => {
-                        return Err(ModuleError::new(
-                            crate::errors::ErrorCode::GeneralInvalidInput,
-                            conflict.message,
-                        ));
+                        // Use DuplicateModuleId for exact-duplicate conflicts so callers
+                        // can distinguish "already registered" from other error types.
+                        let error_code = if conflict.conflict_type == ConflictType::DuplicateId {
+                            crate::errors::ErrorCode::DuplicateModuleId
+                        } else {
+                            crate::errors::ErrorCode::GeneralInvalidInput
+                        };
+                        return Err(ModuleError::new(error_code, conflict.message));
                     }
                     ConflictSeverity::Warning => {
                         tracing::warn!(
@@ -912,40 +955,65 @@ impl Registry {
                     }
                 }
             }
-
-            let schema = serde_json::json!({
-                "input": descriptor.input_schema,
-                "output": descriptor.output_schema,
-            });
-            core.schema_cache.insert(name.to_string(), schema);
-            core.lowercase_map
-                .insert(name.to_lowercase(), name.to_string());
-            core.modules.insert(name.to_string(), module_arc);
-            core.descriptors.insert(name.to_string(), descriptor);
         }
 
-        // on_load runs AFTER successful insertion and OUTSIDE any lock.
-        // Duplicates never reach this point, so on_load cannot leak
-        // resources for a registration that the registry rejected.
-        // If on_load signals failure, roll back the four inserts above so no
-        // half-initialised module remains in the registry (mirrors
-        // apcore-python Registry._invoke_on_load rollback).
-        if let Err(e) = module_clone.on_load() {
-            let mut core = self.core.write();
-            core.schema_cache.remove(name);
-            core.lowercase_map.remove(&name.to_lowercase());
-            core.modules.remove(name);
-            core.descriptors.remove(name);
-            // Re-raise the original error unchanged (mirrors Python `raise` / TypeScript `throw e`).
-            // Wrapping into ModuleLoadError loses the original code and breaks downstream dispatch.
-            return Err(e);
+        // Reserve slot in in_flight (atomic check-and-insert).
+        // If the ID is already in_flight (concurrent registration in progress),
+        // return DuplicateModuleId immediately.
+        {
+            let mut in_flight = self.in_flight.lock();
+            if in_flight.contains(name) {
+                return Err(ModuleError::duplicate_module_id(name));
+            }
+            in_flight.insert(name.to_string());
         }
 
-        for cb in self.snapshot_callbacks("register") {
-            cb(name, module_clone.as_ref());
-        }
+        let module_arc: Arc<dyn Module> = module.into();
+        let module_clone = Arc::clone(&module_arc);
 
-        Ok(())
+        // Issue #65: run on_load WITHOUT any lock held and WITHOUT the module
+        // being visible in core.modules. Only after on_load succeeds do we
+        // atomically publish the module (insert into core.modules) and remove
+        // from in_flight.
+        match module_clone.on_load() {
+            Ok(()) => {
+                // Atomic publish: insert into visible maps, remove from in_flight.
+                {
+                    let mut core = self.core.write();
+                    let schema = serde_json::json!({
+                        "input": descriptor.input_schema,
+                        "output": descriptor.output_schema,
+                    });
+                    core.schema_cache.insert(name.to_string(), schema);
+                    core.lowercase_map
+                        .insert(name.to_lowercase(), name.to_string());
+                    core.modules
+                        .insert(name.to_string(), Arc::clone(&module_arc));
+                    core.descriptors.insert(name.to_string(), descriptor);
+                }
+                self.in_flight.lock().remove(name);
+
+                for cb in self.snapshot_callbacks("register") {
+                    cb(name, module_clone.as_ref());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Roll back: remove from in_flight; fire load_failed callbacks.
+                self.in_flight.lock().remove(name);
+                let cbs: Vec<Arc<LoadFailedCallbackFn>> = self
+                    .load_failed_callbacks
+                    .read()
+                    .iter()
+                    .map(Arc::clone)
+                    .collect();
+                for cb in cbs {
+                    cb(name, &e);
+                }
+                // Re-raise the original error unchanged.
+                Err(e)
+            }
+        }
     }
 
     /// Apply a closure to every registered module.
@@ -1350,17 +1418,17 @@ impl Registry {
     /// For each entry: validate the name per `PROTOCOL_SPEC` §2.7, reject
     /// duplicates, run the custom validator, invoke `on_load`, then register
     /// the instance. Returns the count of entries that successfully registered.
-    /// Failed entries are logged at `warn` and skipped; one bad entry never
-    /// aborts the batch.
+    /// Failed entries are logged at `warn`/`error` and skipped; one bad entry
+    /// never aborts the batch.
+    ///
+    /// Uses the same **deferred-publish** pattern as `register_core` (Issue #65):
+    /// a module is NOT visible in `core.modules` until its `on_load` succeeds.
     #[allow(clippy::too_many_lines)] // sequential per-entry validation gates in a batch loop; splitting further requires passing state and reduces clarity
     fn register_discovered(&self, discovered: Vec<DiscoveredModule>) -> usize {
         let mut registered_count = 0usize;
-        // Collect post-insert work: on_load + callbacks run outside the lock
-        // AFTER successful insertion, mirroring the single-entry `register_core`
-        // discipline so duplicates never observe on_load side effects.
-        let mut post_insert: Vec<(String, Arc<dyn Module>)> = Vec::new();
 
         for dm in discovered {
+            // 1. Validate module_id.
             if let Err(e) = validate_module_id(&dm.name, false) {
                 tracing::warn!(
                     module_id = %dm.name,
@@ -1370,7 +1438,7 @@ impl Registry {
                 continue;
             }
 
-            // Snapshot the validator Arc out of the lock.
+            // 2. Run custom validator (outside any lock).
             let validator_snapshot = self.validator.read().as_ref().map(Arc::clone);
             if let Some(validator) = validator_snapshot {
                 let result = validator.validate(dm.module.as_ref(), Some(&dm.descriptor));
@@ -1384,7 +1452,7 @@ impl Registry {
                 }
             }
 
-            // Validate descriptor schema shapes before insertion.
+            // 3. Validate descriptor schema shapes before insertion.
             if !Self::descriptor_schema_shape_is_valid(&dm.descriptor) {
                 tracing::warn!(
                     module_id = %dm.name,
@@ -1393,9 +1461,9 @@ impl Registry {
                 continue;
             }
 
-            let inserted = {
-                let mut core = self.core.write();
-
+            // 4. Conflict detection under a brief core.read() (LOCK ORDER: core before in_flight).
+            {
+                let core = self.core.read();
                 let existing_ids: HashSet<String> = core.modules.keys().cloned().collect();
                 match detect_id_conflicts(
                     &dm.name,
@@ -1409,7 +1477,7 @@ impl Registry {
                             conflict = %c.message,
                             "Discovered module rejected: id conflict"
                         );
-                        false
+                        continue;
                     }
                     Some(c) => {
                         tracing::warn!(
@@ -1417,59 +1485,56 @@ impl Registry {
                             conflict = %c.message,
                             "Discovered module registered despite warning-level ID conflict"
                         );
-                        let schema = serde_json::json!({
-                            "input": dm.descriptor.input_schema.clone(),
-                            "output": dm.descriptor.output_schema.clone(),
-                        });
-                        core.schema_cache.insert(dm.name.clone(), schema);
-                        core.lowercase_map
-                            .insert(dm.name.to_lowercase(), dm.name.clone());
-                        core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
-                        core.descriptors
-                            .insert(dm.name.clone(), dm.descriptor.clone());
-                        true
                     }
-                    None => {
-                        let schema = serde_json::json!({
-                            "input": dm.descriptor.input_schema.clone(),
-                            "output": dm.descriptor.output_schema.clone(),
-                        });
-                        core.schema_cache.insert(dm.name.clone(), schema);
-                        core.lowercase_map
-                            .insert(dm.name.to_lowercase(), dm.name.clone());
-                        core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
-                        core.descriptors
-                            .insert(dm.name.clone(), dm.descriptor.clone());
-                        true
-                    }
+                    None => {}
                 }
-            };
-
-            if inserted {
-                post_insert.push((dm.name.clone(), dm.module));
-                registered_count += 1;
             }
-        }
 
-        // on_load + callbacks fire AFTER successful insertion, outside any lock.
-        // If on_load returns Err, roll back the insertion for that module.
-        for (name, module_arc) in post_insert {
-            if let Err(e) = module_arc.on_load() {
-                tracing::error!(
-                    module_id = %name,
-                    error = %e.message,
-                    "Discovered module on_load failed; rolling back registration"
-                );
-                let mut core = self.core.write();
-                core.schema_cache.remove(&name);
-                core.lowercase_map.remove(&name.to_lowercase());
-                core.modules.remove(&name);
-                core.descriptors.remove(&name);
-                registered_count = registered_count.saturating_sub(1);
-                continue;
+            // 5. Reserve slot in in_flight (deferred-publish: not yet visible).
+            {
+                let mut in_flight = self.in_flight.lock();
+                if in_flight.contains(&dm.name) {
+                    tracing::warn!(
+                        module_id = %dm.name,
+                        "Discovered module rejected: concurrent registration in progress"
+                    );
+                    continue;
+                }
+                in_flight.insert(dm.name.clone());
             }
-            for cb in self.snapshot_callbacks("register") {
-                cb(&name, module_arc.as_ref());
+
+            // 6. Run on_load WITHOUT any lock held (module NOT yet in core.modules).
+            match dm.module.on_load() {
+                Ok(()) => {
+                    // Commit: insert into visible maps, remove from in_flight.
+                    {
+                        let mut core = self.core.write();
+                        let schema = serde_json::json!({
+                            "input": dm.descriptor.input_schema.clone(),
+                            "output": dm.descriptor.output_schema.clone(),
+                        });
+                        core.schema_cache.insert(dm.name.clone(), schema);
+                        core.lowercase_map
+                            .insert(dm.name.to_lowercase(), dm.name.clone());
+                        core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
+                        core.descriptors
+                            .insert(dm.name.clone(), dm.descriptor.clone());
+                    }
+                    self.in_flight.lock().remove(&dm.name);
+
+                    for cb in self.snapshot_callbacks("register") {
+                        cb(&dm.name, dm.module.as_ref());
+                    }
+                    registered_count += 1;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        module_id = %dm.name,
+                        error = %e.message,
+                        "Discovered module on_load failed; skipping registration"
+                    );
+                    self.in_flight.lock().remove(&dm.name);
+                }
             }
         }
 

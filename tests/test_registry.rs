@@ -855,7 +855,8 @@ mod lifecycle_tests {
         let err = registry
             .register("foo.bar", Box::new(StubModule), make_descriptor("foo.bar"))
             .unwrap_err();
-        assert_eq!(err.code, apcore::errors::ErrorCode::GeneralInvalidInput);
+        // apcore #65: duplicate module IDs now return DuplicateModuleId.
+        assert_eq!(err.code, apcore::errors::ErrorCode::DuplicateModuleId);
         assert!(err.message.contains("already registered"));
     }
 
