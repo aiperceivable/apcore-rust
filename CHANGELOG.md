@@ -13,11 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 
-## [0.22.0] - 2026-05-18
+## [0.22.0] - 2026-05-20
 
 ### Added
 
 - **`Config::reserved_namespaces()` associated function + `pub const RESERVED_NAMESPACES` (PROTOCOL_SPEC §9.9.5, [apcore#60](https://github.com/aiperceivable/apcore/issues/60)).** Implements the new normative requirement that all SDKs MUST expose a public, read-only query API returning the set of reserved top-level namespace names. The private `const RESERVED_NAMESPACES: &[&str]` is promoted to `pub const` and re-exported from the crate root; the new associated function returns it via `&'static [&'static str]`. Single source of truth — `Config::register_namespace` continues to consult the same slice and return `ErrorCode::ConfigNamespaceReserved` for any name it contains. Callable without a `Config` instance. Intended for third-party consumers (custom CLIs, framework integrations) that accept user-supplied namespace names and need fail-fast pre-validation. Idiomatic Rust slice (not `HashSet`) — the small compile-time-known set makes `.contains(&name)` trivially efficient and avoids runtime initialisation overhead.
+
+- **`ContextKey<T>` promoted to documented public API ([apcore#63](https://github.com/aiperceivable/apcore/issues/63)).** `ContextKey<T>` and all six framework built-in key constants (`TRACING_SPANS`, `TRACING_SAMPLED`, `METRICS_STARTS`, `LOGGING_START`, `REDACTED_OUTPUT`, `RETRY_COUNT_BASE`) are now exported at the crate root and fully spec-aligned. The `scoped(suffix)` sub-key factory is part of the stable API.
+
+- **`StreamingModule` trait + `Module::as_streaming()` accessor ([apcore#62](https://github.com/aiperceivable/apcore/issues/62)).** New `StreamingModule` supertrait with `stream_typed()` provides a typed handle for adapter/bridge code that needs to call the streaming path directly. Default `Module::as_streaming() -> Option<&dyn StreamingModule>` returns `None` so non-streaming modules need no changes. `Registry::register` enforces the consistency invariant: `annotations.streaming = true` without a `StreamingModule` impl returns `Err(StreamingInterfaceMismatch)`.
+
+- **Duplicate middleware detection via `MiddlewareManager::add_with_opts()` ([apcore#64](https://github.com/aiperceivable/apcore/issues/64)).** `MiddlewareRegistration<M>` builder with `.allow_duplicate(bool)` and `.identity_key(impl Into<String>)` options. Default identity is `std::any::type_name::<M>()`. A second registration with the same identity emits `tracing::warn!` naming the first and duplicate registration sites (captured with `#[track_caller]`). Registration always succeeds; the middleware chain always includes all added middlewares.
+
+- **Unified event delivery semantics — retry + DLQ + `on_failure` ([apcore#61](https://github.com/aiperceivable/apcore/issues/61)).** New `EventRetryConfig` struct with `max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, and `backoff_multiplier`. New `EventSubscriber::retry()` and `EventSubscriber::on_failure()` default trait methods. New `EventEmitter::emit_delivery_semantics()` fire-and-forget method spawns one `tokio::task` per subscriber, runs the per-subscriber retry loop, and emits a `apcore.event.delivery_failed` DLQ event on exhaustion (when `max_attempts > 1`). Default behavior (`max_attempts = 1`) is unchanged — no retry, no DLQ, backward-compatible. `A2ASubscriber` gains a configurable `skill_id` field (default `"apevo.event_receiver"`).
+
+- **Registry deferred-publish: module not visible until `on_load` completes ([apcore#65](https://github.com/aiperceivable/apcore/issues/65)).** `Registry::register()` now follows deferred-publish ordering: the module ID is reserved in an `in_flight` set, `on_load()` runs without any lock held, and the module is inserted into `core.modules` (visible) only after `on_load` succeeds. This guarantees `get()` / `list()` return `None` during `on_load`. Concurrent registration of the same ID returns `Err(DuplicateModuleId)`. Distinct-ID registrations run `on_load` in parallel (per-OS-thread). `Registry::on_load_failed()` registers callbacks invoked when `on_load` returns `Err`. Same deferred-publish invariant applied to `register_discovered`.
+
+### Changed
+
+- **`A2ASubscriber` retry behaviour ([apcore#61](https://github.com/aiperceivable/apcore/issues/61)).** `A2ASubscriber` now participates in the unified retry/DLQ path via `EventEmitter::emit_delivery_semantics()`. The hardcoded `"apevo.event_receiver"` skill ID is now a configurable `skill_id` field.
+
+- **`ErrorCode::DuplicateModuleId` ([apcore#65](https://github.com/aiperceivable/apcore/issues/65)).** New error code used for exact-duplicate module-ID registration (both from `detect_id_conflicts` and from concurrent in-flight detection), replacing the previous `GeneralInvalidInput` code for the duplicate case. Cross-language: Python/TS `DUPLICATE_MODULE_ID`.
 
 ---
 

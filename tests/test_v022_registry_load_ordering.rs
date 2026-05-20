@@ -245,13 +245,16 @@ fn concurrent_same_id_one_ok_one_err() {
     assert_eq!(ok_count, 1, "exactly one registration must succeed");
     assert_eq!(err_count, 1, "exactly one registration must fail");
 
-    // The failing one should be a duplicate error.
+    // The failing one must carry DuplicateModuleId regardless of which race path
+    // fired (in_flight concurrent check OR detect_id_conflicts exact-duplicate).
     let err_result = [r1, r2].into_iter().find(Result::is_err).unwrap();
     let err = err_result.unwrap_err();
-    assert!(
-        err.code == ErrorCode::DuplicateModuleId || err.code == ErrorCode::GeneralInvalidInput,
-        "duplicate error code expected, got {:?}",
-        err.code
+    assert_eq!(
+        err.code,
+        ErrorCode::DuplicateModuleId,
+        "duplicate registration must use DuplicateModuleId, got {:?}: {}",
+        err.code,
+        err.message
     );
 
     // Exactly one module registered.

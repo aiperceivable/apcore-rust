@@ -320,6 +320,11 @@ impl EventEmitter {
         if retry.max_attempts > 1 {
             // Emit a DLQ event — single attempt, no retry.
             let sub_id = subscriber.subscriber_id().to_string();
+            // subscriber_type is derived from the first dash-delimited segment of
+            // subscriber_id. SDK-generated IDs follow the "{type}-{uuid}" convention
+            // (e.g. "file-abc123", "a2a-xyz456"), so this produces the canonical type.
+            // Custom IDs should follow the same convention; if they don't, the type
+            // falls back to "unknown".
             let subscriber_type = sub_id.split('-').next().unwrap_or("unknown").to_string();
             let dlq_event = ApCoreEvent::new(
                 "apcore.event.delivery_failed",

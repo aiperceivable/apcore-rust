@@ -1,11 +1,14 @@
 // APCore Protocol — Event subscriber retry configuration
 // Spec reference: Event Delivery Semantics (Issue #61)
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 /// Retry configuration for event subscribers.
 ///
 /// Defaults to single-attempt delivery (no retry) for backward compatibility.
 /// Override `EventSubscriber::retry()` to opt into retry behavior.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub struct EventRetryConfig {
     /// Total maximum delivery attempts (1 = no retry, 2 = one retry, etc.).
     pub max_attempts: u32,

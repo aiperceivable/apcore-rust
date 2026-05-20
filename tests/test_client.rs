@@ -80,11 +80,15 @@ async fn test_apcore_register_duplicate_fails() {
         .register("demo.dup", Box::new(Echo))
         .expect_err("duplicate register must fail");
 
-    // The exact error code varies by implementation, but it must not be success.
+    // Duplicate registration must return DuplicateModuleId (since apcore #65
+    // unified the duplicate-ID error code). ModuleLoadError and GeneralInvalidInput
+    // are kept here for resilience against future code reorganisation.
     assert!(
         matches!(
             err.code,
-            ErrorCode::ModuleLoadError | ErrorCode::GeneralInvalidInput
+            ErrorCode::DuplicateModuleId
+                | ErrorCode::ModuleLoadError
+                | ErrorCode::GeneralInvalidInput
         ),
         "unexpected error code: {:?}",
         err.code
