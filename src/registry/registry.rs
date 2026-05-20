@@ -2,7 +2,7 @@
 // Spec reference: Module registration, discovery, validation, and descriptors
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingLotMutex, RwLock};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -159,6 +159,9 @@ pub trait ModuleValidator: Send + Sync {
 /// Type alias for the event callback closure.
 pub type ModuleCallbackFn = dyn Fn(&str, &dyn Module) + Send + Sync;
 type CallbackMap = HashMap<String, Vec<(u64, Arc<ModuleCallbackFn>)>>;
+
+/// Type alias for the on_load_failed callback closure (Issue #65).
+type LoadFailedCallbackFn = dyn Fn(&str, &ModuleError) + Send + Sync;
 
 /// Reserved words that cannot be used as the first segment of a module ID.
 ///
@@ -403,6 +406,12 @@ pub struct Registry {
     /// Background task handle that consumes notify events and triggers
     /// debounced re-discovery. Cleared on `unwatch()`.
     watch_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Issue #65: module IDs whose on_load is currently in progress.
+    /// A module in in_flight is NOT visible via get()/list().
+    /// Prevents concurrent duplicate registration of the same ID.
+    in_flight: ParkingLotMutex<HashSet<String>>,
+    /// Issue #65: callbacks invoked when any module's on_load fails.
+    load_failed_callbacks: RwLock<Vec<Arc<LoadFailedCallbackFn>>>,
 }
 
 /// RAII guard that restores a taken-out `Discoverer` back into the registry's
@@ -439,6 +448,10 @@ impl std::fmt::Debug for Registry {
             .field("descriptors", &core.descriptors)
             .field("ref_counts", &core.ref_counts)
             .field("draining", &core.draining)
+            .field(
+                "in_flight",
+                &self.in_flight.lock().iter().cloned().collect::<Vec<_>>(),
+            )
             .field(
                 "drain_events_keys",
                 &self.drain_events.read().keys().cloned().collect::<Vec<_>>(),
@@ -478,7 +491,16 @@ impl Registry {
             extension_roots: RwLock::new(Vec::new()),
             watcher: parking_lot::Mutex::new(None),
             watch_handle: parking_lot::Mutex::new(None),
+            in_flight: ParkingLotMutex::new(HashSet::new()),
+            load_failed_callbacks: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Register a callback invoked when any module's on_load fails.
+    ///
+    /// The callback receives the module_id and the error from on_load.
+    pub fn on_load_failed(&self, callback: Arc<LoadFailedCallbackFn>) {
+        self.load_failed_callbacks.write().push(callback);
     }
 
     /// Snapshot the callbacks for a given event name so they can be invoked
@@ -887,21 +909,12 @@ impl Registry {
             }
         }
 
-        let module_arc: Arc<dyn Module> = module.into();
-        let module_clone = Arc::clone(&module_arc);
-
+        // Issue #65: deferred-publish — run conflict detection first (under
+        // core.read() to avoid holding write for long), then atomically reserve
+        // the slot in in_flight so concurrent same-ID registrations are rejected.
         {
-            let mut core = self.core.write();
-
+            let core = self.core.read();
             // Full conflict detection (duplicate / reserved / case-collision).
-            // Aligned with `apcore-python.Registry.register`, which invokes
-            // `detect_id_conflicts` on every register call — a prior audit
-            // flagged a cross-language drift where only exact duplicates
-            // were caught by the Rust path.
-            //
-            // When `allow_reserved` is true (sys-module internal path), the
-            // reserved-word check is suppressed by passing an empty slice;
-            // duplicate + case-collision detection still applies.
             let reserved: &[&str] = if allow_reserved { &[] } else { RESERVED_WORDS };
             let existing_ids: HashSet<String> = core.modules.keys().cloned().collect();
             if let Some(conflict) =
@@ -923,40 +936,65 @@ impl Registry {
                     }
                 }
             }
-
-            let schema = serde_json::json!({
-                "input": descriptor.input_schema,
-                "output": descriptor.output_schema,
-            });
-            core.schema_cache.insert(name.to_string(), schema);
-            core.lowercase_map
-                .insert(name.to_lowercase(), name.to_string());
-            core.modules.insert(name.to_string(), module_arc);
-            core.descriptors.insert(name.to_string(), descriptor);
         }
 
-        // on_load runs AFTER successful insertion and OUTSIDE any lock.
-        // Duplicates never reach this point, so on_load cannot leak
-        // resources for a registration that the registry rejected.
-        // If on_load signals failure, roll back the four inserts above so no
-        // half-initialised module remains in the registry (mirrors
-        // apcore-python Registry._invoke_on_load rollback).
-        if let Err(e) = module_clone.on_load() {
-            let mut core = self.core.write();
-            core.schema_cache.remove(name);
-            core.lowercase_map.remove(&name.to_lowercase());
-            core.modules.remove(name);
-            core.descriptors.remove(name);
-            // Re-raise the original error unchanged (mirrors Python `raise` / TypeScript `throw e`).
-            // Wrapping into ModuleLoadError loses the original code and breaks downstream dispatch.
-            return Err(e);
+        // Reserve slot in in_flight (atomic check-and-insert).
+        // If the ID is already in_flight (concurrent registration in progress),
+        // return DuplicateModuleId immediately.
+        {
+            let mut in_flight = self.in_flight.lock();
+            if in_flight.contains(name) {
+                return Err(ModuleError::duplicate_module_id(name));
+            }
+            in_flight.insert(name.to_string());
         }
 
-        for cb in self.snapshot_callbacks("register") {
-            cb(name, module_clone.as_ref());
-        }
+        let module_arc: Arc<dyn Module> = module.into();
+        let module_clone = Arc::clone(&module_arc);
 
-        Ok(())
+        // Issue #65: run on_load WITHOUT any lock held and WITHOUT the module
+        // being visible in core.modules. Only after on_load succeeds do we
+        // atomically publish the module (insert into core.modules) and remove
+        // from in_flight.
+        match module_clone.on_load() {
+            Ok(()) => {
+                // Atomic publish: insert into visible maps, remove from in_flight.
+                {
+                    let mut core = self.core.write();
+                    let schema = serde_json::json!({
+                        "input": descriptor.input_schema,
+                        "output": descriptor.output_schema,
+                    });
+                    core.schema_cache.insert(name.to_string(), schema);
+                    core.lowercase_map
+                        .insert(name.to_lowercase(), name.to_string());
+                    core.modules
+                        .insert(name.to_string(), Arc::clone(&module_arc));
+                    core.descriptors.insert(name.to_string(), descriptor);
+                }
+                self.in_flight.lock().remove(name);
+
+                for cb in self.snapshot_callbacks("register") {
+                    cb(name, module_clone.as_ref());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Roll back: remove from in_flight; fire load_failed callbacks.
+                self.in_flight.lock().remove(name);
+                let cbs: Vec<Arc<LoadFailedCallbackFn>> = self
+                    .load_failed_callbacks
+                    .read()
+                    .iter()
+                    .map(Arc::clone)
+                    .collect();
+                for cb in cbs {
+                    cb(name, &e);
+                }
+                // Re-raise the original error unchanged.
+                Err(e)
+            }
+        }
     }
 
     /// Apply a closure to every registered module.
