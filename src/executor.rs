@@ -623,6 +623,15 @@ impl Executor {
                     // executor.ts:352 (sync finding A-D-016).
                     let underlying =
                         propagate_module_error(underlying, module_id, &pipe_ctx.context);
+                    // Cancellation short-circuit (D-20): an ExecutionCancelled
+                    // error MUST bypass the on_error middleware chain so
+                    // logging middleware cannot swallow it and retry
+                    // middleware cannot resurrect the call via RetrySignal.
+                    // Mirrors apcore-python and apcore-typescript.
+                    // Spec: docs/features/core-executor.md §Cancellation Short-Circuit
+                    if matches!(underlying.code, ErrorCode::ExecutionCancelled) {
+                        return Err(underlying);
+                    }
                     // Run middleware on_error hooks in reverse so any registered
                     // recovery / retry middleware can intercept the error.
                     let executed = pipe_ctx.executed_middlewares.clone();
@@ -1114,6 +1123,15 @@ impl Executor {
     /// and a full execution trace.
     ///
     /// Uses the provided `strategy` override, or the executor's default strategy.
+    ///
+    /// Shares the canonical error-recovery semantics of [`Self::call`] per
+    /// spec docs/features/core-executor.md §Trace Variants (D-19) —
+    /// middleware `on_error` recovery applies, the
+    /// `ExecutionCancelled` short-circuit (D-20) applies, and the
+    /// `MiddlewareChainError` unwrap rule (D-22) applies. On successful
+    /// recovery the returned `PipelineTrace` is the trace captured during
+    /// the failing pipeline run (including any `on_error` events recorded
+    /// inside it).
     pub async fn call_with_trace(
         &self,
         module_id: &str,
@@ -1137,13 +1155,51 @@ impl Executor {
             PipelineContext::new(module_id, inputs, context, effective_strategy.name());
         self.inject_resources(&mut pipeline_ctx);
 
-        // §1.1 fail-fast: PipelineStepError wraps step failures; unwrap so
-        // public callers see the original typed error.
-        let (output, trace) = PipelineEngine::run(effective_strategy, &mut pipeline_ctx)
-            .await
-            .map_err(|e| e.unwrap_pipeline_step_error().unwrap_or(e))?;
+        match PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await {
+            Ok((output, trace)) => Ok((output.unwrap_or(Value::Null), trace)),
+            Err(e) => {
+                // Unwrap PipelineStepError + MiddlewareChainError so callers
+                // and on_error middleware see the typed cause (D-22).
+                let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+                let underlying = underlying
+                    .unwrap_middleware_chain_error()
+                    .unwrap_or(underlying);
+                let underlying =
+                    propagate_module_error(underlying, module_id, &pipeline_ctx.context);
 
-        Ok((output.unwrap_or(Value::Null), trace))
+                // Cancellation short-circuit (D-20).
+                if matches!(underlying.code, ErrorCode::ExecutionCancelled) {
+                    return Err(underlying);
+                }
+
+                // Run middleware on_error chain (D-19) — recovery returns
+                // (recovered_value, trace); a Retry signal is treated as a
+                // failure (the trace variant does not loop). Mirrors
+                // apcore-python `call_with_trace` (recovery yes, retry no).
+                let executed = pipeline_ctx.executed_middlewares.clone();
+                if !executed.is_empty() {
+                    let outcome = self
+                        .middleware_manager
+                        .execute_on_error_outcome(
+                            module_id,
+                            pipeline_ctx.inputs.clone(),
+                            &underlying,
+                            &pipeline_ctx.context,
+                            &executed,
+                        )
+                        .await;
+                    if let Some(crate::middleware::base::OnErrorOutcome::Recovery(value)) = outcome
+                    {
+                        // Trace captured during the failing run includes any
+                        // on_error events recorded inside the pipeline; return
+                        // it alongside the recovered value.
+                        let trace = pipeline_ctx.trace.clone();
+                        return Ok((value, trace));
+                    }
+                }
+                Err(underlying)
+            }
+        }
     }
 
     /// Inject executor resources into a pipeline context so builtin steps
