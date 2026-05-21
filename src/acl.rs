@@ -374,18 +374,20 @@ impl ACL {
         crate::acl_handlers::register_condition(key, handler);
     }
 
-    /// Register a custom async-capable condition handler.
+    /// Register a custom async-only condition handler.
     ///
-    /// In Rust all handlers are structurally async (`ACLConditionHandler::evaluate`
-    /// is `async fn`), so this is an alias for [`ACL::register_condition`].
-    /// The alias exists for cross-language API parity with apcore-python
-    /// `register_async_condition` and apcore-typescript `registerAsyncCondition`
-    /// (sync finding A-D-022).
+    /// Stored in a **separate registry** from sync handlers — `async_check`
+    /// consults the async registry first, then falls back to the sync
+    /// registry. This lets callers override a sync handler for a given key
+    /// with an async-only variant without affecting the sync `ACL::check`
+    /// path. Cross-language parity with apcore-python
+    /// `register_async_condition` and apcore-typescript
+    /// `registerAsyncCondition` (closes A-D-ACL-002).
     pub fn register_async_condition(
         key: impl Into<String>,
         handler: std::sync::Arc<dyn crate::acl_handlers::ACLConditionHandler>,
     ) {
-        Self::register_condition(key, handler);
+        crate::acl_handlers::register_async_condition(key, handler);
     }
 
     /// Reload rules from the stored YAML path.
@@ -656,7 +658,16 @@ impl ACL {
                 .unwrap_or_default(),
             call_depth: ctx.map(|c| c.call_chain.len()),
             trace_id: ctx.map(|c| c.trace_id.clone()),
-            handler_error: None,
+            // Read the per-call handler-error slot populated by
+            // `acl_handlers::report_handler_error`. Returns `None` when no
+            // handler reported an error or when the audit is built outside
+            // a `with_handler_error_capture` scope (sync paths). Mirrors
+            // Python `_handler_error_var.get()` and TypeScript
+            // `_lastHandlerError` (closes A-D-ACL-001).
+            handler_error: crate::acl_handlers::HANDLER_ERROR
+                .try_with(|cell| cell.borrow().clone())
+                .ok()
+                .flatten(),
         }
     }
 
@@ -667,6 +678,24 @@ impl ACL {
     /// `finalize_*` helpers so the two methods cannot drift on logging fields,
     /// reason strings, or default-effect mapping.
     pub async fn async_check(
+        &self,
+        caller_id: Option<&str>,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
+        // Wrap the entire evaluation in a per-call handler-error capture
+        // scope so any handler that calls `report_handler_error(...)` lands
+        // its message in this call's audit entry. The captured value is
+        // read by `build_audit_entry` via the `HANDLER_ERROR` task-local
+        // (closes A-D-ACL-001).
+        let (decision, _captured) = crate::acl_handlers::with_handler_error_capture(
+            self.async_check_inner(caller_id, target_id, ctx),
+        )
+        .await;
+        decision
+    }
+
+    async fn async_check_inner(
         &self,
         caller_id: Option<&str>,
         target_id: &str,
