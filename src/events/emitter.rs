@@ -118,16 +118,47 @@ impl EventEmitter {
 
     /// Emit an event to all subscribers whose pattern matches the event type.
     ///
-    /// Errors from individual subscribers are logged but not propagated
-    /// (error isolation), matching Python's behaviour.
+    /// Canonical delivery path — applies the per-subscriber retry policy and
+    /// emits an `apcore.event.delivery_failed` DLQ event on exhaustion, per
+    /// spec docs/features/event-system.md §Event Delivery Semantics (#61).
+    /// Subscribers are delivered sequentially within this call; each
+    /// subscriber's retry loop is run inline (the call awaits full delivery
+    /// to all matching subscribers).
     ///
     /// **Post-shutdown behaviour:** if [`Self::shutdown`] has been called,
     /// this method returns immediately as a no-op (sync finding A-D-502).
     ///
-    /// Spec event-system.md:448 declares `No errors raised`. The body is
-    /// infallible — subscriber errors are caught and logged internally —
-    /// so the return type is unit, not `Result<(), ModuleError>` (D10-008).
+    /// Spec event-system.md:448 declares `No errors raised`. Subscriber
+    /// errors are caught, retried per the per-subscriber `retry` config, and
+    /// surfaced via DLQ + `on_failure` only after exhaustion. The return
+    /// type is unit (D10-008).
     pub async fn emit(&self, event: &ApCoreEvent) {
+        if self.is_shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
+        for subscriber in &self.subscribers {
+            if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+                Self::deliver_with_dlq(
+                    Arc::clone(subscriber),
+                    event.clone(),
+                    all_subscribers.clone(),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Single-attempt sequential emit — bypasses the per-subscriber retry
+    /// policy and DLQ machinery.
+    ///
+    /// Use this in tests that need strict ordering and deterministic
+    /// single-shot delivery semantics. Production code SHOULD call
+    /// [`Self::emit`] (canonical retry + DLQ) instead.
+    ///
+    /// Errors from individual subscribers are logged but not propagated
+    /// (error isolation), matching Python's behaviour.
+    pub async fn emit_sequential(&self, event: &ApCoreEvent) {
         if self.is_shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -148,6 +179,8 @@ impl EventEmitter {
     /// Emit an event to subscribers matching both the caller's filter pattern
     /// AND the subscriber's own `event_pattern`.
     ///
+    /// Applies the same retry + DLQ semantics as [`Self::emit`].
+    ///
     /// **Post-shutdown behaviour:** drops the event as a no-op (sync
     /// finding A-D-502).
     pub async fn emit_filtered(
@@ -158,18 +191,17 @@ impl EventEmitter {
         if self.is_shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
         for subscriber in &self.subscribers {
             if Self::matches_pattern(pattern, &event.event_type)
                 && Self::matches_pattern(subscriber.event_pattern(), &event.event_type)
             {
-                if let Err(e) = subscriber.on_event(event).await {
-                    tracing::warn!(
-                        subscriber_id = %subscriber.subscriber_id(),
-                        event_type = %event.event_type,
-                        error = %e,
-                        "event subscriber failed"
-                    );
-                }
+                Self::deliver_with_dlq(
+                    Arc::clone(subscriber),
+                    event.clone(),
+                    all_subscribers.clone(),
+                )
+                .await;
             }
         }
         Ok(())
@@ -620,7 +652,10 @@ mod tests {
         emitter.subscribe(Box::new(good_sub));
 
         let event = ApCoreEvent::new("test", json!({}));
-        emitter.emit(&event).await;
+        // Use the sequential single-attempt path so this test focuses on
+        // error isolation without invoking the retry+DLQ machinery (which
+        // is exercised by tests/test_v022_event_delivery_semantics.rs).
+        emitter.emit_sequential(&event).await;
         assert_eq!(received.lock().len(), 1);
     }
 }

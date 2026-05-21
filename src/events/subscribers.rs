@@ -113,7 +113,14 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
 
 /// Delivers events via HTTP POST to a webhook URL.
 ///
-/// Retry strategy: 2xx = success, 4xx = no retry, 5xx / connection error = retry.
+/// Delivery contract (spec docs/features/event-system.md §Event Delivery
+/// Semantics, Issue #61): `on_event` performs a **single** HTTP attempt and
+/// returns `Err(ModuleError)` on 5xx or network errors so that the
+/// surrounding [`EventEmitter`](super::EventEmitter) retry+DLQ policy
+/// (configured via `retry`) applies uniformly across subscriber types.
+/// 4xx responses are non-retryable client errors — they are logged at WARN
+/// and reported as `Ok` to suppress the spec retry loop.
+///
 /// Requires the `events` cargo feature for actual HTTP delivery.
 #[derive(Debug, Clone)]
 pub struct WebhookSubscriber {
@@ -121,8 +128,16 @@ pub struct WebhookSubscriber {
     pub url: String,
     pub event_pattern: String,
     pub headers: HashMap<String, String>,
+    /// **Deprecated** alias for `retry.max_attempts`. Retained as a
+    /// public field for backward-compatible construction; new code should
+    /// configure `retry` instead. When both are present in YAML the spec
+    /// requires `retry.max_attempts` to win — that resolution happens in
+    /// `build_webhook_subscriber`.
     pub retry_count: u32,
     pub timeout_ms: u64,
+    /// Retry policy applied by [`EventEmitter`](super::EventEmitter) — see
+    /// spec §Event Delivery Semantics (#61).
+    pub retry: crate::events::retry::EventRetryConfig,
 }
 
 impl WebhookSubscriber {
@@ -138,7 +153,15 @@ impl WebhookSubscriber {
             headers: HashMap::new(),
             retry_count: 3,
             timeout_ms: 5000,
+            retry: crate::events::retry::EventRetryConfig::default(),
         }
+    }
+
+    /// Override the retry policy applied by [`EventEmitter`](super::EventEmitter).
+    #[must_use]
+    pub fn with_retry(mut self, retry: crate::events::retry::EventRetryConfig) -> Self {
+        self.retry = retry;
+        self
     }
 }
 
@@ -150,6 +173,10 @@ impl EventSubscriber for WebhookSubscriber {
 
     fn event_pattern(&self) -> &str {
         &self.event_pattern
+    }
+
+    fn retry(&self) -> crate::events::retry::EventRetryConfig {
+        self.retry
     }
 
     #[cfg(feature = "events")]
@@ -165,40 +192,36 @@ impl EventSubscriber for WebhookSubscriber {
                 )
             })?;
 
-        let mut last_error = None;
-        for attempt in 0..=self.retry_count {
-            if attempt > 0 {
-                tracing::debug!(attempt, url = %self.url, "WebhookSubscriber retrying");
-            }
-            let mut req = client.post(&self.url).json(&body);
-            req = req.header("Content-Type", "application/json");
-            for (k, v) in &self.headers {
-                req = req.header(k.as_str(), v.as_str());
-            }
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if (200..300).contains(&status) {
-                        return Ok(());
-                    }
-                    if status < 500 {
-                        // 4xx: no retry.
-                        tracing::warn!(status, url = %self.url, "WebhookSubscriber: non-retryable error");
-                        return Ok(());
-                    }
-                    last_error = Some(format!("HTTP {status}"));
-                }
-                Err(e) => {
-                    last_error = Some(e.to_string());
-                }
-            }
+        let mut req = client.post(&self.url).json(&body);
+        req = req.header("Content-Type", "application/json");
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
         }
-        tracing::warn!(
-            url = %self.url,
-            error = ?last_error,
-            "WebhookSubscriber: delivery failed after retries"
-        );
-        Ok(())
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if (200..300).contains(&status) {
+                    return Ok(());
+                }
+                if status < 500 {
+                    // 4xx is a non-retryable client error per the spec retry
+                    // table — log and report success so EventEmitter does not
+                    // retry. (A-D-EVT-001.)
+                    tracing::warn!(status, url = %self.url, "WebhookSubscriber: non-retryable 4xx");
+                    return Ok(());
+                }
+                // 5xx — bubble up so EventEmitter::deliver_with_dlq applies
+                // the per-subscriber retry policy + DLQ on exhaustion.
+                Err(ModuleError::new(
+                    ErrorCode::GeneralInternalError,
+                    format!("WebhookSubscriber: HTTP {status} from {}", self.url),
+                ))
+            }
+            Err(e) => Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                format!("WebhookSubscriber: network error to {}: {e}", self.url),
+            )),
+        }
     }
 
     #[cfg(not(feature = "events"))]
@@ -227,7 +250,13 @@ pub enum A2AAuth {
 ///
 /// Payload: `{ "skillId": "<skill_id>", "event": <serialized> }`.
 /// The `skill_id` field defaults to `"apevo.event_receiver"` and can be
-/// overridden per-subscriber. Errors logged, not raised.
+/// overridden per-subscriber.
+///
+/// Delivery contract (spec docs/features/event-system.md §Event Delivery
+/// Semantics, Issue #61): `on_event` performs a **single** HTTP attempt and
+/// returns `Err(ModuleError)` on `>=400` or network errors so that the
+/// surrounding [`EventEmitter`](super::EventEmitter) retry+DLQ policy
+/// (configured via `retry`) applies uniformly across subscriber types.
 #[derive(Debug, Clone)]
 pub struct A2ASubscriber {
     pub id: String,
@@ -238,6 +267,9 @@ pub struct A2ASubscriber {
     /// The A2A skill ID included in the outgoing payload.
     /// Default: `"apevo.event_receiver"` (per apcore A2A spec).
     pub skill_id: String,
+    /// Retry policy applied by [`EventEmitter`](super::EventEmitter) — see
+    /// spec §Event Delivery Semantics (#61).
+    pub retry: crate::events::retry::EventRetryConfig,
 }
 
 impl A2ASubscriber {
@@ -253,6 +285,7 @@ impl A2ASubscriber {
             event_pattern: event_pattern.into(),
             timeout_ms: 5000,
             skill_id: "apevo.event_receiver".to_string(),
+            retry: crate::events::retry::EventRetryConfig::default(),
         }
     }
 
@@ -260,6 +293,13 @@ impl A2ASubscriber {
     #[must_use]
     pub fn with_skill_id(mut self, skill_id: impl Into<String>) -> Self {
         self.skill_id = skill_id.into();
+        self
+    }
+
+    /// Override the retry policy applied by [`EventEmitter`](super::EventEmitter).
+    #[must_use]
+    pub fn with_retry(mut self, retry: crate::events::retry::EventRetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 }
@@ -272,6 +312,10 @@ impl EventSubscriber for A2ASubscriber {
 
     fn event_pattern(&self) -> &str {
         &self.event_pattern
+    }
+
+    fn retry(&self) -> crate::events::retry::EventRetryConfig {
+        self.retry
     }
 
     #[cfg(feature = "events")]
@@ -311,14 +355,24 @@ impl EventSubscriber for A2ASubscriber {
             None => {}
         }
 
-        if let Err(e) = req.send().await {
-            tracing::warn!(
-                url = %self.platform_url,
-                error = %e,
-                "A2ASubscriber: delivery failed"
-            );
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if (200..400).contains(&status) {
+                    return Ok(());
+                }
+                // 4xx and 5xx both bubble up so EventEmitter applies the
+                // configured retry policy + DLQ on exhaustion (A-D-EVT-001).
+                Err(ModuleError::new(
+                    ErrorCode::GeneralInternalError,
+                    format!("A2ASubscriber: HTTP {status} from {}", self.platform_url),
+                ))
+            }
+            Err(e) => Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                format!("A2ASubscriber: network error to {}: {e}", self.platform_url),
+            )),
         }
-        Ok(())
     }
 
     #[cfg(not(feature = "events"))]

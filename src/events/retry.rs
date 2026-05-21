@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 
 /// Retry configuration for event subscribers.
 ///
-/// Defaults to single-attempt delivery (no retry) for backward compatibility.
-/// Override `EventSubscriber::retry()` to opt into retry behavior.
+/// Defaults align with spec (Event Delivery Semantics, Issue #61):
+/// `max_attempts=3`, `initial_backoff_ms=100`, `max_backoff_ms=30_000`,
+/// `backoff_multiplier=2.0`. Callers that genuinely want single-attempt
+/// (fire-and-forget) semantics should use [`Self::no_retry`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub struct EventRetryConfig {
     /// Total maximum delivery attempts (1 = no retry, 2 = one retry, etc.).
@@ -21,10 +23,14 @@ pub struct EventRetryConfig {
 }
 
 impl Default for EventRetryConfig {
-    /// Default: single-attempt delivery (no retry). Backward-compatible.
+    /// Default: spec-aligned (3 attempts, 100 ms initial backoff, 30 s cap, 2.0x).
+    ///
+    /// Spec: docs/features/event-system.md §"Event Delivery Semantics"
+    /// (Issue #61) — `max_attempts=3`, `initial_backoff_ms=100`,
+    /// `max_backoff_ms=30000`, `backoff_multiplier=2.0`.
     fn default() -> Self {
         Self {
-            max_attempts: 1,
+            max_attempts: 3,
             initial_backoff_ms: 100,
             max_backoff_ms: 30_000,
             backoff_multiplier: 2.0,
@@ -33,6 +39,19 @@ impl Default for EventRetryConfig {
 }
 
 impl EventRetryConfig {
+    /// Single-attempt delivery (no retry). Use for fire-and-forget subscribers
+    /// where transient failures must not be retried (e.g. stdout, local file
+    /// rotation, idempotent push to in-memory metrics).
+    #[must_use]
+    pub fn no_retry() -> Self {
+        Self {
+            max_attempts: 1,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            backoff_multiplier: 1.0,
+        }
+    }
+
     /// Compute backoff delay for a zero-based attempt index.
     ///
     /// `attempt=0` is the first retry (delay before the second delivery try).
@@ -60,8 +79,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_is_single_attempt() {
+    fn test_default_matches_spec() {
+        // Spec: docs/features/event-system.md §Event Delivery Semantics (#61)
         let cfg = EventRetryConfig::default();
+        assert_eq!(cfg.max_attempts, 3);
+        assert_eq!(cfg.initial_backoff_ms, 100);
+        assert_eq!(cfg.max_backoff_ms, 30_000);
+        assert!((cfg.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_no_retry_helper_is_single_attempt() {
+        let cfg = EventRetryConfig::no_retry();
         assert_eq!(cfg.max_attempts, 1);
     }
 

@@ -226,9 +226,13 @@ async fn test_emitter_error_isolation() {
     }));
     emitter.subscribe(Box::new(good));
 
-    // emit() returns unit (D10-008) — error isolation happens internally.
-    // The good subscriber still receives despite the failing one.
-    emitter.emit(&ApCoreEvent::new("err.test", json!({}))).await;
+    // emit_sequential() is the deterministic single-attempt path; error
+    // isolation is the focus of this test. The retry+DLQ behaviour of the
+    // canonical `emit()` path is covered by
+    // tests/test_v022_event_delivery_semantics.rs.
+    emitter
+        .emit_sequential(&ApCoreEvent::new("err.test", json!({})))
+        .await;
     assert_eq!(received.lock().unwrap().len(), 1);
 }
 

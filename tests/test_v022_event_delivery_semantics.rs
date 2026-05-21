@@ -250,7 +250,7 @@ async fn permanent_failure_emits_dlq_event() {
 async fn single_attempt_failure_logs_warn_no_dlq() {
     // Default retry (single attempt) — no DLQ emitted, only a warn log.
     let (sub, attempt_count, failure_recorded) =
-        AlwaysFailSubscriber::new("sub-single", EventRetryConfig::default());
+        AlwaysFailSubscriber::new("sub-single", EventRetryConfig::no_retry());
     let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-single");
 
     let mut emitter = EventEmitter::new();

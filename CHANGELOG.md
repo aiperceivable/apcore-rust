@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **`EventRetryConfig::default()` is now spec-aligned (closes A-D-EVT-004).** Previously defaulted to single-attempt (`max_attempts = 1`) for backward compatibility; now defaults to `max_attempts=3, initial_backoff_ms=100, max_backoff_ms=30_000, backoff_multiplier=2.0` per [docs/features/event-system.md §Event Delivery Semantics (#61)](https://github.com/aiperceivable/apcore/blob/main/docs/features/event-system.md). Callers that genuinely want fire-and-forget single-attempt semantics should switch to the new `EventRetryConfig::no_retry()` helper.
+
+- **`EventEmitter::emit()` and `emit_filtered()` now apply per-subscriber retry + DLQ inline (closes A-D-EVT-003).** The canonical await-completion delivery path runs each matching subscriber through the retry loop defined by `EventSubscriber::retry()` and emits `apcore.event.delivery_failed` on exhaustion (when `max_attempts > 1`). A new `emit_sequential()` helper preserves the legacy single-attempt sequential-dispatch shape for tests that need deterministic ordering without retry/DLQ noise. `emit_delivery_semantics()` (spawned fire-and-forget) and `emit_spawn()` (no-retry spawn) are retained for callers that cannot await delivery.
+
+- **`WebhookSubscriber` and `A2ASubscriber` no longer swallow transient failures (closes A-D-EVT-001).** Both subscribers now return `Err(ModuleError)` from `on_event` on 5xx / network errors (and `>=400` for A2A), letting the surrounding `EventEmitter` apply the spec retry policy + DLQ uniformly. The ad-hoc internal retry loop on `WebhookSubscriber` is removed — `retry_count` is retained as a deprecated alias for `retry.max_attempts` and is no longer consulted on the delivery path. Both structs gain a public `retry: EventRetryConfig` field and a `with_retry()` builder; their `EventSubscriber::retry()` returns that field so per-subscriber policy flows through `EventEmitter` automatically.
+
+### Added
+
+- **`EventRetryConfig::no_retry()` helper.** Returns single-attempt configuration for fire-and-forget subscriber semantics.
+
+---
+
 
 ## [0.22.0] - 2026-05-20
 
