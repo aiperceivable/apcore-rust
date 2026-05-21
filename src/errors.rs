@@ -143,6 +143,11 @@ pub enum ErrorCode {
     /// Raised when `AsyncTaskManager::submit` is called at the task-slot limit.
     /// Cross-language: Python `TASK_LIMIT_EXCEEDED`, TypeScript `TASK_LIMIT_EXCEEDED`.
     TaskLimitExceeded,
+    /// Raised when `AsyncTaskManager::start_reaper` is called while another
+    /// reaper is already running. Mirrors apcore-python
+    /// `REAPER_ALREADY_RUNNING` and apcore-typescript
+    /// `REAPER_ALREADY_RUNNING`. Closes A-D-AT-05.
+    ReaperAlreadyRunning,
     /// Raised when a version constraint string is malformed (e.g., `">="`
     /// without a digit operand, `"v1.0"` prefix, or a non-semver operand).
     /// Cross-language: Python `VERSION_CONSTRAINT_INVALID`, TypeScript `VERSION_CONSTRAINT_INVALID`.

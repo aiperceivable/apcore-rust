@@ -291,22 +291,42 @@ impl Default for ReaperConfig {
 /// background reaper task. Drop the handle to detach (the reaper continues to
 /// run); call [`ReaperHandle::stop`] to gracefully signal cancellation and
 /// await termination.
+#[derive(Debug)]
 pub struct ReaperHandle {
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
     stop_tx: watch::Sender<bool>,
+    /// Shared `running` flag owned by the [`AsyncTaskManager`] that spawned
+    /// this reaper. Cleared on `stop()` (and via the `Drop` fallback) so a
+    /// subsequent `start_reaper` call succeeds.
+    running_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ReaperHandle {
     /// Signal the reaper to stop and await its clean shutdown.
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         // Receivers may have already been dropped — ignore the send error.
         let _ = self.stop_tx.send(true);
-        // The reaper observes the signal and exits its loop; await the join.
-        if let Err(err) = self.handle.await {
-            if !err.is_cancelled() {
-                warn!("reaper task join failed: {err}");
+        // Take the JoinHandle so we can `.await` it without moving out of
+        // `self` (the Drop impl below releases the running flag).
+        if let Some(handle) = self.handle.take() {
+            if let Err(err) = handle.await {
+                if !err.is_cancelled() {
+                    warn!("reaper task join failed: {err}");
+                }
             }
         }
+        self.running_flag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for ReaperHandle {
+    fn drop(&mut self) {
+        // Detached / aborted handles also release the running flag so the
+        // manager can spawn a new reaper afterwards. `stop()` performs an
+        // explicit clear before this runs, so the double-clear is harmless.
+        self.running_flag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -338,6 +358,11 @@ pub struct AsyncTaskManager {
     /// sync mutex's `!Send` guard would block `tokio::spawn` of any code
     /// path that touches `submit` (D10-003 alignment).
     admission_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Tracks whether a reaper is currently running. Closes A-D-AT-05 —
+    /// `start_reaper` returns `Err(ReaperAlreadyRunning)` when this flag is
+    /// already set. Cleared by `ReaperHandle::stop` (and on drop) so a
+    /// caller can `stop()` then `start_reaper()` again.
+    reaper_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AsyncTaskManager {
@@ -371,6 +396,7 @@ impl AsyncTaskManager {
             handles: Arc::new(Mutex::new(HashMap::new())),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             admission_lock: Arc::new(tokio::sync::Mutex::new(())),
+            reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -582,9 +608,38 @@ impl AsyncTaskManager {
     }
 
     /// Start the opt-in background reaper. Returns a [`ReaperHandle`] used to
-    /// stop the reaper gracefully. Multiple concurrent reapers can be started;
-    /// callers SHOULD guard against this and keep at most one handle live.
-    pub fn start_reaper(&self, config: ReaperConfig) -> ReaperHandle {
+    /// stop the reaper gracefully.
+    ///
+    /// At most one reaper may be running per manager. Calling `start_reaper`
+    /// while another reaper is still live returns
+    /// `Err(ModuleError { code: ReaperAlreadyRunning, .. })`. Call
+    /// [`ReaperHandle::stop`] (or drop the handle) before starting a new one.
+    /// Mirrors apcore-python `REAPER_ALREADY_RUNNING` and apcore-typescript
+    /// `REAPER_ALREADY_RUNNING` (closes A-D-AT-05).
+    ///
+    /// # Errors
+    /// Returns `ModuleError` with [`ErrorCode::ReaperAlreadyRunning`] when a
+    /// reaper handle from a prior `start_reaper` call has not yet been
+    /// stopped or dropped.
+    pub fn start_reaper(&self, config: ReaperConfig) -> Result<ReaperHandle, ModuleError> {
+        // Compare-and-swap from `false` → `true` so concurrent calls do not
+        // race past the check. `Err` indicates the flag was already `true`.
+        if self
+            .reaper_running
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err(ModuleError::new(
+                ErrorCode::ReaperAlreadyRunning,
+                "AsyncTaskManager reaper is already running; call stop() first",
+            ));
+        }
+
         let store = Arc::clone(&self.store);
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let interval = Duration::from_millis(config.sweep_interval_ms);
@@ -623,7 +678,11 @@ impl AsyncTaskManager {
             }
         });
 
-        ReaperHandle { handle, stop_tx }
+        Ok(ReaperHandle {
+            handle: Some(handle),
+            stop_tx,
+            running_flag: Arc::clone(&self.reaper_running),
+        })
     }
 }
 
@@ -632,13 +691,20 @@ impl AsyncTaskManager {
 // ---------------------------------------------------------------------------
 
 /// Capacity-check then persist a new task record.
+///
+/// Counts only **active** tasks (`Pending` + `Running`) so terminal-state
+/// records — completed/failed/cancelled tasks still living in the store
+/// pending TTL-based cleanup — do not consume the `max_tasks` budget.
+/// Mirrors apcore-python `_ACTIVE_STATUSES` and apcore-typescript
+/// `_isActiveStatus` (closes A-D-AT-01).
 async fn check_capacity_and_save(
     store: &dyn TaskStore,
     max_tasks: usize,
     info: &TaskInfo,
 ) -> Result<(), ModuleError> {
     let current = store.list(None).await?;
-    if current.len() >= max_tasks {
+    let active = current.iter().filter(|t| t.status.is_active()).count();
+    if active >= max_tasks {
         return Err(ModuleError::new(
             ErrorCode::TaskLimitExceeded,
             format!("Task limit reached ({max_tasks})"),
