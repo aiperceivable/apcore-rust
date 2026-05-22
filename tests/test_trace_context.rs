@@ -10,6 +10,7 @@ fn make_traceparent(trace_id: &str, parent_id: &str) -> TraceParent {
         trace_id: trace_id.to_string(),
         parent_id: parent_id.to_string(),
         trace_flags: 1,
+        tracestate: vec![],
     }
 }
 
@@ -41,6 +42,7 @@ fn test_traceparent_flags_formatted_as_two_hex_digits() {
         trace_id: "aaa".to_string(),
         parent_id: "bbb".to_string(),
         trace_flags: 0,
+        tracestate: vec![],
     };
     let header = tp.to_header();
     assert!(header.ends_with("-00"));
@@ -203,15 +205,21 @@ fn test_inject_omits_tracestate_when_empty() {
 #[test]
 fn test_context_builder_seeds_tracestate_into_context_data() {
     use apcore::context::ContextBuilder;
-    let tp = make_traceparent("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
+    // Per Issue #66, tracestate is a field on TraceParent rather than a
+    // separate builder setter.
     let entries = vec![
         ("vendor1".to_string(), "abc123".to_string()),
         ("vendor2".to_string(), "def456".to_string()),
     ];
-    let ctx: apcore::context::Context<serde_json::Value> = ContextBuilder::new()
-        .trace_parent(Some(tp))
-        .tracestate(entries.clone())
-        .build();
+    let tp = TraceParent {
+        version: 0,
+        trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+        parent_id: "00f067aa0ba902b7".to_string(),
+        trace_flags: 1,
+        tracestate: entries.clone(),
+    };
+    let ctx: apcore::context::Context<serde_json::Value> =
+        ContextBuilder::new().trace_parent(Some(tp)).build();
     let headers = TraceContext::inject(&ctx);
     assert!(
         headers.contains_key("tracestate"),

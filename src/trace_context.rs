@@ -140,13 +140,25 @@ fn format_tracestate(entries: &[(String, String)]) -> String {
         .join(",")
 }
 
-/// Parsed W3C traceparent header.
+/// Parsed W3C traceparent header together with the inbound `tracestate`
+/// (vendor state) entries.
+///
+/// Per the unified `Context.create` contract (apcore Issue #66 / core-executor.md
+/// §"Contract: Context.create"), the SDKs MUST embed `tracestate` in the
+/// `TraceParent` type rather than exposing it as a separate factory parameter.
+/// Constructors that parse only the `traceparent` header value populate
+/// `tracestate` with `vec![]`; `TraceContext::extract_context` populates both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceParent {
     pub version: u8,
     pub trace_id: String,
     pub parent_id: String,
     pub trace_flags: u8,
+    /// W3C `tracestate` vendor entries carried alongside the traceparent.
+    /// Order is significant. When absent (header missing or constructed
+    /// programmatically without vendor state), this is `vec![]`.
+    #[serde(default)]
+    pub tracestate: Vec<(String, String)>,
 }
 
 impl TraceParent {
@@ -195,6 +207,7 @@ impl TraceParent {
             trace_id,
             parent_id,
             trace_flags,
+            tracestate: vec![],
         })
     }
 
@@ -241,6 +254,7 @@ impl TraceContext {
                 trace_id,
                 parent_id,
                 trace_flags: 1,
+                tracestate: vec![],
             },
             tracestate: vec![],
             baggage: std::collections::HashMap::new(),
@@ -258,6 +272,7 @@ impl TraceContext {
                 trace_id: self.traceparent.trace_id.clone(),
                 parent_id,
                 trace_flags: self.traceparent.trace_flags,
+                tracestate: self.traceparent.tracestate.clone(),
             },
             tracestate: self.tracestate.clone(),
             baggage: self.baggage.clone(),
@@ -410,6 +425,7 @@ impl TraceContext {
             trace_id,
             parent_id,
             trace_flags,
+            tracestate: vec![],
         })
     }
 
@@ -421,10 +437,15 @@ impl TraceContext {
     /// is optional, and malformed entries within it are silently dropped per
     /// W3C §3.3.1.
     pub fn extract_context(headers: &HashMap<String, String>) -> Option<TraceContext> {
-        let traceparent = Self::extract(headers)?;
+        let mut traceparent = Self::extract(headers)?;
         let tracestate = lookup_header_ci(headers, "tracestate")
             .map(|v| parse_tracestate(v))
             .unwrap_or_default();
+        // Mirror the tracestate on the TraceParent so callers that only carry
+        // the parsed TraceParent forward (per the unified Context.create
+        // contract) still see the inbound vendor state. Kept identical on the
+        // wrapping TraceContext for backward-compatible field access.
+        traceparent.tracestate.clone_from(&tracestate);
         Some(TraceContext {
             traceparent,
             tracestate,

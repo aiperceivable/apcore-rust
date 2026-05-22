@@ -68,6 +68,7 @@ fn context_builder_seeds_trace_flags_from_trace_parent() {
         trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
         parent_id: "00f067aa0ba902b7".to_string(),
         trace_flags: 0, // unsampled
+        tracestate: vec![],
     };
     let ctx: Context<serde_json::Value> = ContextBuilder::<serde_json::Value>::new()
         .trace_parent(Some(parent))

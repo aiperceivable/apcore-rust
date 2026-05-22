@@ -153,14 +153,21 @@ impl Middleware for SwallowingMiddleware {
 }
 
 fn ctx_with_token(token: CancelToken) -> Context<Value> {
-    let mut ctx = Context::<Value>::new(Identity::new(
-        "@external".to_string(),
-        "external".to_string(),
-        vec![],
-        HashMap::new(),
-    ));
-    ctx.cancel_token = Some(token);
-    ctx
+    // Per Issue #66, `cancel_token` is a first-class `Context::create`
+    // parameter; no post-hoc assignment is needed.
+    Context::<Value>::create(
+        Some(Identity::new(
+            "@external".to_string(),
+            "external".to_string(),
+            vec![],
+            HashMap::new(),
+        )),
+        None,
+        Some(token),
+        None,
+        Value::Null,
+        None,
+    )
 }
 
 /// Register `module` under `module_id` with a descriptor that pins

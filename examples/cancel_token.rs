@@ -67,9 +67,17 @@ async fn main() {
 
     // --- Run 1: complete all steps (no cancellation) ---
     println!("=== Run 1: normal execution ===");
-    let mut ctx: Context<Value> = Context::new(identity.clone());
+    // Per Issue #66, `cancel_token` is a first-class `Context::create`
+    // parameter — no post-hoc assignment required.
     let token = CancelToken::new();
-    ctx.cancel_token = Some(token);
+    let ctx: Context<Value> = Context::create(
+        Some(identity.clone()),
+        None,
+        Some(token),
+        None,
+        Value::Null,
+        None,
+    );
 
     let module = SlowModule;
     let result = module.execute(json!({"steps": 3}), &ctx).await.unwrap();
@@ -77,9 +85,15 @@ async fn main() {
 
     // --- Run 2: cancel mid-flight ---
     println!("=== Run 2: cancelled mid-flight ===");
-    let mut ctx2: Context<Value> = Context::new(identity.clone());
     let token2 = CancelToken::new();
-    ctx2.cancel_token = Some(token2.clone());
+    let ctx2: Context<Value> = Context::create(
+        Some(identity.clone()),
+        None,
+        Some(token2.clone()),
+        None,
+        Value::Null,
+        None,
+    );
 
     // Cancel after 80 ms (step 1 runs at ~0ms, step 2 at ~50ms, cancel fires at ~80ms)
     let token2_clone = token2.clone();

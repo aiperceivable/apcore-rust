@@ -203,6 +203,14 @@ pub enum ErrorCode {
     /// because the first is still in the in-flight loading set.
     /// Cross-language: Python/TS `DUPLICATE_MODULE_ID`.
     DuplicateModuleId,
+    /// Issue #66 (core-executor.md §"Contract: Executor binding to Context"): a
+    /// Context whose `executor` field is already bound to a different Executor
+    /// instance was passed to `Executor::bind_executor` (or the equivalent
+    /// pipeline-entry binding). Cross-executor rebind is rejected by default;
+    /// SDKs that accept silently MUST document the deviation prominently.
+    /// Cross-language: Python/TS `CONTEXT_BINDING_ERROR`.
+    #[serde(rename = "CONTEXT_BINDING_ERROR")]
+    ContextBindingError,
 }
 
 /// Structured error returned by module execution.

@@ -102,10 +102,11 @@ fn test_context_no_cancel_token_by_default() {
 
 #[test]
 fn test_context_with_cancel_token() {
+    // Per Issue #66, `cancel_token` is a first-class parameter on
+    // `Context::create` so this no longer requires post-hoc assignment.
     let id = make_identity("user-1", "Alice", &[]);
-    let mut ctx: Context<Value> = Context::new(id);
     let token = CancelToken::new();
-    ctx.cancel_token = Some(token);
+    let ctx: Context<Value> = Context::create(Some(id), None, Some(token), None, Value::Null, None);
     assert!(!ctx.cancel_token.as_ref().unwrap().is_cancelled());
 }
 
@@ -135,7 +136,7 @@ fn test_anonymous_context_has_none_identity() {
 
 #[test]
 fn test_context_create_accepts_none_identity() {
-    let ctx: Context<Value> = Context::create(None, Value::Null, None, None);
+    let ctx: Context<Value> = Context::create(None, None, None, None, Value::Null, None);
     assert!(
         ctx.identity.is_none(),
         "Context::create(None, ...) must leave identity as None — downstream consumers \
@@ -149,7 +150,8 @@ fn test_context_create_accepts_none_identity() {
 #[test]
 fn test_context_create_preserves_supplied_identity() {
     let id = make_identity("alice", "Alice", &["admin"]);
-    let ctx: Context<Value> = Context::create(Some(id.clone()), Value::Null, None, None);
+    let ctx: Context<Value> =
+        Context::create(Some(id.clone()), None, None, None, Value::Null, None);
     assert_eq!(
         ctx.identity.as_ref().map(apcore::Identity::id),
         Some("alice")
