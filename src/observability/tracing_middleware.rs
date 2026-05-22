@@ -286,8 +286,10 @@ mod tests {
                 vec![],
                 HashMap::new(),
             )),
-            serde_json::Value::Null,
             None,
+            None,
+            None,
+            serde_json::Value::Null,
             None,
         )
         .tap_trace_id(trace_id)

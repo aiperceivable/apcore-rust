@@ -407,6 +407,13 @@ pub struct Executor {
     pub middleware_manager: Arc<MiddlewareManager>,
     /// Execution strategy — all calls go through PipelineEngine.
     strategy: ExecutionStrategy,
+    /// Unique per-Executor identity handle bound to `context.executor` at
+    /// pipeline entry (apcore Issue #66 / `core-executor.md` §"Contract:
+    /// Executor binding to Context"). Two `Executor` instances are
+    /// distinguished by `Arc::ptr_eq` on this handle; cloning an `Executor`
+    /// would produce a fresh handle by design — Executors are meant to be
+    /// shared via `Arc<Executor>`, not duplicated.
+    instance_handle: Arc<()>,
 }
 
 impl Executor {
@@ -423,6 +430,7 @@ impl Executor {
             approval_handler: None,
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy: build_standard_strategy(),
+            instance_handle: Arc::new(()),
         }
     }
 
@@ -443,6 +451,7 @@ impl Executor {
             approval_handler: None,
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
+            instance_handle: Arc::new(()),
         })
     }
 
@@ -459,6 +468,7 @@ impl Executor {
             approval_handler: None,
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
+            instance_handle: Arc::new(()),
         }
     }
 
@@ -487,6 +497,7 @@ impl Executor {
             approval_handler: approval_handler.map(|h| Arc::from(h) as Arc<dyn ApprovalHandler>),
             middleware_manager: Arc::new(middleware_manager),
             strategy: build_standard_strategy(),
+            instance_handle: Arc::new(()),
         }
     }
 
@@ -578,6 +589,7 @@ impl Executor {
             pipe_ctx.version_hint = Some(hint.to_string());
         }
         self.inject_resources(&mut pipe_ctx);
+        self.bind_to_context(&mut pipe_ctx)?;
 
         // Loop iterates only when a RetrySignal is returned from middleware
         // on_error_outcome; every other path returns or errors on the first
@@ -623,6 +635,15 @@ impl Executor {
                     // executor.ts:352 (sync finding A-D-016).
                     let underlying =
                         propagate_module_error(underlying, module_id, &pipe_ctx.context);
+                    // Cancellation short-circuit (D-20): an ExecutionCancelled
+                    // error MUST bypass the on_error middleware chain so
+                    // logging middleware cannot swallow it and retry
+                    // middleware cannot resurrect the call via RetrySignal.
+                    // Mirrors apcore-python and apcore-typescript.
+                    // Spec: docs/features/core-executor.md §Cancellation Short-Circuit
+                    if matches!(underlying.code, ErrorCode::ExecutionCancelled) {
+                        return Err(underlying);
+                    }
                     // Run middleware on_error hooks in reverse so any registered
                     // recovery / retry middleware can intercept the error.
                     let executed = pipe_ctx.executed_middlewares.clone();
@@ -716,6 +737,22 @@ impl Executor {
             PipelineContext::new(module_id, inputs.clone(), context, self.strategy.name());
         pipe_ctx.dry_run = true;
         self.inject_resources(&mut pipe_ctx);
+        // validate() is non-throwing per A-D-010: bind errors surface as a
+        // failed `executor_binding` check rather than bubbling up.
+        if let Err(err) = self.bind_to_context(&mut pipe_ctx) {
+            let check = PreflightCheckResult {
+                check: "executor_binding".to_string(),
+                passed: false,
+                error: Some(err.to_dict()),
+                warnings: vec![],
+            };
+            return Ok(PreflightResult {
+                valid: false,
+                checks: vec![check],
+                requires_approval: false,
+                predicted_changes: vec![],
+            });
+        }
 
         let mut checks: Vec<PreflightCheckResult> = Vec::new();
         let trace_result = PipelineEngine::run(&self.strategy, &mut pipe_ctx).await;
@@ -1023,6 +1060,7 @@ impl Executor {
             pipe_ctx.version_hint = Some(hint.to_string());
         }
         self.inject_resources(&mut pipe_ctx);
+        self.bind_to_context(&mut pipe_ctx)?;
 
         // Drive the shared pipeline engine up to — but not including — the
         // `execute` step. This inherits all per-step metadata handling from
@@ -1114,6 +1152,15 @@ impl Executor {
     /// and a full execution trace.
     ///
     /// Uses the provided `strategy` override, or the executor's default strategy.
+    ///
+    /// Shares the canonical error-recovery semantics of [`Self::call`] per
+    /// spec docs/features/core-executor.md §Trace Variants (D-19) —
+    /// middleware `on_error` recovery applies, the
+    /// `ExecutionCancelled` short-circuit (D-20) applies, and the
+    /// `MiddlewareChainError` unwrap rule (D-22) applies. On successful
+    /// recovery the returned `PipelineTrace` is the trace captured during
+    /// the failing pipeline run (including any `on_error` events recorded
+    /// inside it).
     pub async fn call_with_trace(
         &self,
         module_id: &str,
@@ -1136,14 +1183,53 @@ impl Executor {
         let mut pipeline_ctx =
             PipelineContext::new(module_id, inputs, context, effective_strategy.name());
         self.inject_resources(&mut pipeline_ctx);
+        self.bind_to_context(&mut pipeline_ctx)?;
 
-        // §1.1 fail-fast: PipelineStepError wraps step failures; unwrap so
-        // public callers see the original typed error.
-        let (output, trace) = PipelineEngine::run(effective_strategy, &mut pipeline_ctx)
-            .await
-            .map_err(|e| e.unwrap_pipeline_step_error().unwrap_or(e))?;
+        match PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await {
+            Ok((output, trace)) => Ok((output.unwrap_or(Value::Null), trace)),
+            Err(e) => {
+                // Unwrap PipelineStepError + MiddlewareChainError so callers
+                // and on_error middleware see the typed cause (D-22).
+                let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+                let underlying = underlying
+                    .unwrap_middleware_chain_error()
+                    .unwrap_or(underlying);
+                let underlying =
+                    propagate_module_error(underlying, module_id, &pipeline_ctx.context);
 
-        Ok((output.unwrap_or(Value::Null), trace))
+                // Cancellation short-circuit (D-20).
+                if matches!(underlying.code, ErrorCode::ExecutionCancelled) {
+                    return Err(underlying);
+                }
+
+                // Run middleware on_error chain (D-19) — recovery returns
+                // (recovered_value, trace); a Retry signal is treated as a
+                // failure (the trace variant does not loop). Mirrors
+                // apcore-python `call_with_trace` (recovery yes, retry no).
+                let executed = pipeline_ctx.executed_middlewares.clone();
+                if !executed.is_empty() {
+                    let outcome = self
+                        .middleware_manager
+                        .execute_on_error_outcome(
+                            module_id,
+                            pipeline_ctx.inputs.clone(),
+                            &underlying,
+                            &pipeline_ctx.context,
+                            &executed,
+                        )
+                        .await;
+                    if let Some(crate::middleware::base::OnErrorOutcome::Recovery(value)) = outcome
+                    {
+                        // Trace captured during the failing run includes any
+                        // on_error events recorded inside the pipeline; return
+                        // it alongside the recovered value.
+                        let trace = pipeline_ctx.trace.clone();
+                        return Ok((value, trace));
+                    }
+                }
+                Err(underlying)
+            }
+        }
     }
 
     /// Inject executor resources into a pipeline context so builtin steps
@@ -1154,6 +1240,40 @@ impl Executor {
         ctx.acl = self.acl.as_ref().map(Arc::clone);
         ctx.approval_handler = self.approval_handler.as_ref().map(Arc::clone);
         ctx.middleware_manager = Some(Arc::clone(&self.middleware_manager));
+    }
+
+    /// Bind this Executor's identity handle to `ctx.context.executor` per
+    /// apcore Issue #66 / `core-executor.md` §"Contract: Executor binding to
+    /// Context". Called before pipeline step 1 from every top-level entry
+    /// point (`call`, `call_with_trace`, `validate`, `stream` via
+    /// `prepare_stream`).
+    ///
+    /// Errors out with [`ErrorCode::ContextBindingError`] when the supplied
+    /// Context is already bound to a different Executor instance.
+    fn bind_to_context(&self, ctx: &mut PipelineContext) -> Result<(), ModuleError> {
+        ctx.context.bind_executor(self.instance_handle())
+    }
+
+    /// Type-erased Executor identity handle.
+    ///
+    /// Returned as `Arc<dyn Any + Send + Sync>` because `Context::executor` is
+    /// non-generic over the Executor type. Two Executors are considered the
+    /// same instance iff the underlying `Arc`s point to the same allocation
+    /// (`Arc::ptr_eq`). The pointed-to payload is opaque to callers — only
+    /// the identity matters.
+    ///
+    /// Marked `doc(hidden)` because it exists to support binding-aware
+    /// integrations (e.g. test fixtures, distributed runtimes injecting a
+    /// pre-bound Context); application code SHOULD let the Executor bind
+    /// itself implicitly at pipeline entry instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn instance_handle(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        // Coerce `Arc<()>` → `Arc<dyn Any + Send + Sync>` via the implicit
+        // unsized cast performed by `let` annotation; this preserves identity
+        // because `Arc::clone` increments the same strong-count.
+        let h: Arc<dyn std::any::Any + Send + Sync> = self.instance_handle.clone();
+        h
     }
 
     /// Add a before middleware.

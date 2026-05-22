@@ -953,18 +953,24 @@ async fn test_usage_middleware_records_error() {
 async fn test_usage_middleware_caller_id_from_context() {
     let collector = UsageCollector::new();
     let mw = UsageMiddleware::new(collector.clone());
-    // Context::new sets caller_id to None; use Context::create to supply one.
-    let ctx = Context::<Value>::create(
+    // Per Issue #66, top-level `Context::create` no longer accepts caller_id;
+    // it is managed exclusively by `Context::child()`. To simulate an
+    // Executor-set caller_id in this test we assign the field post-hoc — the
+    // production pipeline never does this directly.
+    let mut ctx = Context::<Value>::create(
         Some(Identity::new(
             "test-caller".into(),
             "test-caller".into(),
             vec![],
             HashMap::default(),
         )),
+        None,
+        None,
+        None,
         Value::Null,
-        Some("explicit-caller".to_string()),
         None,
     );
+    ctx.caller_id = Some("explicit-caller".to_string());
 
     mw.before("mod.a", json!({}), &ctx).await.unwrap();
     mw.after("mod.a", json!({}), json!({}), &ctx).await.unwrap();

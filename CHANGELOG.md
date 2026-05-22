@@ -12,6 +12,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **`Context::create` unified to the canonical six-parameter signature ([apcore Issue #66](https://github.com/aiperceivable/apcore/issues/66)).** The factory now takes `(identity, trace_parent, cancel_token, data, services, global_deadline)` matching the cross-language contract in [docs/features/core-executor.md §"Contract: Context.create"](https://github.com/aiperceivable/apcore/blob/main/docs/features/core-executor.md). The legacy `caller_id` parameter is removed — top-level Contexts always carry `caller_id = None`, which is managed exclusively by `Context::child()`. `cancel_token` and `global_deadline` are now first-class parameters, eliminating the post-hoc `ctx.cancel_token = Some(token)` anti-pattern. Pre-release breaking change; all in-tree call sites and examples are migrated.
+
+- **`TraceParent` carries `tracestate` as a struct field.** Per the unified `Context::create` contract, the inbound W3C `tracestate` (vendor state) travels on `TraceParent` itself rather than via a separate factory parameter or builder setter. `TraceContext::extract_context` and `ContextBuilder::build` populate the field; `ContextBuilder::tracestate(entries)` is removed (replaced by setting `TraceParent::tracestate` directly). `ContextBuilder` gains a `cancel_token(...)` setter for parity with `Context::create`.
+
+- **Executor binds itself to `Context::executor` at pipeline entry** ([docs/features/core-executor.md §"Contract: Executor binding to Context"](https://github.com/aiperceivable/apcore/blob/main/docs/features/core-executor.md)). `Executor::call`, `Executor::call_with_trace`, `Executor::validate`, and `Executor::stream` (via `prepare_stream`) bind the receiving Executor's identity handle to `ctx.context.executor` before pipeline step 1. Same-instance rebinds are idempotent; cross-Executor rebinds raise `ContextBindingError` (new `ErrorCode::ContextBindingError` / wire code `CONTEXT_BINDING_ERROR`). A new `Context::bind_executor(...)` helper exposes the binding rule for distributed runtimes that re-inject a Context after deserialization. A new SDK-internal `Executor::instance_handle()` accessor returns the type-erased handle compared by `Arc::ptr_eq`.
+
+- **`EventRetryConfig::default()` is now spec-aligned (closes A-D-EVT-004).** Previously defaulted to single-attempt (`max_attempts = 1`) for backward compatibility; now defaults to `max_attempts=3, initial_backoff_ms=100, max_backoff_ms=30_000, backoff_multiplier=2.0` per [docs/features/event-system.md §Event Delivery Semantics (#61)](https://github.com/aiperceivable/apcore/blob/main/docs/features/event-system.md). Callers that genuinely want fire-and-forget single-attempt semantics should switch to the new `EventRetryConfig::no_retry()` helper.
+
+- **`EventEmitter::emit()` and `emit_filtered()` now apply per-subscriber retry + DLQ inline (closes A-D-EVT-003).** The canonical await-completion delivery path runs each matching subscriber through the retry loop defined by `EventSubscriber::retry()` and emits `apcore.event.delivery_failed` on exhaustion (when `max_attempts > 1`). A new `emit_sequential()` helper preserves the legacy single-attempt sequential-dispatch shape for tests that need deterministic ordering without retry/DLQ noise. `emit_delivery_semantics()` (spawned fire-and-forget) and `emit_spawn()` (no-retry spawn) are retained for callers that cannot await delivery.
+
+- **`WebhookSubscriber` and `A2ASubscriber` no longer swallow transient failures (closes A-D-EVT-001).** Both subscribers now return `Err(ModuleError)` from `on_event` on 5xx / network errors (and `>=400` for A2A), letting the surrounding `EventEmitter` apply the spec retry policy + DLQ uniformly. The ad-hoc internal retry loop on `WebhookSubscriber` is removed — `retry_count` is retained as a deprecated alias for `retry.max_attempts` and is no longer consulted on the delivery path. Both structs gain a public `retry: EventRetryConfig` field and a `with_retry()` builder; their `EventSubscriber::retry()` returns that field so per-subscriber policy flows through `EventEmitter` automatically.
+
+- **`BuiltinExecute` honors per-module `resources.timeout` (closes A-D-EXEC-001 / D-11).** Reads `annotations.extra["resources"]["timeout"]` from the module descriptor before falling back to `config.executor.default_timeout`. The global deadline clamp applies after this lookup so per-module overrides cannot exceed the remaining global budget.
+
+- **Cancel-token observed at two pipeline points (closes A-D-EXEC-002 / D-21).** `BuiltinCallChainGuard` calls `cancel_token.check_for(module_id)` before validation/ACL/middleware work, and `BuiltinExecute` repeats the check immediately before `module.execute` as a defensive backstop. A pre-cancelled token short-circuits the pipeline in microseconds; a token cancelled mid-pipeline is observed at the execute step.
+
+- **`Executor::call` short-circuits on `ExecutionCancelled` (closes A-D-EXEC-003 / D-20).** Cancellation now propagates directly from the pipeline error path; it MUST NOT enter the `on_error` middleware chain, so logging middleware cannot swallow cancellation and retry middleware cannot resurrect a cancelled call via `RetrySignal`.
+
+- **`Executor::call_with_trace` shares error-recovery semantics with `call` (closes A-D-EXEC-004 / D-19).** The trace variant now runs `on_error` middleware recovery, applies the cancellation short-circuit, and unwraps `MiddlewareChainError` identically to `call`. On successful recovery it returns `(recovered_value, trace)`.
+
+- **`BuiltinContextCreation` preserves per-call context fields.** Previously replaced `ctx.context` with a fresh `Context::new(...)` when `caller_id` was `None`, silently dropping caller-supplied `cancel_token`, `global_deadline`, and `data`. Now mutates `caller_id`/`identity` in place so D-21 cancel-token checks (and other per-call resources) flow through unchanged.
+
+- **`AsyncTaskManager.max_tasks` counts only active statuses (closes A-D-AT-01).** `check_capacity_and_save` filters `store.list(None)` to `Pending` + `Running` records so terminal-state tasks retained for TTL-based cleanup do not consume the active budget. Mirrors apcore-python `_ACTIVE_STATUSES`.
+
+- **`AsyncTaskManager::start_reaper` is single-instance (closes A-D-AT-05).** A second `start_reaper` call while a prior `ReaperHandle` is still live now returns `Err(ModuleError { code: ReaperAlreadyRunning, .. })`. `ReaperHandle::stop` (and the `Drop` fallback) releases the manager's `reaper_running` flag so callers can stop-and-restart. Return type changes from `ReaperHandle` to `Result<ReaperHandle, ModuleError>` — callers must add `?` or `.unwrap()`.
+
+### Added
+
+- **`EventRetryConfig::no_retry()` helper.** Returns single-attempt configuration for fire-and-forget subscriber semantics.
+- **`ACL::register_async_condition` writes to a separate registry (closes A-D-ACL-002).** New `acl_handlers::ASYNC_CONDITION_HANDLERS` `LazyLock` map is consulted by `evaluate_conditions_async` before the sync `CONDITION_HANDLERS` registry, enabling async-only handler overrides without disturbing `ACL::check`.
+- **`AuditEntry.handler_error` populated via `tokio::task_local!` (closes A-D-ACL-001).** New `acl_handlers::HANDLER_ERROR` task-local slot, `report_handler_error()` setter, and `with_handler_error_capture()` scope wrapper. `ACL::async_check` runs the entire evaluation inside a fresh capture scope so concurrent ACL checks on different tokio tasks see only their own error messages.
+- **`ErrorCode::ReaperAlreadyRunning`.** Raised by `AsyncTaskManager::start_reaper` when a reaper is already running.
+
+---
+
 
 ## [0.22.0] - 2026-05-20
 

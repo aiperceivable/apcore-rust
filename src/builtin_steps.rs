@@ -158,14 +158,22 @@ impl Step for BuiltinContextCreation {
     }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
-        // If the context has no caller_id, default to @external.
+        // If the context has no caller_id, default to @external. Preserve
+        // every other field on the incoming context (cancel_token,
+        // global_deadline, data, identity, services, redacted_inputs/output)
+        // so per-call resources like cancellation tokens flow through the
+        // pipeline unmodified (otherwise D-21 cancel-token checks observe a
+        // fresh, never-cancelled token).
         if ctx.context.caller_id.is_none() {
-            ctx.context = crate::context::Context::new(Identity::new(
-                "@external".to_string(),
-                "external".to_string(),
-                vec![],
-                HashMap::new(),
-            ));
+            ctx.context.caller_id = Some("@external".to_string());
+            if ctx.context.identity.is_none() {
+                ctx.context.identity = Some(Identity::new(
+                    "@external".to_string(),
+                    "external".to_string(),
+                    vec![],
+                    HashMap::new(),
+                ));
+            }
         }
 
         // Spec: BuiltinContextCreation MUST set context.global_deadline if
@@ -208,6 +216,15 @@ impl Step for BuiltinCallChainGuard {
             .config
             .as_ref()
             .expect("config must be injected into PipelineContext");
+        // Cancellation check before any expensive validation/middleware work
+        // (D-21 — `Cancel Token Mid-Pipeline Check`, point 1). The pipeline
+        // MUST observe `cancel_token` at the call-chain guard so a caller
+        // who cancelled before submission does not pay the cost of ACL,
+        // middleware, and validation steps. Spec:
+        // docs/features/core-executor.md §Cancel Token Mid-Pipeline Check.
+        if let Some(token) = ctx.context.cancel_token.as_ref() {
+            token.check_for(&ctx.module_id)?;
+        }
         crate::utils::guard_call_chain_with_repeat(
             &ctx.context,
             &ctx.module_id,
@@ -529,8 +546,20 @@ impl Step for BuiltinExecute {
             .as_ref()
             .expect("config must be injected into PipelineContext");
 
-        // Compute effective timeout: clamp to remaining global deadline (dual-timeout model).
-        let mut timeout_ms = config.executor.default_timeout;
+        // Compute effective timeout — start from per-module override
+        // (`annotations.extra["resources"]["timeout"]`, in milliseconds; spec
+        // D-11), fall back to `config.executor.default_timeout`. Both are
+        // then clamped against the remaining global deadline below.
+        // Spec: docs/features/core-executor.md §Step 8 (dual-timeout model).
+        let per_module_timeout_ms: Option<u64> = ctx
+            .registry
+            .as_ref()
+            .and_then(|reg| reg.get_definition(&ctx.module_id))
+            .and_then(|desc| desc.annotations)
+            .and_then(|ann| ann.extra.get("resources").cloned())
+            .and_then(|res| res.get("timeout").cloned())
+            .and_then(|v| v.as_u64());
+        let mut timeout_ms = per_module_timeout_ms.unwrap_or(config.executor.default_timeout);
         if let Some(deadline) = ctx.context.global_deadline {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -557,6 +586,16 @@ impl Step for BuiltinExecute {
         // bypasses this step entirely. `ctx.stream` is intentionally ignored
         // here — `BuiltinExecute` always calls `module.execute()` for the
         // unary path. See `Executor::stream` for the streaming pipeline.
+
+        // Cancellation check immediately before invoking the module
+        // (D-21 — `Cancel Token Mid-Pipeline Check`, point 2). Acts as a
+        // defensive backstop for tokens that became cancelled while earlier
+        // steps were running, ensuring `cancel()` interrupts the in-flight
+        // pipeline rather than handing control to a doomed module. Spec:
+        // docs/features/core-executor.md §Cancel Token Mid-Pipeline Check.
+        if let Some(token) = ctx.context.cancel_token.as_ref() {
+            token.check_for(&ctx.module_id)?;
+        }
 
         let execute_result = if timeout_ms > 0 {
             match tokio::time::timeout(

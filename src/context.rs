@@ -500,35 +500,97 @@ impl<T: Default> Context<T> {
         logger
     }
 
-    /// Create a context from explicit parameters.
+    /// Create a context from the canonical caller-supplied inputs.
     ///
-    /// `identity` is optional (D10-002, spec `core-executor.md` §Contract.Context.create):
-    /// when `None`, the resulting context's `identity` field is `None`. Downstream
-    /// consumers (e.g. `ACL::check`, `sys_modules`) map a `None` identity / caller_id
-    /// to the canonical `@external` sentinel at evaluation time, matching
-    /// apcore-python (`context.py:48-103`) and apcore-typescript (`context.ts:80-116`).
-    /// This API surface lets cross-language fixtures construct anonymous contexts
-    /// without fabricating an `Identity`.
+    /// Unified factory signature per apcore Issue #66 / `core-executor.md`
+    /// §"Contract: Context.create". The six inputs are positional and ordered
+    /// to match the cross-language contract:
     ///
-    /// For `trace_parent` (W3C trace-context propagation) or `global_deadline`
-    /// support, use [`Context::builder`] instead.
+    /// 1. `identity` — optional caller identity. `None` represents an
+    ///    anonymous/unauthenticated caller. Downstream consumers
+    ///    (`ACL::check`, `sys_modules`) map `None` to the `@external`
+    ///    sentinel at evaluation time.
+    /// 2. `trace_parent` — optional W3C Trace Context entry. The trace_id is
+    ///    inherited when well-formed (`^[0-9a-f]{32}$`, not all-zero,
+    ///    not all-f); invalid values log WARN and a fresh trace_id is
+    ///    generated. Per the v0.22.0 contract, `tracestate` is a field of
+    ///    `TraceParent` rather than a separate parameter — see
+    ///    [`crate::trace_context::TraceParent::tracestate`].
+    /// 3. `cancel_token` — optional external cooperative-cancellation source.
+    ///    Adopting this as a first-class parameter eliminates the post-hoc
+    ///    `ctx.cancel_token = Some(token)` anti-pattern.
+    /// 4. `data` — optional initial entries for the shared data map. The
+    ///    inbound `trace_parent` (when present) seeds the canonical
+    ///    `_apcore.trace.flags` / `_apcore.trace.state` keys so
+    ///    `TraceContext::inject` propagates the inbound sampling decision and
+    ///    vendor state.
+    /// 5. `services` — caller-supplied DI container (positional `T`, not
+    ///    `Option<T>`). The `cancel_token` parameter above is now first-class
+    ///    and MUST NOT be smuggled inside `services`.
+    /// 6. `global_deadline` — absolute epoch-seconds timestamp bounding the
+    ///    total execution time of the call tree. Local-only.
+    ///
+    /// The following Context fields are NOT caller inputs and are intentionally
+    /// excluded from the signature:
+    ///
+    /// - `trace_id` — derived from `trace_parent` or freshly generated.
+    /// - `caller_id` — top-level Contexts always have `caller_id = None`;
+    ///   managed exclusively by [`Context::child`].
+    /// - `call_chain` — empty `[]` at top-level; managed by the Executor.
+    /// - `executor` — bound by the Executor at pipeline entry; see
+    ///   [`Context::bind_executor`].
     pub fn create(
         identity: Option<Identity>,
-        services: T,
-        caller_id: Option<String>,
+        trace_parent: Option<TraceParent>,
+        cancel_token: Option<CancelToken>,
         data: Option<HashMap<String, serde_json::Value>>,
+        services: T,
+        global_deadline: Option<f64>,
     ) -> Self {
+        let mut initial_data = data.unwrap_or_default();
+        let trace_id = if let Some(tp) = trace_parent {
+            let tid = accept_or_regenerate_trace_id(&tp.trace_id);
+            // Stash inbound trace-flags as a 2-char hex string for symmetry
+            // with the W3C wire format; readers parse via `u8::from_str_radix`.
+            initial_data
+                .entry(crate::trace_context::TRACE_FLAGS_KEY.to_string())
+                .or_insert_with(|| serde_json::Value::String(format!("{:02x}", tp.trace_flags)));
+            // Stash inbound tracestate as a JSON array of 2-element arrays so
+            // `TraceContext::inject(&context)` can read it back without
+            // requiring the caller to pass it as an explicit argument.
+            // Mirrors apcore-python `_apcore.trace.state` (context.py).
+            if !tp.tracestate.is_empty() {
+                initial_data
+                    .entry(crate::trace_context::TRACE_STATE_KEY.to_string())
+                    .or_insert_with(|| {
+                        serde_json::Value::Array(
+                            tp.tracestate
+                                .into_iter()
+                                .map(|(k, v)| {
+                                    serde_json::Value::Array(vec![
+                                        serde_json::Value::String(k),
+                                        serde_json::Value::String(v),
+                                    ])
+                                })
+                                .collect(),
+                        )
+                    });
+            }
+            tid
+        } else {
+            generate_trace_id()
+        };
         Self {
-            trace_id: generate_trace_id(),
+            trace_id,
             identity,
             services,
-            caller_id,
-            data: Arc::new(RwLock::new(data.unwrap_or_default())),
+            caller_id: None,
+            data: Arc::new(RwLock::new(initial_data)),
             call_chain: vec![],
             redacted_inputs: None,
             redacted_output: None,
-            cancel_token: None,
-            global_deadline: None,
+            cancel_token,
+            global_deadline,
             executor: None,
         }
     }
@@ -553,24 +615,24 @@ impl<T: Default> Context<T> {
 /// fresh trace_id and emits a `tracing::warn!` log.
 pub struct ContextBuilder<T> {
     trace_parent: Option<TraceParent>,
-    tracestate: Option<Vec<(String, String)>>,
     identity: Option<Identity>,
     services: Option<T>,
     caller_id: Option<String>,
     data: Option<HashMap<String, serde_json::Value>>,
     global_deadline: Option<f64>,
+    cancel_token: Option<CancelToken>,
 }
 
 impl<T> Default for ContextBuilder<T> {
     fn default() -> Self {
         Self {
             trace_parent: None,
-            tracestate: None,
             identity: None,
             services: None,
             caller_id: None,
             data: None,
             global_deadline: None,
+            cancel_token: None,
         }
     }
 }
@@ -585,22 +647,6 @@ impl<T> ContextBuilder<T> {
     #[must_use]
     pub fn trace_parent(mut self, trace_parent: Option<TraceParent>) -> Self {
         self.trace_parent = trace_parent;
-        self
-    }
-
-    /// Set the inbound W3C `tracestate` entries (vendor state) to carry
-    /// forward through the request lifecycle.
-    ///
-    /// The Rust [`TraceParent`] struct does not include `tracestate`
-    /// (see `crate::trace_context::TraceContext` for the wrapper that
-    /// pairs them). Transports parsing inbound headers should call this
-    /// method alongside [`Self::trace_parent`] so a downstream
-    /// `TraceContext::inject(&context)` propagates the inbound vendor
-    /// state instead of dropping it. Mirrors the Python SDK convention
-    /// of stashing tracestate under `_apcore.trace.state` (D11-002b).
-    #[must_use]
-    pub fn tracestate(mut self, entries: Vec<(String, String)>) -> Self {
-        self.tracestate = Some(entries);
         self
     }
 
@@ -639,6 +685,18 @@ impl<T> ContextBuilder<T> {
         self.global_deadline = deadline;
         self
     }
+
+    /// Set the external cooperative-cancellation token for this Context.
+    ///
+    /// Mirrors the first-class `cancel_token` parameter of [`Context::create`]
+    /// per the unified factory contract (apcore Issue #66 /
+    /// `core-executor.md` §"Contract: Context.create"). Eliminates the
+    /// post-hoc `ctx.cancel_token = Some(token)` anti-pattern.
+    #[must_use]
+    pub fn cancel_token(mut self, token: Option<CancelToken>) -> Self {
+        self.cancel_token = token;
+        self
+    }
 }
 
 impl<T: Default> ContextBuilder<T> {
@@ -667,16 +725,17 @@ impl<T: Default> ContextBuilder<T> {
         }
         // D11-002b: Stash inbound tracestate as a JSON array of 2-element
         // arrays so `TraceContext::inject(&context)` can read it back without
-        // requiring the caller to pass it as an explicit argument. Mirrors
-        // apcore-python which stores tracestate under
-        // `_apcore.trace.state` (context.py:94 / trace_context.py:26).
-        if let Some(entries) = self.tracestate.as_ref() {
-            if !entries.is_empty() {
+        // requiring the caller to pass it as an explicit argument. Per the
+        // v0.22.0 contract the inbound tracestate now travels on the
+        // `TraceParent` itself (Issue #66) rather than via a separate builder
+        // setter.
+        if let Some(tp) = self.trace_parent.as_ref() {
+            if !tp.tracestate.is_empty() {
                 initial_data
                     .entry(crate::trace_context::TRACE_STATE_KEY.to_string())
                     .or_insert_with(|| {
                         serde_json::Value::Array(
-                            entries
+                            tp.tracestate
                                 .iter()
                                 .map(|(k, v)| {
                                     serde_json::Value::Array(vec![
@@ -698,9 +757,47 @@ impl<T: Default> ContextBuilder<T> {
             call_chain: vec![],
             redacted_inputs: None,
             redacted_output: None,
-            cancel_token: None,
+            cancel_token: self.cancel_token,
             global_deadline: self.global_deadline,
             executor: None,
+        }
+    }
+}
+
+impl<T> Context<T> {
+    /// SDK-internal: bind the receiving Executor to this Context per apcore
+    /// Issue #66 / `core-executor.md` §"Contract: Executor binding to Context".
+    ///
+    /// Rules (identity comparison uses `Arc::ptr_eq`):
+    ///
+    /// 1. If `context.executor` is `None`, the Executor handle is stored and
+    ///    `Ok(())` is returned.
+    /// 2. If `context.executor` is already bound to **the same** Executor
+    ///    instance (`Arc::ptr_eq`), the rebind is a noop and `Ok(())` is
+    ///    returned. This covers the common pattern of reusing one Context
+    ///    across multiple top-level calls on the same Executor.
+    /// 3. If `context.executor` is already bound to a **different** Executor
+    ///    instance, this method returns
+    ///    [`crate::errors::ErrorCode::ContextBindingError`].
+    ///
+    /// Hidden from rustdoc because the binding is an Executor-pipeline
+    /// invariant, not a caller-facing API. Application code should never call
+    /// it directly.
+    #[doc(hidden)]
+    pub fn bind_executor(
+        &mut self,
+        executor: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), crate::errors::ModuleError> {
+        match &self.executor {
+            None => {
+                self.executor = Some(executor);
+                Ok(())
+            }
+            Some(existing) if Arc::ptr_eq(existing, &executor) => Ok(()),
+            Some(_) => Err(crate::errors::ModuleError::new(
+                crate::errors::ErrorCode::ContextBindingError,
+                "Context already bound to a different Executor instance",
+            )),
         }
     }
 }

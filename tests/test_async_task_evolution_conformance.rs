@@ -583,7 +583,7 @@ async fn reaper_handle_starts_and_stops_gracefully() {
     let mut reaper_cfg = ReaperConfig::default();
     reaper_cfg.ttl_seconds = 1.0;
     reaper_cfg.sweep_interval_ms = 50;
-    let handle = mgr.start_reaper(reaper_cfg);
+    let handle = mgr.start_reaper(reaper_cfg).unwrap();
 
     // Allow at least one sweep to run.
     tokio::time::sleep(Duration::from_millis(200)).await;

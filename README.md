@@ -32,17 +32,24 @@ A schema-enforced module standard for the AI-Perceivable era.
 ## Cross-Language Feature Parity
 
 The Rust SDK tracks the apcore protocol spec and ships full feature parity
-with the Python and TypeScript SDKs:
+with the Python and TypeScript SDKs. The table below highlights the v0.22
+hardening items (#60–#65) plus the long-standing background-task and
+extension surfaces.
 
 | Feature | Python | TypeScript | Rust |
 |---------|:------:|:----------:|:----:|
+| Reserved namespace query API (#60) | Yes | Yes | Yes |
+| Event delivery semantics — retry + DLQ (#61) | Yes | Yes | Yes |
+| Streaming module interface (#62) | Yes | Yes | Yes |
+| `ContextKey` typed context accessors (#63) | Yes | Yes | Yes |
+| Middleware duplicate-name detection (#64) | Yes | Yes | Yes |
+| Registry load-ordering guarantees (#65) | Yes | Yes | Yes |
 | `AsyncTaskManager` (background task execution) | Yes | Yes | Yes |
 | `ExtensionManager` / `ExtensionPoint` (plugin registry) | Yes | Yes | Yes |
 
-Both were reintroduced in 0.19.0 with full `Executor` integration. See the
-[`AsyncTaskManager`](./src/async_task.rs) and [`ExtensionManager`](./src/extensions.rs)
-source, plus the corresponding tests at `tests/test_async_task.rs` and
-`tests/test_extensions.rs`.
+See the [`AsyncTaskManager`](./src/async_task.rs) and
+[`ExtensionManager`](./src/extensions.rs) source, plus the corresponding
+tests at `tests/test_async_task.rs` and `tests/test_extensions.rs`.
 
 ## API Overview
 
@@ -105,8 +112,8 @@ source, plus the corresponding tests at `tests/test_async_task.rs` and
 | `CancelToken` | Cooperative cancellation token |
 | `BindingLoader` | Load modules from YAML binding files |
 
-> See [Cross-Language Feature Parity](#cross-language-feature-parity) — as of 0.19.0,
-> `ExtensionManager` and `AsyncTaskManager` are available in all three SDKs.
+> See [Cross-Language Feature Parity](#cross-language-feature-parity) for the
+> full v0.22 parity matrix across Python, TypeScript, and Rust.
 
 ## Documentation
 
@@ -124,7 +131,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-apcore = "0.20"
+apcore = "0.22"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -271,6 +278,15 @@ client.use_middleware(Box::new(ObsLoggingMiddleware::new(ContextLogger::new("app
 // TracingMiddleware requires a SpanExporter — see observability docs
 ```
 
+> **`TracingMiddleware` vs `OtelTracingMiddleware`** — the Rust SDK ships two
+> tracing adapters. `apcore::TracingMiddleware` (re-exported from
+> `observability::tracing_middleware`) is the built-in span exporter with
+> sampling-based controls and zero external dependencies.
+> `apcore::OtelTracingMiddleware` (alias for
+> `middleware::otel_tracing::TracingMiddleware`) is the OpenTelemetry-backed
+> adapter — use it when you want spans to flow into an existing OTel
+> collector pipeline.
+
 ### Access control
 
 ```rust
@@ -280,6 +296,24 @@ let acl = ACL::new(vec![
     ACLRule { callers: vec!["admin.*".into()], targets: vec!["*".into()], effect: "allow".into(), description: Some("Admins can call anything".into()), conditions: None },
     ACLRule { callers: vec!["*".into()], targets: vec!["admin.*".into()], effect: "deny".into(), description: Some("Others cannot call admin modules".into()), conditions: None },
 ], "deny", None);
+```
+
+### Rust-specific quirks: two `RetryConfig` types
+
+The Rust SDK ships two distinct `RetryConfig` structs that cannot share a
+crate-root alias because they collide on name. Pick the import path that
+matches the subsystem you are configuring:
+
+```rust
+// Middleware-level retry (used by `RetryMiddleware`). This one IS
+// re-exported at the crate root for convenience.
+use apcore::RetryConfig as MiddlewareRetryConfig;
+// equivalent to: use apcore::middleware::RetryConfig;
+
+// AsyncTaskManager-level retry (used by background task scheduling).
+// Must be imported via the full path — intentionally NOT re-exported at
+// the crate root (see src/lib.rs).
+use apcore::async_task::RetryConfig as TaskRetryConfig;
 ```
 
 ### YAML bindings
@@ -337,20 +371,52 @@ If you need runtime-configurable annotations (e.g., ops teams toggling `readonly
 `requires_approval` without recompiling), you can load a YAML/JSON file yourself and
 construct `ModuleAnnotations` via `serde`:
 
+The Rust `Registry` exposes two registration entry points:
+
+- `register_module(module_id, module)` — **spec-compliant two-argument form**
+  (parity with `apcore-python.Registry.register` and
+  `apcore-typescript.Registry.register`). The `ModuleDescriptor` is
+  auto-generated from the module's `input_schema()` / `output_schema()` /
+  `description()` / annotations.
+- `register(module_id, module, descriptor)` — **extended three-argument form**
+  for supplying a pre-built descriptor (e.g. one with overlay annotations
+  loaded from YAML).
+
 ```rust
+use apcore::module::{Module, ModuleAnnotations, ModuleDescriptor};
+use apcore::registry::Registry;
+use std::collections::HashMap;
+
+// (1) Auto descriptor — parity with Python / TypeScript `register`.
+let registry = Registry::new();
+registry.register_module("my.module", Box::new(MyModule))?;
+
+// (2) Explicit descriptor — Rust-only extended form. Construct the
+// descriptor fully (there is no `Default` impl that matches every field);
+// the literal below mirrors the one used by `APCore::register` internally
+// (see src/client.rs).
 let yaml: serde_json::Value = serde_yaml_ng::from_reader(file)?;
 let annotations: ModuleAnnotations = serde_json::from_value(yaml)?;
-let descriptor = ModuleDescriptor { annotations: Some(annotations), ..default_descriptor };
 
-// 3-arg form: pass an explicit ModuleDescriptor. This is a Rust-only signature
-// — apcore-python and apcore-typescript use `register(module_id, module,
-// version?, metadata?)`. Use `Some(descriptor)` to attach the descriptor or
-// `None` to fall back to the auto-built one.
-registry.register("my.module", module, Some(descriptor))?;
-
-// 2-arg convenience form for parity with Python/TS examples — equivalent to
-// passing `None` for the descriptor:
-//   registry.register_module("my.module", another_module)?;
+let module = Box::new(MyModule);
+let descriptor = ModuleDescriptor {
+    module_id: "my.module".to_string(),
+    name: None,
+    description: module.description().to_string(),
+    documentation: None,
+    input_schema: module.input_schema(),
+    output_schema: module.output_schema(),
+    version: "1.0.0".to_string(),
+    tags: vec![],
+    annotations: Some(annotations), // overlay annotations from YAML
+    examples: vec![],
+    metadata: HashMap::new(),
+    display: None,
+    sunset_date: None,
+    dependencies: vec![],
+    enabled: true,
+};
+registry.register("my.module", module, descriptor)?;
 ```
 
 ## Examples
