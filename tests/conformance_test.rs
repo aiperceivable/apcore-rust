@@ -2275,14 +2275,13 @@ async fn conformance_context_create() {
                     "FAIL [{id}]: executor must bind after deserialize"
                 );
             }
-            "distributed_cancel_token_synthesized_locally" => {
-                // The Rust pipeline does not currently synthesize a CancelToken
-                // at pipeline entry for deserialized Contexts (the field
-                // simply stays None and the pipeline runs without
-                // cancellation). We assert the precondition only — that a
-                // deserialized Context arrives with cancel_token=None — and
-                // leave the synthesis MUST as a known SDK gap tracked
-                // separately in Issue #66 follow-ups.
+            "distributed_cancel_token_post_deserialize_null" => {
+                // Negative invariant: cancel_token MUST NOT serialize. A
+                // deserialized Context arrives with cancel_token=None. The
+                // pipeline-entry synthesis (apcore #67) ensures modules
+                // observe a usable token, but that synthesis is asserted in
+                // tests/test_v022_executor_hardening.rs::pipeline_synthesizes_cancel_token_when_context_lacks_one
+                // since it is a pipeline-internal effect.
                 let serialized = json!({
                     "_context_version": 1,
                     "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -2295,11 +2294,13 @@ async fn conformance_context_create() {
                     "FAIL [{id}]: deserialized cancel_token MUST be None"
                 );
             }
-            "distributed_global_deadline_recomputed_locally" => {
-                // BuiltinContextCreation seeds global_deadline from
-                // executor.global_timeout when the context arrives without
-                // one. We exercise that path by running a no-op call on a
-                // deserialized Context and asserting the call succeeds.
+            "distributed_global_deadline_post_deserialize_null" => {
+                // Negative invariant: global_deadline MUST NOT serialize.
+                // BuiltinContextCreation recomputes it locally from
+                // executor.global_timeout when the pipeline runs; that
+                // recomputation is exercised by other timeout/deadline
+                // tests. Here we assert only the serialization-level
+                // invariant.
                 let client = APCore::new();
                 register_echo(client.registry(), "local.echo");
                 let serialized = json!({
@@ -2319,7 +2320,7 @@ async fn conformance_context_create() {
                     .await;
                 assert!(
                     result.is_ok(),
-                    "FAIL [{id}]: pipeline must run with recomputed deadline"
+                    "FAIL [{id}]: pipeline must run with locally recomputed deadline"
                 );
             }
             "tracestate_carried_inside_traceparent" => {

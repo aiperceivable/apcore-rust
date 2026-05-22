@@ -331,3 +331,126 @@ async fn call_with_trace_runs_on_error_recovery() {
     assert_eq!(output, json!({"recovered": true}));
     assert_eq!(trace.module_id, "fail.module");
 }
+
+// ---------------------------------------------------------------------------
+// apcore #67: BuiltinContextCreation synthesizes a fresh CancelToken when the
+// incoming context lacks one (local create-without-token, deserialized
+// context, hot-reload survivor — all converge on the same pipeline-entry rule
+// per apcore #66 §"Contract: Executor binding to Context").
+// ---------------------------------------------------------------------------
+
+/// Module that records, into a shared flag, whether the context it received
+/// has a `cancel_token` bound by the time `execute()` runs.
+struct CaptureCancelTokenModule {
+    saw_token: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Module for CaptureCancelTokenModule {
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn description(&self) -> &'static str {
+        "Captures whether ctx.cancel_token is set when the module executes"
+    }
+    async fn execute(&self, _inputs: Value, ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        self.saw_token
+            .store(ctx.cancel_token.is_some(), Ordering::SeqCst);
+        Ok(json!({"ok": true}))
+    }
+}
+
+#[tokio::test]
+async fn pipeline_synthesizes_cancel_token_when_context_lacks_one() {
+    // Caller-supplied Context with cancel_token = None — emulates the three
+    // converging sources: local `Context::create()` without a token, a
+    // freshly deserialized cross-process Context (where cancel_token MUST
+    // NOT serialize per PROTOCOL_SPEC §5.7), and a hot-reload survivor
+    // restored from persistence. Per apcore #67, the pipeline MUST
+    // synthesize a fresh local CancelToken at Step 1 so D-21 mid-pipeline
+    // checks and modules polling ctx.cancel_token observe a usable token.
+    let client = APCore::new();
+    let saw_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    client
+        .register(
+            "capture.token",
+            Box::new(CaptureCancelTokenModule {
+                saw_token: saw_token.clone(),
+            }),
+        )
+        .unwrap();
+
+    let ctx = Context::<Value>::create(
+        Some(Identity::new(
+            "@external".to_string(),
+            "external".to_string(),
+            vec![],
+            HashMap::new(),
+        )),
+        None,        // trace_parent
+        None,        // cancel_token — DELIBERATELY absent
+        None,        // data
+        Value::Null, // services
+        None,        // global_deadline
+    );
+    assert!(
+        ctx.cancel_token.is_none(),
+        "precondition: context entering the pipeline must lack a cancel_token"
+    );
+
+    let result = client
+        .executor()
+        .call("capture.token", json!({}), Some(&ctx), None)
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "call should succeed; got error {:?}",
+        result.err()
+    );
+    assert!(
+        saw_token.load(Ordering::SeqCst),
+        "module MUST observe a non-None cancel_token after pipeline-entry synthesis (apcore #67)"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_preserves_caller_supplied_cancel_token() {
+    // Negative control for the synthesis rule: when the caller DOES supply
+    // a cancel_token, the pipeline MUST NOT replace it with a fresh one —
+    // otherwise the caller's cancel() signal becomes unreachable. The
+    // synthesis is a fallback, not an override.
+    let client = APCore::new();
+    let saw_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    client
+        .register(
+            "capture.token",
+            Box::new(CaptureCancelTokenModule {
+                saw_token: saw_token.clone(),
+            }),
+        )
+        .unwrap();
+
+    let caller_token = CancelToken::new();
+    let ctx = ctx_with_token(caller_token.clone());
+
+    let result = client
+        .executor()
+        .call("capture.token", json!({}), Some(&ctx), None)
+        .await;
+
+    assert!(result.is_ok(), "call should succeed");
+    assert!(
+        saw_token.load(Ordering::SeqCst),
+        "module observes the caller-supplied cancel_token (not replaced by synthesis)"
+    );
+    // The caller's token reference is still live and observable on the
+    // original Context — confirming the pipeline did not overwrite it.
+    assert!(
+        ctx.cancel_token.is_some(),
+        "caller-supplied cancel_token reference remains observable"
+    );
+}

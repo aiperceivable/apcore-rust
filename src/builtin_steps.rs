@@ -176,6 +176,19 @@ impl Step for BuiltinContextCreation {
             }
         }
 
+        // Spec: BuiltinContextCreation MUST synthesize a fresh local
+        // CancelToken when the incoming context lacks one. Covers three
+        // sources uniformly per apcore #66 §"Contract: Executor binding to
+        // Context": local construction without cancel_token, cross-process
+        // deserialize (cancel_token MUST NOT serialize per PROTOCOL_SPEC
+        // §5.7), and hot-reload survivor. Without this, D-21 cancel checks
+        // at Step 2 and Step 8 always pass through as no-ops, and modules
+        // that poll ctx.cancel_token observe None even for in-process
+        // contexts arriving from non-create code paths. Closes apcore #67.
+        if ctx.context.cancel_token.is_none() {
+            ctx.context.cancel_token = Some(crate::cancel::CancelToken::new());
+        }
+
         // Spec: BuiltinContextCreation MUST set context.global_deadline if
         // the context does not already carry one and the executor config
         // declares a non-zero global_timeout (sync finding A-D-201).
