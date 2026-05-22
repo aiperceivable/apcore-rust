@@ -2275,6 +2275,30 @@ async fn conformance_context_create() {
                     "FAIL [{id}]: executor must bind after deserialize"
                 );
             }
+            "distributed_cancel_token_post_deserialize_null" => {
+                // Negative invariant (PROTOCOL_SPEC §5.7): cancel_token MUST NOT
+                // serialize across process boundaries. Verify (a) a Context
+                // serialized with a live token omits the field, and (b) the
+                // deserialized Context arrives with cancel_token = None.
+                use apcore::cancel::CancelToken;
+                let token = CancelToken::new();
+                let ctx_with_token: Context<Value> =
+                    Context::create(None, None, Some(token), None, Value::Null, None);
+                assert!(
+                    ctx_with_token.cancel_token.is_some(),
+                    "FAIL [{id}]: pre-condition — cancel_token must be set before serialize"
+                );
+                let serialized = ctx_with_token.serialize();
+                assert!(
+                    !serialized.as_object().unwrap().contains_key("cancel_token"),
+                    "FAIL [{id}]: cancel_token MUST NOT appear in serialized output"
+                );
+                let ctx_des: Context<Value> = Context::deserialize(serialized).unwrap();
+                assert!(
+                    ctx_des.cancel_token.is_none(),
+                    "FAIL [{id}]: cancel_token MUST be None after deserialize"
+                );
+            }
             "distributed_cancel_token_synthesized_locally" => {
                 // The Rust pipeline does not currently synthesize a CancelToken
                 // at pipeline entry for deserialized Contexts (the field
@@ -2293,6 +2317,31 @@ async fn conformance_context_create() {
                 assert!(
                     ctx_des.cancel_token.is_none(),
                     "FAIL [{id}]: deserialized cancel_token MUST be None"
+                );
+            }
+            "distributed_global_deadline_post_deserialize_null" => {
+                // Negative invariant (PROTOCOL_SPEC §5.7): global_deadline MUST NOT
+                // serialize across process boundaries. Verify (a) a Context
+                // serialized with a deadline omits the field, and (b) the
+                // deserialized Context arrives with global_deadline = None.
+                let ctx_with_deadline: Context<Value> =
+                    Context::create(None, None, None, None, Value::Null, Some(9_999_999.0));
+                assert!(
+                    ctx_with_deadline.global_deadline.is_some(),
+                    "FAIL [{id}]: pre-condition — global_deadline must be set before serialize"
+                );
+                let serialized = ctx_with_deadline.serialize();
+                assert!(
+                    !serialized
+                        .as_object()
+                        .unwrap()
+                        .contains_key("global_deadline"),
+                    "FAIL [{id}]: global_deadline MUST NOT appear in serialized output"
+                );
+                let ctx_des: Context<Value> = Context::deserialize(serialized).unwrap();
+                assert!(
+                    ctx_des.global_deadline.is_none(),
+                    "FAIL [{id}]: global_deadline MUST be None after deserialize"
                 );
             }
             "distributed_global_deadline_recomputed_locally" => {
