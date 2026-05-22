@@ -48,12 +48,15 @@ pub use approval::{
     AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,
     CallbackApprovalHandler,
 };
-// Note: `async_task::RetryConfig` is intentionally NOT re-exported at the
-// crate root because the name collides with `middleware::RetryConfig`. Users
-// MUST import it via `apcore::async_task::RetryConfig`.
+// Note: `async_task::RetryConfig` is re-exported at the crate root as
+// `AsyncRetryConfig` to avoid colliding with `middleware::RetryConfig`,
+// mirroring the Python/TypeScript SDKs which both rename-export the same
+// class as `AsyncRetryConfig`. The fully qualified path
+// `apcore::async_task::RetryConfig` remains available for callers that
+// prefer the nested form.
 pub use async_task::{
-    AsyncTaskManager, InMemoryTaskStore, ReaperConfig, ReaperHandle, TaskInfo, TaskStatus,
-    TaskStore,
+    AsyncTaskManager, InMemoryTaskStore, ReaperConfig, ReaperHandle,
+    RetryConfig as AsyncRetryConfig, TaskInfo, TaskStatus, TaskStore,
 };
 pub use bindings::{
     typed_handler, AutoSchemaValue, BindingEntry, BindingHandler, BindingLoader, BindingsFile,
