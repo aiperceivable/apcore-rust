@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.22.0] - 2026-05-22
 
 ### Changed
 
@@ -44,9 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ErrorCode::ReaperAlreadyRunning`.** Raised by `AsyncTaskManager::start_reaper` when a reaper is already running.
 
 ---
-
-
-## [0.22.0] - 2026-05-20
 
 ### Added
 
