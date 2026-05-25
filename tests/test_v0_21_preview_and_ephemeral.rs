@@ -402,7 +402,7 @@ fn test_registry_list_excludes_hidden_modules_by_default() {
         )
         .unwrap();
 
-    let visible = registry.list(None, None);
+    let visible = registry.list(None, None, None);
     assert!(visible.contains(&"math.add".to_string()));
     assert!(
         !visible.contains(&"secret.tool".to_string()),
@@ -417,8 +417,8 @@ fn test_registry_list_excludes_hidden_modules_by_default() {
     let entries = registry.entries();
     assert!(!entries.iter().any(|(k, _)| k == "secret.tool"));
 
-    // include_hidden=true reveals everything.
-    let full = registry.list_full(None, None, true);
+    // visibility reveals everything.
+    let full = registry.list_full(None, None, Some(&["public", "hidden"]));
     assert!(full.contains(&"secret.tool".to_string()));
     let full_ids = registry.module_ids_full(true);
     assert!(full_ids.contains(&"secret.tool".to_string()));

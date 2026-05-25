@@ -330,7 +330,7 @@ impl APCore {
 
     /// List all registered modules, optionally filtered by tags and/or prefix.
     pub fn list_modules(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<String> {
-        self.registry.list(tags, prefix)
+        self.registry.list(tags, prefix, None)
     }
 
     /// Register a middleware in the execution pipeline.

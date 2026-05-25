@@ -171,7 +171,7 @@ impl Module for ManifestFullModule {
             (name, root)
         };
 
-        let all_ids = self.registry.list(None, None);
+        let all_ids = self.registry.list(None, None, None);
 
         let mut modules = Vec::new();
         for mid in &all_ids {

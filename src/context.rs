@@ -120,6 +120,15 @@ impl Identity {
     pub fn attrs(&self) -> &HashMap<String, serde_json::Value> {
         &self.attrs
     }
+
+    /// Get an attribute value by key.
+    ///
+    /// Aligned with apcore D-03. May trigger a fetch if the identity
+    /// is lazy-loaded (future extension).
+    #[must_use]
+    pub fn get_attr(&self, key: &str) -> Option<&serde_json::Value> {
+        self.attrs.get(key)
+    }
 }
 
 // Manual Hash impl: serde_json::Value doesn't implement Hash, so we sort

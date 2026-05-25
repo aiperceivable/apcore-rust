@@ -222,6 +222,10 @@ pub struct Config {
     pub yaml_path: Option<PathBuf>,
     #[serde(skip)]
     pub mode: ConfigMode,
+    /// Atomic-style generation counter to detect concurrent modifications.
+    /// Incremented on every mutation (set, mount, reload). Aligned with D-20.
+    #[serde(skip)]
+    pub generation: u64,
 }
 
 /// Legacy v0.17.x root-level field names that are no longer accepted in v0.18.0.
@@ -295,6 +299,7 @@ impl<'de> Deserialize<'de> for Config {
             user_namespaces: helper.user_namespaces,
             yaml_path: None,
             mode,
+            generation: 0,
         })
     }
 }
@@ -552,6 +557,7 @@ impl Config {
     /// Attempts to set canonical typed fields first, then falls back to
     /// user namespaces. Returns silently on type mismatch.
     pub fn set(&mut self, key: &str, value: serde_json::Value) {
+        self.generation += 1;
         // Try canonical typed fields.
         if self.set_typed_field(key, &value) {
             return;
@@ -594,15 +600,25 @@ impl Config {
 
     /// Reload config from the stored `yaml_path`. Returns error if no path stored.
     pub fn reload(&mut self) -> Result<(), ModuleError> {
+        let start_gen = self.generation;
         let path = self.yaml_path.clone().ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ReloadFailed,
                 "Cannot reload: no yaml_path stored (config was not loaded from a file)",
             )
         })?;
-        let reloaded = Self::load(&path)?;
+        let mut reloaded = Self::load(&path)?;
+
+        if self.generation != start_gen {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleReloadConflict,
+                "Config modified during reload",
+            ));
+        }
+
         // Preserve the yaml_path through reload
         let yaml_path = self.yaml_path.take();
+        reloaded.generation = self.generation + 1;
         *self = reloaded;
         self.yaml_path = yaml_path;
         Ok(())
@@ -726,6 +742,7 @@ impl Config {
     }
 
     pub fn mount(&mut self, namespace: &str, source: MountSource) -> Result<(), ModuleError> {
+        self.generation += 1;
         // W-2: Reject reserved namespace per §9.7 spec.
         if namespace == "_config" {
             return Err(ModuleError::config_mount_error(

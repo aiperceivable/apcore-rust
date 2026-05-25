@@ -66,13 +66,13 @@ fn dummy_identity() -> Identity {
 #[test]
 fn test_registry_new_is_empty() {
     let registry = Registry::new();
-    assert!(registry.list(None, None).is_empty());
+    assert!(registry.list(None, None, None).is_empty());
 }
 
 #[test]
 fn test_registry_default_is_empty() {
     let registry = Registry::default();
-    assert!(registry.list(None, None).is_empty());
+    assert!(registry.list(None, None, None).is_empty());
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn test_registry_get_definition_unknown_returns_none() {
 #[test]
 fn test_registry_list_returns_vec_of_str() {
     let registry = Registry::new();
-    let list: Vec<String> = registry.list(None, None);
+    let list: Vec<String> = registry.list(None, None, None);
     assert!(list.is_empty());
 }
 
@@ -1061,7 +1061,7 @@ mod on_load_rollback_tests {
             "module must not remain in registry after on_load failure"
         );
         assert_eq!(
-            registry.list(None, None).len(),
+            registry.list(None, None, None).len(),
             0,
             "registry must be empty after failed registration"
         );
@@ -1276,7 +1276,7 @@ fn test_list_returns_sorted_unique_ids() {
             .expect("registration should succeed");
     }
 
-    let listed = registry.list(None, None);
+    let listed = registry.list(None, None, None);
     let mut expected: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
     expected.sort();
     assert_eq!(
@@ -1296,7 +1296,7 @@ fn test_list_with_prefix_returns_sorted() {
             .expect("registration should succeed");
     }
 
-    let listed = registry.list(None, Some("math."));
+    let listed = registry.list(None, Some("math."), None);
     let expected: Vec<String> = vec![
         "math.alpha".to_string(),
         "math.beta".to_string(),
@@ -1408,21 +1408,21 @@ fn test_list_tag_filter_unions_module_instance_tags() {
         .register_module("tagged.module", Box::new(TaggedModule))
         .expect("register_module should succeed");
 
-    let with_alpha = registry.list(Some(&["alpha"]), None);
+    let with_alpha = registry.list(Some(&["alpha"]), None, None);
     assert_eq!(
         with_alpha,
         vec!["tagged.module".to_string()],
         "module-instance tags from `fn tags()` must participate in tag filter"
     );
 
-    let with_alpha_and_beta = registry.list(Some(&["alpha", "beta"]), None);
+    let with_alpha_and_beta = registry.list(Some(&["alpha", "beta"]), None, None);
     assert_eq!(
         with_alpha_and_beta,
         vec!["tagged.module".to_string()],
         "all required tags satisfied via module-instance tags"
     );
 
-    let with_unknown = registry.list(Some(&["unknown"]), None);
+    let with_unknown = registry.list(Some(&["unknown"]), None, None);
     assert!(
         with_unknown.is_empty(),
         "tag not declared on module instance must not match"

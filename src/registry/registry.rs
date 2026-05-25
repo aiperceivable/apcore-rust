@@ -702,35 +702,49 @@ impl Registry {
     /// Modules whose `ModuleAnnotations { discoverable: false, .. }` are
     /// excluded. Use [`Self::list_full`] with `include_hidden=true` when the
     /// full set is required (introspection, debug consoles).
+    /// Return sorted list of unique registered module IDs, optionally filtered.
+    ///
+    /// # Arguments
+    /// * `tags` - When supplied, only modules carrying *all* of the given tags are returned.
+    /// * `prefix` - When supplied, only IDs starting with the prefix are returned.
+    /// * `visibility` - Filter by module visibility. Supported: `["public", "hidden"]`.
+    ///   Defaults to `["public"]`. Aligned with apcore D-24.
     ///
     /// Aligned with apcore-python `Registry.list(...)` (default
-    /// `include_hidden=False`).
+    /// `visibility=["public"]`).
     ///
     /// Returns owned `String` values because the storage is behind a lock.
-    pub fn list(&self, tags: Option<&[&str]>, prefix: Option<&str>) -> Vec<String> {
-        self.list_full(tags, prefix, false)
+    pub fn list(
+        &self,
+        tags: Option<&[&str]>,
+        prefix: Option<&str>,
+        visibility: Option<&[&str]>,
+    ) -> Vec<String> {
+        self.list_full(tags, prefix, visibility)
     }
 
-    /// Same as [`Self::list`] but with explicit `include_hidden` control.
+    /// Same as [`Self::list`] but with explicit visibility control.
     ///
-    /// Pass `include_hidden=true` to enumerate every registered module ID
-    /// including those annotated `discoverable: false` (RFC ephemeral-modules,
-    /// target v0.21.0). Aligned with apcore-python
-    /// `Registry.list(..., include_hidden=True)`.
+    /// Pass `visibility=Some(&["public", "hidden"])` to enumerate every registered
+    /// module ID including those annotated `discoverable: false` (RFC ephemeral-modules).
+    /// Aligned with apcore-python `Registry.list(..., visibility=["public", "hidden"])`.
     pub fn list_full(
         &self,
         tags: Option<&[&str]>,
         prefix: Option<&str>,
-        include_hidden: bool,
+        visibility: Option<&[&str]>,
     ) -> Vec<String> {
+        let vis = visibility.unwrap_or(&["public"]);
+        let show_public = vis.contains(&"public");
+        let show_hidden = vis.contains(&"hidden");
+
         let core = self.core.read();
         let mut result: Vec<String> = core
             .modules
             .keys()
             .filter(|name| {
-                if !include_hidden
-                    && !descriptor_is_discoverable(core.descriptors.get(name.as_str()))
-                {
+                let is_disc = descriptor_is_discoverable(core.descriptors.get(name.as_str()));
+                if !((is_disc && show_public) || (!is_disc && show_hidden)) {
                     return false;
                 }
                 if let Some(pfx) = prefix {

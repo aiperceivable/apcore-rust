@@ -88,7 +88,7 @@ impl Module for HealthSummaryModule {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
 
-        let module_ids = self.registry.list(None, None);
+        let module_ids = self.registry.list(None, None, None);
 
         let project_name = {
             let cfg = self.config.lock().await;

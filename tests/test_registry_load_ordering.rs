@@ -132,7 +132,7 @@ fn successful_on_load_makes_module_visible_after_register() {
     );
     assert!(
         registry
-            .list(None, None)
+            .list(None, None, None)
             .contains(&"executor.test.success".to_string()),
         "module must appear in list() after successful registration"
     );
@@ -192,7 +192,7 @@ fn failing_on_load_blocks_visibility_and_emits_callback() {
     );
     assert!(
         !registry
-            .list(None, None)
+            .list(None, None, None)
             .contains(&"executor.test.failing".to_string()),
         "module must not appear in list() after failed on_load"
     );

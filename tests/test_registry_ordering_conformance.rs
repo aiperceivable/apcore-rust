@@ -197,7 +197,9 @@ fn conformance_visibility_after_successful_on_load() {
         "post_register_visible mismatch"
     );
     assert_eq!(
-        registry.list(None, None).contains(&module_id.to_string()),
+        registry
+            .list(None, None, None)
+            .contains(&module_id.to_string()),
         post_visible,
         "module must appear in list() after registration"
     );
@@ -289,7 +291,9 @@ fn conformance_callback_failure_blocks_visibility() {
         "module must not be visible after failed on_load"
     );
     assert!(
-        !registry.list(None, None).contains(&module_id.to_string()),
+        !registry
+            .list(None, None, None)
+            .contains(&module_id.to_string()),
         "module must not appear in list() after failed on_load"
     );
 
