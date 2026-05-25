@@ -65,33 +65,42 @@ pub fn deep_merge_chunks_checked(chunks: &[Value]) -> Result<Value, ModuleError>
     let mut acc: Value = Value::Object(serde_json::Map::new());
     for (idx, chunk) in chunks.iter().enumerate() {
         if !chunk.is_object() {
-            let mut details = std::collections::HashMap::new();
-            details.insert(
-                "code".to_string(),
-                Value::String("STREAM_CHUNK_NOT_OBJECT".to_string()),
-            );
-            details.insert(
-                "chunk_index".to_string(),
-                Value::Number(serde_json::Number::from(idx)),
-            );
-            details.insert(
-                "actual_type".to_string(),
-                Value::String(json_type_name(chunk).to_string()),
-            );
-            return Err(ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
-                format!(
-                    "Streaming chunk at index {idx} is not a JSON object \
-                     (got {}); chunks must be objects so deep_merge can \
-                     accumulate them.",
-                    json_type_name(chunk)
-                ),
-            )
-            .with_details(details));
+            return Err(stream_chunk_not_object_error(idx, chunk));
         }
         deep_merge_value(&mut acc, chunk, 0);
     }
     Ok(acc)
+}
+
+/// Build the canonical "chunk is not a JSON object" error (audit D10-001 /
+/// sync finding D-19). Shared by Phase 2 reject-before-deliver in
+/// [`Executor::stream`] and by [`deep_merge_chunks_checked`] so both surface an
+/// identical `code` / `message` / `details` shape that cross-language consumers
+/// can match (mirrors Python's `_deep_merge` AttributeError and TS's TypeError).
+pub fn stream_chunk_not_object_error(idx: usize, chunk: &Value) -> ModuleError {
+    let mut details = std::collections::HashMap::new();
+    details.insert(
+        "code".to_string(),
+        Value::String("STREAM_CHUNK_NOT_OBJECT".to_string()),
+    );
+    details.insert(
+        "chunk_index".to_string(),
+        Value::Number(serde_json::Number::from(idx)),
+    );
+    details.insert(
+        "actual_type".to_string(),
+        Value::String(json_type_name(chunk).to_string()),
+    );
+    ModuleError::new(
+        ErrorCode::GeneralInvalidInput,
+        format!(
+            "Streaming chunk at index {idx} is not a JSON object \
+             (got {}); chunks must be objects so deep_merge can \
+             accumulate them.",
+            json_type_name(chunk)
+        ),
+    )
+    .with_details(details)
 }
 
 fn json_type_name(v: &Value) -> &'static str {
@@ -938,6 +947,11 @@ impl Executor {
             // validation runs on the deep-merged result in Phase 3 after the stream
             // is exhausted. See Module::stream contract for details.
             //
+            // Audit D10-001: chunk *shape* IS validated here, before delivery — a
+            // non-object chunk is rejected and surfaced as an error rather than
+            // yielded. Phase 3's deep_merge_chunks_checked then only ever sees
+            // objects, so it acts as a defensive backstop.
+            //
             // Fallback (sync STREAM-002): if Module::stream returns None, fall back
             // to Module::execute() and yield the result as a single chunk.
             // Mirrors apcore-python/src/apcore/executor.py:862-865 and
@@ -964,6 +978,17 @@ impl Executor {
                         }
                     }
                     let chunk = chunk_result?;
+                    // Audit D10-001: reject a non-object chunk BEFORE delivering
+                    // it. The canonical contract is "reject before deliver +
+                    // raise": a chunk is valid iff it is a JSON object. On the
+                    // first invalid chunk we surface a structured error and do
+                    // NOT yield the bad chunk. We mirror the exact error shape
+                    // produced by `deep_merge_chunks_checked` (same code,
+                    // message, and details) so cross-language consumers match.
+                    if !chunk.is_object() {
+                        Err(stream_chunk_not_object_error(accumulated.len(), &chunk))?;
+                        return;
+                    }
                     accumulated.push(chunk.clone());
                     yield chunk;
                 }
