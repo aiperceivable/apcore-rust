@@ -217,6 +217,19 @@ struct StreamSetup {
     middleware_manager: Option<Arc<MiddlewareManager>>,
 }
 
+/// Internal: outcome of `Executor::prepare_stream`. A Phase-1 (pre-execute)
+/// pipeline failure can be intercepted by a middleware `on_error` handler that
+/// supplies a recovery value — mirroring `call()` and the Python/TypeScript
+/// SDKs. In that case the streaming body must YIELD the recovery value as the
+/// stream's chunk rather than surfacing the error (sync finding A-D-001).
+enum StreamPrep {
+    /// Phase 1 succeeded; proceed to invoke `module.stream()`.
+    Setup(Box<StreamSetup>),
+    /// A middleware `on_error` handler recovered from a Phase-1 failure; yield
+    /// this value as the single stream chunk, then end the stream.
+    Recovery(Value),
+}
+
 /// Validate a JSON value against a JSON Schema.
 /// Returns Ok(()) if valid, or a ModuleError with SchemaValidationError on failure.
 pub fn validate_against_schema(
@@ -932,15 +945,25 @@ impl Executor {
             // Fail fast for invalid module IDs before setting up any pipeline state.
             Self::validate_module_id(&module_id_owned)?;
 
-            // Phase 1: pre-stream setup. Any error short-circuits the whole stream.
-            let mut setup = self
+            // Phase 1: pre-stream setup. A pre-execute failure runs the
+            // middleware on_error recovery chain (A-D-001): a recovery value is
+            // yielded as the stream's chunk; otherwise the error short-circuits
+            // the whole stream.
+            let mut setup = match self
                 .prepare_stream(
                     &module_id_owned,
                     inputs,
                     initial_context,
                     version_hint_owned.as_deref(),
                 )
-                .await?;
+                .await?
+            {
+                StreamPrep::Setup(setup) => *setup,
+                StreamPrep::Recovery(value) => {
+                    yield value;
+                    return;
+                }
+            };
 
             // Phase 2: invoke module.stream() and forward chunks as they arrive.
             // Note: individual chunks are NOT validated against output_schema here;
@@ -1070,7 +1093,7 @@ impl Executor {
         inputs: Value,
         ctx: Option<Context<Value>>,
         version_hint: Option<&str>,
-    ) -> Result<StreamSetup, ModuleError> {
+    ) -> Result<StreamPrep, ModuleError> {
         let context = ctx.unwrap_or_else(|| {
             Context::<Value>::new(Identity::new(
                 "@external".to_string(),
@@ -1090,12 +1113,75 @@ impl Executor {
         // Drive the shared pipeline engine up to — but not including — the
         // `execute` step. This inherits all per-step metadata handling from
         // `PipelineEngine::run`, so streaming and non-streaming never diverge.
-        // §1.1 fail-fast: unwrap PipelineStepError to surface the original
-        // typed error to the streaming caller.
-        let (_output, trace) =
-            PipelineEngine::run_until_step(&self.strategy, &mut pipe_ctx, "execute")
-                .await
-                .map_err(|e| e.unwrap_pipeline_step_error().unwrap_or(e))?;
+        let (_output, trace) = match PipelineEngine::run_until_step(
+            &self.strategy,
+            &mut pipe_ctx,
+            "execute",
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A-D-001: a Phase-1 (pre-execute) failure MUST run the
+                // middleware on_error recovery chain over the executed
+                // middlewares — mirroring `call()` and apcore-python /
+                // apcore-typescript `stream()`. Any recovery value is yielded
+                // as the stream's chunk; otherwise the (unwrapped, decorated)
+                // error is surfaced as today.
+                //
+                // §1.1 fail-fast: unwrap PipelineStepError to the original
+                // typed error. §1.2: unwrap MiddlewareChainError so on_error
+                // handlers and the caller see the typed cause. Algorithm A11:
+                // decorate with trace_id + module_id. These mirror `call()`'s
+                // error handling exactly.
+                let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+                let underlying = underlying
+                    .unwrap_middleware_chain_error()
+                    .unwrap_or(underlying);
+                let underlying = propagate_module_error(underlying, module_id, &pipe_ctx.context);
+                // Cancellation short-circuit (D-20): an ExecutionCancelled
+                // error MUST bypass the on_error middleware chain so logging
+                // middleware cannot swallow it and retry middleware cannot
+                // resurrect the call. Mirrors `call()` and Python/TS stream().
+                if matches!(underlying.code, ErrorCode::ExecutionCancelled) {
+                    return Err(underlying);
+                }
+                let executed = pipe_ctx.executed_middlewares.clone();
+                if !executed.is_empty() {
+                    let outcome = self
+                        .middleware_manager
+                        .execute_on_error_outcome(
+                            module_id,
+                            pipe_ctx.inputs.clone(),
+                            &underlying,
+                            &pipe_ctx.context,
+                            &executed,
+                        )
+                        .await;
+                    match outcome {
+                        Some(crate::middleware::base::OnErrorOutcome::Recovery(value)) => {
+                            return Ok(StreamPrep::Recovery(value));
+                        }
+                        Some(crate::middleware::base::OnErrorOutcome::Retry(_)) => {
+                            // Retry is not meaningful once stream() has been
+                            // entered: a streaming caller could only be mid-
+                            // stream on a re-run, so a retry request is
+                            // translated back into the original error rather
+                            // than silently re-running. Mirrors apcore-python
+                            // (executor.py: "Retry requested during stream …
+                            // ignored; re-raising") and apcore-typescript.
+                            tracing::warn!(
+                                module_id = %module_id,
+                                "Retry requested during stream phase 1 — ignored; surfacing original error"
+                            );
+                            return Err(underlying);
+                        }
+                        None => {}
+                    }
+                }
+                return Err(underlying);
+            }
+        };
 
         // `run_until` returns `Ok` for pipeline-level aborts (so the caller
         // can observe the trace). Streaming requires a resolved module, so
@@ -1126,13 +1212,13 @@ impl Executor {
         })?;
         let output_schema = module.output_schema();
 
-        Ok(StreamSetup {
+        Ok(StreamPrep::Setup(Box::new(StreamSetup {
             module,
             inputs: pipe_ctx.inputs,
             context: pipe_ctx.context,
             output_schema,
             middleware_manager: pipe_ctx.middleware_manager.clone(),
-        })
+        })))
     }
 
     /// Get a reference to the executor's execution strategy.
