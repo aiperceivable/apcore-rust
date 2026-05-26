@@ -286,6 +286,25 @@ impl ACL {
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
+        // Wrap the entire evaluation in a synchronous handler-error capture
+        // scope (A-D-002) so any condition handler that calls
+        // `report_handler_error(...)` lands its message in this call's audit
+        // entry — mirroring `async_check`'s task-local scope and Python's
+        // sync `_handler_error_var.set(None)` / `reset(token)` pairing.
+        // Without this, `build_audit_entry` always read `None` on the sync
+        // path because the only scope was tokio-task-local.
+        let (decision, _captured) = crate::acl_handlers::with_handler_error_capture_sync(|| {
+            self.check_inner(caller_id, target_id, ctx)
+        });
+        decision
+    }
+
+    fn check_inner(
+        &self,
+        caller_id: Option<&str>,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+    ) -> bool {
         let caller = caller_id.unwrap_or("@external");
 
         // Snapshot rules + default_effect before evaluation so any concurrent
@@ -659,15 +678,14 @@ impl ACL {
             call_depth: ctx.map(|c| c.call_chain.len()),
             trace_id: ctx.map(|c| c.trace_id.clone()),
             // Read the per-call handler-error slot populated by
-            // `acl_handlers::report_handler_error`. Returns `None` when no
-            // handler reported an error or when the audit is built outside
-            // a `with_handler_error_capture` scope (sync paths). Mirrors
+            // `acl_handlers::report_handler_error`. Consults the async
+            // task-local scope (from `async_check`) and the synchronous
+            // thread-local scope (from `check`), so a handler error populates
+            // the audit entry on BOTH paths. Returns `None` when no handler
+            // reported an error or when built outside a capture scope. Mirrors
             // Python `_handler_error_var.get()` and TypeScript
-            // `_lastHandlerError` (closes A-D-ACL-001).
-            handler_error: crate::acl_handlers::HANDLER_ERROR
-                .try_with(|cell| cell.borrow().clone())
-                .ok()
-                .flatten(),
+            // `_lastHandlerError` (closes A-D-ACL-001 / A-D-002).
+            handler_error: crate::acl_handlers::current_handler_error(),
         }
     }
 
