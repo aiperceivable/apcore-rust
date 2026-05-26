@@ -56,7 +56,7 @@ impl Module for ManifestModule {
                 ModuleError::new(ErrorCode::GeneralInvalidInput, "'module_id' is required")
             })?;
 
-        let descriptor = self.registry.get_definition(module_id).ok_or_else(|| {
+        let descriptor = self.registry.get_definition(module_id)?.ok_or_else(|| {
             ModuleError::new(
                 ErrorCode::ModuleNotFound,
                 format!("Module '{module_id}' not found"),
@@ -181,7 +181,7 @@ impl Module for ManifestFullModule {
                     continue;
                 }
             }
-            let Some(descriptor) = self.registry.get_definition(mid) else {
+            let Some(descriptor) = self.registry.get_definition(mid).ok().flatten() else {
                 continue;
             };
             // Tag filter (all tags must match).

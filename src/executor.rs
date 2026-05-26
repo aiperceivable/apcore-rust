@@ -809,7 +809,7 @@ impl Executor {
 
         // Detect requires_approval from module annotations.
         let mut requires_approval = false;
-        if let Some(desc) = self.registry.get_definition(module_id) {
+        if let Ok(Some(desc)) = self.registry.get_definition(module_id) {
             if desc
                 .annotations
                 .as_ref()
@@ -985,12 +985,19 @@ impl Executor {
             if let Some(mut inner) = stream_handle {
                 while let Some(chunk_result) = inner.next().await {
                     // STREAM-003 (sync): enforce global_deadline between chunks.
+                    // A-D-007: use strict `>` to match apcore-python
+                    // (`time.monotonic() > global_deadline`) and apcore-typescript
+                    // (`Date.now() > globalDeadline`). The unit here is internal
+                    // epoch-seconds (set+compared consistently via as_secs_f64);
+                    // the cross-SDK clocks differ (Python monotonic-seconds, TS
+                    // epoch-ms) but each is self-consistent — only the comparator
+                    // is normalized.
                     if let Some(deadline) = setup.context.global_deadline {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs_f64();
-                        if now >= deadline {
+                        if now > deadline {
                             Err(ModuleError::new(
                                 ErrorCode::ModuleTimeout,
                                 format!(

@@ -293,6 +293,8 @@ impl ReloadModule {
                 let deps: Vec<DepInfo> = self
                     .registry
                     .get_definition(mid)
+                    .ok()
+                    .flatten()
                     .map(|d| {
                         d.dependencies
                             .into_iter()
@@ -362,6 +364,8 @@ impl ReloadModule {
         let previous_version = self
             .registry
             .get_definition(&module_id)
+            .ok()
+            .flatten()
             .map(|d| d.version)
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -415,6 +419,8 @@ impl ReloadModule {
         let new_version = self
             .registry
             .get_definition(&module_id)
+            .ok()
+            .flatten()
             .map(|d| d.version)
             .unwrap_or_else(|| previous_version.clone());
 
