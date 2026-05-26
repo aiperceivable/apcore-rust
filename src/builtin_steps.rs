@@ -225,14 +225,20 @@ impl Step for BuiltinCallChainGuard {
         if let Some(token) = ctx.context.cancel_token.as_ref() {
             token.check_for(&ctx.module_id)?;
         }
+        // Create the child context FIRST so call_chain already includes
+        // module_id at the end, then guard. This matches the cross-language
+        // canonical contract (apcore-python `Context.child()` populates the
+        // chain before `guard_call_chain`, and apcore-typescript does the
+        // same): the guard counts the full chain — including the trailing
+        // self-entry — for frequency, and strips it for circular detection
+        // (sync findings A-D-039 / A-D-040).
+        ctx.context = ctx.context.child(&ctx.module_id);
         crate::utils::guard_call_chain_with_repeat(
             &ctx.context,
             &ctx.module_id,
             config.executor.max_call_depth,
             config.executor.max_module_repeat as usize,
         )?;
-        // Create child context (adds module_id to call_chain).
-        ctx.context = ctx.context.child(&ctx.module_id);
         Ok(StepResult::continue_step())
     }
 }
@@ -339,7 +345,7 @@ impl Step for BuiltinApprovalGate {
             .expect("registry must be injected into PipelineContext");
 
         let desc = match registry.get_definition(&ctx.module_id) {
-            Some(d) if d.annotations.as_ref().is_some_and(|a| a.requires_approval) => d,
+            Ok(Some(d)) if d.annotations.as_ref().is_some_and(|a| a.requires_approval) => d,
             _ => return Ok(StepResult::continue_step()),
         };
 
@@ -554,7 +560,7 @@ impl Step for BuiltinExecute {
         let per_module_timeout_ms: Option<u64> = ctx
             .registry
             .as_ref()
-            .and_then(|reg| reg.get_definition(&ctx.module_id))
+            .and_then(|reg| reg.get_definition(&ctx.module_id).ok().flatten())
             .and_then(|desc| desc.annotations)
             .and_then(|ann| ann.extra.get("resources").cloned())
             .and_then(|res| res.get("timeout").cloned())

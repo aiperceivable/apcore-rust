@@ -121,9 +121,19 @@ fn guard_circular_longer_chain_detected() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn guard_frequency_exceeded_returns_error() {
-    // mod.a appears 3 times (consecutive, no cycle) — hits default max_module_repeat=3
+fn guard_frequency_at_default_limit_passes() {
+    // A-D-040: canonical frequency uses `count > max_module_repeat`. The chain
+    // includes the trailing self, so exactly 3 occurrences == default limit 3
+    // is allowed (3 > 3 is false).
     let ctx = ctx_with_chain(vec!["mod.a", "mod.a", "mod.a"]);
+    assert!(guard_call_chain(&ctx, "mod.a", 100).is_ok());
+}
+
+#[test]
+fn guard_frequency_exceeded_returns_error() {
+    // mod.a appears 4 times (consecutive, no cycle) — exceeds default
+    // max_module_repeat=3 (count 4 > 3).
+    let ctx = ctx_with_chain(vec!["mod.a", "mod.a", "mod.a", "mod.a"]);
     let result = guard_call_chain(&ctx, "mod.a", 100);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
@@ -152,9 +162,17 @@ fn guard_frequency_two_occurrences_passes_with_default_limit() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn guard_with_repeat_max_repeat_one_triggers_frequency_on_first_occurrence() {
-    // With max_repeat=1, a single occurrence already exceeds the limit.
+fn guard_with_repeat_max_repeat_one_single_occurrence_passes() {
+    // With max_repeat=1, a single occurrence (count 1) is within the limit
+    // (1 > 1 is false). The chain includes the trailing self.
     let ctx = ctx_with_chain(vec!["mod.a"]);
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.a", 100, 1).is_ok());
+}
+
+#[test]
+fn guard_with_repeat_max_repeat_one_second_occurrence_errors() {
+    // With max_repeat=1, two occurrences (count 2 > 1) exceed the limit.
+    let ctx = ctx_with_chain(vec!["mod.a", "mod.a"]);
     let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, 1);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
@@ -173,8 +191,15 @@ fn guard_with_repeat_custom_limit_two_passes_at_one_occurrence() {
 }
 
 #[test]
-fn guard_with_repeat_custom_limit_two_errors_at_two_occurrences() {
+fn guard_with_repeat_custom_limit_two_passes_at_two_occurrences() {
+    // count 2 == max_repeat 2 → allowed (2 > 2 is false).
     let ctx = ctx_with_chain(vec!["mod.a", "mod.a"]);
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.a", 100, 2).is_ok());
+}
+
+#[test]
+fn guard_with_repeat_custom_limit_two_errors_at_three_occurrences() {
+    let ctx = ctx_with_chain(vec!["mod.a", "mod.a", "mod.a"]);
     let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, 2);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
