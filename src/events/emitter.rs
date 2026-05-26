@@ -5,10 +5,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 use super::subscribers::EventSubscriber;
 use crate::errors::{ErrorCode, ModuleError};
+
+/// Event type for dead-letter-queue notifications emitted on delivery exhaustion.
+const DLQ_EVENT_TYPE: &str = "apcore.event.delivery_failed";
 
 /// An event emitted by the `APCore` system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +68,11 @@ pub struct EventEmitter {
     /// Set to `true` by [`Self::shutdown`]. Once set, all `emit*` methods
     /// drop incoming events as no-ops (sync finding A-D-502).
     is_shutdown: Arc<AtomicBool>,
+    /// In-flight delivery tasks spawned by [`Self::emit`]. [`Self::flush`]
+    /// awaits these (up to a timeout) so callers can wait for pending
+    /// deliveries to drain (sync findings A-D-024 / A-D-027). Completed
+    /// handles are pruned lazily on each `emit`/`flush`.
+    pending: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl EventEmitter {
@@ -73,6 +83,7 @@ impl EventEmitter {
             subscribers: vec![],
             max_workers: 4,
             is_shutdown: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -84,7 +95,16 @@ impl EventEmitter {
     }
 
     /// Remove the first subscriber whose `subscriber_id()` matches the given
-    /// subscriber's ID, matching Python's identity-based removal semantics.
+    /// subscriber's ID.
+    ///
+    /// **Cross-language divergence (A-D-030, accepted Rust constraint):**
+    /// apcore-python / apcore-typescript remove by exact *instance* identity.
+    /// Rust stores subscribers as `Arc<dyn EventSubscriber>` trait objects, and
+    /// pointer identity is not preserved across the `Box`→`Arc` conversion in
+    /// [`Self::subscribe`], so instance matching is not feasible without a
+    /// handle-returning API. Identity is therefore approximated by
+    /// `subscriber_id()`; callers needing independent removal MUST assign each
+    /// subscriber a unique id.
     pub fn unsubscribe(&mut self, subscriber: &dyn EventSubscriber) -> bool {
         let target_id = subscriber.subscriber_id();
         self.unsubscribe_by_id(target_id)
@@ -121,9 +141,13 @@ impl EventEmitter {
     /// Canonical delivery path — applies the per-subscriber retry policy and
     /// emits an `apcore.event.delivery_failed` DLQ event on exhaustion, per
     /// spec docs/features/event-system.md §Event Delivery Semantics (#61).
-    /// Subscribers are delivered sequentially within this call; each
-    /// subscriber's retry loop is run inline (the call awaits full delivery
-    /// to all matching subscribers).
+    ///
+    /// **Non-blocking (sync finding A-D-024):** each matching subscriber's
+    /// retry loop (including backoff sleeps) runs on its own spawned task, so
+    /// this method returns immediately without waiting for subscriber
+    /// execution — matching apcore-python (`ThreadPoolExecutor.submit`) and
+    /// apcore-typescript (fire-and-forget). Use [`Self::flush`] to wait for
+    /// pending deliveries to drain.
     ///
     /// **Post-shutdown behaviour:** if [`Self::shutdown`] has been called,
     /// this method returns immediately as a no-op (sync finding A-D-502).
@@ -132,21 +156,30 @@ impl EventEmitter {
     /// errors are caught, retried per the per-subscriber `retry` config, and
     /// surfaced via DLQ + `on_failure` only after exhaustion. The return
     /// type is unit (D10-008).
+    ///
+    /// `async fn` is retained for API parity and so callers may `.await` it;
+    /// the body itself does not block on subscriber execution.
+    #[allow(clippy::unused_async)]
     pub async fn emit(&self, event: &ApCoreEvent) {
         if self.is_shutdown.load(Ordering::SeqCst) {
             return;
         }
         let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
         for subscriber in &self.subscribers {
             if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
-                Self::deliver_with_dlq(
-                    Arc::clone(subscriber),
-                    event.clone(),
-                    all_subscribers.clone(),
-                )
-                .await;
+                let sub = Arc::clone(subscriber);
+                let evt = event.clone();
+                let dlq_subs = all_subscribers.clone();
+                handles.push(tokio::spawn(async move {
+                    Self::deliver_with_dlq(sub, evt, dlq_subs).await;
+                }));
             }
         }
+        // Track in-flight tasks so flush() can await them; prune finished ones.
+        let mut pending = self.pending.lock();
+        pending.retain(|h| !h.is_finished());
+        pending.extend(handles);
     }
 
     /// Single-attempt sequential emit — bypasses the per-subscriber retry
@@ -207,12 +240,59 @@ impl EventEmitter {
         Ok(())
     }
 
-    /// Flush all pending events, waiting up to `timeout_ms` milliseconds.
+    /// Flush all pending event deliveries, waiting up to `timeout_ms`
+    /// milliseconds for the tasks spawned by [`Self::emit`] to complete.
     ///
-    /// This implementation uses a synchronous dispatch model — all events are
-    /// dispatched inline during `emit()`, so there is nothing to flush.
-    pub fn flush(&self, _timeout_ms: u64) -> Result<(), ModuleError> {
-        // Synchronous dispatch model — nothing to flush.
+    /// Drains the tracked in-flight delivery tasks (sync findings A-D-024 /
+    /// A-D-027), matching apcore-python's `flush()` which waits on each pending
+    /// future. If the overall timeout elapses before all tasks finish, the
+    /// remaining (still-running) tasks are left in place and `flush` returns
+    /// `Ok(())` — delivery continues in the background, mirroring Python which
+    /// swallows per-future timeouts. A `timeout_ms` of 0 waits indefinitely.
+    pub async fn flush(&self, timeout_ms: u64) -> Result<(), ModuleError> {
+        // Take ownership of the current in-flight handles.
+        let handles: Vec<JoinHandle<()>> = {
+            let mut pending = self.pending.lock();
+            std::mem::take(&mut *pending)
+        };
+        if handles.is_empty() {
+            return Ok(());
+        }
+
+        let deadline = if timeout_ms == 0 {
+            None
+        } else {
+            Some(tokio::time::Instant::now() + Duration::from_millis(timeout_ms))
+        };
+
+        let mut unfinished: Vec<JoinHandle<()>> = Vec::new();
+        for handle in handles {
+            match deadline {
+                None => {
+                    let _ = handle.await;
+                }
+                Some(dl) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= dl {
+                        // Budget exhausted — keep remaining tasks running.
+                        unfinished.push(handle);
+                        continue;
+                    }
+                    // Await the task up to the deadline. On either outcome
+                    // (completed or per-task timeout) the result is discarded:
+                    // a timed-out delivery continues detached in the background
+                    // (the JoinHandle is consumed by timeout_at).
+                    let _ = tokio::time::timeout_at(dl, handle).await;
+                }
+            }
+        }
+
+        if !unfinished.is_empty() {
+            let mut pending = self.pending.lock();
+            // Re-track any tasks we did not get to await, plus any new ones.
+            unfinished.extend(std::mem::take(&mut *pending));
+            *pending = unfinished;
+        }
         Ok(())
     }
 
@@ -267,23 +347,16 @@ impl EventEmitter {
     /// - Subsequent calls to `shutdown` return `Ok(())` immediately
     ///   (idempotent).
     ///
-    /// `timeout_ms` bounds the wait for any in-flight flush. The current
-    /// implementation dispatches events synchronously / via spawned tasks
-    /// that the emitter does not own, so flush is a no-op pass-through —
-    /// the parameter is reserved for future buffering implementations and
-    /// kept for API parity with apcore-python and apcore-typescript
-    /// (sync finding A-D-502).
-    ///
-    /// `async fn` is preserved for cross-language API parity even though
-    /// the current body has no `.await` points; future buffered/spawned
-    /// implementations will need to await flush completion.
-    #[allow(clippy::unused_async)]
+    /// `timeout_ms` bounds the wait for in-flight deliveries to drain via
+    /// [`Self::flush`]. After the flush completes (or times out), no new
+    /// events are accepted (sync finding A-D-502). Kept for API parity with
+    /// apcore-python and apcore-typescript.
     pub async fn shutdown(&mut self, timeout_ms: u64) -> Result<(), ModuleError> {
         if self.is_shutdown.swap(true, Ordering::SeqCst) {
             // Already shut down — idempotent.
             return Ok(());
         }
-        self.flush(timeout_ms)
+        self.flush(timeout_ms).await
     }
 
     /// Returns `true` if this emitter has been shut down.
@@ -295,11 +368,13 @@ impl EventEmitter {
     /// Fire-and-forget dispatch with full delivery semantics (retry + DLQ).
     ///
     /// For each matching subscriber, spawns a `tokio::task` running the full
-    /// per-subscriber retry loop. On exhaustion:
-    /// - If `max_attempts > 1`: a `apcore.event.delivery_failed` DLQ event is
-    ///   delivered to any subscriber whose pattern matches that event type.
-    /// - If `max_attempts == 1` (single-attempt default): logs a `warn!` only.
-    /// - `on_failure` is called in both cases.
+    /// per-subscriber retry loop. On exhaustion (regardless of `max_attempts`):
+    /// - a `apcore.event.delivery_failed` DLQ event is delivered to any
+    ///   subscriber whose pattern matches that event type, EXCEPT catch-all
+    ///   `'*'` subscribers (sync findings A-D-025 / A-D-026).
+    /// - `on_failure` is called.
+    ///
+    /// Spawned tasks are tracked so [`Self::flush`] can await them.
     ///
     /// **Post-shutdown:** drops the event as a no-op.
     #[allow(clippy::needless_pass_by_value)]
@@ -310,6 +385,7 @@ impl EventEmitter {
         // Capture a snapshot for both the delivery loop and DLQ delivery.
         let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
 
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
         for subscriber in &self.subscribers {
             if !Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 continue;
@@ -317,10 +393,13 @@ impl EventEmitter {
             let sub = Arc::clone(subscriber);
             let evt = event.clone();
             let dlq_subs = all_subscribers.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 Self::deliver_with_dlq(sub, evt, dlq_subs).await;
-            });
+            }));
         }
+        let mut pending = self.pending.lock();
+        pending.retain(|h| !h.is_finished());
+        pending.extend(handles);
     }
 
     /// Deliver an event to one subscriber with retry + optional DLQ emission.
@@ -349,51 +428,48 @@ impl EventEmitter {
             ModuleError::new(ErrorCode::GeneralInternalError, "unknown delivery failure")
         });
 
-        if retry.max_attempts > 1 {
-            // Emit a DLQ event — single attempt, no retry.
-            let sub_id = subscriber.subscriber_id().to_string();
-            // subscriber_type is derived from the first dash-delimited segment of
-            // subscriber_id. SDK-generated IDs follow the "{type}-{uuid}" convention
-            // (e.g. "file-abc123", "a2a-xyz456"), so this produces the canonical type.
-            // Custom IDs should follow the same convention; if they don't, the type
-            // falls back to "unknown".
-            let subscriber_type = sub_id.split('-').next().unwrap_or("unknown").to_string();
-            let dlq_event = ApCoreEvent::new(
-                "apcore.event.delivery_failed",
-                serde_json::json!({
-                    "subscriber_type": subscriber_type,
-                    "subscriber_id": sub_id,
-                    "original_event": {
-                        "event_type": event.event_type,
-                        "data": event.data,
-                        "timestamp": event.timestamp,
-                    },
-                    "error": {
-                        "type": format!("{:?}", err.code),
-                        "message": err.message,
-                    },
-                    "attempt_count": retry.max_attempts,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                }),
-            );
-            for dlq_sub in &all_subscribers {
-                if Self::matches_pattern(dlq_sub.event_pattern(), "apcore.event.delivery_failed") {
-                    if let Err(e) = dlq_sub.on_event(&dlq_event).await {
-                        tracing::error!(
-                            subscriber_id = %dlq_sub.subscriber_id(),
-                            error = %e,
-                            "DLQ subscriber on_event failed (discarded, not retried)"
-                        );
-                    }
+        // A-D-025: always emit the DLQ event on exhaustion, regardless of
+        // max_attempts (including single-attempt subscribers). Matches
+        // apcore-python / apcore-typescript, which emit the DLQ whenever a
+        // subscriber's delivery attempts are exhausted.
+        let sub_id = subscriber.subscriber_id().to_string();
+        // A-D-029: use the subscriber's DECLARED type rather than parsing the id.
+        let subscriber_type = subscriber.subscriber_type().to_string();
+        let dlq_event = ApCoreEvent::new(
+            DLQ_EVENT_TYPE,
+            serde_json::json!({
+                "subscriber_type": subscriber_type,
+                "subscriber_id": sub_id,
+                "original_event": {
+                    "event_type": event.event_type,
+                    "data": event.data,
+                    "timestamp": event.timestamp,
+                },
+                "error": {
+                    "type": format!("{:?}", err.code),
+                    "message": err.message,
+                },
+                "attempt_count": retry.max_attempts,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+        );
+        for dlq_sub in &all_subscribers {
+            // A-D-026: exclude catch-all '*' subscribers from DLQ delivery to
+            // prevent cascading failures where every wildcard subscriber would
+            // recursively receive a DLQ about itself. Matches apcore-python.
+            if dlq_sub.event_pattern() == "*" {
+                continue;
+            }
+            if Self::matches_pattern(dlq_sub.event_pattern(), DLQ_EVENT_TYPE) {
+                // DLQ delivery is single-attempt (no retry, no second-order DLQ).
+                if let Err(e) = dlq_sub.on_event(&dlq_event).await {
+                    tracing::error!(
+                        subscriber_id = %dlq_sub.subscriber_id(),
+                        error = %e,
+                        "DLQ subscriber on_event failed (discarded, not retried)"
+                    );
                 }
             }
-        } else {
-            tracing::warn!(
-                subscriber_id = %subscriber.subscriber_id(),
-                event_type = %event.event_type,
-                error = %err,
-                "event delivery failed (single-attempt, no DLQ)"
-            );
         }
 
         subscriber
@@ -522,6 +598,7 @@ mod tests {
 
         let event = ApCoreEvent::new("test.hello", json!({}));
         emitter.emit(&event).await;
+        emitter.flush(5000).await.unwrap();
         assert_eq!(received.lock().len(), 1);
         assert_eq!(received.lock()[0], "test.hello");
     }
@@ -547,6 +624,7 @@ mod tests {
 
         let event = ApCoreEvent::new("anything.at.all", json!({}));
         emitter.emit(&event).await;
+        emitter.flush(5000).await.unwrap();
         assert_eq!(received.lock().len(), 1);
     }
 
@@ -587,10 +665,10 @@ mod tests {
         assert_eq!(received.lock().len(), 1);
     }
 
-    #[test]
-    fn test_flush_succeeds() {
+    #[tokio::test]
+    async fn test_flush_succeeds() {
         let emitter = EventEmitter::new();
-        emitter.flush(1000).unwrap();
+        emitter.flush(1000).await.unwrap();
     }
 
     #[test]

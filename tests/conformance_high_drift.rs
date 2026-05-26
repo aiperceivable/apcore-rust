@@ -414,6 +414,20 @@ async fn conformance_contextual_audit() {
 
         let expected = &tc["expected"];
         let expected_event_type = expected["event_type"].as_str().unwrap();
+
+        // emit() dispatches deliveries on spawned tasks (A-D-024), so poll
+        // until the expected event arrives or a short timeout elapses.
+        for _ in 0..200 {
+            if captured
+                .lock()
+                .iter()
+                .any(|e| e.event_type == expected_event_type)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
         let evts = captured.lock().clone();
         let evt = evts
             .iter()

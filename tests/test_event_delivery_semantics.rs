@@ -247,8 +247,11 @@ async fn permanent_failure_emits_dlq_event() {
 }
 
 #[tokio::test]
-async fn single_attempt_failure_logs_warn_no_dlq() {
-    // Default retry (single attempt) — no DLQ emitted, only a warn log.
+async fn single_attempt_failure_emits_dlq() {
+    // A-D-025: a single-attempt (no_retry) failure MUST also emit a DLQ event
+    // on exhaustion — matching apcore-python / apcore-typescript, which emit
+    // the DLQ regardless of max_attempts. (Previously Rust emitted the DLQ only
+    // when max_attempts > 1.)
     let (sub, attempt_count, failure_recorded) =
         AlwaysFailSubscriber::new("sub-single", EventRetryConfig::no_retry());
     let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-single");
@@ -262,13 +265,17 @@ async fn single_attempt_failure_logs_warn_no_dlq() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Exactly 1 attempt (default single-attempt).
+    // Exactly 1 attempt (single-attempt mode).
     assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
-    // No DLQ emitted for single-attempt mode.
-    assert!(
-        dlq_received.lock().is_empty(),
-        "no DLQ for single-attempt mode"
+    // DLQ emitted even for single-attempt mode.
+    let dlq_events = dlq_received.lock();
+    assert_eq!(
+        dlq_events.len(),
+        1,
+        "DLQ must be emitted on single-attempt exhaustion"
     );
+    assert_eq!(dlq_events[0].data["attempt_count"].as_u64(), Some(1));
+    drop(dlq_events);
     // on_failure was still called.
     assert_eq!(*failure_recorded.lock(), Some(1));
 }
@@ -345,5 +352,206 @@ async fn dlq_payload_contains_original_event_type() {
         original_event["event_type"].as_str(),
         Some("test.specific.event"),
         "DLQ payload must include original event_type"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A-D-024 — emit() is non-blocking (does not await the subscriber retry loop)
+// ---------------------------------------------------------------------------
+
+/// Subscriber whose first delivery attempt blocks for `delay`, then fails,
+/// so the retry loop (with backoff) keeps the delivery task alive a while.
+#[derive(Debug)]
+struct SlowFailingSubscriber {
+    id: String,
+    delay: Duration,
+    done: Arc<Mutex<bool>>,
+    retry_config: EventRetryConfig,
+}
+
+#[async_trait]
+impl EventSubscriber for SlowFailingSubscriber {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn event_pattern(&self) -> &str {
+        "test.*"
+    }
+    fn retry(&self) -> EventRetryConfig {
+        self.retry_config
+    }
+    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+        tokio::time::sleep(self.delay).await;
+        *self.done.lock() = true;
+        Err(ModuleError::new(
+            apcore::errors::ErrorCode::GeneralInternalError,
+            "slow failure",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn emit_returns_before_slow_subscriber_completes() {
+    // A-D-024: emit() must return immediately, before the subscriber's slow
+    // retry/backoff loop finishes.
+    let done = Arc::new(Mutex::new(false));
+    let sub = SlowFailingSubscriber {
+        id: "slow".into(),
+        delay: Duration::from_millis(200),
+        done: Arc::clone(&done),
+        retry_config: EventRetryConfig::no_retry(),
+    };
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(sub));
+
+    let start = std::time::Instant::now();
+    emitter
+        .emit(&ApCoreEvent::new("test.slow", json!({})))
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "emit() blocked for {elapsed:?}; should return before the slow subscriber finishes"
+    );
+    assert!(
+        !*done.lock(),
+        "subscriber should not yet have completed when emit() returned"
+    );
+
+    // A-D-027: flush() waits for the in-flight delivery to complete.
+    emitter.flush(5000).await.unwrap();
+    assert!(*done.lock(), "flush() must await the spawned delivery task");
+}
+
+// ---------------------------------------------------------------------------
+// A-D-026 — wildcard '*' subscribers are excluded from DLQ delivery
+// ---------------------------------------------------------------------------
+
+/// A wildcard ('*') DLQ-capturing subscriber. Under A-D-026 it must NOT
+/// receive `apcore.event.delivery_failed` events.
+#[derive(Debug)]
+struct WildcardDlqSubscriber {
+    id: String,
+    dlq_received: Arc<Mutex<u32>>,
+}
+
+#[async_trait]
+impl EventSubscriber for WildcardDlqSubscriber {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn event_pattern(&self) -> &str {
+        "*"
+    }
+    async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
+        if event.event_type == "apcore.event.delivery_failed" {
+            *self.dlq_received.lock() += 1;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn wildcard_subscriber_excluded_from_dlq() {
+    // A-D-026: a '*' subscriber must NOT receive delivery_failed DLQ events.
+    let retry_cfg = EventRetryConfig::no_retry();
+    let (fail_sub, _attempts, _failure) = AlwaysFailSubscriber::new("sub-fail", retry_cfg);
+    let dlq_count = Arc::new(Mutex::new(0u32));
+    let wildcard = WildcardDlqSubscriber {
+        id: "wildcard".into(),
+        dlq_received: Arc::clone(&dlq_count),
+    };
+    // Also add an explicit DLQ subscriber to prove the DLQ WAS emitted.
+    let (dlq_sub, dlq_received) = DlqSubscriber::new("explicit-dlq");
+
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(fail_sub));
+    emitter.subscribe(Box::new(wildcard));
+    emitter.subscribe(Box::new(dlq_sub));
+
+    emitter
+        .emit(&ApCoreEvent::new("test.fail", json!({})))
+        .await;
+    emitter.flush(5000).await.unwrap();
+
+    assert_eq!(
+        dlq_received.lock().len(),
+        1,
+        "explicit (non-wildcard) DLQ subscriber should receive the DLQ event"
+    );
+    assert_eq!(
+        *dlq_count.lock(),
+        0,
+        "wildcard '*' subscriber must be excluded from DLQ delivery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A-D-029 — DLQ payload subscriber_type uses the declared type, not the id
+// ---------------------------------------------------------------------------
+
+/// A subscriber whose id has NO dash (so the old id-parsing logic would have
+/// produced the whole id), but declares a distinct subscriber_type.
+#[derive(Debug)]
+struct DeclaredTypeSubscriber {
+    id: String,
+}
+
+#[async_trait]
+impl EventSubscriber for DeclaredTypeSubscriber {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn subscriber_type(&self) -> &str {
+        "customsink"
+    }
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn event_pattern(&self) -> &str {
+        "test.*"
+    }
+    fn retry(&self) -> EventRetryConfig {
+        EventRetryConfig::no_retry()
+    }
+    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+        Err(ModuleError::new(
+            apcore::errors::ErrorCode::GeneralInternalError,
+            "always fails",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn dlq_payload_uses_declared_subscriber_type() {
+    // A-D-029: subscriber_type comes from the declared trait method, even when
+    // the subscriber_id has no dash (the old split('-') heuristic would have
+    // returned "noDashId" instead of the declared "customsink").
+    let sub = DeclaredTypeSubscriber {
+        id: "noDashId".into(),
+    };
+    let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-type");
+
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(sub));
+    emitter.subscribe(Box::new(dlq_sub));
+
+    emitter
+        .emit(&ApCoreEvent::new("test.typed", json!({})))
+        .await;
+    emitter.flush(5000).await.unwrap();
+
+    let dlq_events = dlq_received.lock();
+    assert_eq!(dlq_events.len(), 1);
+    assert_eq!(
+        dlq_events[0].data["subscriber_type"].as_str(),
+        Some("customsink"),
+        "DLQ subscriber_type must use the declared type"
+    );
+    assert_eq!(
+        dlq_events[0].data["subscriber_id"].as_str(),
+        Some("noDashId")
     );
 }

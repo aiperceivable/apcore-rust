@@ -59,6 +59,22 @@ impl EventSubscriber for RecordingSub {
     }
 }
 
+/// Poll a shared event buffer until `predicate` is satisfied or a short timeout
+/// elapses. Needed because `EventEmitter::emit` now dispatches deliveries on
+/// spawned tasks (A-D-024), so events arrive asynchronously after `emit`
+/// returns.
+async fn wait_for_events<F>(received: &Arc<Mutex<Vec<ApCoreEvent>>>, predicate: F)
+where
+    F: Fn(&[ApCoreEvent]) -> bool,
+{
+    for _ in 0..200 {
+        if predicate(&received.lock()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 struct DummyModule;
 #[async_trait]
 impl Module for DummyModule {
@@ -132,6 +148,18 @@ async fn error_threshold_emits_canonical_and_legacy_events() {
         )
         .await;
 
+    // emit() dispatches asynchronously (A-D-024); wait for both events to land.
+    wait_for_events(&received, |evts| {
+        evts.iter()
+            .any(|e| e.event_type == "apcore.health.error_threshold_exceeded")
+    })
+    .await;
+    wait_for_events(&legacy_received, |evts| {
+        evts.iter()
+            .any(|e| e.event_type == "error_threshold_exceeded")
+    })
+    .await;
+
     let canonical_count = received
         .lock()
         .iter()
@@ -183,6 +211,18 @@ async fn latency_threshold_emits_canonical_and_legacy_events() {
 
     let ctx = build_ctx_with_caller(None, None);
     let _ = pn.after("mod.b", json!({}), json!({}), &ctx).await;
+
+    // emit() dispatches asynchronously (A-D-024); wait for both events to land.
+    wait_for_events(&received, |evts| {
+        evts.iter()
+            .any(|e| e.event_type == "apcore.health.latency_threshold_exceeded")
+    })
+    .await;
+    wait_for_events(&legacy_received, |evts| {
+        evts.iter()
+            .any(|e| e.event_type == "latency_threshold_exceeded")
+    })
+    .await;
 
     let canonical = received
         .lock()
@@ -350,6 +390,9 @@ async fn update_config_audit_event_includes_caller_id_from_context() {
     });
     module.execute(inputs, &ctx).await.expect("update_config");
 
+    // emit() dispatches asynchronously (A-D-024); wait for the event to land.
+    wait_for_events(&received, |evts| !evts.is_empty()).await;
+
     // The emitted event payload MUST carry caller_id from the Context.
     let evts = received.lock().clone();
     assert!(!evts.is_empty(), "expected apcore.config.updated event");
@@ -380,6 +423,13 @@ async fn update_config_audit_event_includes_caller_id_from_context() {
         .execute(inputs2, &ctx_anon)
         .await
         .expect("update_config2");
+
+    // Wait for the second event to be dispatched asynchronously.
+    wait_for_events(&received, |evts| {
+        evts.iter()
+            .any(|e| e.data.get("key").and_then(|v| v.as_str()) == Some("another.flag"))
+    })
+    .await;
 
     let later_events = received.lock().clone();
     let anon_event = later_events

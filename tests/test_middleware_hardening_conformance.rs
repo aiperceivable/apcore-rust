@@ -106,6 +106,23 @@ impl RecordingSubscriber {
     fn captured(&self) -> Vec<ApCoreEvent> {
         self.events.lock().clone()
     }
+
+    /// Poll until an event of `event_type` is captured or a short timeout
+    /// elapses. Needed because `EventEmitter::emit` now dispatches deliveries
+    /// on spawned tasks (A-D-024), so events arrive asynchronously.
+    async fn wait_for_event(&self, event_type: &str) {
+        for _ in 0..200 {
+            if self
+                .events
+                .lock()
+                .iter()
+                .any(|e| e.event_type == event_type)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -248,6 +265,7 @@ async fn conformance_circuit_breaker_opens_at_threshold() {
     );
     assert_eq!(case["expected"]["circuit_state"].as_str(), Some("OPEN"),);
 
+    recorder.wait_for_event("apcore.circuit.opened").await;
     let captured = recorder.captured();
     assert!(
         captured
@@ -397,6 +415,7 @@ async fn conformance_circuit_breaker_closes_on_success() {
     assert_eq!(mw.state(module_id, caller_id), CircuitBreakerState::Closed,);
     assert_eq!(case["expected"]["circuit_state"].as_str(), Some("CLOSED"),);
 
+    recorder.wait_for_event("apcore.circuit.closed").await;
     let captured = recorder.captured();
     assert!(
         captured
