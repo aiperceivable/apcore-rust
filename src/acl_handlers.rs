@@ -17,26 +17,74 @@ use crate::context::Context;
 // — a handler that detects an internal failure can record it here, and
 // `ACL::build_audit_entry` reads it back when emitting the audit record.
 //
-// Stored as a task-local so concurrent ACL evaluations on different tokio
-// tasks do not see each other's errors. The cell defaults to `None`; the
-// `with_handler_error_capture` helper wraps an async evaluation in a fresh
-// slot so the read at the end of the call sees only that call's error.
+// Python uses a single `contextvars.ContextVar` that works on both its sync
+// and async `check()` paths. Rust has no single primitive with that property,
+// so we keep TWO scopes that the read/write helpers consult transparently:
+//
+//   * `HANDLER_ERROR` — a tokio task-local, used by the async `async_check()`
+//     path. Concurrent ACL evaluations on different tokio tasks cannot see
+//     each other's errors.
+//   * `HANDLER_ERROR_SYNC` — a thread-local, used by the synchronous `check()`
+//     path (A-D-002). Tokio task-locals are unavailable on a purely
+//     synchronous call, so the async-only scope left `handler_error` always
+//     null on the sync path even when a condition handler reported an error.
+//
+// `report_handler_error` writes to whichever scope is active; `take_*` /
+// `current_*` reads mirror that. A sync scope is only "active" inside
+// `with_handler_error_capture_sync`, so a stray report outside any check is a
+// no-op (matching the async task-local's behavior).
 tokio::task_local! {
     pub(crate) static HANDLER_ERROR: RefCell<Option<String>>;
+}
+
+thread_local! {
+    // `(active_depth, slot)`. The depth guards against a stray
+    // `report_handler_error` leaking into an unrelated later read: writes and
+    // reads only apply while a `with_handler_error_capture_sync` scope is open.
+    static HANDLER_ERROR_SYNC: RefCell<(u32, Option<String>)> = const { RefCell::new((0, None)) };
 }
 
 /// Record a handler-evaluation error for the current ACL check.
 ///
 /// Cross-language parity with apcore-python `_handler_error_var.set(...)` and
-/// apcore-typescript `_lastHandlerError = ...`. If called outside an active
-/// `with_handler_error_capture` scope (i.e. from synchronous evaluation paths
-/// or outside an ACL check entirely), the call is a no-op so handlers never
-/// panic on a missing task-local.
+/// apcore-typescript `_lastHandlerError = ...`. Writes to the active async
+/// task-local scope if one exists, otherwise to the active synchronous
+/// thread-local scope. If called outside any active capture scope (i.e.
+/// outside an ACL check entirely), the call is a no-op so handlers never panic
+/// on a missing scope.
 pub fn report_handler_error(message: impl Into<String>) {
     let msg = message.into();
-    let _ = HANDLER_ERROR.try_with(|cell| {
-        *cell.borrow_mut() = Some(msg);
+    // Prefer the async task-local scope when present.
+    if HANDLER_ERROR
+        .try_with(|cell| {
+            *cell.borrow_mut() = Some(msg.clone());
+        })
+        .is_ok()
+    {
+        return;
+    }
+    // Fall back to the synchronous thread-local scope, if one is active.
+    HANDLER_ERROR_SYNC.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.0 > 0 {
+            state.1 = Some(msg);
+        }
     });
+}
+
+/// Read the handler error recorded for the current ACL check, if any.
+///
+/// Checks the async task-local scope first, then the synchronous thread-local
+/// scope. Returns `None` outside any active capture scope. Used by
+/// `ACL::build_audit_entry` so a handler error populates the audit entry on
+/// both the sync and async paths (A-D-002).
+pub(crate) fn current_handler_error() -> Option<String> {
+    if let Ok(v) = HANDLER_ERROR.try_with(|cell| cell.borrow().clone()) {
+        if v.is_some() {
+            return v;
+        }
+    }
+    HANDLER_ERROR_SYNC.with(|cell| cell.borrow().1.clone())
 }
 
 /// Run an async evaluation under a fresh handler-error capture scope.
@@ -55,6 +103,37 @@ where
         (value, captured)
     });
     result.await
+}
+
+/// Run a synchronous evaluation under a fresh handler-error capture scope.
+///
+/// Synchronous analogue of [`with_handler_error_capture`] for the sync
+/// `ACL::check()` path (A-D-002). Opens a thread-local scope for the duration
+/// of `f`, restoring the previous slot on exit so nested checks are isolated.
+/// Mirrors Python's `_handler_error_var.set(None)` / `.reset(token)` pairing.
+pub fn with_handler_error_capture_sync<F, T>(f: F) -> (T, Option<String>)
+where
+    F: FnOnce() -> T,
+{
+    // Open a fresh slot, saving the previous one so a nested check restores it.
+    let previous = HANDLER_ERROR_SYNC.with(|cell| {
+        let mut state = cell.borrow_mut();
+        state.0 += 1;
+        state.1.take()
+    });
+
+    let value = f();
+
+    let captured = HANDLER_ERROR_SYNC.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let captured = state.1.take();
+        state.0 -= 1;
+        // Restore the enclosing scope's slot (None at the outermost level).
+        state.1 = previous;
+        captured
+    });
+
+    (value, captured)
 }
 
 /// Trait for evaluating a single ACL condition.
