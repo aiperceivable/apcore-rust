@@ -329,7 +329,7 @@ promoted to `Accepted`). Mirrors the
 This batch introduces the protocol-canonical `StorageBackend` abstraction
 (Issue #43 §1), wires it through the three observability collectors as an
 optional persistence surface, and resolves five additional cross-language
-alignment findings (D-14, D-19, D-25, D-27, D-28). Behavior of the streaming
+alignment findings (D-14, D-58, D-25, D-27, D-28). Behavior of the streaming
 chunk-merge path now surfaces a structured `STREAM_CHUNK_NOT_OBJECT` error,
 the runtime config-key policy emits a distinct `CONFIG_KEY_RESTRICTED`
 ErrorCode, and `ContextLogger`/`ObsLoggingMiddleware` align on lowercase
@@ -357,7 +357,7 @@ levels, nested-`extra` schema, and the `module_id` / `inputs` field names.
   filters records by recency. Trend is now derived from current-vs-previous
   sample counts (`stable` / `rising` / `declining` / `new` / `inactive`),
   matching `apcore-python` and `apcore-typescript` exactly.
-- **`executor::deep_merge_chunks_checked(chunks)`** (D-19) — public helper
+- **`executor::deep_merge_chunks_checked(chunks)`** (D-58) — public helper
   that merges streaming chunks while enforcing each chunk is a JSON object;
   a non-object chunk yields `ModuleError::GeneralInvalidInput` with
   `details["code"] = "STREAM_CHUNK_NOT_OBJECT"` (cross-language: Python's

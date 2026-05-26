@@ -39,7 +39,7 @@ const DEEP_MERGE_MAX_DEPTH: usize = 32;
 /// Deep-merge a list of JSON Value chunks into a single accumulated Value.
 ///
 /// Retained for tests that explicitly verify the unchecked merge behavior;
-/// the streaming pipeline now uses [`deep_merge_chunks_checked`] (D-19) so a
+/// the streaming pipeline now uses [`deep_merge_chunks_checked`] (D-58) so a
 /// non-object chunk surfaces a structured error rather than silently
 /// replacing the accumulator.
 #[cfg(test)]
@@ -51,7 +51,7 @@ fn deep_merge_chunks(chunks: &[Value]) -> Value {
     acc
 }
 
-/// Sync finding D-19: deep-merge chunks while *enforcing* that every chunk is
+/// Sync finding D-58: deep-merge chunks while *enforcing* that every chunk is
 /// a JSON object. A non-object chunk (string, number, array, etc.) yields
 /// `ModuleError::GeneralInvalidInput` with `details["code"] =
 /// "STREAM_CHUNK_NOT_OBJECT"`, mirroring Python's `_deep_merge` AttributeError
@@ -73,7 +73,7 @@ pub fn deep_merge_chunks_checked(chunks: &[Value]) -> Result<Value, ModuleError>
 }
 
 /// Build the canonical "chunk is not a JSON object" error (audit D10-001 /
-/// sync finding D-19). Shared by Phase 2 reject-before-deliver in
+/// sync finding D-58). Shared by Phase 2 reject-before-deliver in
 /// [`Executor::stream`] and by [`deep_merge_chunks_checked`] so both surface an
 /// identical `code` / `message` / `details` shape that cross-language consumers
 /// can match (mirrors Python's `_deep_merge` AttributeError and TS's TypeError).
@@ -1010,7 +1010,7 @@ impl Executor {
             // `apcore.stream.post_validation_failed` event and does not raise)
             // and apcore-typescript (console.warn + swallow) behavior
             // (sync finding A-D-012).
-            // D-19: enforce that all chunks are objects before merging. A
+            // D-58: enforce that all chunks are objects before merging. A
             // non-object chunk is logged and skips post-stream validation
             // (chunks have already been delivered to the consumer).
             let merged = match deep_merge_chunks_checked(&accumulated) {

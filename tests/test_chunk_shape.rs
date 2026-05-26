@@ -1,4 +1,4 @@
-// D-19 alignment: streaming chunks that are not JSON objects MUST cause the
+// D-58 alignment: streaming chunks that are not JSON objects MUST cause the
 // merge-on-accumulate path to raise InvalidInput with code STREAM_CHUNK_NOT_OBJECT.
 // The previous Rust impl silently replaced or merged non-object chunks, which
 // diverged from Python (raises AttributeError on .items()) and TS (TypeError).
