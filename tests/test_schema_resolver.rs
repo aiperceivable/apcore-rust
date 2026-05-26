@@ -320,7 +320,8 @@ fn test_schema_resolver_default_max_depth_is_32() {
 fn test_schema_resolver_rejects_chain_exceeding_max_depth() {
     // Build a non-circular chain of 40 cascading $refs:
     //   #/$defs/level0 -> #/$defs/level1 -> ... -> #/$defs/level39
-    // With max_depth=32 this MUST fail with SchemaCircularRef (max-depth bucket).
+    // With max_depth=32 this MUST fail with SchemaMaxDepthExceeded (A-D-038):
+    // depth-cap exhaustion is distinct from an actual cycle.
     let resolver = RefResolver::with_max_depth(32);
     let mut defs = serde_json::Map::new();
     for i in 0..40usize {
@@ -338,7 +339,7 @@ fn test_schema_resolver_rejects_chain_exceeding_max_depth() {
     let err = resolver
         .resolve(&schema)
         .expect_err("40-level $ref chain must exceed max_depth=32");
-    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaCircularRef);
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaMaxDepthExceeded);
     assert!(
         err.message.to_lowercase().contains("max_depth")
             || err.message.to_lowercase().contains("max-depth")

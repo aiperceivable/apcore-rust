@@ -68,14 +68,24 @@ impl RefResolver {
         depth: usize,
     ) -> Result<serde_json::Value, ModuleError> {
         if depth >= self.max_depth {
-            return Err(SchemaCircularRefError::new(
+            // A-D-038: depth-cap exhaustion is distinct from an actual cycle.
+            // Emit SCHEMA_MAX_DEPTH_EXCEEDED here; the genuine-cycle branch
+            // below (seen.contains) emits SCHEMA_CIRCULAR_REF. Cross-SDK note:
+            // apcore-python/typescript currently report CIRCULAR_REF for the
+            // depth cap too — Rust is the canonical here and they should follow.
+            let mut details = std::collections::HashMap::new();
+            details.insert(
+                "max_depth".to_string(),
+                serde_json::Value::from(self.max_depth),
+            );
+            return Err(ModuleError::new(
+                ErrorCode::SchemaMaxDepthExceeded,
                 format!(
                     "Schema $ref recursion exceeded max_depth={} (sync SCHEMA-001)",
                     self.max_depth
                 ),
-                "<max_depth>".to_string(),
             )
-            .to_module_error());
+            .with_details(details));
         }
         match node {
             serde_json::Value::Object(map) => {

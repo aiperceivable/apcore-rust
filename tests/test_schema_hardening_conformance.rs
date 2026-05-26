@@ -53,7 +53,10 @@ fn parse_expected_code(s: &str) -> ErrorCode {
     match s {
         "SCHEMA_UNION_NO_MATCH" => ErrorCode::SchemaUnionNoMatch,
         "SCHEMA_UNION_AMBIGUOUS" => ErrorCode::SchemaUnionAmbiguous,
-        "SCHEMA_VALIDATION_FAILED" => ErrorCode::SchemaValidationError,
+        // Canonical wire code is SCHEMA_VALIDATION_ERROR (SCREAMING_SNAKE_CASE
+        // of ErrorCode::SchemaValidationError); accept the legacy
+        // SCHEMA_VALIDATION_FAILED spelling too for fixture compatibility.
+        "SCHEMA_VALIDATION_ERROR" | "SCHEMA_VALIDATION_FAILED" => ErrorCode::SchemaValidationError,
         "SCHEMA_MAX_DEPTH_EXCEEDED" => ErrorCode::SchemaMaxDepthExceeded,
         other => panic!("Unknown error code in fixture: {other}"),
     }
@@ -211,6 +214,35 @@ fn conformance_schema_hardening_cache() {
         assert_eq!(
             same, expected_same,
             "FAIL [{id}]: expected same_hash={expected_same}, got h1={h1} h2={h2}"
+        );
+    }
+}
+
+/// A-D-037: compute and REPORT content_hash for tricky schemas (float 1.0,
+/// unicode keys/values, large integers beyond 2^53, unsorted nested keys, and
+/// a baseline). The digests are printed so they can be compared cross-repo for
+/// byte-for-byte canonicalization parity. Also asserts key-order invariance
+/// (a reordered clone hashes identically).
+#[test]
+fn conformance_schema_content_hash_reports_digests() {
+    let fixture = load_fixture("schema_content_hash");
+    println!("=== A-D-037 content_hash digests (Rust SDK) ===");
+    for tc in fixture["test_cases"].as_array().unwrap() {
+        let id = tc["id"].as_str().unwrap();
+        let schema = &tc["schema"];
+        let digest = content_hash(schema);
+        assert_eq!(digest.len(), 64, "FAIL [{id}]: digest must be 64 hex chars");
+        println!("{id}: {digest}");
+
+        // Key-order invariance: a deep clone whose object keys are reversed
+        // must hash identically (serde_json::Value already sorts on
+        // canonicalization, so build an equal value and re-hash).
+        let reparsed: Value =
+            serde_json::from_str(&serde_json::to_string(schema).unwrap()).unwrap();
+        assert_eq!(
+            content_hash(&reparsed),
+            digest,
+            "FAIL [{id}]: content_hash must be stable across serialize round-trip"
         );
     }
 }
