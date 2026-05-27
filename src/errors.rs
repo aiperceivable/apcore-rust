@@ -8,25 +8,27 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Framework error code prefixes reserved by the protocol.
+///
+/// Canonical set of exactly 14 prefixes (see decision A-D-006). Codes that
+/// belong to the framework but fall outside these prefixes (e.g.
+/// `CIRCUIT_BREAKER_OPEN`, `PIPELINE_STEP_ERROR`, `STEP_NOT_FOUND`,
+/// `STRATEGY_NOT_FOUND`, `RELOAD_FAILED`) are protected by the exact-code
+/// collision check in [`ErrorCodeRegistry::register`] rather than by a prefix.
 pub const FRAMEWORK_ERROR_CODE_PREFIXES: &[&str] = &[
-    "CONFIG_",
     "ACL_",
-    "MODULE_",
-    "SCHEMA_",
+    "APPROVAL_",
+    "BINDING_",
     "CALL_",
     "CIRCULAR_",
-    "CIRCUIT_",
-    "GENERAL_",
-    "FUNC_",
-    "BINDING_",
-    "MIDDLEWARE_",
-    "APPROVAL_",
-    "VERSION_",
-    "ERROR_CODE_",
+    "CONFIG_",
     "DEPENDENCY_",
-    "PIPELINE_",
-    "STEP_",
-    "STRATEGY_",
+    "ERROR_CODE_",
+    "FUNC_",
+    "GENERAL_",
+    "MIDDLEWARE_",
+    "MODULE_",
+    "SCHEMA_",
+    "VERSION_",
 ];
 
 /// All error codes defined by the `APCore` protocol.
@@ -212,6 +214,113 @@ pub enum ErrorCode {
     #[serde(rename = "CONTEXT_BINDING_ERROR")]
     ContextBindingError,
 }
+
+impl ErrorCode {
+    /// All `ErrorCode` variants defined by the protocol.
+    ///
+    /// This list MUST contain every enum variant; it is the source from which
+    /// the framework reserved-code set is derived (mirrors Python
+    /// `_collect_framework_codes` and TypeScript `collectFrameworkCodes`).
+    pub const ALL: &'static [ErrorCode] = &[
+        ErrorCode::ConfigNotFound,
+        ErrorCode::ConfigInvalid,
+        ErrorCode::ACLRuleError,
+        ErrorCode::ACLDenied,
+        ErrorCode::ModuleNotFound,
+        ErrorCode::ModuleDisabled,
+        ErrorCode::ModuleTimeout,
+        ErrorCode::ModuleLoadError,
+        ErrorCode::ModuleExecuteError,
+        ErrorCode::ReloadFailed,
+        ErrorCode::ExecutionCancelled,
+        ErrorCode::SchemaValidationError,
+        ErrorCode::SchemaNotFound,
+        ErrorCode::SchemaParseError,
+        ErrorCode::SchemaCircularRef,
+        ErrorCode::SchemaUnionNoMatch,
+        ErrorCode::SchemaUnionAmbiguous,
+        ErrorCode::SchemaMaxDepthExceeded,
+        ErrorCode::CallDepthExceeded,
+        ErrorCode::CircularCall,
+        ErrorCode::CallFrequencyExceeded,
+        ErrorCode::GeneralInvalidInput,
+        ErrorCode::GeneralInternalError,
+        ErrorCode::GeneralNotImplemented,
+        ErrorCode::FuncMissingTypeHint,
+        ErrorCode::FuncMissingReturnType,
+        ErrorCode::BindingInvalidTarget,
+        ErrorCode::BindingModuleNotFound,
+        ErrorCode::BindingCallableNotFound,
+        ErrorCode::BindingNotCallable,
+        ErrorCode::BindingSchemaMissing,
+        ErrorCode::BindingSchemaInferenceFailed,
+        ErrorCode::BindingSchemaModeConflict,
+        ErrorCode::BindingStrictSchemaIncompatible,
+        ErrorCode::BindingFileInvalid,
+        ErrorCode::CircularDependency,
+        ErrorCode::MiddlewareChainError,
+        ErrorCode::ApprovalDenied,
+        ErrorCode::ApprovalTimeout,
+        ErrorCode::ApprovalPending,
+        ErrorCode::VersionIncompatible,
+        ErrorCode::ErrorCodeCollision,
+        ErrorCode::DependencyNotFound,
+        ErrorCode::DependencyVersionMismatch,
+        ErrorCode::ConfigNamespaceDuplicate,
+        ErrorCode::ConfigNamespaceReserved,
+        ErrorCode::ConfigEnvPrefixConflict,
+        ErrorCode::ConfigMountError,
+        ErrorCode::ConfigBindError,
+        ErrorCode::ConfigEnvMapConflict,
+        ErrorCode::ErrorFormatterDuplicate,
+        ErrorCode::PipelineAbort,
+        ErrorCode::PipelineConfigInvalid,
+        ErrorCode::ConfigurationError,
+        ErrorCode::PipelineHandlerNotSupported,
+        ErrorCode::PipelineStepInsertionAmbiguous,
+        ErrorCode::PipelineStepError,
+        ErrorCode::PipelineStepNotFound,
+        ErrorCode::PipelineDependencyError,
+        ErrorCode::StepNotFound,
+        ErrorCode::StepNotRemovable,
+        ErrorCode::StepNotReplaceable,
+        ErrorCode::StepNameDuplicate,
+        ErrorCode::StrategyNotFound,
+        ErrorCode::EntryPointNotFound,
+        ErrorCode::EntryPointAmbiguous,
+        ErrorCode::EntryPointRuntimeUnsupported,
+        ErrorCode::NoDiscovererConfigured,
+        ErrorCode::TaskLimitExceeded,
+        ErrorCode::ReaperAlreadyRunning,
+        ErrorCode::VersionConstraintInvalid,
+        ErrorCode::ModuleIdConflict,
+        ErrorCode::InvalidSegment,
+        ErrorCode::IdTooLong,
+        ErrorCode::CircuitBreakerOpen,
+        ErrorCode::ModuleReloadConflict,
+        ErrorCode::SysModuleRegistrationFailed,
+        ErrorCode::SysModulesDisabled,
+        ErrorCode::ConfigKeyRestricted,
+        ErrorCode::StreamingInterfaceMismatch,
+        ErrorCode::DuplicateModuleId,
+        ErrorCode::ContextBindingError,
+    ];
+}
+
+/// Lazily-built set of every framework error-code wire string.
+///
+/// Mirrors Python `_FRAMEWORK_CODES` / TypeScript `FRAMEWORK_CODES`. Used by
+/// [`ErrorCodeRegistry::register`] for the exact-code collision check and to
+/// seed the registry's `all_codes` set.
+pub static FRAMEWORK_CODES: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(|| {
+    ErrorCode::ALL
+        .iter()
+        .filter_map(|c| match serde_json::to_value(c) {
+            Ok(serde_json::Value::String(s)) => Some(s),
+            _ => None,
+        })
+        .collect()
+});
 
 /// Structured error returned by module execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -742,7 +851,9 @@ impl ErrorCodeRegistry {
     pub fn new() -> Self {
         Self {
             module_codes: HashMap::new(),
-            all_codes: HashSet::new(),
+            // Seed with the framework code set so `all_codes()` returns
+            // framework + module codes (mirrors Python/TS `_all_codes`).
+            all_codes: FRAMEWORK_CODES.clone(),
         }
     }
 
@@ -757,6 +868,21 @@ impl ErrorCodeRegistry {
         codes: &HashSet<String>,
     ) -> Result<(), ModuleError> {
         for code in codes {
+            // Check exact-code collision with a framework code. This protects
+            // framework codes whose names fall outside the 14 reserved prefixes
+            // (e.g. CIRCUIT_BREAKER_OPEN, PIPELINE_STEP_ERROR, STEP_NOT_FOUND,
+            // STRATEGY_NOT_FOUND, RELOAD_FAILED). Mirrors Python `_FRAMEWORK_CODES`
+            // and TypeScript `FRAMEWORK_CODES`.
+            if FRAMEWORK_CODES.contains(code) {
+                return Err(ErrorCodeCollisionError::new(
+                    format!("Error code '{code}' is a reserved framework code"),
+                    code,
+                    module_id,
+                    "framework",
+                )
+                .to_module_error());
+            }
+
             // Check framework prefix collision
             for prefix in FRAMEWORK_ERROR_CODE_PREFIXES {
                 if code.starts_with(prefix) {
@@ -807,13 +933,16 @@ impl ErrorCodeRegistry {
         None
     }
 
-    /// Rebuild the `all_codes` set from the current `module_codes`.
+    /// Rebuild the `all_codes` set from the framework codes plus the current
+    /// `module_codes`, so `all_codes()` always returns framework + module codes.
     fn rebuild_all_codes(&mut self) {
-        self.all_codes = self
-            .module_codes
-            .values()
-            .flat_map(|codes| codes.iter().cloned())
-            .collect();
+        let mut all = FRAMEWORK_CODES.clone();
+        all.extend(
+            self.module_codes
+                .values()
+                .flat_map(|codes| codes.iter().cloned()),
+        );
+        self.all_codes = all;
     }
 
     /// Returns a reference to the set of all currently registered codes.

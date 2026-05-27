@@ -184,3 +184,122 @@ fn unwrap_middleware_chain_error_returns_none_when_inner_missing() {
     let err = ModuleError::new(ErrorCode::MiddlewareChainError, "no inner");
     assert!(err.unwrap_middleware_chain_error().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// A-D-006 + A-D-007: 14 canonical reserved prefixes + exact framework-code
+// collision check.
+// ---------------------------------------------------------------------------
+
+use apcore::errors::{ErrorCodeRegistry, FRAMEWORK_ERROR_CODE_PREFIXES};
+use std::collections::HashSet;
+
+fn code_set(codes: &[&str]) -> HashSet<String> {
+    codes.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// A-D-006: the reserved-prefix set is exactly the canonical 14, with the
+/// four non-canonical prefixes (CIRCUIT_, PIPELINE_, STEP_, STRATEGY_) dropped.
+#[test]
+fn test_reserved_prefixes_are_canonical_14() {
+    let expected: HashSet<&str> = [
+        "ACL_",
+        "APPROVAL_",
+        "BINDING_",
+        "CALL_",
+        "CIRCULAR_",
+        "CONFIG_",
+        "DEPENDENCY_",
+        "ERROR_CODE_",
+        "FUNC_",
+        "GENERAL_",
+        "MIDDLEWARE_",
+        "MODULE_",
+        "SCHEMA_",
+        "VERSION_",
+    ]
+    .into_iter()
+    .collect();
+    let actual: HashSet<&str> = FRAMEWORK_ERROR_CODE_PREFIXES.iter().copied().collect();
+    assert_eq!(actual, expected);
+    assert_eq!(FRAMEWORK_ERROR_CODE_PREFIXES.len(), 14);
+    for dropped in ["CIRCUIT_", "PIPELINE_", "STEP_", "STRATEGY_"] {
+        assert!(!actual.contains(dropped), "{dropped} must not be reserved");
+    }
+}
+
+/// A-D-006: a custom code with a `STEP_` prefix that is NOT a framework code
+/// now registers successfully (prefix no longer reserved).
+#[test]
+fn test_register_step_custom_succeeds_after_prefix_narrowing() {
+    let mut reg = ErrorCodeRegistry::new();
+    let result = reg.register("m", &code_set(&["STEP_CUSTOM"]));
+    assert!(result.is_ok(), "STEP_CUSTOM should register: {result:?}");
+}
+
+/// A-D-007: an exact framework code that no longer matches any prefix
+/// (`STEP_NOT_FOUND`) is still rejected via the exact-code check.
+#[test]
+fn test_register_step_not_found_rejected_as_framework_code() {
+    let mut reg = ErrorCodeRegistry::new();
+    let err = reg
+        .register("m", &code_set(&["STEP_NOT_FOUND"]))
+        .expect_err("STEP_NOT_FOUND is a framework code");
+    assert_eq!(err.code, ErrorCode::ErrorCodeCollision);
+    assert_eq!(
+        err.details.get("conflict_source").and_then(|v| v.as_str()),
+        Some("framework")
+    );
+}
+
+/// A-D-007: a framework code with no reserved prefix at all (`RELOAD_FAILED`)
+/// is rejected by the exact-code check.
+#[test]
+fn test_register_reload_failed_rejected_as_framework_code() {
+    let mut reg = ErrorCodeRegistry::new();
+    let err = reg
+        .register("m", &code_set(&["RELOAD_FAILED"]))
+        .expect_err("RELOAD_FAILED is a framework code");
+    assert_eq!(err.code, ErrorCode::ErrorCodeCollision);
+    assert_eq!(
+        err.details.get("conflict_source").and_then(|v| v.as_str()),
+        Some("framework")
+    );
+}
+
+/// A-D-007: CIRCUIT_BREAKER_OPEN / PIPELINE_STEP_ERROR / STRATEGY_NOT_FOUND
+/// remain protected by the exact-code check after prefix narrowing.
+#[test]
+fn test_register_non_prefix_framework_codes_rejected() {
+    for code in [
+        "CIRCUIT_BREAKER_OPEN",
+        "PIPELINE_STEP_ERROR",
+        "STRATEGY_NOT_FOUND",
+    ] {
+        let mut reg = ErrorCodeRegistry::new();
+        assert!(
+            reg.register("m", &code_set(&[code])).is_err(),
+            "{code} must be rejected as framework code"
+        );
+    }
+}
+
+/// A-D-021: a fresh registry (no modules) seeds `all_codes` with the framework
+/// code set, so it is non-empty and contains framework codes.
+#[test]
+fn test_fresh_registry_all_codes_contains_framework_codes() {
+    let reg = ErrorCodeRegistry::new();
+    assert!(!reg.all_codes().is_empty());
+    assert!(reg.all_codes().contains("SCHEMA_VALIDATION_ERROR"));
+    assert!(reg.all_codes().contains("CIRCUIT_BREAKER_OPEN"));
+    assert!(reg.all_codes().contains("RELOAD_FAILED"));
+}
+
+/// A-D-021: after registering module codes, `all_codes` still contains the
+/// framework codes (rebuild must not drop them).
+#[test]
+fn test_all_codes_retains_framework_after_module_register() {
+    let mut reg = ErrorCodeRegistry::new();
+    reg.register("m", &code_set(&["MY_CUSTOM_CODE"])).unwrap();
+    assert!(reg.all_codes().contains("MY_CUSTOM_CODE"));
+    assert!(reg.all_codes().contains("SCHEMA_VALIDATION_ERROR"));
+}
