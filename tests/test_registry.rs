@@ -1452,3 +1452,26 @@ fn test_list_tag_filter_unions_module_instance_tags() {
         "tag not declared on module instance must not match"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A-D-017: register_module populates descriptor.tags from module.tags()
+// (reuses the TaggedModule defined above, which advertises ["alpha","beta"]).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_register_module_populates_descriptor_tags_from_module() {
+    let registry = Registry::new();
+    registry
+        .register_module("executor.test.tagged", Box::new(TaggedModule))
+        .expect("registration must succeed");
+
+    let def = registry
+        .get_definition("executor.test.tagged")
+        .expect("get_definition must succeed")
+        .expect("module must be registered");
+    assert_eq!(
+        def.tags,
+        vec!["alpha".to_string(), "beta".to_string()],
+        "register_module must populate descriptor.tags from module.tags() (A-D-017)"
+    );
+}

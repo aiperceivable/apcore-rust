@@ -609,7 +609,9 @@ impl Registry {
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
             version: DEFAULT_MODULE_VERSION.to_string(),
-            tags: vec![],
+            // A-D-017: populate tags from module.tags() like register_versioned,
+            // instead of dropping them. Matches Python/TS register().
+            tags: module.tags(),
             annotations: Some(ModuleAnnotations::default()),
             examples: vec![],
             metadata: HashMap::new(),
