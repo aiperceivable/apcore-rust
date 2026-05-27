@@ -334,3 +334,100 @@ fn load_failed_callback_receives_error_details() {
         "error message should contain 'on_load'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A-D-002: on_load failure emits apcore.registry.module_load_failed
+// ---------------------------------------------------------------------------
+
+use apcore::events::emitter::{ApCoreEvent, EventEmitter};
+use apcore::events::subscribers::EventSubscriber;
+
+#[derive(Debug)]
+struct CapturingSubscriber {
+    received: Arc<Mutex<Vec<ApCoreEvent>>>,
+}
+
+#[async_trait]
+impl EventSubscriber for CapturingSubscriber {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn subscriber_id(&self) -> &str {
+        "capture"
+    }
+    async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
+        self.received.lock().push(event.clone());
+        Ok(())
+    }
+}
+
+/// A-D-002: when an event emitter is wired and a module's on_load fails, the
+/// registry emits `apcore.registry.module_load_failed` carrying the 5-field
+/// payload AND the module is not visible.
+#[tokio::test]
+async fn on_load_failure_emits_module_load_failed_event() {
+    let received: Arc<Mutex<Vec<ApCoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(CapturingSubscriber {
+        received: Arc::clone(&received),
+    }));
+    let emitter = Arc::new(emitter);
+
+    let registry = Registry::new();
+    registry.set_event_emitter(Arc::clone(&emitter));
+
+    let err = registry
+        .register(
+            "executor.test.evt_failing",
+            Box::new(DelayedModule {
+                delay_ms: 0,
+                fail: true,
+            }),
+            make_descriptor("executor.test.evt_failing"),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ModuleLoadError);
+
+    // emit_spawn dispatches on a tokio task; poll until the event arrives.
+    let mut attempts = 0;
+    while received.lock().is_empty() && attempts < 200 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        attempts += 1;
+    }
+
+    let events = received.lock();
+    let evt = events
+        .iter()
+        .find(|e| e.event_type == "apcore.registry.module_load_failed")
+        .expect("module_load_failed event must be emitted");
+    assert_eq!(evt.severity, "error");
+    assert_eq!(evt.module_id.as_deref(), Some("executor.test.evt_failing"));
+    let data = evt.data.as_object().expect("payload object");
+    assert_eq!(
+        data.get("module_id").and_then(|v| v.as_str()),
+        Some("executor.test.evt_failing")
+    );
+    assert_eq!(
+        data.get("callback_name").and_then(|v| v.as_str()),
+        Some("on_load")
+    );
+    assert!(
+        data.get("error_type").and_then(|v| v.as_str()).is_some(),
+        "error_type must be present"
+    );
+    assert!(
+        data.get("error_message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains("on_load")),
+        "error_message must carry the on_load failure detail"
+    );
+    assert!(
+        data.get("timestamp").and_then(|v| v.as_str()).is_some(),
+        "timestamp must be present"
+    );
+
+    // Module must NOT be visible after a failed on_load.
+    assert!(
+        registry.get("executor.test.evt_failing").unwrap().is_none(),
+        "module must not be visible after failed on_load"
+    );
+}

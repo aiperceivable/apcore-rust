@@ -12,6 +12,7 @@ use std::sync::{
 };
 
 use crate::errors::ModuleError;
+use crate::events::emitter::{ApCoreEvent, EventEmitter};
 use crate::module::{Module, ModuleAnnotations, ModuleExample, ValidationResult};
 use crate::registry::conflicts::{detect_id_conflicts, ConflictSeverity, ConflictType};
 
@@ -412,6 +413,11 @@ pub struct Registry {
     in_flight: ParkingLotMutex<HashSet<String>>,
     /// Issue #65: callbacks invoked when any module's on_load fails.
     load_failed_callbacks: RwLock<Vec<Arc<LoadFailedCallbackFn>>>,
+    /// Optional event emitter wired by the host (A-D-002). When set, the
+    /// registry emits `apcore.registry.module_load_failed` on `on_load`
+    /// failure, mirroring apcore-python `_event_emitter` /
+    /// apcore-typescript `_eventEmitter`.
+    event_emitter: RwLock<Option<Arc<EventEmitter>>>,
 }
 
 /// RAII guard that restores a taken-out `Discoverer` back into the registry's
@@ -497,6 +503,7 @@ impl Registry {
             watch_handle: parking_lot::Mutex::new(None),
             in_flight: ParkingLotMutex::new(HashSet::new()),
             load_failed_callbacks: RwLock::new(Vec::new()),
+            event_emitter: RwLock::new(None),
         }
     }
 
@@ -505,6 +512,50 @@ impl Registry {
     /// The callback receives the module_id and the error from on_load.
     pub fn on_load_failed(&self, callback: Arc<LoadFailedCallbackFn>) {
         self.load_failed_callbacks.write().push(callback);
+    }
+
+    /// Wire an event emitter so the registry can emit normative registry
+    /// events such as `apcore.registry.module_load_failed` (A-D-002).
+    ///
+    /// Mirrors apcore-python `Registry.set_event_emitter` and
+    /// apcore-typescript `Registry.setEventEmitter`.
+    pub fn set_event_emitter(&self, emitter: Arc<EventEmitter>) {
+        *self.event_emitter.write() = Some(emitter);
+    }
+
+    /// Emit `apcore.registry.module_load_failed` when a module's `on_load`
+    /// raises (A-D-002). Payload mirrors Python/TS:
+    /// `{module_id, callback_name, error_type, error_message, timestamp}`.
+    ///
+    /// When no emitter is wired the failure is logged at `error` level so the
+    /// signal is never silently lost (matching the Python fallback).
+    fn emit_module_load_failed(&self, module_id: &str, error: &ModuleError) {
+        let emitter = self.event_emitter.read().clone();
+        let error_type = format!("{:?}", error.code);
+        let error_message = error.message.clone();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let Some(emitter) = emitter else {
+            tracing::error!(
+                module_id = %module_id,
+                error_type = %error_type,
+                error_message = %error_message,
+                "apcore.registry.module_load_failed (no EventEmitter wired)"
+            );
+            return;
+        };
+        let event = ApCoreEvent::with_module(
+            "apcore.registry.module_load_failed",
+            serde_json::json!({
+                "module_id": module_id,
+                "callback_name": "on_load",
+                "error_type": error_type,
+                "error_message": error_message,
+                "timestamp": timestamp,
+            }),
+            module_id,
+            "error",
+        );
+        emitter.emit_spawn(event);
     }
 
     /// Snapshot the callbacks for a given event name so they can be invoked
@@ -1038,6 +1089,9 @@ impl Registry {
                 for cb in cbs {
                     cb(name, &e);
                 }
+                // A-D-002: emit the normative registry event so subscribers
+                // (not just bespoke callbacks) observe the load failure.
+                self.emit_module_load_failed(name, &e);
                 // Re-raise the original error unchanged.
                 Err(e)
             }
