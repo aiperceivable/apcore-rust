@@ -197,17 +197,38 @@ impl ACL {
         for (key, handler, value) in to_evaluate {
             // Built-in handlers are trivially async (return immediately).
             // We poll the future once — if it's not ready, treat as unsatisfied.
-            let fut = handler.evaluate(value, ctx);
-            let fut = std::pin::pin!(fut);
-            let waker = std::task::Waker::noop();
-            let mut cx = std::task::Context::from_waker(waker);
-            let result = match fut.poll(&mut cx) {
-                std::task::Poll::Ready(val) => val,
-                std::task::Poll::Pending => {
+            //
+            // A-D-011 (SECURITY): wrap both the future construction and the
+            // single poll in catch_unwind so a panicking custom handler does
+            // NOT unwind out of the ACL gate. On panic we record a handler
+            // error and fail closed (deny). Mirrors the Python `try/except`
+            // and TypeScript `try/catch` around handler.evaluate.
+            let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let fut = handler.evaluate(value, ctx);
+                let mut fut = std::pin::pin!(fut);
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                fut.as_mut().poll(&mut cx)
+            }));
+            let result = match poll_result {
+                Ok(std::task::Poll::Ready(val)) => val,
+                Ok(std::task::Poll::Pending) => {
                     tracing::warn!(
                         "Async condition '{}' not immediately ready in sync context — treated as unsatisfied",
                         key,
                     );
+                    return false;
+                }
+                Err(payload) => {
+                    let msg = crate::acl_handlers::panic_message(payload.as_ref());
+                    tracing::error!(
+                        condition = %key,
+                        panic = %msg,
+                        "ACL condition handler panicked — denying (fail-closed)"
+                    );
+                    crate::acl_handlers::report_handler_error(format!(
+                        "{key}: handler panicked: {msg}"
+                    ));
                     return false;
                 }
             };

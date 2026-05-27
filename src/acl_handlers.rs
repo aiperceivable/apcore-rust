@@ -136,6 +136,20 @@ where
     (value, captured)
 }
 
+/// Extract a human-readable message from a panic payload.
+///
+/// Shared by the sync and async ACL condition-evaluation paths (A-D-011) so a
+/// panicking custom handler produces a consistent `handler_error` string.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Trait for evaluating a single ACL condition.
 #[async_trait]
 pub trait ACLConditionHandler: Send + Sync {
@@ -192,7 +206,7 @@ pub async fn evaluate_conditions_async<S: ::std::hash::BuildHasher>(
     conditions: &HashMap<String, Value, S>,
     ctx: &Context<Value>,
 ) -> bool {
-    let mut to_evaluate: Vec<(Arc<dyn ACLConditionHandler>, Value)> =
+    let mut to_evaluate: Vec<(String, Arc<dyn ACLConditionHandler>, Value)> =
         Vec::with_capacity(conditions.len());
     {
         let async_handlers = ASYNC_CONDITION_HANDLERS.read();
@@ -206,12 +220,29 @@ pub async fn evaluate_conditions_async<S: ::std::hash::BuildHasher>(
                 tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
                 return false;
             };
-            to_evaluate.push((handler, value.clone()));
+            to_evaluate.push((key.clone(), handler, value.clone()));
         }
     }
-    for (handler, value) in &to_evaluate {
-        if !handler.evaluate(value, ctx).await {
-            return false;
+    for (key, handler, value) in &to_evaluate {
+        // A-D-011 (SECURITY): a panicking custom handler must NOT unwind out of
+        // the ACL gate. Catch the panic, record it as a handler error, and fail
+        // closed (deny). Mirrors Python `try/except` and TypeScript `try/catch`
+        // around handler.evaluate.
+        use futures_util::FutureExt;
+        let fut = std::panic::AssertUnwindSafe(handler.evaluate(value, ctx)).catch_unwind();
+        match fut.await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(payload) => {
+                let msg = panic_message(payload.as_ref());
+                tracing::error!(
+                    condition = %key,
+                    panic = %msg,
+                    "ACL condition handler panicked — denying (fail-closed)"
+                );
+                report_handler_error(format!("{key}: handler panicked: {msg}"));
+                return false;
+            }
         }
     }
     true
