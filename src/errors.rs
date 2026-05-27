@@ -146,9 +146,10 @@ pub enum ErrorCode {
     /// Cross-language: Python `TASK_LIMIT_EXCEEDED`, TypeScript `TASK_LIMIT_EXCEEDED`.
     TaskLimitExceeded,
     /// Raised when `AsyncTaskManager::start_reaper` is called while another
-    /// reaper is already running. Mirrors apcore-python
-    /// `REAPER_ALREADY_RUNNING` and apcore-typescript
-    /// `REAPER_ALREADY_RUNNING`. Closes A-D-AT-05.
+    /// reaper is already running. Rust-specific (A-D-019): apcore-python raises
+    /// a generic `RuntimeError` and apcore-typescript throws a plain `Error`
+    /// for this case — neither defines a `REAPER_ALREADY_RUNNING` code. The
+    /// Rust SDK uses a typed code for idiomatic error handling.
     ReaperAlreadyRunning,
     /// Raised when a version constraint string is malformed (e.g., `">="`
     /// without a digit operand, `"v1.0"` prefix, or a non-semver operand).
