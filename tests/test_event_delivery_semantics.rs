@@ -320,7 +320,41 @@ async fn sdk_generated_subscriber_ids_are_distinct() {
     );
     assert!(
         s1.subscriber_id().starts_with("stdout-"),
-        "ID format: stdout-<uuid>"
+        "ID format: stdout-<n>"
+    );
+}
+
+/// A-D-010: auto-generated subscriber IDs follow `^{type}-[0-9]+$` (a
+/// process-scoped monotonic per-type counter, not a UUID), matching the
+/// event_delivery_semantics conformance fixture and Python/TS.
+#[tokio::test]
+async fn sdk_subscriber_ids_match_monotonic_numeric_pattern() {
+    use apcore::events::subscribers::StdoutSubscriber;
+
+    let a = StdoutSubscriber::new();
+    let b = StdoutSubscriber::new();
+
+    let parse = |id: &str| -> u64 {
+        let rest = id
+            .strip_prefix("stdout-")
+            .unwrap_or_else(|| panic!("id must start with 'stdout-': {id}"));
+        assert!(
+            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()),
+            "id suffix must be all digits (^stdout-[0-9]+$): {id}"
+        );
+        rest.parse::<u64>().expect("numeric suffix")
+    };
+
+    let na = parse(a.subscriber_id());
+    let nb = parse(b.subscriber_id());
+    // Strictly increasing. (Tests share the process-wide counter, so other
+    // concurrently-running tests may bump it between the two `new()` calls;
+    // assert monotonicity rather than an exact +1 delta.)
+    assert!(
+        nb > na,
+        "per-type counter must increment: {} then {}",
+        a.subscriber_id(),
+        b.subscriber_id()
     );
 }
 

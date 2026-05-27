@@ -14,6 +14,23 @@ use tokio::io::AsyncWriteExt;
 use super::emitter::ApCoreEvent;
 use crate::errors::{ErrorCode, ModuleError};
 
+/// Process-scoped per-type monotonic counters for auto-generated subscriber
+/// IDs (A-D-010). Mirrors Python `_id_counters` / `_next_subscriber_id` and
+/// TypeScript `_subscriberCounters` / `_nextSubscriberId`.
+static SUBSCRIBER_ID_COUNTERS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Generate the next auto subscriber ID for `type_name`, of the form
+/// `^{type}-[0-9]+$` (per the event_delivery_semantics conformance fixture).
+/// The counter is per-type and starts at 0, matching Python/TypeScript.
+fn next_subscriber_id(type_name: &str) -> String {
+    let mut counters = SUBSCRIBER_ID_COUNTERS.lock();
+    let count = counters.entry(type_name.to_string()).or_insert(0);
+    let current = *count;
+    *count += 1;
+    format!("{type_name}-{current}")
+}
+
 /// Severity ranking used by `StdoutSubscriber` for `level_filter`.
 /// Unknown levels fall back to `info` (rank 0).
 fn severity_rank(level: &str) -> u8 {
@@ -446,7 +463,7 @@ impl FileSubscriber {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
-            id: format!("file-{}", uuid::Uuid::new_v4()),
+            id: next_subscriber_id("file"),
             path: path.into(),
             append: true,
             format: OutputFormat::Json,
@@ -587,7 +604,7 @@ impl StdoutSubscriber {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            id: format!("stdout-{}", uuid::Uuid::new_v4()),
+            id: next_subscriber_id("stdout"),
             format: OutputFormat::Text,
             level_filter: None,
         }
@@ -689,7 +706,7 @@ impl FilterSubscriber {
     #[must_use]
     pub fn new(delegate: Box<dyn EventSubscriber>) -> Self {
         Self {
-            id: format!("filter-{}", uuid::Uuid::new_v4()),
+            id: next_subscriber_id("filter"),
             delegate,
             include_events: None,
             exclude_events: None,
@@ -825,7 +842,7 @@ fn build_webhook_subscriber(
             }
         }
     }
-    let id = format!("webhook-{}", uuid::Uuid::new_v4());
+    let id = next_subscriber_id("webhook");
     let mut sub = WebhookSubscriber::new(id, url, "*");
     sub.headers = headers;
     sub.retry_count = retry_count;
@@ -861,7 +878,7 @@ fn build_a2a_subscriber(
         }
         _ => None,
     };
-    let id = format!("a2a-{}", uuid::Uuid::new_v4());
+    let id = next_subscriber_id("a2a");
     let mut sub = A2ASubscriber::new(id, platform_url, "*");
     sub.auth = auth;
     sub.timeout_ms = timeout_ms;
