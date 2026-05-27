@@ -440,10 +440,18 @@ impl EventEmitter {
             serde_json::json!({
                 "subscriber_type": subscriber_type,
                 "subscriber_id": sub_id,
+                // A-D-009: original_event MUST use the spec wire keys
+                // name/payload/metadata (event-system.md, conformance fixture
+                // event_delivery_semantics.json). The original event's
+                // module_id/timestamp are preserved under metadata so no
+                // information is lost. Mirrors Python emitter.py original_event.
                 "original_event": {
-                    "event_type": event.event_type,
-                    "data": event.data,
-                    "timestamp": event.timestamp,
+                    "name": event.event_type,
+                    "payload": event.data,
+                    "metadata": {
+                        "module_id": event.module_id,
+                        "timestamp": event.timestamp,
+                    },
                 },
                 "error": {
                     "type": format!("{:?}", err.code),

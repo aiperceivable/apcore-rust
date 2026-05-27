@@ -324,8 +324,11 @@ async fn sdk_generated_subscriber_ids_are_distinct() {
     );
 }
 
+/// A-D-009: the DLQ payload's `original_event` MUST use the spec wire keys
+/// `name` / `payload` / `metadata` (event-system.md, conformance fixture
+/// event_delivery_semantics.json) — not the legacy `event_type` / `data` keys.
 #[tokio::test]
-async fn dlq_payload_contains_original_event_type() {
+async fn dlq_payload_original_event_uses_name_payload_metadata() {
     let retry_cfg = EventRetryConfig {
         max_attempts: 2,
         initial_backoff_ms: 1,
@@ -340,7 +343,12 @@ async fn dlq_payload_contains_original_event_type() {
     emitter.subscribe(Box::new(dlq_sub));
 
     // The pattern for AlwaysFailSubscriber is "test.*", so use a test.* event.
-    let event = ApCoreEvent::new("test.specific.event", json!({"key": "value"}));
+    let event = ApCoreEvent::with_module(
+        "test.specific.event",
+        json!({"key": "value"}),
+        "executor.test.mod",
+        "info",
+    );
     emitter.emit_delivery_semantics(event);
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -348,10 +356,39 @@ async fn dlq_payload_contains_original_event_type() {
     let dlq_events = dlq_received.lock();
     assert_eq!(dlq_events.len(), 1);
     let original_event = &dlq_events[0].data["original_event"];
+
+    // Canonical spec keys present.
     assert_eq!(
-        original_event["event_type"].as_str(),
+        original_event["name"].as_str(),
         Some("test.specific.event"),
-        "DLQ payload must include original event_type"
+        "original_event must carry `name`"
+    );
+    assert_eq!(
+        original_event["payload"]["key"].as_str(),
+        Some("value"),
+        "original_event must carry `payload`"
+    );
+    assert!(
+        original_event
+            .get("metadata")
+            .is_some_and(serde_json::Value::is_object),
+        "original_event must carry a `metadata` object"
+    );
+    // module_id/timestamp preserved under metadata (no information lost).
+    assert_eq!(
+        original_event["metadata"]["module_id"].as_str(),
+        Some("executor.test.mod")
+    );
+    assert!(original_event["metadata"]["timestamp"].as_str().is_some());
+
+    // Legacy keys MUST be gone.
+    assert!(
+        original_event.get("event_type").is_none(),
+        "legacy `event_type` key must not be present"
+    );
+    assert!(
+        original_event.get("data").is_none(),
+        "legacy `data` key must not be present"
     );
 }
 

@@ -341,10 +341,11 @@ async fn conformance_permanent_failure_emits_dlq_event() {
         data_contains["attempt_count"].as_u64(),
         "attempt_count in DLQ payload mismatch"
     );
+    // A-D-009: original_event uses the spec wire key `name` (not event_type).
     assert_eq!(
-        dlq.data["original_event"]["event_type"].as_str(),
+        dlq.data["original_event"]["name"].as_str(),
         data_contains["original_event"]["name"].as_str(),
-        "original_event.event_type mismatch"
+        "original_event.name mismatch"
     );
 
     // on_failure was called
