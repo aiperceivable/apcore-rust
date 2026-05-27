@@ -55,29 +55,42 @@ pub fn match_pattern(pattern: &str, value: &str) -> bool {
 
 /// Guard against call depth and circular call violations.
 ///
-/// - If `call_chain.len() >= max_depth`, returns `CallDepthExceeded`.
-/// - If `module_name` appears >= `max_module_repeat` times in `call_chain`, returns `CallFrequencyExceeded`.
-/// - If `module_name` is already in `call_chain`, returns `CircularCall`.
+/// See [`guard_call_chain_with_repeat`] for the full contract; this is the
+/// convenience wrapper using the default `max_module_repeat` of 3.
 pub fn guard_call_chain(
     ctx: &Context<serde_json::Value>,
     module_name: &str,
     max_depth: u32,
 ) -> Result<(), ModuleError> {
-    guard_call_chain_with_repeat(ctx, module_name, max_depth, 3)
+    guard_call_chain_with_repeat(ctx, module_name, max_depth, DEFAULT_MAX_MODULE_REPEAT)
 }
 
 /// Guard against call depth, frequency, and circular call violations with configurable repeat limit.
 ///
-/// Note: Frequency is checked before circular calls. When `max_module_repeat` is 1,
-/// a module appearing once triggers `CallFrequencyExceeded` rather than `CircularCall`.
-/// This is intentional — the frequency limit subsumes circular detection at that threshold.
+/// Implements Algorithm A20. The cross-language canonical contract (matching
+/// apcore-python `utils/call_chain.py` and apcore-typescript) is that
+/// `ctx.call_chain` ALREADY includes `module_name` at the end (appended by the
+/// executor via [`Context::child`](crate::context::Context::child) before this
+/// guard runs). The three checks run in order:
+///
+/// 1. **Depth** — `len(call_chain) > max_depth` → `CallDepthExceeded`.
+/// 2. **Circular** — strip the trailing self-entry, then if `module_name`
+///    appears in the prior chain forming a cycle of length >= 2 →
+///    `CircularCall`.
+/// 3. **Frequency** — count occurrences of `module_name` over the FULL chain
+///    (including the trailing self); if `count > max_module_repeat` →
+///    `CallFrequencyExceeded`.
+///
+/// Because the chain includes the trailing self, this is equivalent to the
+/// spec pseudocode form (which excludes self and uses `>=`): a module
+/// appearing exactly `max_module_repeat` times is allowed; one more throws.
 pub fn guard_call_chain_with_repeat(
     ctx: &Context<serde_json::Value>,
     module_name: &str,
     max_depth: u32,
     max_module_repeat: usize,
 ) -> Result<(), ModuleError> {
-    // Check call depth (chain length must not exceed max_depth)
+    // 1. Depth check — chain length must not exceed max_depth.
     #[allow(clippy::cast_possible_truncation)]
     // call_chain length is bounded by max_depth which is u32
     if ctx.call_chain.len() as u32 > max_depth {
@@ -91,13 +104,14 @@ pub fn guard_call_chain_with_repeat(
         ));
     }
 
-    // Circular detection: strict cycles of length >= 2 in prior chain.
-    // The call chain's last entry is the current module (added by child()),
-    // so check prior entries for a previous occurrence forming A->...->A.
-    let prior = if ctx.call_chain.last().map(std::string::String::as_str) == Some(module_name) {
-        &ctx.call_chain[..ctx.call_chain.len() - 1]
-    } else {
+    // 2. Circular detection: strict cycles of length >= 2.
+    // call_chain already includes module_name at the end (from child()),
+    // so always strip the last entry and inspect the prior chain for a
+    // previous occurrence forming A->...->A.
+    let prior = if ctx.call_chain.is_empty() {
         &ctx.call_chain[..]
+    } else {
+        &ctx.call_chain[..ctx.call_chain.len() - 1]
     };
     if let Some(last_idx) = prior.iter().rposition(|n| n.as_str() == module_name) {
         let subsequence = &prior[last_idx + 1..];
@@ -112,14 +126,15 @@ pub fn guard_call_chain_with_repeat(
         }
     }
 
-    // Frequency throttle: module must not appear more than max_module_repeat times.
+    // 3. Frequency throttle: count over the FULL chain (including the trailing
+    // self); the module must not appear MORE than max_module_repeat times.
     let count = ctx
         .call_chain
         .iter()
         .filter(|name| name.as_str() == module_name)
         .count();
 
-    if count >= max_module_repeat {
+    if count > max_module_repeat {
         return Err(ModuleError::new(
             ErrorCode::CallFrequencyExceeded,
             format!(
@@ -285,12 +300,29 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_call_chain_frequency_exceeded() {
+    fn test_guard_call_chain_frequency_at_default_limit_passes() {
+        // A-D-040: canonical frequency uses `count > max_module_repeat` over the
+        // FULL chain (which includes the trailing self). A module appearing
+        // exactly max_module_repeat (default 3) times must PASS, not throw.
         let mut ctx = Context::<serde_json::Value>::anonymous();
-        // Three adjacent occurrences: no cycle of length >= 2 is detected
-        // (subsequence between occurrences is empty), but count reaches
-        // the default max_module_repeat of 3.
         ctx.call_chain = vec!["mod.a".into(), "mod.a".into(), "mod.a".into()];
+        let result = guard_call_chain(&ctx, "mod.a", 100);
+        assert!(
+            result.is_ok(),
+            "exactly max_module_repeat (3) occurrences must pass, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_guard_call_chain_frequency_exceeded() {
+        // Four occurrences with default max_module_repeat=3: count(4) > 3 → throw.
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec![
+            "mod.a".into(),
+            "mod.a".into(),
+            "mod.a".into(),
+            "mod.a".into(),
+        ];
         let result = guard_call_chain(&ctx, "mod.a", 100);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
@@ -298,11 +330,24 @@ mod tests {
 
     #[test]
     fn test_guard_call_chain_with_repeat_custom_limit() {
+        // max_module_repeat=1: a chain ["mod.a", "mod.a"] has count=2 > 1 → throw.
         let mut ctx = Context::<serde_json::Value>::anonymous();
-        ctx.call_chain = vec!["mod.a".into()];
+        ctx.call_chain = vec!["mod.a".into(), "mod.a".into()];
         let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, 1);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
+    }
+
+    #[test]
+    fn test_guard_call_chain_with_repeat_single_self_within_limit() {
+        // max_module_repeat=1, chain=["mod.a"] (count=1): 1 > 1 is false → ok.
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["mod.a".into()];
+        let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, 1);
+        assert!(
+            result.is_ok(),
+            "count==max_module_repeat must pass: {result:?}"
+        );
     }
 
     #[test]

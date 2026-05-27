@@ -324,7 +324,7 @@ async fn call_with_trace_runs_on_error_recovery() {
 
     let (output, trace) = client
         .executor()
-        .call_with_trace("fail.module", json!({}), None, None)
+        .call_with_trace("fail.module", json!({}), None, None, None)
         .await
         .expect("on_error recovery should succeed");
 

@@ -556,6 +556,15 @@ impl Config {
     ///
     /// Attempts to set canonical typed fields first, then falls back to
     /// user namespaces. Returns silently on type mismatch.
+    ///
+    /// NOTE (sync finding A-D-050, deferred): unlike `get()`, this does NOT
+    /// route through `match_registered_namespace`. Doing so would re-acquire
+    /// the global namespace-registry read lock, which deadlocks because
+    /// `apply_env_overrides` already calls `set()` while holding that read
+    /// guard (parking_lot RwLock is not reentrant under a queued writer). The
+    /// naive dot-split below matches `get()` for every realistic namespace
+    /// name (the two only diverge for a namespace whose *name* contains a dot,
+    /// which `register_namespace` does not permit). See decision log.
     pub fn set(&mut self, key: &str, value: serde_json::Value) {
         self.generation += 1;
         // Try canonical typed fields.

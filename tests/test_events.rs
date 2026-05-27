@@ -139,6 +139,7 @@ async fn test_emitter_subscribe_and_emit() {
 
     let event = ApCoreEvent::new("test.ping", json!({}));
     emitter.emit(&event).await;
+    emitter.flush(5000).await.unwrap();
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 1);
@@ -169,6 +170,7 @@ async fn test_emitter_pattern_filtering() {
     emitter
         .emit(&ApCoreEvent::new("registry.changed", json!({})))
         .await;
+    emitter.flush(5000).await.unwrap();
 
     assert_eq!(recv_all.lock().unwrap().len(), 3);
     assert_eq!(recv_mod.lock().unwrap().len(), 2);
@@ -283,10 +285,10 @@ async fn test_emitter_emit_filtered() {
     assert_eq!(received.lock().unwrap().len(), 1);
 }
 
-#[test]
-fn test_emitter_flush_is_noop() {
+#[tokio::test]
+async fn test_emitter_flush_empty_succeeds() {
     let emitter = EventEmitter::new();
-    let result = emitter.flush(1000);
+    let result = emitter.flush(1000).await;
     assert!(result.is_ok());
 }
 
@@ -316,6 +318,7 @@ async fn test_pattern_wildcard_matches_everything() {
     emitter
         .emit(&ApCoreEvent::new("anything.at.all", json!({})))
         .await;
+    emitter.flush(5000).await.unwrap();
     assert_eq!(received.lock().unwrap().len(), 1);
 }
 
@@ -332,6 +335,7 @@ async fn test_pattern_exact_match() {
     emitter
         .emit(&ApCoreEvent::new("exact.match.extra", json!({})))
         .await;
+    emitter.flush(5000).await.unwrap();
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 1);
@@ -350,6 +354,7 @@ async fn test_pattern_prefix_wildcard() {
         .emit(&ApCoreEvent::new("foo.baz.qux", json!({})))
         .await;
     emitter.emit(&ApCoreEvent::new("bar.foo", json!({}))).await;
+    emitter.flush(5000).await.unwrap();
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 2);

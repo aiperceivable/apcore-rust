@@ -90,7 +90,28 @@ fn test_registry_contains_unknown_module_returns_false() {
 #[test]
 fn test_registry_get_definition_unknown_returns_none() {
     let registry = Registry::new();
-    assert!(registry.get_definition("nonexistent").is_none());
+    assert!(registry.get_definition("nonexistent").unwrap().is_none());
+}
+
+#[test]
+fn test_registry_get_definition_empty_id_errors_like_get() {
+    // A-D-001: get_definition("") MUST propagate get()'s empty-id error
+    // (ModuleNotFound), matching apcore-python / apcore-typescript.
+    let registry = Registry::new();
+    // `get()`'s Ok variant holds `Option<Arc<dyn Module>>` which is not Debug,
+    // so map to the error code before comparing.
+    let def_code = registry
+        .get_definition("")
+        .map(|_| ())
+        .err()
+        .map(|e| e.code);
+    let get_code = registry.get("").map(|_| ()).err().map(|e| e.code);
+    assert!(def_code.is_some(), "get_definition(\"\") must be Err");
+    assert!(get_code.is_some(), "get(\"\") must be Err");
+    assert_eq!(
+        def_code, get_code,
+        "get_definition empty-id error code must match get()"
+    );
 }
 
 #[test]
@@ -635,7 +656,7 @@ mod discoverer_tests {
 
         assert_eq!(count, 1);
         assert!(registry.has("math.add"));
-        assert!(registry.get_definition("math.add").is_some());
+        assert!(registry.get_definition("math.add").unwrap().is_some());
         assert_eq!(
             counter.load(Ordering::SeqCst),
             1,
@@ -657,9 +678,10 @@ mod discoverer_tests {
 
         assert_eq!(count, 1, "only the single valid entry should register");
         assert!(registry.has("good.one"));
-        assert!(registry.get_definition("Invalid-ID").is_none());
-        assert!(registry.get_definition("").is_none());
-        assert!(registry.get_definition("system.hacker").is_none());
+        assert!(registry.get_definition("Invalid-ID").unwrap().is_none());
+        // A-D-001: empty id propagates get()'s ModuleNotFound error.
+        assert!(registry.get_definition("").is_err());
+        assert!(registry.get_definition("system.hacker").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -689,7 +711,7 @@ mod discoverer_tests {
 
         assert_eq!(count, 0);
         assert!(!registry.has("math.add"));
-        assert!(registry.get_definition("math.add").is_none());
+        assert!(registry.get_definition("math.add").unwrap().is_none());
         assert_eq!(called.load(Ordering::SeqCst), 1);
     }
 
@@ -1333,6 +1355,7 @@ fn test_register_versioned_with_version_and_metadata() {
 
     let definition = registry
         .get_definition("versioned.module")
+        .expect("get_definition must not error for a valid id")
         .expect("registered module has a descriptor");
     assert_eq!(definition.version, "2.5.0", "version flows into descriptor");
     assert_eq!(
@@ -1351,6 +1374,7 @@ fn test_register_versioned_with_none_version_falls_back_to_default() {
 
     let definition = registry
         .get_definition("default.version")
+        .expect("get_definition must not error for a valid id")
         .expect("registered module has a descriptor");
     // DEFAULT_MODULE_VERSION matches what register_module would set.
     assert!(

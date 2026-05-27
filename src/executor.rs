@@ -809,7 +809,7 @@ impl Executor {
 
         // Detect requires_approval from module annotations.
         let mut requires_approval = false;
-        if let Some(desc) = self.registry.get_definition(module_id) {
+        if let Ok(Some(desc)) = self.registry.get_definition(module_id) {
             if desc
                 .annotations
                 .as_ref()
@@ -985,12 +985,19 @@ impl Executor {
             if let Some(mut inner) = stream_handle {
                 while let Some(chunk_result) = inner.next().await {
                     // STREAM-003 (sync): enforce global_deadline between chunks.
+                    // A-D-007: use strict `>` to match apcore-python
+                    // (`time.monotonic() > global_deadline`) and apcore-typescript
+                    // (`Date.now() > globalDeadline`). The unit here is internal
+                    // epoch-seconds (set+compared consistently via as_secs_f64);
+                    // the cross-SDK clocks differ (Python monotonic-seconds, TS
+                    // epoch-ms) but each is self-consistent — only the comparator
+                    // is normalized.
                     if let Some(deadline) = setup.context.global_deadline {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs_f64();
-                        if now >= deadline {
+                        if now > deadline {
                             Err(ModuleError::new(
                                 ErrorCode::ModuleTimeout,
                                 format!(
@@ -1277,6 +1284,7 @@ impl Executor {
         module_id: &str,
         inputs: Value,
         ctx: Option<&Context<Value>>,
+        version_hint: Option<&str>,
         strategy: Option<&ExecutionStrategy>,
     ) -> Result<(Value, PipelineTrace), ModuleError> {
         let effective_strategy = strategy.unwrap_or(&self.strategy);
@@ -1293,6 +1301,11 @@ impl Executor {
 
         let mut pipeline_ctx =
             PipelineContext::new(module_id, inputs, context, effective_strategy.name());
+        // Sync finding A-D-005 (D-19): forward version_hint like call() does so
+        // the trace variant shares call()'s version-negotiation semantics.
+        if let Some(hint) = version_hint {
+            pipeline_ctx.version_hint = Some(hint.to_string());
+        }
         self.inject_resources(&mut pipeline_ctx);
         self.bind_to_context(&mut pipeline_ctx)?;
 

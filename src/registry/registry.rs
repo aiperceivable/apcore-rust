@@ -688,8 +688,22 @@ impl Registry {
     ///
     /// Returns a cloned `ModuleDescriptor` because the underlying storage
     /// is behind a lock — we cannot hand out borrowed references.
-    pub fn get_definition(&self, name: &str) -> Option<ModuleDescriptor> {
-        self.core.read().descriptors.get(name).cloned()
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Registry::get`]'s empty-id error: an empty `name` yields
+    /// `Err(ModuleError(code=ModuleNotFound))`, matching apcore-python
+    /// `Registry.get_definition` (which delegates to `get()` and lets the
+    /// `ModuleNotFoundError` propagate) and apcore-typescript (sync finding
+    /// A-D-001). A well-formed but unregistered `name` returns `Ok(None)`.
+    pub fn get_definition(&self, name: &str) -> Result<Option<ModuleDescriptor>, ModuleError> {
+        // Route through get() so the empty-id contract is surfaced uniformly.
+        // Descriptors and modules are inserted/removed together (1:1), so a
+        // present module always has a present descriptor.
+        if self.get(name)?.is_none() {
+            return Ok(None);
+        }
+        Ok(self.core.read().descriptors.get(name).cloned())
     }
 
     /// List registered module names with optional filtering.
@@ -1654,7 +1668,8 @@ impl Registry {
     ///
     /// Aligned with `apcore-python.Registry.export_schema(module_id, strict=True)`.
     pub fn export_schema_strict(&self, name: &str, strict: bool) -> Option<serde_json::Value> {
-        let descriptor = self.get_definition(name)?;
+        // An empty/unregistered name maps to None for this Option-returning API.
+        let descriptor = self.get_definition(name).ok().flatten()?;
         let (input_schema, output_schema) = if strict {
             (
                 crate::schema::to_strict_schema(&descriptor.input_schema),

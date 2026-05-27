@@ -84,6 +84,18 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Declared subscriber type, surfaced in `apcore.event.delivery_failed`
+    /// DLQ payloads as `subscriber_type` (sync finding A-D-029).
+    ///
+    /// Defaults to `"subscriber"`. Built-in subscribers override this to report
+    /// their concrete type (e.g. `"webhook"`, `"stdout"`, `"file"`). Matches
+    /// apcore-python's declared `subscriber_type` attribute (rather than
+    /// parsing the type out of `subscriber_id`).
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn subscriber_type(&self) -> &str {
+        "subscriber"
+    }
+
     /// Retry configuration for delivery of events to this subscriber.
     ///
     /// Defaults to single-attempt (no retry). Override to opt into exponential
@@ -169,6 +181,11 @@ impl WebhookSubscriber {
 impl EventSubscriber for WebhookSubscriber {
     fn subscriber_id(&self) -> &str {
         &self.id
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn subscriber_type(&self) -> &str {
+        "webhook"
     }
 
     fn event_pattern(&self) -> &str {
@@ -308,6 +325,11 @@ impl A2ASubscriber {
 impl EventSubscriber for A2ASubscriber {
     fn subscriber_id(&self) -> &str {
         &self.id
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn subscriber_type(&self) -> &str {
+        "a2a"
     }
 
     fn event_pattern(&self) -> &str {
@@ -484,6 +506,11 @@ impl EventSubscriber for FileSubscriber {
         &self.id
     }
 
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn subscriber_type(&self) -> &str {
+        "file"
+    }
+
     // Built-in subscribers always match every event; the `&str` signature is
     // dictated by the trait, so the literal lifetime cannot be widened.
     #[allow(clippy::unnecessary_literal_bound)]
@@ -598,6 +625,11 @@ impl EventSubscriber for StdoutSubscriber {
         &self.id
     }
 
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn subscriber_type(&self) -> &str {
+        "stdout"
+    }
+
     #[allow(clippy::unnecessary_literal_bound)] // see FileSubscriber comment
     fn event_pattern(&self) -> &str {
         "*"
@@ -703,6 +735,12 @@ impl FilterSubscriber {
 impl EventSubscriber for FilterSubscriber {
     fn subscriber_id(&self) -> &str {
         &self.id
+    }
+
+    fn subscriber_type(&self) -> &str {
+        // Report the wrapped delegate's type so DLQ payloads identify the real
+        // downstream sink, not the filter wrapper.
+        self.delegate.subscriber_type()
     }
 
     fn event_pattern(&self) -> &str {
