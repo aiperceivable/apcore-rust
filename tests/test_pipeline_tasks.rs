@@ -129,7 +129,7 @@ async fn test_call_with_trace_returns_output_and_trace() {
 
     let executor = Executor::with_strategy(registry, config, strategy);
     let (output, trace) = executor
-        .call_with_trace("test_mod", serde_json::json!({}), None, None)
+        .call_with_trace("test_mod", serde_json::json!({}), None, None, None)
         .await
         .unwrap();
 
@@ -138,6 +138,30 @@ async fn test_call_with_trace_returns_output_and_trace() {
     assert_eq!(trace.steps.len(), 1);
     assert_eq!(trace.steps[0].name, "output_step");
     assert_eq!(trace.strategy_name, "simple");
+}
+
+// Sync finding A-D-005 (D-19): call_with_trace accepts and forwards
+// version_hint like call(), so the trace variant shares call()'s
+// version-negotiation semantics.
+#[tokio::test]
+async fn test_call_with_trace_accepts_version_hint() {
+    let registry = Registry::new();
+    let config = Config::default();
+
+    let strategy = ExecutionStrategy::new(
+        "simple",
+        vec![Box::new(OutputStep::new(serde_json::json!({"result": 7})))],
+    )
+    .unwrap();
+
+    let executor = Executor::with_strategy(registry, config, strategy);
+    let (output, trace) = executor
+        .call_with_trace("test_mod", serde_json::json!({}), None, Some("1.0.0"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(output, serde_json::json!({"result": 7}));
+    assert!(trace.success);
 }
 
 #[tokio::test]
@@ -165,7 +189,13 @@ async fn test_call_with_trace_strategy_override() {
 
     // Override should take precedence
     let (output, trace) = executor
-        .call_with_trace("mod", serde_json::json!({}), None, Some(&override_strategy))
+        .call_with_trace(
+            "mod",
+            serde_json::json!({}),
+            None,
+            None,
+            Some(&override_strategy),
+        )
         .await
         .unwrap();
 
@@ -183,7 +213,7 @@ async fn test_call_with_trace_no_override_uses_default_strategy() {
     // Module lookup will fail since the registry is empty, but the
     // strategy itself is always available.
     let result = executor
-        .call_with_trace("nonexistent", serde_json::json!({}), None, None)
+        .call_with_trace("nonexistent", serde_json::json!({}), None, None, None)
         .await;
 
     assert!(result.is_err());

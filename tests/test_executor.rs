@@ -405,7 +405,7 @@ async fn test_call_with_trace_returns_output_and_trace() {
 
     let (output, trace): (serde_json::Value, PipelineTrace) = client
         .executor()
-        .call_with_trace("math.add", json!({"a": 3, "b": 4}), None, None)
+        .call_with_trace("math.add", json!({"a": 3, "b": 4}), None, None, None)
         .await
         .unwrap();
 

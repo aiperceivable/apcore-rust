@@ -1284,6 +1284,7 @@ impl Executor {
         module_id: &str,
         inputs: Value,
         ctx: Option<&Context<Value>>,
+        version_hint: Option<&str>,
         strategy: Option<&ExecutionStrategy>,
     ) -> Result<(Value, PipelineTrace), ModuleError> {
         let effective_strategy = strategy.unwrap_or(&self.strategy);
@@ -1300,6 +1301,11 @@ impl Executor {
 
         let mut pipeline_ctx =
             PipelineContext::new(module_id, inputs, context, effective_strategy.name());
+        // Sync finding A-D-005 (D-19): forward version_hint like call() does so
+        // the trace variant shares call()'s version-negotiation semantics.
+        if let Some(hint) = version_hint {
+            pipeline_ctx.version_hint = Some(hint.to_string());
+        }
         self.inject_resources(&mut pipeline_ctx);
         self.bind_to_context(&mut pipeline_ctx)?;
 
