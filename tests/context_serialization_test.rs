@@ -207,3 +207,79 @@ fn test_deserialize_unknown_top_level_fields() {
     let data_map = restored.data.read();
     assert_eq!(data_map.get("custom"), Some(&serde_json::json!("value")));
 }
+
+// ---------------------------------------------------------------------------
+// A-D-005 + A-D-020: the public to_json() path must produce the SAME canonical
+// wire shape as serialize() — _context_version present, no services, caller_id
+// always emitted — and must round-trip through Context::deserialize.
+// ---------------------------------------------------------------------------
+
+/// A top-level anonymous context with no caller still emits `caller_id` (null)
+/// and `_context_version`, and never leaks `services`.
+fn make_top_level_ctx() -> Context<()> {
+    Context {
+        trace_id: "trace-top-level".to_string(),
+        identity: None,
+        services: (),
+        caller_id: None,
+        data: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        call_chain: vec![],
+        redacted_inputs: None,
+        redacted_output: None,
+        cancel_token: None,
+        global_deadline: None,
+        executor: None,
+    }
+}
+
+#[test]
+fn test_to_json_matches_serialize_canonical_shape() {
+    let ctx = make_ctx();
+    let to_json = ctx.to_json();
+    let serialize = ctx.serialize();
+    assert_eq!(
+        to_json, serialize,
+        "to_json() must produce the same wire shape as serialize()"
+    );
+}
+
+#[test]
+fn test_to_json_has_context_version_and_no_services() {
+    let ctx = make_top_level_ctx();
+    let json = ctx.to_json();
+    let obj = json.as_object().unwrap();
+    assert_eq!(json["_context_version"], 1);
+    assert!(
+        !obj.contains_key("services"),
+        "to_json() must not leak services"
+    );
+    // caller_id present (null) even for a top-level/anonymous context.
+    assert!(obj.contains_key("caller_id"));
+    assert!(json["caller_id"].is_null());
+    assert!(obj.contains_key("identity"));
+    assert!(json["identity"].is_null());
+}
+
+#[test]
+fn test_to_json_checked_matches_serialize() {
+    let ctx = make_ctx();
+    let checked = ctx.to_json_checked().unwrap();
+    assert_eq!(checked, ctx.serialize());
+}
+
+#[test]
+fn test_to_json_round_trips_through_deserialize() {
+    // The canonical to_json() output must be accepted by Python/TS-style
+    // deserialize (Context::deserialize on the same shape).
+    let ctx = make_ctx();
+    let json = ctx.to_json();
+    let restored: Context<()> = Context::deserialize(json).expect("round-trip");
+    assert_eq!(restored.trace_id, ctx.trace_id);
+    assert_eq!(restored.caller_id, ctx.caller_id);
+
+    // And the top-level (null caller_id) shape round-trips too.
+    let top = make_top_level_ctx();
+    let top_json = top.to_json();
+    let restored_top: Context<()> = Context::deserialize(top_json).expect("round-trip top");
+    assert_eq!(restored_top.caller_id, None);
+}

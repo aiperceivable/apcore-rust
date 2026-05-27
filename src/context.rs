@@ -284,69 +284,27 @@ impl<T: Default> Context<T> {
         }
     }
 
-    /// Serialize context to JSON.
+    /// Serialize context to the canonical cross-language JSON wire shape.
     ///
-    /// On serialization failure (which can occur when `T` contains
-    /// non-serializable data), logs at `tracing::error!` and returns an
-    /// empty object. Callers needing hard failure semantics should
-    /// `serde_json::to_value(&ctx)` directly.
-    pub fn to_json(&self) -> serde_json::Value
-    where
-        T: Serialize,
-    {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|e| {
-            tracing::error!(
-                trace_id = %self.trace_id,
-                error = %e,
-                "Context::to_json serialization failed; returning partial object"
-            );
-            // Preserve trace_id so callers can still correlate logs on failure.
-            serde_json::json!({ "trace_id": self.trace_id })
-        });
-        // Filter out internal keys (keys starting with "_") from data
-        if let Some(obj) = value.as_object_mut() {
-            if let Some(data_val) = obj.get_mut("data") {
-                if let Some(data_obj) = data_val.as_object_mut() {
-                    let internal_keys: Vec<String> = data_obj
-                        .keys()
-                        .filter(|k| k.starts_with('_'))
-                        .cloned()
-                        .collect();
-                    for key in internal_keys {
-                        data_obj.remove(&key);
-                    }
-                }
-            }
-        }
-        value
+    /// A-D-005 / A-D-020: this delegates to [`serialize`](Self::serialize) so the
+    /// public `to_json` path produces the SAME wire shape as `serialize()` —
+    /// `_context_version: 1` present, `services` excluded, `caller_id`/`identity`
+    /// always emitted (null when absent), and `_`-prefixed data keys filtered.
+    /// The previous implementation went through the derived `Serialize`, which
+    /// emitted `services`, omitted `_context_version`, and dropped `caller_id`
+    /// when `None` — a shape that could not round-trip through Python/TS.
+    pub fn to_json(&self) -> serde_json::Value {
+        self.serialize()
     }
 
-    /// Serialize context to JSON, returning an error if serialization fails.
+    /// Serialize context to the canonical JSON wire shape, fallibly.
     ///
-    /// Prefer this over [`to_json`](Self::to_json) when correctness matters — `to_json` returns
-    /// an empty object on failure, which silently drops context data. This variant propagates the
-    /// error so callers can decide how to handle it.
-    pub fn to_json_checked(&self) -> Result<serde_json::Value, crate::errors::ModuleError>
-    where
-        T: Serialize,
-    {
-        let mut value = serde_json::to_value(self)?;
-        // Filter out internal keys (keys starting with "_") from data
-        if let Some(obj) = value.as_object_mut() {
-            if let Some(data_val) = obj.get_mut("data") {
-                if let Some(data_obj) = data_val.as_object_mut() {
-                    let internal_keys: Vec<String> = data_obj
-                        .keys()
-                        .filter(|k| k.starts_with('_'))
-                        .cloned()
-                        .collect();
-                    for key in internal_keys {
-                        data_obj.remove(&key);
-                    }
-                }
-            }
-        }
-        Ok(value)
+    /// A-D-005 / A-D-020: like [`to_json`](Self::to_json), delegates to
+    /// [`serialize`](Self::serialize) to guarantee the canonical wire shape.
+    /// `serialize()` is infallible, so this never returns `Err`; the `Result`
+    /// signature is retained for API compatibility.
+    pub fn to_json_checked(&self) -> Result<serde_json::Value, crate::errors::ModuleError> {
+        Ok(self.serialize())
     }
 
     /// Deserialize context from JSON.
