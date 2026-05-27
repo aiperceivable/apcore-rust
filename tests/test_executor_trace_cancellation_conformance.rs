@@ -206,22 +206,6 @@ fn build_executor(on_error_invoked: Arc<AtomicBool>) -> Executor {
     executor
 }
 
-// BUG (A-D-001 / D-20, incomplete Rust fix): currently FAILS. The cancellation
-// short-circuit lives only in `Executor::call` / `call_with_trace`, but the
-// `BuiltinExecute` pipeline step (src/builtin_steps.rs ~L631-647) runs
-// `middleware_manager.execute_on_error(...)` recovery UNCONDITIONALLY on any
-// module error, with no `ExecutionCancelled` guard. So a module that returns an
-// EXECUTION_CANCELLED error is recovered into a success at the step level and
-// the D-20 short-circuit in call/call_with_trace never sees it. The Python
-// reference (apcore-python/src/apcore/executor.py: _unwrap_cancellation +
-// _handle_error, "D-20: cancellation MUST short-circuit BEFORE on_error") does
-// the cancellation check before any on_error recovery; Rust does not at the
-// step boundary. The fix is to guard `BuiltinExecute`'s inline on_error call
-// (and any other step-level execute_on_error) so ExecutionCancelled propagates
-// untouched. This test asserts the CORRECT contract; it is `#[ignore]`d (not
-// weakened) so the suite stays green until the Rust fix lands — remove the
-// `#[ignore]` once it does.
-#[ignore = "A-D-001/D-20 incomplete in Rust: BuiltinExecute step runs on_error recovery on a cancellation; see comment above"]
 #[tokio::test]
 async fn trace_cancellation_propagates_bypassing_on_error() {
     let fixture = load_fixture();

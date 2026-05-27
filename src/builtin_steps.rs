@@ -629,6 +629,17 @@ impl Step for BuiltinExecute {
                 Ok(StepResult::continue_step())
             }
             Err(e) => {
+                // Cancellation short-circuit (D-20): an ExecutionCancelled
+                // error MUST bypass the on_error middleware chain even at the
+                // step level, so a recovering on_error middleware cannot
+                // swallow it into a success before reaching the executor-level
+                // guard in `Executor::call` / `call_with_trace`. Propagate it
+                // untouched. Mirrors apcore-python `_handle_error`
+                // (`_unwrap_cancellation` before any on_error recovery).
+                // Spec: docs/features/core-executor.md §Cancellation Short-Circuit
+                if matches!(e.code, ErrorCode::ExecutionCancelled) {
+                    return Err(e);
+                }
                 // On execution error, attempt middleware recovery.
                 if let Some(ref mm) = ctx.middleware_manager {
                     let recovery = mm
