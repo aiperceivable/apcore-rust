@@ -94,9 +94,9 @@ pub use events::circuit_breaker::{
 pub use events::emitter::{ApCoreEvent, EventEmitter};
 pub use events::retry::EventRetryConfig;
 pub use events::subscribers::{
-    register_subscriber_type, reset_subscriber_registry, unregister_subscriber_type, A2ASubscriber,
-    EventSubscriber, FileSubscriber, FilterSubscriber, OutputFormat, StdoutSubscriber,
-    WebhookSubscriber,
+    create_subscriber, register_subscriber_type, reset_subscriber_registry,
+    unregister_subscriber_type, A2ASubscriber, EventSubscriber, FileSubscriber, FilterSubscriber,
+    OutputFormat, StdoutSubscriber, WebhookSubscriber,
 };
 pub use executor::{
     list_strategies, redact_sensitive, register_strategy, Executor, REDACTED_VALUE,
@@ -170,8 +170,9 @@ pub use sys_modules::overrides::{
 };
 pub use sys_modules::{
     check_module_disabled, is_module_disabled, register_sys_modules,
-    register_sys_modules_with_options, SysModuleError, SysModulesContext, SysModulesOptions,
-    ToggleState,
+    register_sys_modules_with_options, HealthModule, HealthSummaryModule, ManifestFullModule,
+    ManifestModule, ReloadModule, SysModuleError, SysModulesContext, SysModulesOptions,
+    ToggleFeatureModule, ToggleState, UsageModule, UsageSummaryModule,
 };
 pub use trace_context::{TraceContext, TraceParent};
 pub use utils::{

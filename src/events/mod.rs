@@ -13,6 +13,7 @@ pub use circuit_breaker::{
 pub use emitter::{ApCoreEvent, EventEmitter};
 pub use retry::EventRetryConfig;
 pub use subscribers::{
-    EventSubscriber, FileSubscriber, FilterSubscriber, OutputFormat, StdoutSubscriber,
-    WebhookSubscriber,
+    create_subscriber, register_subscriber_type, reset_subscriber_registry,
+    unregister_subscriber_type, EventSubscriber, FileSubscriber, FilterSubscriber, OutputFormat,
+    StdoutSubscriber, WebhookSubscriber,
 };

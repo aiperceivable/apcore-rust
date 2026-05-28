@@ -213,14 +213,45 @@ fn test_event_subscriber_types_at_crate_root() {
 
 #[test]
 fn test_subscriber_registry_functions_at_crate_root() {
-    // D1-002: register_subscriber_type, unregister_subscriber_type,
-    // reset_subscriber_registry must be accessible from the crate root.
-    use apcore::{register_subscriber_type, reset_subscriber_registry, unregister_subscriber_type};
+    // D1-002: create_subscriber, register_subscriber_type, unregister_subscriber_type,
+    // reset_subscriber_registry must all be accessible from the crate root, matching
+    // apcore-python create_subscriber_from_config/register_subscriber_factory and
+    // apcore-typescript createSubscriberFromConfig/registerSubscriberType at root.
+    use apcore::{
+        create_subscriber, register_subscriber_type, reset_subscriber_registry,
+        unregister_subscriber_type,
+    };
     // reset_subscriber_registry restores built-ins — safe to call in tests.
     reset_subscriber_registry();
     // Confirm the function signatures are callable with expected argument types.
     let result = unregister_subscriber_type("nonexistent_type_xyz");
     assert!(result.is_err());
+    // create_subscriber resolves at the crate root; an unknown type errors.
+    let made = create_subscriber(&serde_json::json!({"type": "nonexistent_type_xyz"}));
+    assert!(made.is_err());
+}
+
+#[test]
+fn test_sys_modules_concrete_classes_at_crate_root() {
+    // D1-004: every concrete system-module struct must be reachable from the crate
+    // root, matching apcore-python (HealthModule, HealthSummaryModule, ManifestModule,
+    // ManifestFullModule, UsageModule, UsageSummaryModule, ReloadModule,
+    // ToggleFeatureModule, UpdateConfigModule) and the equivalent apcore-typescript
+    // root exports. Previously only UpdateConfigModule was re-exported at the root.
+    use apcore::{
+        HealthModule, HealthSummaryModule, ManifestFullModule, ManifestModule, ReloadModule,
+        ToggleFeatureModule, UpdateConfigModule, UsageModule, UsageSummaryModule,
+    };
+    // Compile-time references — if any struct isn't at the crate root, this fails to compile.
+    let _: Option<HealthModule> = None;
+    let _: Option<HealthSummaryModule> = None;
+    let _: Option<ManifestModule> = None;
+    let _: Option<ManifestFullModule> = None;
+    let _: Option<UsageModule> = None;
+    let _: Option<UsageSummaryModule> = None;
+    let _: Option<ReloadModule> = None;
+    let _: Option<ToggleFeatureModule> = None;
+    let _: Option<UpdateConfigModule> = None;
 }
 
 #[test]

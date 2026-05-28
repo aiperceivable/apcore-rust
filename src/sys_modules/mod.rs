@@ -32,8 +32,10 @@ use crate::observability::usage::{UsageCollector, UsageMiddleware};
 use crate::registry::registry::{is_ephemeral_module_id, ModuleDescriptor, Registry};
 
 pub use audit::{AuditAction, AuditChange, AuditEntry, AuditStore, InMemoryAuditStore};
-pub use control::UpdateConfigModule;
-pub(crate) use control::{ReloadModule, ToggleFeatureModule};
+pub use control::{ReloadModule, ToggleFeatureModule, UpdateConfigModule};
+pub use health::{HealthModule, HealthSummaryModule};
+pub use manifest::{ManifestFullModule, ManifestModule};
+pub use usage::{UsageModule, UsageSummaryModule};
 
 // ---------------------------------------------------------------------------
 // ToggleState — thread-safe enable/disable tracking
