@@ -117,6 +117,21 @@ pub trait Module: Send + Sync {
         Vec::new()
     }
 
+    /// Module-instance behavior annotations (D10-003).
+    ///
+    /// Cross-language alignment with apcore-python (`builtin_steps.py`, reads
+    /// `getattr(module, "annotations", None)`) and apcore-typescript
+    /// (`builtin-steps.ts`, reads `mod['annotations']`). `BuiltinApprovalGate`
+    /// sources the [`ApprovalRequest`](crate::approval::ApprovalRequest)
+    /// annotations from the resolved live module instance via this accessor
+    /// (PROTOCOL_SPEC §7.4 Step 5), not from the registry descriptor.
+    ///
+    /// The default implementation returns [`ModuleAnnotations::default`], so
+    /// existing `impl Module` blocks remain source-compatible.
+    fn annotations(&self) -> ModuleAnnotations {
+        ModuleAnnotations::default()
+    }
+
     /// Optional preview hook — return a structured prediction of changes.
     ///
     /// Per the apcore RFC `docs/spec/rfc-preview-method.md` (Accepted, target

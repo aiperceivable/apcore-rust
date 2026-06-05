@@ -390,10 +390,16 @@ impl Step for BuiltinApprovalGate {
             .as_ref()
             .expect("registry must be injected into PipelineContext");
 
-        let desc = match registry.get_definition(&ctx.module_id) {
-            Ok(Some(d)) if d.annotations.as_ref().is_some_and(|a| a.requires_approval) => d,
-            _ => return Ok(StepResult::continue_step()),
-        };
+        // Gate firing is decided from the registered descriptor's
+        // `requires_approval` flag; the ApprovalRequest metadata, however, is
+        // sourced from the live module instance below (PROTOCOL_SPEC §7.4).
+        let requires_approval = matches!(
+            registry.get_definition(&ctx.module_id),
+            Ok(Some(d)) if d.annotations.as_ref().is_some_and(|a| a.requires_approval)
+        );
+        if !requires_approval {
+            return Ok(StepResult::continue_step());
+        }
 
         // Phase B: check for _approval_token in inputs.
         let approval_result = if let Some(token) = ctx
@@ -426,17 +432,26 @@ impl Step for BuiltinApprovalGate {
             }
             handler.check_approval(&token_str).await?
         } else {
-            // Spec (A-D-203): ApprovalRequest MUST carry the resolved module's
-            // real annotations / description / tags so handlers can inspect
-            // them. Sourced from the registry's ModuleDescriptor (cross-language
-            // parity with apcore-python and apcore-typescript).
-            let annotations = desc.annotations.clone().unwrap_or_default();
-            let description = if desc.description.is_empty() {
+            // Spec (PROTOCOL_SPEC §7.4 Step 5): ApprovalRequest MUST carry the
+            // resolved live module instance's real annotations / description /
+            // tags so handlers can inspect them. Sourced from the live module
+            // (`module.annotations()` / `.description()` / `.tags()`) — NOT from
+            // the registry descriptor — matching apcore-python
+            // (`getattr(module, ...)`) and apcore-typescript (`mod[...]`).
+            let module = registry.get(&ctx.module_id)?.ok_or_else(|| {
+                ModuleError::new(
+                    ErrorCode::ModuleNotFound,
+                    format!("Module '{}' not found in registry", ctx.module_id),
+                )
+            })?;
+            let annotations = module.annotations();
+            let module_description = module.description();
+            let description = if module_description.is_empty() {
                 None
             } else {
-                Some(desc.description.clone())
+                Some(module_description.to_string())
             };
-            let tags = desc.tags.clone();
+            let tags = module.tags();
             let request = crate::approval::ApprovalRequest {
                 module_id: ctx.module_id.clone(),
                 arguments: ctx.inputs.clone(),
