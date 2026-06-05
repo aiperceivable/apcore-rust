@@ -71,8 +71,9 @@ impl RefResolver {
             // A-D-038: depth-cap exhaustion is distinct from an actual cycle.
             // Emit SCHEMA_MAX_DEPTH_EXCEEDED here; the genuine-cycle branch
             // below (seen.contains) emits SCHEMA_CIRCULAR_REF. Cross-SDK note:
-            // apcore-python/typescript currently report CIRCULAR_REF for the
-            // depth cap too — Rust is the canonical here and they should follow.
+            // all three SDKs are aligned — apcore-python and apcore-typescript
+            // also raise a distinct max-depth error (SchemaMaxDepthExceededError)
+            // on the depth cap, separate from the circular-ref error.
             let mut details = std::collections::HashMap::new();
             details.insert(
                 "max_depth".to_string(),
