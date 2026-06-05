@@ -160,10 +160,6 @@ pub use schema::{
     to_strict_schema, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader,
     SchemaStrategy, SchemaValidator,
 };
-pub use sys_modules::audit::{
-    AuditAction as SysAuditAction, AuditChange as SysAuditChange, AuditEntry as SysAuditEntry,
-    AuditStore as SysAuditStore, InMemoryAuditStore as SysInMemoryAuditStore,
-};
 pub use sys_modules::control::UpdateConfigModule;
 pub use sys_modules::overrides::{
     FileOverridesStore, InMemoryOverridesStore, OverridesError, OverridesStore,
