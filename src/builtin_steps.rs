@@ -324,6 +324,52 @@ impl Step for BuiltinACLCheck {
     }
 }
 
+impl BuiltinApprovalGate {
+    /// Emit an `approval_decision` audit/observability event for a resolved
+    /// approval. Mirrors apcore-python (`_emit_audit`) and apcore-typescript:
+    /// emits a structured `tracing` log and, when a tracing span stack is
+    /// present in `ctx.data` (`TRACING_SPANS`), appends an `approval_decision`
+    /// event carrying `{module_id, status, approved_by, reason, approval_id}`
+    /// to the active (last) span.
+    fn emit_approval_decision(ctx: &PipelineContext, result: &crate::approval::ApprovalResult) {
+        let approved_by = result.approved_by.clone().unwrap_or_default();
+        let reason = result.reason.clone().unwrap_or_default();
+        let approval_id = result.approval_id.clone().unwrap_or_default();
+
+        tracing::info!(
+            module_id = %ctx.module_id,
+            status = %result.status,
+            approved_by = %approved_by,
+            reason = %reason,
+            approval_id = %approval_id,
+            "approval_decision"
+        );
+
+        // Append the event to the active tracing span when the span stack is
+        // present in context data (cross-SDK parity). No-op when tracing is
+        // inactive, matching the reference SDKs.
+        if let Some(mut spans) = crate::context_keys::TRACING_SPANS.get(&ctx.context) {
+            if let Some(last) = spans.last_mut() {
+                if let Some(events) = last.as_object_mut().and_then(|obj| {
+                    obj.entry("events")
+                        .or_insert_with(|| serde_json::json!([]))
+                        .as_array_mut()
+                }) {
+                    events.push(serde_json::json!({
+                        "name": "approval_decision",
+                        "module_id": ctx.module_id,
+                        "status": result.status,
+                        "approved_by": approved_by,
+                        "reason": reason,
+                        "approval_id": approval_id,
+                    }));
+                    crate::context_keys::TRACING_SPANS.set(&ctx.context, spans);
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Step for BuiltinApprovalGate {
     impl_step_meta!(BuiltinApprovalGate);
@@ -401,6 +447,12 @@ impl Step for BuiltinApprovalGate {
             };
             handler.request_approval(&request).await?
         };
+
+        // D10-001: emit an `approval_decision` audit/observability event before
+        // the status -> Err mapping below. Cross-SDK parity with apcore-python
+        // (`_emit_audit`) and apcore-typescript: log the decision and append an
+        // `approval_decision` event to the active tracing span when one exists.
+        Self::emit_approval_decision(ctx, &approval_result);
 
         match approval_result.status.as_str() {
             "approved" => {}
