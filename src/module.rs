@@ -351,6 +351,46 @@ pub struct ModuleExample {
     pub output: serde_json::Value,
 }
 
+/// A single validation failure in the PROTOCOL_SPEC §4.14 detail format.
+///
+/// Cross-language parity with apcore-python `SchemaValidationErrorDetail`
+/// (`schema/types.py`) and apcore-typescript `SchemaValidationErrorDetail`
+/// (`schema/types.ts`): `path` and `message` are always present; `constraint`,
+/// `expected`, and `actual` are optional and omitted from serialization when
+/// absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ValidationErrorDetail {
+    /// Dot/bracket path to the offending value (`""` / `<root>` for the root).
+    pub path: String,
+    /// Human-readable, one-line description of the failure.
+    pub message: String,
+    /// The JSON Schema keyword that was violated (e.g. `type`, `required`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+    /// The value the schema expected, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
+    /// The value actually encountered, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<serde_json::Value>,
+}
+
+impl ValidationErrorDetail {
+    /// Build a message-only detail (no path/constraint metadata). Used by
+    /// custom `ModuleValidator` implementations and other call sites that only
+    /// have a flat error string.
+    #[must_use]
+    pub fn message_only(message: impl Into<String>) -> Self {
+        Self {
+            path: String::new(),
+            message: message.into(),
+            constraint: None,
+            expected: None,
+            actual: None,
+        }
+    }
+}
+
 /// Result of validating a single aspect (used by `SchemaValidator` and `ModuleValidator`).
 ///
 /// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
@@ -360,8 +400,10 @@ pub struct ModuleExample {
 #[non_exhaustive]
 pub struct ValidationResult {
     pub valid: bool,
+    /// Per-failure detail objects (PROTOCOL_SPEC §4.14). Cross-language parity
+    /// with apcore-python/typescript `SchemaValidationResult.errors`.
     #[serde(default)]
-    pub errors: Vec<String>,
+    pub errors: Vec<ValidationErrorDetail>,
     #[serde(default)]
     pub warnings: Vec<String>,
 }

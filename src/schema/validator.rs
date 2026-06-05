@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::errors::{ErrorCode, ModuleError, SchemaValidationError};
-use crate::module::ValidationResult;
+use crate::module::{ValidationErrorDetail, ValidationResult};
 use crate::schema::hardening::{content_hash, format_warnings, FormatWarning};
 
 /// Validates JSON values against JSON Schema documents (Draft 2020-12).
@@ -29,8 +29,9 @@ pub struct SchemaValidator {
 pub struct DetailedValidationResult {
     /// `true` only if the input matches the schema.
     pub valid: bool,
-    /// One-line error messages, suitable for logging or surfacing to users.
-    pub errors: Vec<String>,
+    /// Per-failure detail objects (path/message plus optional constraint),
+    /// suitable for logging or surfacing to users.
+    pub errors: Vec<ValidationErrorDetail>,
     /// SCREAMING_SNAKE_CASE error code derived from the *first* error, mapped to
     /// apcore semantics: `SCHEMA_UNION_NO_MATCH`, `SCHEMA_UNION_AMBIGUOUS`, or
     /// `SCHEMA_VALIDATION_FAILED`. `None` when valid.
@@ -70,7 +71,9 @@ impl SchemaValidator {
             Err(message) => {
                 return DetailedValidationResult {
                     valid: false,
-                    errors: vec![format!("invalid schema: {message}")],
+                    errors: vec![ValidationErrorDetail::message_only(format!(
+                        "invalid schema: {message}"
+                    ))],
                     error_code: Some(ErrorCode::SchemaParseError),
                     warnings: Vec::new(),
                 };
@@ -89,7 +92,7 @@ impl SchemaValidator {
         }
 
         let error_code = Some(map_error_code(&raw_errors));
-        let errors = raw_errors.iter().map(format_error).collect();
+        let errors = raw_errors.iter().map(build_error_detail).collect();
         DetailedValidationResult {
             valid: false,
             errors,
@@ -130,9 +133,15 @@ impl SchemaValidator {
         let error_maps: Vec<HashMap<String, String>> = detailed
             .errors
             .iter()
-            .map(|message| {
+            .map(|detail| {
                 let mut m = HashMap::new();
-                m.insert("message".to_string(), message.clone());
+                m.insert("message".to_string(), detail.message.clone());
+                if !detail.path.is_empty() {
+                    m.insert("path".to_string(), detail.path.clone());
+                }
+                if let Some(constraint) = &detail.constraint {
+                    m.insert("constraint".to_string(), constraint.clone());
+                }
                 m
             })
             .collect();
@@ -196,13 +205,51 @@ fn map_error_code(errors: &[jsonschema::ValidationError<'_>]) -> ErrorCode {
     ErrorCode::SchemaValidationError
 }
 
+/// Build a structured [`ValidationErrorDetail`] from a single raw validator error.
+///
+/// `message` preserves the legacy substring-friendly text (see
+/// [`format_error_message`]); `path` is the dot/bracket instance path; and
+/// `constraint` is the violated JSON Schema keyword when identifiable.
+fn build_error_detail(error: &jsonschema::ValidationError<'_>) -> ValidationErrorDetail {
+    ValidationErrorDetail {
+        path: format_instance_path(error.instance_path.as_str()),
+        message: format_error_message(error),
+        constraint: constraint_name(&error.kind),
+        expected: None,
+        actual: None,
+    }
+}
+
+/// Map a raw validator error kind to the JSON Schema keyword it violated.
+fn constraint_name(kind: &ValidationErrorKind) -> Option<String> {
+    let name = match kind {
+        ValidationErrorKind::Required { .. } => "required",
+        ValidationErrorKind::AdditionalProperties { .. } => "additionalProperties",
+        ValidationErrorKind::Type { .. } => "type",
+        ValidationErrorKind::Pattern { .. } => "pattern",
+        ValidationErrorKind::Enum { .. } => "enum",
+        ValidationErrorKind::Constant { .. } => "const",
+        ValidationErrorKind::MinLength { .. } => "minLength",
+        ValidationErrorKind::MaxLength { .. } => "maxLength",
+        ValidationErrorKind::Minimum { .. } => "minimum",
+        ValidationErrorKind::Maximum { .. } => "maximum",
+        ValidationErrorKind::ExclusiveMinimum { .. } => "exclusiveMinimum",
+        ValidationErrorKind::ExclusiveMaximum { .. } => "exclusiveMaximum",
+        ValidationErrorKind::OneOfMultipleValid | ValidationErrorKind::OneOfNotValid => "oneOf",
+        ValidationErrorKind::AnyOf => "anyOf",
+        ValidationErrorKind::Not { .. } => "not",
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
 /// Render a single validator error as the legacy substring-friendly message format.
 ///
 /// The existing test suite asserts that error strings contain phrases like
 /// "expected type", "missing required field", "additional property not allowed",
 /// dot-separated paths (`address.city`), and bracketed array indices (`[1]`).
 /// We keep that contract while delegating actual checking to the jsonschema crate.
-fn format_error(error: &jsonschema::ValidationError<'_>) -> String {
+fn format_error_message(error: &jsonschema::ValidationError<'_>) -> String {
     let path = format_instance_path(error.instance_path.as_str());
     let display_path = if path.is_empty() {
         "<root>".to_string()

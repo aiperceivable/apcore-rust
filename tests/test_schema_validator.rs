@@ -23,7 +23,7 @@ fn test_schema_validator_invalid_type_string_expected() {
     let result = v.validate(&json!(42), &schema);
     assert!(!result.valid);
     assert_eq!(result.errors.len(), 1);
-    assert!(result.errors[0].contains("expected type"));
+    assert!(result.errors[0].message.contains("expected type"));
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn test_schema_validator_enum_invalid() {
     let schema = json!({ "enum": ["red", "green", "blue"] });
     let result = v.validate(&json!("yellow"), &schema);
     assert!(!result.valid);
-    assert!(result.errors[0].contains("enum"));
+    assert!(result.errors[0].message.contains("enum"));
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ fn test_schema_validator_required_field_missing() {
     });
     let result = v.validate(&json!({}), &schema);
     assert!(!result.valid);
-    assert!(result.errors[0].contains("missing required field"));
+    assert!(result.errors[0].message.contains("missing required field"));
 }
 
 #[test]
@@ -219,7 +219,7 @@ fn test_schema_validator_nested_object_invalid_type() {
     });
     let result = v.validate(&json!({ "address": { "city": 42 } }), &schema);
     assert!(!result.valid);
-    assert!(result.errors[0].contains("address.city"));
+    assert!(result.errors[0].message.contains("address.city"));
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +238,9 @@ fn test_schema_validator_additional_properties_false_rejects_extra() {
     });
     let result = v.validate(&json!({ "name": "Alice", "age": 30 }), &schema);
     assert!(!result.valid);
-    assert!(result.errors[0].contains("additional property not allowed"));
+    assert!(result.errors[0]
+        .message
+        .contains("additional property not allowed"));
 }
 
 #[test]
@@ -279,7 +281,7 @@ fn test_schema_validator_array_items_invalid_element() {
     });
     let result = v.validate(&json!(["a", 42, "c"]), &schema);
     assert!(!result.valid);
-    assert!(result.errors[0].contains("[1]"));
+    assert!(result.errors[0].message.contains("[1]"));
 }
 
 #[test]
@@ -311,7 +313,7 @@ fn test_schema_validator_pattern_no_match() {
     let schema = json!({ "type": "string", "pattern": "^[a-z]+$" });
     let result = v.validate(&json!("Hello123"), &schema);
     assert!(!result.valid);
-    assert!(result.errors[0].contains("pattern"));
+    assert!(result.errors[0].message.contains("pattern"));
 }
 
 #[test]
@@ -431,4 +433,40 @@ fn test_schema_validator_default() {
     let v = SchemaValidator::default();
     let schema = json!({ "type": "string" });
     assert!(v.validate(&json!("ok"), &schema).valid);
+}
+
+// ---------------------------------------------------------------------------
+// D10-002: structured per-failure error details (path/message/constraint),
+// cross-language parity with apcore-python/typescript SchemaValidationResult.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_validator_errors_are_structured_details() {
+    let v = SchemaValidator::new();
+    let schema = json!({
+        "type": "object",
+        "properties": { "address": { "type": "object", "properties": { "city": { "type": "integer" } } } }
+    });
+    let result = v.validate(&json!({ "address": { "city": "not-an-int" } }), &schema);
+
+    assert!(!result.valid);
+    assert_eq!(result.errors.len(), 1);
+
+    let detail = &result.errors[0];
+    // Structured shape: dedicated `path` and `message` fields (not a flat string).
+    assert_eq!(detail.path, "address.city");
+    assert!(detail.message.contains("expected type"));
+    assert_eq!(detail.constraint.as_deref(), Some("type"));
+}
+
+#[test]
+fn test_schema_validator_required_error_detail_has_constraint() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "object", "required": ["name"] });
+    let result = v.validate(&json!({}), &schema);
+
+    assert!(!result.valid);
+    let detail = &result.errors[0];
+    assert!(detail.message.contains("missing required field"));
+    assert_eq!(detail.constraint.as_deref(), Some("required"));
 }

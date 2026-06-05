@@ -113,8 +113,8 @@ pub use middleware::{
 };
 pub use module::{
     Change, ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult,
-    PreflightResult, PreviewResult, StreamingModule, ValidationResult, DEFAULT_ANNOTATIONS,
-    MODULE_PREVIEW_CHECK_NAME,
+    PreflightResult, PreviewResult, StreamingModule, ValidationErrorDetail, ValidationResult,
+    DEFAULT_ANNOTATIONS, MODULE_PREVIEW_CHECK_NAME,
 };
 pub use observability::error_history::{
     compute_fingerprint, compute_fingerprint_from_error, normalize_message, ErrorEntry,

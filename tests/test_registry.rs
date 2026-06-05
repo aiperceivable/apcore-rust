@@ -625,7 +625,9 @@ mod discoverer_tests {
             self.called.fetch_add(1, Ordering::SeqCst);
             let mut r = ValidationResult::default();
             r.valid = false;
-            r.errors = vec!["rejected by test validator".to_string()];
+            r.errors = vec![apcore::ValidationErrorDetail::message_only(
+                "rejected by test validator",
+            )];
             r
         }
     }

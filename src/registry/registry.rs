@@ -13,8 +13,20 @@ use std::sync::{
 
 use crate::errors::ModuleError;
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
-use crate::module::{Module, ModuleAnnotations, ModuleExample, ValidationResult};
+use crate::module::{
+    Module, ModuleAnnotations, ModuleExample, ValidationErrorDetail, ValidationResult,
+};
 use crate::registry::conflicts::{detect_id_conflicts, ConflictSeverity, ConflictType};
+
+/// Join the `message` field of each validation error detail into a single
+/// comma-separated string for human-readable error reporting.
+fn join_validation_messages(errors: &[ValidationErrorDetail]) -> String {
+    errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Cross-language compatible module descriptor.
 ///
@@ -996,7 +1008,7 @@ impl Registry {
                         format!(
                             "Module '{}' failed validation: {}",
                             name,
-                            result.errors.join(", ")
+                            join_validation_messages(&result.errors)
                         ),
                     ));
                 }

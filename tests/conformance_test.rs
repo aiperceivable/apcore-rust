@@ -635,7 +635,10 @@ fn conformance_schema_validation() {
         // Verify error path when expected
         if !expected_valid {
             if let Some(expected_path) = tc.get("expected_error_path").and_then(|v| v.as_str()) {
-                let has_matching = result.errors.iter().any(|e| e.contains(expected_path));
+                let has_matching = result
+                    .errors
+                    .iter()
+                    .any(|e| e.path.contains(expected_path) || e.message.contains(expected_path));
                 assert!(
                     has_matching,
                     "FAIL [{}]: expected error at {:?}, got {:?}",
