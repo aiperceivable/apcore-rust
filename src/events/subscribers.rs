@@ -288,9 +288,11 @@ pub enum A2AAuth {
 ///
 /// Delivery contract (spec docs/features/event-system.md §Event Delivery
 /// Semantics, Issue #61): `on_event` performs a **single** HTTP attempt and
-/// returns `Err(ModuleError)` on `>=400` or network errors so that the
+/// returns `Err(ModuleError)` on 5xx or network errors so that the
 /// surrounding [`EventEmitter`](super::EventEmitter) retry+DLQ policy
 /// (configured via `retry`) applies uniformly across subscriber types.
+/// 4xx responses are non-retryable client errors — they are logged at WARN
+/// and reported as `Ok` to suppress the spec retry loop.
 #[derive(Debug, Clone)]
 pub struct A2ASubscriber {
     pub id: String,
@@ -397,11 +399,18 @@ impl EventSubscriber for A2ASubscriber {
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                if (200..400).contains(&status) {
+                if (200..300).contains(&status) {
                     return Ok(());
                 }
-                // 4xx and 5xx both bubble up so EventEmitter applies the
-                // configured retry policy + DLQ on exhaustion (A-D-EVT-001).
+                if status < 500 {
+                    // 4xx is a non-retryable client error per the spec retry
+                    // table — log and report success so EventEmitter does not
+                    // retry. (A-D-EVT-001.)
+                    tracing::warn!(status, url = %self.platform_url, "A2ASubscriber: non-retryable 4xx");
+                    return Ok(());
+                }
+                // 5xx — bubble up so EventEmitter::deliver_with_dlq applies
+                // the per-subscriber retry policy + DLQ on exhaustion.
                 Err(ModuleError::new(
                     ErrorCode::GeneralInternalError,
                     format!("A2ASubscriber: HTTP {status} from {}", self.platform_url),

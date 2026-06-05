@@ -323,6 +323,52 @@ pub static FRAMEWORK_CODES: std::sync::LazyLock<HashSet<String>> = std::sync::La
         .collect()
 });
 
+/// Declarative `user_fixable` policy, keyed by error code (single source of
+/// truth; kept in lock-step with `apcore/conformance/fixtures/error_recovery_metadata.json`
+/// so the language SDKs agree).
+///
+/// - `Some(true)`  — the caller can resolve it by changing the input or
+///   configuration they sent.
+/// - `Some(false)` — governance / system / structural / transient; not
+///   resolvable by changing input.
+/// - `None`        — left for the module author to supply (business errors,
+///   e.g. `MODULE_EXECUTE_ERROR`); any code not listed here stays unset.
+///
+/// Mirrors apcore-python `_USER_FIXABLE_BY_CODE` and the resolution performed in
+/// `ModuleError.__init__`.
+///
+/// Not part of the public crate API: `pub` only so integration tests in `tests/`
+/// can assert fixture↔source parity; hidden from rustdoc. Mirrors Python's private
+/// `_USER_FIXABLE_BY_CODE` and TypeScript's `@internal` `USER_FIXABLE_BY_CODE`.
+#[doc(hidden)]
+#[must_use]
+pub fn user_fixable_for_code(code: ErrorCode) -> Option<bool> {
+    match code {
+        // Caller can fix by changing input/config:
+        ErrorCode::SchemaValidationError
+        | ErrorCode::GeneralInvalidInput
+        | ErrorCode::ModuleNotFound
+        | ErrorCode::VersionConstraintInvalid
+        | ErrorCode::BindingSchemaInferenceFailed
+        | ErrorCode::BindingSchemaModeConflict
+        | ErrorCode::BindingStrictSchemaIncompatible
+        | ErrorCode::DependencyNotFound
+        | ErrorCode::DependencyVersionMismatch => Some(true),
+        // Governance / system / structural / transient — not caller-fixable by input:
+        ErrorCode::ACLDenied
+        | ErrorCode::ApprovalDenied
+        | ErrorCode::ApprovalTimeout
+        | ErrorCode::ModuleTimeout
+        | ErrorCode::ModuleDisabled
+        | ErrorCode::CallDepthExceeded
+        | ErrorCode::CircularCall
+        | ErrorCode::CallFrequencyExceeded
+        | ErrorCode::GeneralInternalError => Some(false),
+        // Unlisted codes (e.g. MODULE_EXECUTE_ERROR) stay unset.
+        _ => None,
+    }
+}
+
 /// Structured error returned by module execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleError {
@@ -356,7 +402,11 @@ impl ModuleError {
             timestamp: Utc::now(),
             retryable: None,
             ai_guidance: None,
-            user_fixable: None,
+            // Resolve the framework-deterministic default from the error code
+            // (single source of truth: `user_fixable_for_code`). An explicit
+            // value still overrides via `with_user_fixable`. Mirrors apcore-python
+            // `ModuleError.__init__` resolving `user_fixable` from `code`.
+            user_fixable: user_fixable_for_code(code),
             suggestion: None,
         }
     }
@@ -393,6 +443,15 @@ impl ModuleError {
         self
     }
 
+    /// Explicitly set `user_fixable`, overriding the code-derived default
+    /// resolved in [`ModuleError::new`]. Mirrors apcore-python's explicit
+    /// `user_fixable=` override of `_USER_FIXABLE_BY_CODE`.
+    #[must_use]
+    pub fn with_user_fixable(mut self, user_fixable: bool) -> Self {
+        self.user_fixable = Some(user_fixable);
+        self
+    }
+
     #[must_use]
     pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
         self.suggestion = Some(suggestion.into());
@@ -403,6 +462,19 @@ impl ModuleError {
     #[must_use]
     pub fn to_dict(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    /// Builder for `GENERAL_INVALID_INPUT` carrying the default AI recovery
+    /// guidance. Mirrors apcore-python `InvalidInputError`, whose `__init__`
+    /// supplies a default `ai_guidance` (still overridable via
+    /// [`Self::with_ai_guidance`]). `user_fixable` resolves to `true` from the
+    /// code via [`user_fixable_for_code`].
+    #[must_use]
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::GeneralInvalidInput, message).with_ai_guidance(
+            "The input was malformed or missing required fields. Check the values against the \
+             module's input_schema and retry with corrected input.",
+        )
     }
 
     #[must_use]

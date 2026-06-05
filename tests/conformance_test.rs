@@ -2412,3 +2412,46 @@ async fn conformance_context_create() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Error-recovery metadata: default `user_fixable` resolved from error code.
+//
+// Mirrors apcore-python `test_error_recovery_user_fixable`: for each fixture
+// case, a default error constructed with the given code must carry the
+// expected `user_fixable`. Only `user_fixable` is asserted here — `retryable`
+// is class-based (per error type) and verified elsewhere, matching the Python
+// test's scope.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conformance_error_recovery_user_fixable() {
+    use apcore::errors::{ErrorCode, ModuleError};
+
+    let fixture = load_fixture("error_recovery_metadata");
+    for tc in fixture["test_cases"].as_array().unwrap() {
+        let id = tc["id"].as_str().unwrap();
+        let code_str = tc["code"].as_str().unwrap();
+        let expected = &tc["expected"]["user_fixable"];
+
+        // Resolve the wire code string to the typed ErrorCode via serde.
+        let code: ErrorCode = serde_json::from_value(Value::String(code_str.to_string()))
+            .unwrap_or_else(|e| panic!("FAIL [{id}]: unknown error code '{code_str}': {e}"));
+
+        let err = ModuleError::new(code, "conformance");
+
+        let expected_user_fixable = if expected.is_null() {
+            None
+        } else {
+            Some(
+                expected
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("FAIL [{id}]: user_fixable must be bool or null")),
+            )
+        };
+
+        assert_eq!(
+            err.user_fixable, expected_user_fixable,
+            "FAIL [{id}]: code '{code_str}' user_fixable mismatch"
+        );
+    }
+}

@@ -140,7 +140,12 @@ pub fn guard_call_chain_with_repeat(
             format!(
                 "Module '{module_name}' called {count} times, exceeds max repeat limit of {max_module_repeat}"
             ),
-        ));
+        )
+        .with_ai_guidance(format!(
+            "Module '{module_name}' was called {count} times in this chain (limit \
+             {max_module_repeat}), tripping the frequency guard. Reduce repeated calls or \
+             batch the work before retrying."
+        )));
     }
 
     Ok(())

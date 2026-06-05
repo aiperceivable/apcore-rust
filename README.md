@@ -26,6 +26,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 - **Async support** — Built on `tokio` for seamless async module execution
 - **Safety guards** — Call depth limits, circular call detection, frequency throttling
 - **Approval system** — Pluggable approval gate with async handlers, Phase B resume, and audit events
+- **AI error-recovery metadata** — Framework errors carry structured `retryable` / `user_fixable` / `ai_guidance` recovery hints resolved per error code, so self-healing agents get a consistent recovery contract on every surface
 - **Behavioral annotations** — Declare module traits (readonly, destructive, idempotent, cacheable, paginated, streaming) for AI-aware orchestration
 - **W3C Trace Context** — `traceparent` header injection/extraction for distributed tracing interop
 

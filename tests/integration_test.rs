@@ -90,5 +90,7 @@ fn test_module_error_creation() {
         apcore::errors::ModuleError::new(ErrorCode::GeneralInternalError, "something went wrong");
     assert_eq!(error.code, ErrorCode::GeneralInternalError);
     assert_eq!(error.retryable, None);
-    assert_eq!(error.user_fixable, None);
+    // user_fixable is resolved from the code: GENERAL_INTERNAL_ERROR is
+    // governance/system, so not caller-fixable by input.
+    assert_eq!(error.user_fixable, Some(false));
 }

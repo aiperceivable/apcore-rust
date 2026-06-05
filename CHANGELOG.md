@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.23.0] - 2026-06-05
+
+### Added
+
+- **AI error-recovery metadata is now populated at the source (#70).** Framework-deterministic errors carry a default `user_fixable` resolved from the error code via the new `user_fixable_for_code()` policy wired into `ModuleError::new`, so the recovery contract flows to every surface (MCP/CLI/A2A) from one definition. `Some(true)` for caller-fixable codes (`SCHEMA_VALIDATION_ERROR`, `GENERAL_INVALID_INPUT`, `MODULE_NOT_FOUND`, `VERSION_CONSTRAINT_INVALID`, `BINDING_SCHEMA_INFERENCE_FAILED`, `BINDING_SCHEMA_MODE_CONFLICT`, `BINDING_STRICT_SCHEMA_INCOMPATIBLE`, `DEPENDENCY_NOT_FOUND`, `DEPENDENCY_VERSION_MISMATCH`); `Some(false)` for governance/system/structural/transient codes (`ACL_DENIED`, `APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `MODULE_TIMEOUT`, `MODULE_DISABLED`, `CALL_DEPTH_EXCEEDED`, `CIRCULAR_CALL`, `CALL_FREQUENCY_EXCEEDED`, `GENERAL_INTERNAL_ERROR`); unlisted codes (e.g. `MODULE_EXECUTE_ERROR`) stay `None` for the module author to supply. The `with_user_fixable` builder overrides the policy. Default `ai_guidance` filled for the invalid-input and call-frequency errors. Serialization stays sparse (`skip_serializing_if`). Locked by the shared conformance fixture `error_recovery_metadata.json` — at parity with apcore-python / apcore-typescript 0.23.0.
+
+
+### Fixed
+
+- **`A2ASubscriber` no longer retries 4xx responses (#69).** It previously returned `Err` on any HTTP `status >= 400`, contradicting the spec (`event-system.md`: 4xx MUST NOT be retried, for both Webhook and A2A) and diverging from `WebhookSubscriber`. `A2ASubscriber::on_event` now mirrors Webhook: 5xx (and connection/timeout) → `Err` → retried → `apcore.event.delivery_failed` on exhaustion; 4xx → logged permanent, `Ok` (no retry, no DLQ). Per-SDK regression tests lock both subscribers' 4xx/5xx behavior.
+
+
 ## [0.22.0] - 2026-05-28
 
 ### Changed

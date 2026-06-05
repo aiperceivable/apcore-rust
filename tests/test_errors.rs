@@ -98,9 +98,17 @@ fn test_module_error_not_retryable_by_default() {
 }
 
 #[test]
-fn test_module_error_not_user_fixable_by_default() {
+fn test_module_error_user_fixable_resolved_from_code() {
+    // GENERAL_INTERNAL_ERROR is governance/system — not caller-fixable by input.
+    // Resolved from the code at construction (parity with apcore-python
+    // `_USER_FIXABLE_BY_CODE`).
     let err = ModuleError::new(ErrorCode::GeneralInternalError, "oops");
-    assert_eq!(err.user_fixable, None);
+    assert_eq!(err.user_fixable, Some(false));
+
+    // A code absent from the policy leaves user_fixable unset for the module
+    // author to supply.
+    let unset = ModuleError::new(ErrorCode::ModuleExecuteError, "boom");
+    assert_eq!(unset.user_fixable, None);
 }
 
 #[test]
