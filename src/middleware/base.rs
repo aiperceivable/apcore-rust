@@ -54,6 +54,14 @@ pub trait Middleware: Send + Sync + std::fmt::Debug {
     /// Name of this middleware for logging/debugging.
     fn name(&self) -> &str;
 
+    /// Optional downcast hook. Returns `Some(self as &dyn Any)` for middleware
+    /// that need to be located and reconfigured in the chain (e.g.
+    /// `TracingMiddleware`, whose exporter is set by span_exporter extensions —
+    /// sync finding A-D-18). Defaults to `None`; most middleware never need it.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Priority of this middleware (higher runs first). Default is 100.
     /// Valid range: 0-1000 (enforced by `MiddlewareManager::add`).
     /// When two middlewares have the same priority, registration order is preserved.

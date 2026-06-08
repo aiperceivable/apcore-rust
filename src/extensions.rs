@@ -307,11 +307,11 @@ impl ExtensionManager {
     /// - acl -> `executor.set_acl()`
     /// - `approval_handler` -> `executor.set_approval_handler()`
     /// - middleware -> `executor.use_middleware()` for each
-    ///
-    /// Note: `span_exporter` wiring is logged as a warning if no
-    /// `TracingMiddleware` is found; the Rust `TracingMiddleware` does not
-    /// currently expose a `set_exporter` method, so exporters must be provided
-    /// at construction time.
+    /// - `span_exporter` -> sets the exporter on the EXISTING
+    ///   `TracingMiddleware` in the executor's middleware chain (via
+    ///   `TracingMiddleware::set_exporter`); logs a warning and applies nothing
+    ///   if no `TracingMiddleware` is present. A new `TracingMiddleware` is
+    ///   never appended here.
     pub fn apply(
         &mut self,
         registry: &Registry,
@@ -349,8 +349,12 @@ impl ExtensionManager {
             }
         }
 
-        // Span exporters: wrap in TracingMiddleware and add to executor pipeline.
-        // Aligned with apcore-typescript: find existing TracingMiddleware or create one.
+        // Span exporters: locate the EXISTING TracingMiddleware in the
+        // executor's middleware chain and set its exporter. We do NOT append a
+        // new TracingMiddleware — if none exists, warn and skip. Mirrors
+        // apcore-python `_find_tracing_middleware` + `set_exporter` else warn
+        // (extensions.py:226) and apcore-typescript (extensions.ts:261). Sync
+        // finding A-D-18.
         let exporters: Vec<Box<dyn SpanExporter>> = self
             .extensions
             .get_mut("span_exporter")
@@ -376,7 +380,22 @@ impl ExtensionManager {
             } else {
                 Box::new(crate::observability::CompositeExporter::new(exporters))
             };
-            executor.use_middleware(Box::new(TracingMiddleware::new(combined)))?;
+
+            let tracing_mw = executor.find_middleware("tracing").and_then(|mw| {
+                // SAFETY of downcast: only TracingMiddleware overrides as_any to
+                // return Some(self); other middleware named "tracing" would not.
+                mw.as_any()
+                    .and_then(|any| any.downcast_ref::<TracingMiddleware>())
+                    .map(|tm| {
+                        tm.set_exporter(combined);
+                    })
+            });
+            if tracing_mw.is_none() {
+                tracing::warn!(
+                    "span_exporter extensions registered but no TracingMiddleware \
+                     found in the executor middleware chain; exporter not applied"
+                );
+            }
         }
 
         Ok(())

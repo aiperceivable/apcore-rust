@@ -321,6 +321,82 @@ fn test_apply_wires_two_span_exporters_via_composite() {
 }
 
 // ---------------------------------------------------------------------------
+// A-D-18 — span_exporter reconfigures an existing TracingMiddleware in place,
+// it must NOT append a second one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_apply_span_exporter_does_not_add_second_tracing_middleware() {
+    use apcore::observability::tracing_middleware::TracingMiddleware;
+    use apcore::observability::InMemoryExporter;
+
+    let registry = Arc::new(Registry::new());
+    let config = Arc::new(apcore::Config::default());
+    let mut executor = Executor::new(Arc::clone(&registry), config);
+
+    // Pre-register a TracingMiddleware so the chain already has one.
+    executor
+        .use_middleware(Box::new(TracingMiddleware::new(Box::new(
+            InMemoryExporter::new(),
+        ))))
+        .expect("register tracing middleware");
+    let tracing_count_before = executor
+        .middlewares()
+        .iter()
+        .filter(|n| *n == "tracing")
+        .count();
+    assert_eq!(tracing_count_before, 1);
+
+    // Apply a span_exporter extension.
+    let mut mgr = ExtensionManager::new();
+    mgr.register(
+        "span_exporter",
+        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+    )
+    .unwrap();
+    mgr.apply(&registry, &mut executor)
+        .expect("apply should succeed");
+
+    // Still exactly one TracingMiddleware — the exporter was set in place, not
+    // appended as a second middleware.
+    let tracing_count_after = executor
+        .middlewares()
+        .iter()
+        .filter(|n| *n == "tracing")
+        .count();
+    assert_eq!(
+        tracing_count_after, 1,
+        "span_exporter must reconfigure the existing TracingMiddleware, not add a second one"
+    );
+}
+
+#[test]
+fn test_apply_span_exporter_without_tracing_middleware_warns_and_adds_nothing() {
+    use apcore::observability::InMemoryExporter;
+
+    let registry = Arc::new(Registry::new());
+    let config = Arc::new(apcore::Config::default());
+    let mut executor = Executor::new(Arc::clone(&registry), config);
+
+    let mut mgr = ExtensionManager::new();
+    mgr.register(
+        "span_exporter",
+        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+    )
+    .unwrap();
+    mgr.apply(&registry, &mut executor)
+        .expect("apply should succeed even with no TracingMiddleware");
+
+    // No TracingMiddleware was present, so none should have been added.
+    let tracing_count = executor
+        .middlewares()
+        .iter()
+        .filter(|n| *n == "tracing")
+        .count();
+    assert_eq!(tracing_count, 0, "no TracingMiddleware should be appended");
+}
+
+// ---------------------------------------------------------------------------
 // Debug output
 // ---------------------------------------------------------------------------
 

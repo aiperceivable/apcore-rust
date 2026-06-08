@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -47,7 +48,12 @@ struct TraceState {
 /// deadlocks.
 #[derive(Debug)]
 pub struct TracingMiddleware {
-    exporter: Box<dyn SpanExporter>,
+    /// The active span exporter. Wrapped in a `Mutex<Arc<…>>` for interior
+    /// mutability so `set_exporter` can swap it on an already-registered
+    /// middleware (the middleware chain holds `Arc<dyn Middleware>`, which is
+    /// shared and immutable). Sync finding A-D-18: span_exporter extensions
+    /// reconfigure an existing TracingMiddleware rather than appending a new one.
+    exporter: Mutex<Arc<dyn SpanExporter>>,
     pub sampling_strategy: SamplingStrategy,
     pub sampling_rate: f64,
     /// Combined span stacks and sampling decisions, protected by a single mutex.
@@ -59,7 +65,7 @@ impl TracingMiddleware {
     #[must_use]
     pub fn new(exporter: Box<dyn SpanExporter>) -> Self {
         Self {
-            exporter,
+            exporter: Mutex::new(Arc::from(exporter)),
             sampling_strategy: SamplingStrategy::Always,
             sampling_rate: 1.0,
             state: Mutex::new(TraceState::default()),
@@ -74,11 +80,25 @@ impl TracingMiddleware {
         rate: f64,
     ) -> Self {
         Self {
-            exporter,
+            exporter: Mutex::new(Arc::from(exporter)),
             sampling_strategy: strategy,
             sampling_rate: rate.clamp(0.0, 1.0),
             state: Mutex::new(TraceState::default()),
         }
+    }
+
+    /// Replace the active span exporter. Used by the extension-application
+    /// path to reconfigure a TracingMiddleware that is already registered in
+    /// the executor's middleware chain (sync finding A-D-18). Mirrors
+    /// apcore-python `TracingMiddleware.set_exporter`.
+    pub fn set_exporter(&self, exporter: Box<dyn SpanExporter>) {
+        *self.exporter.lock() = Arc::from(exporter);
+    }
+
+    /// Snapshot the current exporter handle (clones the `Arc`, not the
+    /// exporter) so the export call can `.await` without holding the lock.
+    fn exporter_handle(&self) -> Arc<dyn SpanExporter> {
+        Arc::clone(&self.exporter.lock())
     }
 
     /// Determine if this request should be sampled, inheriting from parent if available.
@@ -120,6 +140,10 @@ impl TracingMiddleware {
 impl Middleware for TracingMiddleware {
     fn name(&self) -> &'static str {
         "tracing"
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     async fn before(
@@ -190,7 +214,8 @@ impl Middleware for TracingMiddleware {
             span.set_attribute("success".to_string(), serde_json::json!(true));
 
             if self.should_sample(ctx) {
-                let _ = self.exporter.export(&span).await;
+                let exporter = self.exporter_handle();
+                let _ = exporter.export(&span).await;
             }
         }
 
@@ -258,7 +283,8 @@ impl Middleware for TracingMiddleware {
             };
 
             if should_export {
-                let _ = self.exporter.export(&span).await;
+                let exporter = self.exporter_handle();
+                let _ = exporter.export(&span).await;
             }
         }
 

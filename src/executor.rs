@@ -533,6 +533,13 @@ impl Executor {
         self.middleware_manager.snapshot()
     }
 
+    /// Find the first middleware in the chain whose name matches, as a shared
+    /// handle. Used by extension application to locate an existing
+    /// `TracingMiddleware` and reconfigure it (sync finding A-D-18).
+    pub fn find_middleware(&self, name: &str) -> Option<Arc<dyn Middleware>> {
+        self.middleware_manager.find_by_name(name)
+    }
+
     /// Set the ACL for access control.
     pub fn set_acl(&mut self, acl: ACL) {
         self.acl = Some(Arc::new(acl));

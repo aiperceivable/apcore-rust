@@ -181,6 +181,15 @@ impl MiddlewareManager {
         mws.iter().map(|m| m.name().to_string()).collect()
     }
 
+    /// Return the first middleware in the chain whose `name()` matches, as a
+    /// shared handle. Used by the extension-application path to locate an
+    /// existing `TracingMiddleware` and reconfigure its exporter in place
+    /// rather than appending a duplicate (sync finding A-D-18).
+    pub fn find_by_name(&self, name: &str) -> Option<Arc<dyn Middleware>> {
+        let mws = self.middlewares.lock();
+        mws.iter().find(|m| m.name() == name).map(Arc::clone)
+    }
+
     /// Run the before hooks for all middlewares in order.
     ///
     /// Returns the (possibly modified) input and the list of indices of
