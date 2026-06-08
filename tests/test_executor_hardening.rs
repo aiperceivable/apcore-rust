@@ -152,6 +152,52 @@ impl Middleware for SwallowingMiddleware {
     }
 }
 
+/// Middleware whose `before()` always fails. Used to drive the
+/// MiddlewareChainError path in BuiltinMiddlewareBefore (A-D-01).
+#[derive(Debug)]
+struct FailingBeforeMiddleware;
+
+#[async_trait]
+impl Middleware for FailingBeforeMiddleware {
+    fn name(&self) -> &'static str {
+        "failing-before"
+    }
+    fn priority(&self) -> u16 {
+        // Lower priority runs after the recovering middleware so the
+        // recovering middleware is in `executed` when this one fails.
+        10
+    }
+    async fn before(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Err(ModuleError::new(
+            ErrorCode::GeneralInternalError,
+            "before failed",
+        ))
+    }
+    async fn after(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        _output: Value,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(None)
+    }
+    async fn on_error(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        _error: &ModuleError,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(None)
+    }
+}
+
 fn ctx_with_token(token: CancelToken) -> Context<Value> {
     // Per Issue #66, `cancel_token` is a first-class `Context::create`
     // parameter; no post-hoc assignment is needed.
@@ -231,6 +277,94 @@ async fn per_module_timeout_overrides_default() {
         elapsed < Duration::from_millis(180),
         "per-module timeout (50 ms) was not honored; took {elapsed:?}"
     );
+}
+
+/// Register `module` with a raw JSON `resources.timeout` value (allows
+/// injecting an invalid negative timeout for A-D-W1).
+fn register_with_raw_timeout(
+    registry: &Registry,
+    module_id: &str,
+    module: Box<dyn Module>,
+    timeout: &Value,
+) {
+    let mut annotations = ModuleAnnotations::default();
+    annotations
+        .extra
+        .insert("resources".to_string(), json!({ "timeout": timeout }));
+    let descriptor = ModuleDescriptor {
+        module_id: module_id.to_string(),
+        name: None,
+        description: module.description().to_string(),
+        documentation: None,
+        input_schema: module.input_schema(),
+        output_schema: module.output_schema(),
+        version: "1.0.0".to_string(),
+        tags: vec![],
+        annotations: Some(annotations),
+        examples: vec![],
+        metadata: HashMap::new(),
+        display: None,
+        sunset_date: None,
+        dependencies: vec![],
+        enabled: true,
+    };
+    registry.register(module_id, module, descriptor).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// A-D-01: a recovery middleware registered before a failing before-middleware
+// MUST have its on_error invoked. Previously BuiltinMiddlewareBefore passed an
+// empty &[] to execute_on_error, so on_error never ran on the recovery mw.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn before_middleware_error_invokes_recovery_on_error() {
+    let client = APCore::new();
+    client
+        .register("ok.module", Box::new(SleepModule { delay_ms: 1 }))
+        .unwrap();
+    // Recovering middleware has default priority 100 (runs first in `before`);
+    // the failing middleware has priority 10 (runs second, then fails).
+    client
+        .use_middleware(Box::new(RecoveringMiddleware))
+        .unwrap();
+    client
+        .use_middleware(Box::new(FailingBeforeMiddleware))
+        .unwrap();
+
+    let result = client.call("ok.module", json!({}), None, None).await;
+
+    assert!(
+        result.is_ok(),
+        "expected recovery via on_error, got {result:?}"
+    );
+    assert_eq!(result.unwrap(), json!({"recovered": true}));
+}
+
+// ---------------------------------------------------------------------------
+// A-D-W1: a negative per-module declared timeout MUST raise
+// GENERAL_INVALID_INPUT, not be silently swallowed and fall back to default.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn negative_declared_timeout_is_rejected() {
+    let client = APCore::new();
+    register_with_raw_timeout(
+        client.registry(),
+        "neg.timeout.module",
+        Box::new(SleepModule { delay_ms: 1 }),
+        &json!(-1),
+    );
+
+    let result = client
+        .call("neg.timeout.module", json!({}), None, None)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected negative timeout to be rejected, got {result:?}"
+    );
+    assert_eq!(result.unwrap_err().code, ErrorCode::GeneralInvalidInput);
 }
 
 // ---------------------------------------------------------------------------

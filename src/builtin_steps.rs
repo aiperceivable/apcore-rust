@@ -579,9 +579,28 @@ impl Step for BuiltinMiddlewareBefore {
         {
             Ok((inputs, executed)) => (inputs, executed),
             Err(e) => {
+                // Recover the list of middlewares that ran during execute_before
+                // from the MiddlewareChainError details so on_error runs over
+                // exactly those (mirrors Python builtin_steps.py:483 setting
+                // ctx.executed_middlewares = exc.executed_middlewares and TS
+                // builtin-steps.ts:442) — sync finding A-D-01. Without this the
+                // recovery middleware's on_error is skipped (empty &[]) and the
+                // executor-level on_error/RetrySignal loop is bypassed.
+                let executed: Vec<usize> = e
+                    .details
+                    .get("executed_middlewares")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                ctx.executed_middlewares.clone_from(&executed);
                 // On middleware before error, run on_error for recovery.
                 let recovery = middleware_manager
-                    .execute_on_error(&ctx.module_id, ctx.inputs.clone(), &e, &ctx.context, &[])
+                    .execute_on_error(
+                        &ctx.module_id,
+                        ctx.inputs.clone(),
+                        &e,
+                        &ctx.context,
+                        &executed,
+                    )
                     .await;
                 if let Some(recovery_value) = recovery {
                     ctx.output = Some(recovery_value);
@@ -624,14 +643,31 @@ impl Step for BuiltinExecute {
         // D-11), fall back to `config.executor.default_timeout`. Both are
         // then clamped against the remaining global deadline below.
         // Spec: docs/features/core-executor.md §Step 8 (dual-timeout model).
-        let per_module_timeout_ms: Option<u64> = ctx
+        let declared_timeout: Option<serde_json::Value> = ctx
             .registry
             .as_ref()
             .and_then(|reg| reg.get_definition(&ctx.module_id).ok().flatten())
             .and_then(|desc| desc.annotations)
             .and_then(|ann| ann.extra.get("resources").cloned())
-            .and_then(|res| res.get("timeout").cloned())
-            .and_then(|v| v.as_u64());
+            .and_then(|res| res.get("timeout").cloned());
+        // A negative declared timeout is invalid and MUST be rejected rather
+        // than silently swallowed (`as_u64()` would return None and fall back
+        // to the default). Spec Edge Cases table; peer Python builtin_steps.py:620
+        // raises InvalidInputError (sync finding A-D-W1).
+        if let Some(ref v) = declared_timeout {
+            let is_negative =
+                v.as_i64().is_some_and(|n| n < 0) || v.as_f64().is_some_and(|f| f < 0.0);
+            if is_negative {
+                return Err(ModuleError::new(
+                    ErrorCode::GeneralInvalidInput,
+                    format!(
+                        "Module '{}' declares a negative timeout ({}); timeout must be non-negative",
+                        ctx.module_id, v
+                    ),
+                ));
+            }
+        }
+        let per_module_timeout_ms: Option<u64> = declared_timeout.and_then(|v| v.as_u64());
         let mut timeout_ms = per_module_timeout_ms.unwrap_or(config.executor.default_timeout);
         if let Some(deadline) = ctx.context.global_deadline {
             let now = std::time::SystemTime::now()

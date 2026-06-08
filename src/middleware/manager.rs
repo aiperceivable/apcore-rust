@@ -224,6 +224,15 @@ impl MiddlewareManager {
                     if let Ok(inner_json) = serde_json::to_value(&e) {
                         details.insert("inner_error".to_string(), inner_json);
                     }
+                    // Carry the list of middlewares that ran (including the
+                    // failing one) so the caller can run on_error over exactly
+                    // those — mirrors Python's `MiddlewareChainError.executed_middlewares`
+                    // and TS's `MiddlewareChainError.executedMiddlewares` (sync
+                    // finding A-D-01).
+                    details.insert(
+                        "executed_middlewares".to_string(),
+                        serde_json::json!(executed),
+                    );
                     return Err(ModuleError::new(
                         ErrorCode::MiddlewareChainError,
                         e.message.clone(),
