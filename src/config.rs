@@ -524,6 +524,56 @@ impl Config {
             }
         }
 
+        // Namespace-mode validation (A12-NS, §9.14). Mirrors apcore-python
+        // `_validate_namespace_mode` (config.py:1106) and the TS equivalent
+        // (sync finding A-D-02). In namespace mode we additionally:
+        //   1. Validate each registered namespace that declares a schema
+        //      against its loaded subtree.
+        //   2. In strict mode (`_config.strict == true`) reject any top-level
+        //      namespace that is not registered (other than `apcore`/`_config`).
+        if self.mode == ConfigMode::Namespace {
+            let strict = self
+                .user_namespaces
+                .get("_config")
+                .and_then(|v| v.get("strict"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            // Snapshot the global namespace registry once so we can look up
+            // schemas without re-acquiring the lock per namespace.
+            let registry_snapshot: HashMap<String, NamespaceRegistration> =
+                global_ns_registry().read().clone();
+
+            for (key, value) in &self.user_namespaces {
+                if key == "apcore" || key == "_config" {
+                    continue;
+                }
+                // Only object-valued top-level keys are namespaces.
+                if !value.is_object() {
+                    continue;
+                }
+                match registry_snapshot.get(key) {
+                    None => {
+                        if strict {
+                            errors.push(format!("unknown namespace '{key}' in strict mode"));
+                        }
+                    }
+                    Some(reg) => {
+                        if let Some(schema) = reg.schema.as_ref() {
+                            if let Err(e) =
+                                crate::executor::validate_against_schema(value, schema, "Config")
+                            {
+                                errors.push(format!(
+                                    "namespace '{key}' failed schema validation: {}",
+                                    e.message
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1602,5 +1652,72 @@ mod tests {
         // which relies on from_defaults path. Test via from_defaults behavior:
         // Just verify the config parsed correctly.
         assert_eq!(cfg.executor.max_call_depth, 8);
+    }
+
+    // -------------------------------------------------------------------------
+    // A-D-02: namespace-mode validation (strict unknown-namespace rejection
+    // and registered-namespace schema validation).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn strict_mode_rejects_unknown_namespace() {
+        // Namespace mode (apcore key present) + _config.strict=true +
+        // an unregistered top-level namespace MUST fail with CONFIG_INVALID.
+        let json_str = r#"{
+            "apcore": {},
+            "_config": {"strict": true},
+            "totally-unregistered-ns-ad02": {"foo": "bar"}
+        }"#;
+        let cfg: Config = serde_json::from_str(json_str).expect("should parse");
+        assert_eq!(cfg.mode, ConfigMode::Namespace);
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "strict mode must reject unknown namespace, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn registered_namespace_with_schema_rejects_invalid_data() {
+        // Register a namespace with a schema requiring `count` to be an integer.
+        let ns_name = "schema-ns-ad02";
+        let reg = NamespaceRegistration {
+            name: ns_name.to_string(),
+            env_prefix: None,
+            defaults: None,
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"]
+            })),
+            env_style: EnvStyle::Auto,
+            max_depth: DEFAULT_MAX_DEPTH,
+            env_map: None,
+        };
+        // Ignore duplicate-registration error if a prior test registered it.
+        let _ = Config::register_namespace(reg);
+
+        // Invalid: `count` is a string, not an integer.
+        let json_str = r#"{
+            "apcore": {},
+            "schema-ns-ad02": {"count": "not-an-integer"}
+        }"#;
+        let cfg: Config = serde_json::from_str(json_str).expect("should parse");
+        assert_eq!(cfg.mode, ConfigMode::Namespace);
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "registered namespace with invalid data must fail, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+
+        // Sanity: valid data passes the same schema.
+        let valid_str = r#"{
+            "apcore": {},
+            "schema-ns-ad02": {"count": 5}
+        }"#;
+        let cfg_ok: Config = serde_json::from_str(valid_str).expect("should parse");
+        assert!(cfg_ok.validate().is_ok());
     }
 }
