@@ -476,7 +476,10 @@ impl Middleware for MetricsMiddleware {
                 .map_or(0.0, |s| s.elapsed().as_secs_f64())
         };
 
-        let error_code = format!("{:?}", _error.code);
+        // Use the canonical wire code (SCREAMING_SNAKE_CASE) for the metric
+        // label, not Debug (PascalCase), for cross-language parity (sync
+        // finding A-D-14).
+        let error_code = _error.code.wire_str();
         self.collector.increment_calls(module_id, "error");
         self.collector.increment_errors(module_id, &error_code);
         self.collector.observe_duration(module_id, duration_secs);
@@ -488,6 +491,45 @@ impl Middleware for MetricsMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::{Context, Identity};
+    use crate::errors::ErrorCode;
+
+    // A-D-14: the error metric label MUST be the canonical wire code
+    // (SCREAMING_SNAKE_CASE), not Debug formatting (PascalCase).
+    #[tokio::test]
+    async fn on_error_uses_canonical_wire_code_label() {
+        let collector = MetricsCollector::new();
+        let mw = MetricsMiddleware::new(collector);
+        let ctx = Context::<serde_json::Value>::new(Identity::new(
+            "@test".to_string(),
+            "test".to_string(),
+            vec![],
+            HashMap::new(),
+        ));
+        let error = ModuleError::new(ErrorCode::ModuleExecuteError, "boom");
+
+        mw.on_error("demo.module", serde_json::json!({}), &error, &ctx)
+            .await
+            .expect("on_error must not fail");
+
+        let exported = mw.collector().export_prometheus();
+        assert!(
+            exported.contains("error_code=\"MODULE_EXECUTE_ERROR\""),
+            "metric label must use canonical wire code; got:\n{exported}"
+        );
+        assert!(
+            !exported.contains("ModuleExecuteError"),
+            "metric label must NOT use Debug (PascalCase) formatting; got:\n{exported}"
+        );
+    }
+
+    #[test]
+    fn error_code_wire_str_is_screaming_snake_case() {
+        assert_eq!(
+            ErrorCode::ModuleExecuteError.wire_str(),
+            "MODULE_EXECUTE_ERROR"
+        );
+    }
 
     // -------------------------------------------------------------------------
     // p99 helper — correctness regression tests for Issue 23 refactor

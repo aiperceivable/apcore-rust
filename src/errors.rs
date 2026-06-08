@@ -315,6 +315,20 @@ impl ErrorCode {
         ErrorCode::DuplicateModuleId,
         ErrorCode::ContextBindingError,
     ];
+
+    /// Canonical wire string for this code (SCREAMING_SNAKE_CASE via serde,
+    /// e.g. `MODULE_EXECUTE_ERROR`). This is the cross-language-stable
+    /// representation used in error fingerprints and observability metric
+    /// labels — never `Debug` formatting, which yields PascalCase and breaks
+    /// parity with Python/TS (sync finding A-D-14). Falls back to `Debug` only
+    /// if serde serialization unexpectedly fails (should never occur).
+    #[must_use]
+    pub fn wire_str(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{self:?}"))
+    }
 }
 
 /// Lazily-built set of every framework error-code wire string.
