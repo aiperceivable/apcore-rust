@@ -847,15 +847,17 @@ impl Module for ToggleFeatureModule {
 
         let before_enabled = !self.toggle_state.is_disabled(&module_id);
 
-        // Flip the descriptor's `enabled` flag in the Registry first — that's
-        // the fallible operation. Only after it succeeds do we update the
-        // infallible `ToggleState`. This ordering guarantees the two stores
-        // cannot diverge on Registry rejection.
+        // Mutate ONLY the ToggleState — never the registry descriptor's
+        // `enabled` flag. A reload re-registers descriptors (resetting their
+        // `enabled` flag), so toggling the descriptor would not survive a
+        // reload, violating the spec's "toggle survives reload" guarantee.
+        // The authoritative disabled-set lives in ToggleState, which is
+        // independent of registry re-registration. Cross-language parity with
+        // apcore-python control.py and apcore-typescript toggle.ts, which
+        // mutate only the toggle store (sync finding A-D-12).
         if enabled {
-            self.registry.enable(&module_id)?;
             self.toggle_state.enable(&module_id);
         } else {
-            self.registry.disable(&module_id)?;
             self.toggle_state.disable(&module_id);
         }
 

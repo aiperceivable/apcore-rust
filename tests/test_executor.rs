@@ -310,29 +310,35 @@ async fn test_apcore_with_components() {
 
 #[tokio::test]
 async fn test_apcore_disable_enable() {
-    // Enable sys_modules.events so the control modules get registered.
+    // Enable sys_modules (opt-in; default is false per spec — sync finding
+    // A-D-11) and sys_modules.events so the control modules get registered.
     let mut config = apcore::config::Config::default();
+    config.set("sys_modules.enabled", json!(true));
     config.set("sys_modules.events.enabled", json!(true));
     let client = APCore::with_config(config);
-    client.register("math.add", Box::new(AddModule)).unwrap();
+    // Unique module id: the disabled-set is a process-global ToggleState (sync
+    // finding A-D-12), so a shared id could leak into other tests in this
+    // binary while this test transiently disables it.
+    let module_id = "math.add.toggle_test";
+    client.register(module_id, Box::new(AddModule)).unwrap();
 
     // Disable through the pipeline.
-    let result = client.disable("math.add", Some("test")).await;
+    let result = client.disable(module_id, Some("test")).await;
     assert!(result.is_ok(), "disable should succeed: {result:?}");
 
     // Next call should fail with ModuleDisabled.
     let call_err = client
-        .call("math.add", json!({"a": 1, "b": 2}), None, None)
+        .call(module_id, json!({"a": 1, "b": 2}), None, None)
         .await
         .expect_err("call on disabled module should fail");
     assert_eq!(call_err.code, ErrorCode::ModuleDisabled);
 
     // Re-enable and call should succeed again.
-    let result = client.enable("math.add", Some("test")).await;
+    let result = client.enable(module_id, Some("test")).await;
     assert!(result.is_ok(), "enable should succeed: {result:?}");
 
     let ok = client
-        .call("math.add", json!({"a": 1, "b": 2}), None, None)
+        .call(module_id, json!({"a": 1, "b": 2}), None, None)
         .await
         .expect("call should succeed after re-enable");
     assert_eq!(ok["result"], 3);
@@ -340,7 +346,9 @@ async fn test_apcore_disable_enable() {
 
 #[tokio::test]
 async fn test_apcore_disable_nonexistent_module() {
+    // System modules are opt-in (default false; sync finding A-D-11).
     let mut config = apcore::config::Config::default();
+    config.set("sys_modules.enabled", json!(true));
     config.set("sys_modules.events.enabled", json!(true));
     let client = APCore::with_config(config);
 

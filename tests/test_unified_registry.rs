@@ -44,6 +44,9 @@ impl Module for Dummy {
 
 fn enable_events_config() -> Config {
     let mut config = Config::default();
+    // System modules are opt-in (default false; sync finding A-D-11) — enable
+    // explicitly so the control modules register.
+    config.set("sys_modules.enabled", json!(true));
     config.set("sys_modules.events.enabled", json!(true));
     config
 }
@@ -55,11 +58,15 @@ fn enable_events_config() -> Config {
 
 #[tokio::test]
 async fn apcore_constructor_works_inside_tokio_runtime() {
-    let apcore = APCore::new();
+    // System modules are opt-in (default false; sync finding A-D-11) — enable
+    // them so this test can assert they register inside a tokio runtime.
+    let mut config = Config::default();
+    config.set("sys_modules.enabled", json!(true));
+    let apcore = APCore::with_config(config);
 
     let registered = apcore.list_modules(None, None);
 
-    // Health, manifest, and usage modules are always registered when
+    // Health, manifest, and usage modules are registered when
     // sys_modules.enabled=true. These used to be absent when the constructor
     // was invoked inside a tokio runtime (the pre-refactor guard bailed out
     // to avoid a blocking_lock panic).
@@ -90,15 +97,17 @@ async fn apcore_toggle_feature_is_reachable_from_executor_when_events_enabled() 
         "system.control.toggle_feature should be registered in the executor's registry; got: {registered:?}"
     );
 
-    // And calling it through the executor pipeline must succeed.
+    // And calling it through the executor pipeline must succeed. Use a unique
+    // module id so the process-global ToggleState (sync finding A-D-12) cannot
+    // collide with other tests in this binary.
     apcore
-        .register("demo.module", Box::new(Dummy))
+        .register("demo.module.toggle_reachable", Box::new(Dummy))
         .expect("register should succeed");
     let result = apcore
         .call(
             "system.control.toggle_feature",
             json!({
-                "module_id": "demo.module",
+                "module_id": "demo.module.toggle_reachable",
                 "enabled": false,
                 "reason": "test",
             }),
@@ -118,18 +127,20 @@ async fn apcore_toggle_feature_is_reachable_from_executor_when_events_enabled() 
 
 #[tokio::test]
 async fn disable_through_pipeline_is_observed_by_executor() {
+    // Unique module id avoids collisions in the process-global ToggleState.
+    let module_id = "demo.module.disable_observed";
     let apcore = APCore::with_config(enable_events_config());
     apcore
-        .register("demo.module", Box::new(Dummy))
+        .register(module_id, Box::new(Dummy))
         .expect("register should succeed");
 
     // Disable via the pipeline.
-    let res = apcore.disable("demo.module", Some("integration")).await;
+    let res = apcore.disable(module_id, Some("integration")).await;
     assert!(res.is_ok(), "disable should succeed: {res:?}");
 
     // Subsequent call must be blocked by the pipeline's module_lookup step.
     let err = apcore
-        .call("demo.module", json!({}), None, None)
+        .call(module_id, json!({}), None, None)
         .await
         .expect_err("call on disabled module must fail");
     assert_eq!(err.code, ErrorCode::ModuleDisabled);
@@ -137,22 +148,24 @@ async fn disable_through_pipeline_is_observed_by_executor() {
 
 #[tokio::test]
 async fn enable_through_pipeline_restores_execution() {
+    // Unique module id avoids collisions in the process-global ToggleState.
+    let module_id = "demo.module.enable_restores";
     let apcore = APCore::with_config(enable_events_config());
     apcore
-        .register("demo.module", Box::new(Dummy))
+        .register(module_id, Box::new(Dummy))
         .expect("register should succeed");
 
     apcore
-        .disable("demo.module", Some("first"))
+        .disable(module_id, Some("first"))
         .await
         .expect("disable should succeed");
     apcore
-        .enable("demo.module", Some("second"))
+        .enable(module_id, Some("second"))
         .await
         .expect("enable should succeed");
 
     let ok = apcore
-        .call("demo.module", json!({}), None, None)
+        .call(module_id, json!({}), None, None)
         .await
         .expect("call after re-enable should succeed");
     assert_eq!(ok["ok"], true);

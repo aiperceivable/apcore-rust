@@ -262,8 +262,17 @@ impl Step for BuiltinModuleLookup {
                 format!("Module '{}' not found in registry", ctx.module_id),
             )
         })?;
-        // Check if the module is disabled before proceeding.
-        if let Some(false) = registry.is_enabled(&ctx.module_id) {
+        // Check if the module is disabled before proceeding. Two sources:
+        //   1. The registry descriptor's `enabled` flag (direct registry-level
+        //      disable).
+        //   2. The process-global ToggleState, which is the authoritative store
+        //      written by `ToggleFeatureModule` and survives registry reloads
+        //      (sync finding A-D-12). The pipeline MUST consult it because the
+        //      toggle no longer mutates the descriptor flag. Mirrors
+        //      apcore-python BuiltinModuleLookup (builtin_steps.py:252).
+        if matches!(registry.is_enabled(&ctx.module_id), Some(false))
+            || crate::sys_modules::is_module_disabled(&ctx.module_id)
+        {
             return Err(ModuleError::new(
                 ErrorCode::ModuleDisabled,
                 format!("Module '{}' is disabled", ctx.module_id),

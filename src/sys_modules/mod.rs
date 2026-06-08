@@ -77,11 +77,27 @@ impl Default for ToggleState {
     }
 }
 
-// Global default instance.
-static GLOBAL_TOGGLE_STATE: OnceLock<ToggleState> = OnceLock::new();
+// Global default instance, shared via Arc so the execution pipeline
+// (`BuiltinModuleLookup`) and `ToggleFeatureModule` observe the SAME toggle
+// store. This is the authoritative disabled-set that survives registry
+// reloads (the registry descriptor's `enabled` flag is reset on
+// re-registration, so the pipeline must consult ToggleState — sync finding
+// A-D-12).
+static GLOBAL_TOGGLE_STATE: OnceLock<Arc<ToggleState>> = OnceLock::new();
 
-fn global_toggle_state() -> &'static ToggleState {
-    GLOBAL_TOGGLE_STATE.get_or_init(ToggleState::new)
+fn global_toggle_state() -> &'static Arc<ToggleState> {
+    GLOBAL_TOGGLE_STATE.get_or_init(|| Arc::new(ToggleState::new()))
+}
+
+/// Shared handle to the process-global [`ToggleState`].
+///
+/// The execution pipeline's module-lookup step reads this store to reject
+/// disabled modules, and [`register_sys_modules`] injects it into
+/// [`control::ToggleFeatureModule`] so toggles are immediately visible to the
+/// pipeline and survive registry reloads.
+#[must_use]
+pub fn global_toggle_state_arc() -> Arc<ToggleState> {
+    Arc::clone(global_toggle_state())
 }
 
 /// Check if a module is disabled using the default global toggle state.
@@ -399,7 +415,10 @@ pub fn register_sys_modules_with_options(
         fail_on_error,
     } = options;
 
-    let toggle_state = Arc::new(ToggleState::new());
+    // Use the process-global toggle store so toggles made via
+    // ToggleFeatureModule are observed by the execution pipeline
+    // (BuiltinModuleLookup) and survive registry reloads (sync finding A-D-12).
+    let toggle_state = global_toggle_state_arc();
 
     // Spec default is FALSE: system modules are opt-in. Mirrors apcore-python
     // registration.py:335 and apcore-typescript registration.ts:250 (sync
