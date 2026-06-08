@@ -395,6 +395,31 @@ impl ACL {
             )
         })?;
 
+        // A12-ACL: every rule MUST explicitly declare `callers` and `targets`.
+        // `#[serde(default)]` on those fields would otherwise let an omitted
+        // key load as an empty Vec, silently turning a deny rule inert. Reject
+        // a missing key here (the key may be an empty list — only OMISSION is
+        // rejected), matching apcore-python acl.py:270 and apcore-typescript
+        // acl.ts:74 which raise ACLRuleError at load (sync finding A-D-09).
+        if let Some(rules_arr) = rules_val.as_array() {
+            for (i, raw_rule) in rules_arr.iter().enumerate() {
+                let Some(obj) = raw_rule.as_object() else {
+                    return Err(ModuleError::new(
+                        ErrorCode::ACLRuleError,
+                        format!("ACL rule {i} in '{path}' must be a mapping"),
+                    ));
+                };
+                for key in ["callers", "targets"] {
+                    if !obj.contains_key(key) {
+                        return Err(ModuleError::new(
+                            ErrorCode::ACLRuleError,
+                            format!("ACL rule {i} in '{path}' missing required key '{key}'"),
+                        ));
+                    }
+                }
+            }
+        }
+
         let rules: Vec<ACLRule> = serde_json::from_value(rules_val.clone()).map_err(|e| {
             ModuleError::new(
                 ErrorCode::ACLRuleError,
