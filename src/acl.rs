@@ -115,6 +115,20 @@ impl ACL {
                 format!("Invalid default_effect '{default_effect}': must be 'allow' or 'deny'"),
             ));
         }
+        // Validate each rule's effect at load, matching apcore-python
+        // `acl.py` and apcore-typescript `acl.ts` (both raise ACLRuleError
+        // on a rule effect that is not 'allow' or 'deny').
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.effect != "allow" && rule.effect != "deny" {
+                return Err(ModuleError::new(
+                    ErrorCode::ACLRuleError,
+                    format!(
+                        "Rule {index} has invalid effect '{}', must be 'allow' or 'deny'",
+                        rule.effect
+                    ),
+                ));
+            }
+        }
         Ok(Self::new_unchecked(rules, default_effect, audit_logger))
     }
 

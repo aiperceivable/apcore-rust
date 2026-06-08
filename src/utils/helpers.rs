@@ -90,6 +90,22 @@ pub fn guard_call_chain_with_repeat(
     max_depth: u32,
     max_module_repeat: usize,
 ) -> Result<(), ModuleError> {
+    // 0. Floor validation — reject non-positive limits defensively, matching
+    // apcore-python `call_chain.py` and apcore-typescript `call-chain.ts`
+    // (both raise on max_call_depth < 1 / max_module_repeat < 1).
+    if max_depth < 1 {
+        return Err(ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            format!("max_depth must be >= 1, got {max_depth}"),
+        ));
+    }
+    if max_module_repeat < 1 {
+        return Err(ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            format!("max_module_repeat must be >= 1, got {max_module_repeat}"),
+        ));
+    }
+
     // 1. Depth check — chain length must not exceed max_depth.
     #[allow(clippy::cast_possible_truncation)]
     // call_chain length is bounded by max_depth which is u32

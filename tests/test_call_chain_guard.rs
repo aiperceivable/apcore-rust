@@ -218,10 +218,13 @@ fn guard_with_repeat_depth_check_still_applies() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn guard_empty_chain_max_depth_zero_empty_passes() {
-    // chain length 0 is not > 0, so passes
+fn guard_max_depth_zero_rejected_as_invalid_input() {
+    // max_depth < 1 is rejected as invalid input before any chain inspection,
+    // matching apcore-python and apcore-typescript. The rejection is
+    // unconditional — it fires even on an empty chain.
     let ctx = anon_ctx();
-    assert!(guard_call_chain(&ctx, "mod.a", 0).is_ok());
+    let err = guard_call_chain(&ctx, "mod.a", 0).expect_err("max_depth=0 is invalid input");
+    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
 }
 
 #[test]

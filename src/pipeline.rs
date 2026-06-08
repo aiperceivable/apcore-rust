@@ -627,6 +627,14 @@ impl ExecutionStrategy {
                 format!("Pipeline step not found: '{step_name}'"),
             )
         })?;
+        // Respect the replaceable flag, matching `replace()` and the
+        // apcore-python / apcore-typescript `configure_step` guards.
+        if !self.steps[idx].replaceable() {
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!("Step '{step_name}' is not replaceable"),
+            ));
+        }
         self.steps[idx] = new_step;
         self.rebuild_index();
         Ok(())
