@@ -217,6 +217,12 @@ fn conformance_call_chain() {
                     err_lower.contains("frequency"),
                     "FAIL [{id}]: expected frequency error, got: {err_lower}"
                 ),
+                // Non-positive limit floor (T-B-005): Rust rejects with
+                // GENERAL_INVALID_INPUT and a "must be >= 1" message.
+                "INVALID_LIMIT" => assert!(
+                    err_lower.contains(">= 1"),
+                    "FAIL [{id}]: expected invalid-limit floor error, got: {err_lower}"
+                ),
                 _ => panic!("Unknown expected_error: {expected_error}"),
             }
         } else {
