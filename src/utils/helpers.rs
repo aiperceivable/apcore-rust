@@ -110,14 +110,18 @@ pub fn guard_call_chain_with_repeat(
     #[allow(clippy::cast_possible_truncation)]
     // call_chain length is bounded by max_depth which is u32
     if ctx.call_chain.len() as u32 > max_depth {
+        let depth = ctx.call_chain.len();
+        // Structured details mirror apcore-python CallDepthExceededError
+        // (errors.py:624): {depth, max_depth, call_chain} — sync finding A-D-17.
+        let mut details = std::collections::HashMap::new();
+        details.insert("depth".to_string(), serde_json::json!(depth));
+        details.insert("max_depth".to_string(), serde_json::json!(max_depth));
+        details.insert("call_chain".to_string(), serde_json::json!(ctx.call_chain));
         return Err(ModuleError::new(
             ErrorCode::CallDepthExceeded,
-            format!(
-                "Call depth exceeded: chain length {} > max_depth {}",
-                ctx.call_chain.len(),
-                max_depth
-            ),
-        ));
+            format!("Call depth exceeded: chain length {depth} > max_depth {max_depth}"),
+        )
+        .with_details(details));
     }
 
     // 2. Circular detection: strict cycles of length >= 2.
@@ -132,13 +136,19 @@ pub fn guard_call_chain_with_repeat(
     if let Some(last_idx) = prior.iter().rposition(|n| n.as_str() == module_name) {
         let subsequence = &prior[last_idx + 1..];
         if !subsequence.is_empty() {
+            // Structured details mirror apcore-python CircularCallError
+            // (errors.py): {module_id, call_chain} — sync finding A-D-17.
+            let mut details = std::collections::HashMap::new();
+            details.insert("module_id".to_string(), serde_json::json!(module_name));
+            details.insert("call_chain".to_string(), serde_json::json!(ctx.call_chain));
             return Err(ModuleError::new(
                 ErrorCode::CircularCall,
                 format!(
                     "Circular call detected: '{}' already in call chain {:?}",
                     module_name, ctx.call_chain
                 ),
-            ));
+            )
+            .with_details(details));
         }
     }
 
@@ -151,12 +161,24 @@ pub fn guard_call_chain_with_repeat(
         .count();
 
     if count > max_module_repeat {
+        // Structured details mirror apcore-python CallFrequencyExceededError
+        // (errors.py:683): {module_id, count, max_repeat, call_chain} — sync
+        // finding A-D-17.
+        let mut details = std::collections::HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_name));
+        details.insert("count".to_string(), serde_json::json!(count));
+        details.insert(
+            "max_repeat".to_string(),
+            serde_json::json!(max_module_repeat),
+        );
+        details.insert("call_chain".to_string(), serde_json::json!(ctx.call_chain));
         return Err(ModuleError::new(
             ErrorCode::CallFrequencyExceeded,
             format!(
                 "Module '{module_name}' called {count} times, exceeds max repeat limit of {max_module_repeat}"
             ),
         )
+        .with_details(details)
         .with_ai_guidance(format!(
             "Module '{module_name}' was called {count} times in this chain (limit \
              {max_module_repeat}), tripping the frequency guard. Reduce repeated calls or \
@@ -199,27 +221,83 @@ fn to_snake_case(segment: &str) -> String {
     result.replace("__", "_")
 }
 
-/// Language-specific separators used to split local IDs into segments.
-fn separator_for_language(language: &str) -> &'static str {
-    match language {
-        "rust" => "::",
-        // Python, Go, Java, TypeScript all use "."
-        _ => ".",
-    }
+/// Supported source languages for [`normalize_to_canonical_id`], with their
+/// local-ID separators. Mirrors apcore-python `_SEPARATORS` (normalize.py:10).
+const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
+    ("python", "."),
+    ("rust", "::"),
+    ("go", "."),
+    ("java", "."),
+    ("typescript", "."),
+];
+
+/// Language-specific separator used to split local IDs into segments, or
+/// `None` if the language is not supported.
+fn separator_for_language(language: &str) -> Option<&'static str> {
+    SUPPORTED_LANGUAGES
+        .iter()
+        .find(|(lang, _)| *lang == language)
+        .map(|(_, sep)| *sep)
 }
 
 /// Normalize a local module identifier to its canonical dotted `snake_case` form.
 ///
-/// Implements Algorithm A02 from the apcore protocol spec.
-/// Splits `local_id` by the language-specific separator, converts each segment
-/// to `snake_case`, and joins with `"."`.
-pub fn normalize_to_canonical_id(local_id: &str, language: &str) -> String {
-    let separator = separator_for_language(language);
-    local_id
+/// Implements Algorithm A02 from the apcore protocol spec. Splits `local_id`
+/// by the language-specific separator, converts each segment to `snake_case`,
+/// and joins with `"."`.
+///
+/// # Errors
+///
+/// Returns `Err(ModuleError)` with `ErrorCode::GeneralInvalidInput` if:
+/// - `local_id` is empty,
+/// - `language` is not one of the supported languages (python, rust, go,
+///   java, typescript), or
+/// - the normalized result does not conform to the Canonical ID grammar
+///   (`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`).
+///
+/// Mirrors apcore-python `normalize_to_canonical_id` (normalize.py:75), which
+/// raises on each of these conditions (sync finding A-D-21).
+pub fn normalize_to_canonical_id(local_id: &str, language: &str) -> Result<String, ModuleError> {
+    if local_id.is_empty() {
+        return Err(ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            "local_id must be a non-empty string",
+        ));
+    }
+
+    let separator = separator_for_language(language).ok_or_else(|| {
+        let supported: Vec<&str> = SUPPORTED_LANGUAGES.iter().map(|(l, _)| *l).collect();
+        ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            format!(
+                "Unsupported language '{}'. Must be one of: {}",
+                language,
+                supported.join(", ")
+            ),
+        )
+    })?;
+
+    let canonical_id = local_id
         .split(separator)
         .map(to_snake_case)
         .collect::<Vec<_>>()
-        .join(".")
+        .join(".");
+
+    // Validate against the Canonical ID grammar (Algorithm A02).
+    // SAFETY: the pattern is a compile-time constant known to be a valid regex.
+    let re = regex::Regex::new(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
+        .expect("canonical ID regex is a valid compile-time pattern");
+    if !re.is_match(&canonical_id) {
+        return Err(ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            format!(
+                "Normalized ID '{canonical_id}' (from '{local_id}', language='{language}') \
+                 does not conform to Canonical ID grammar"
+            ),
+        ));
+    }
+
+    Ok(canonical_id)
 }
 
 /// Calculate the specificity of a pattern for ACL rule ordering.
@@ -381,7 +459,7 @@ mod tests {
     #[test]
     fn test_normalize_python_dotted() {
         assert_eq!(
-            normalize_to_canonical_id("MyModule.SendEmail", "python"),
+            normalize_to_canonical_id("MyModule.SendEmail", "python").unwrap(),
             "my_module.send_email"
         );
     }
@@ -389,7 +467,7 @@ mod tests {
     #[test]
     fn test_normalize_rust_double_colon() {
         assert_eq!(
-            normalize_to_canonical_id("MyModule::SendEmail", "rust"),
+            normalize_to_canonical_id("MyModule::SendEmail", "rust").unwrap(),
             "my_module.send_email"
         );
     }
@@ -397,7 +475,7 @@ mod tests {
     #[test]
     fn test_normalize_already_snake_case() {
         assert_eq!(
-            normalize_to_canonical_id("my_module.send_email", "python"),
+            normalize_to_canonical_id("my_module.send_email", "python").unwrap(),
             "my_module.send_email"
         );
     }
@@ -405,23 +483,101 @@ mod tests {
     #[test]
     fn test_normalize_acronym_handling() {
         assert_eq!(
-            normalize_to_canonical_id("HTTPClient", "python"),
+            normalize_to_canonical_id("HTTPClient", "python").unwrap(),
             "http_client"
         );
         assert_eq!(
-            normalize_to_canonical_id("HTMLParser", "python"),
+            normalize_to_canonical_id("HTMLParser", "python").unwrap(),
             "html_parser"
         );
     }
 
     #[test]
     fn test_normalize_camel_case_boundary() {
-        assert_eq!(normalize_to_canonical_id("getValue", "python"), "get_value");
+        assert_eq!(
+            normalize_to_canonical_id("getValue", "python").unwrap(),
+            "get_value"
+        );
     }
 
     #[test]
     fn test_normalize_digit_boundary() {
-        assert_eq!(normalize_to_canonical_id("log2Base", "python"), "log2_base");
+        assert_eq!(
+            normalize_to_canonical_id("log2Base", "python").unwrap(),
+            "log2_base"
+        );
+    }
+
+    // A-D-21: validation in normalize_to_canonical_id.
+    #[test]
+    fn test_normalize_empty_local_id_is_error() {
+        let err = normalize_to_canonical_id("", "python").expect_err("empty must error");
+        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    }
+
+    #[test]
+    fn test_normalize_unsupported_language_is_error() {
+        let err =
+            normalize_to_canonical_id("MyModule", "cobol").expect_err("unsupported must error");
+        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    }
+
+    #[test]
+    fn test_normalize_invalid_canonical_grammar_is_error() {
+        // A leading digit yields a normalized id that violates the grammar
+        // (`^[a-z]...`), so it must be rejected rather than silently returned.
+        let err =
+            normalize_to_canonical_id("123bad", "python").expect_err("invalid grammar must error");
+        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    }
+
+    #[test]
+    fn test_normalize_valid_returns_ok() {
+        assert_eq!(
+            normalize_to_canonical_id("MyModule.SendEmail", "python").unwrap(),
+            "my_module.send_email"
+        );
+    }
+
+    // A-D-17: call-chain guard errors carry structured details.
+    #[test]
+    fn test_depth_guard_error_carries_structured_details() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["a".into(), "b".into(), "c".into()];
+        let err =
+            guard_call_chain_with_repeat(&ctx, "c", 2, 3).expect_err("depth guard should trip");
+        assert_eq!(err.code, ErrorCode::CallDepthExceeded);
+        assert!(
+            err.details.contains_key("max_depth"),
+            "details must contain max_depth: {:?}",
+            err.details
+        );
+        assert!(
+            err.details.contains_key("call_chain"),
+            "details must contain call_chain: {:?}",
+            err.details
+        );
+    }
+
+    #[test]
+    fn test_frequency_guard_error_carries_structured_details() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        // "x" appears 3 times; max_repeat 2 → frequency guard trips.
+        ctx.call_chain = vec!["x".into(), "x".into(), "x".into()];
+        let err = guard_call_chain_with_repeat(&ctx, "x", 10, 2)
+            .expect_err("frequency guard should trip");
+        assert_eq!(err.code, ErrorCode::CallFrequencyExceeded);
+        assert_eq!(
+            err.details.get("count").and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            err.details
+                .get("max_repeat")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert!(err.details.contains_key("call_chain"));
     }
 
     #[test]

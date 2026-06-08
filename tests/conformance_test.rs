@@ -116,7 +116,8 @@ fn conformance_normalize_id() {
         let language = tc["language"].as_str().unwrap();
         let expected = tc["expected"].as_str().unwrap();
 
-        let result = normalize_to_canonical_id(local_id, language);
+        let result = normalize_to_canonical_id(local_id, language)
+            .unwrap_or_else(|e| panic!("FAIL [{id}]: normalize errored: {}", e.message));
         assert_eq!(
             result, expected,
             "FAIL [{id}]: normalize({local_id:?}, {language:?}) = {result:?}, expected {expected:?}"
