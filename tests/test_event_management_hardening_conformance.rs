@@ -401,7 +401,7 @@ async fn conformance_circuit_open_after_threshold() {
             id: "webhook-x".into(),
             calls: calls.clone(),
         }),
-        Some(sink.clone()),
+        sink.clone(),
     )
     .with_timeout_ms(timeout_ms)
     .with_open_threshold(open_threshold)
@@ -448,7 +448,7 @@ async fn conformance_circuit_discards_in_open_state() {
             id: "webhook-x".into(),
             calls: calls.clone(),
         }),
-        Some(sink.clone()),
+        sink.clone(),
     )
     // Long recovery window so the wrapper stays in OPEN for the duration of the test.
     .with_recovery_window_ms(60_000_000);
@@ -501,7 +501,7 @@ async fn conformance_circuit_half_open_after_window() {
             id: "webhook-x".into(),
             calls: calls.clone(),
         }),
-        None,
+        Arc::new(CapturingSink::default()),
     )
     .with_recovery_window_ms(recovery_window_ms)
     .with_clock(move || frozen_now);
@@ -531,7 +531,7 @@ async fn conformance_circuit_closes_on_success() {
             id: "webhook-x".into(),
             calls: calls.clone(),
         }),
-        Some(sink.clone()),
+        sink.clone(),
     )
     .with_subscriber_type_name("webhook");
     wrapper.force_state(CircuitState::HalfOpen);

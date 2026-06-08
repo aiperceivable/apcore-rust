@@ -48,13 +48,26 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use apcore::errors::{ErrorCode, ModuleError};
-use apcore::events::circuit_breaker::{CircuitBreakerWrapper, CircuitState};
+use apcore::events::circuit_breaker::{CircuitBreakerWrapper, CircuitEventSink, CircuitState};
 use apcore::events::emitter::{ApCoreEvent, EventEmitter};
 use apcore::events::subscribers::EventSubscriber;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// No-op circuit-event sink for tests that only assert on circuit state, not
+/// on emitted lifecycle events. The sink is mandatory (sync finding A-D-07).
+#[derive(Debug, Default)]
+struct NoopSink;
+
+impl CircuitEventSink for NoopSink {
+    fn emit_circuit_event(&self, _event: ApCoreEvent) {}
+}
+
+fn noop_sink() -> Arc<dyn CircuitEventSink> {
+    Arc::new(NoopSink)
+}
 
 /// Build a canonical test event.
 fn make_event() -> ApCoreEvent {
@@ -607,8 +620,9 @@ fn circuit_on_failure_input_subscriber_id_required() {
 async fn circuit_on_failure_error_none_raised() {
     // The circuit breaker MUST NOT error on a delivery failure; it records
     // state. Observed via the public on_event driver wrapping a failing sub.
-    let wrapper = CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), None)
-        .with_open_threshold(5);
+    let wrapper =
+        CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), noop_sink())
+            .with_open_threshold(5);
     // Must not error even though the wrapped subscriber returns Err.
     wrapper
         .on_event(&make_event())
@@ -622,8 +636,9 @@ async fn circuit_on_failure_error_none_raised() {
 async fn circuit_on_failure_returns_circuit_state() {
     // Failure handling drives the CLOSED->OPEN transition. After open_threshold
     // consecutive failures the observable state is OPEN (a CircuitState).
-    let wrapper = CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), None)
-        .with_open_threshold(3);
+    let wrapper =
+        CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), noop_sink())
+            .with_open_threshold(3);
     for _ in 0..3 {
         wrapper.on_event(&make_event()).await.unwrap();
     }
@@ -637,8 +652,9 @@ async fn circuit_on_failure_property_async() {
     // observable counter mutation happens within the synchronous part of the
     // on_event driver. Assert the counter advances synchronously per delivery
     // (the breaker's own bookkeeping is not an async value).
-    let wrapper = CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), None)
-        .with_open_threshold(2);
+    let wrapper =
+        CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), noop_sink())
+            .with_open_threshold(2);
     let before = wrapper.consecutive_failures();
     wrapper.on_event(&make_event()).await.unwrap();
     // consecutive_failures() is a plain (non-async) accessor returning u32.
@@ -652,7 +668,7 @@ async fn circuit_on_failure_property_thread_safe() {
     // >=8 concurrent failure events must update the shared counter without
     // loss; the lock-protected state stays consistent (OPEN after threshold).
     let wrapper = Arc::new(
-        CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), None)
+        CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), noop_sink())
             .with_open_threshold(8),
     );
     let mut handles = Vec::new();
@@ -674,8 +690,9 @@ async fn circuit_on_failure_property_thread_safe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn circuit_on_failure_property_pure() {
     // Failure handling mutates circuit state (consecutive_failures increments).
-    let wrapper = CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), None)
-        .with_open_threshold(5);
+    let wrapper =
+        CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), noop_sink())
+            .with_open_threshold(5);
     let before = wrapper.consecutive_failures();
     wrapper.on_event(&make_event()).await.unwrap();
     let after = wrapper.consecutive_failures();
@@ -686,8 +703,9 @@ async fn circuit_on_failure_property_pure() {
 #[tokio::test(flavor = "multi_thread")]
 async fn circuit_on_failure_property_idempotent() {
     // Repeated failures are NOT idempotent: each increments the counter.
-    let wrapper = CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), None)
-        .with_open_threshold(10);
+    let wrapper =
+        CircuitBreakerWrapper::new(Box::new(FailingSubscriber::new("webhook-x")), noop_sink())
+            .with_open_threshold(10);
     wrapper.on_event(&make_event()).await.unwrap();
     let first = wrapper.consecutive_failures();
     wrapper.on_event(&make_event()).await.unwrap();
