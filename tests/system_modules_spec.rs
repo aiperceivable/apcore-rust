@@ -817,6 +817,28 @@ fn register_sys_modules_side_effect_disabled_returns_empty() {
     assert!(ctx.registered_modules.is_empty());
 }
 
+// A-D-11: when `sys_modules.enabled` is OMITTED from config, the default is
+// FALSE (opt-in), so zero system modules are registered. Previously the Rust
+// fallback defaulted to true, diverging from Python/TS.
+#[test]
+fn register_sys_modules_defaults_disabled_when_key_absent() {
+    let registry = make_registry();
+    // Config::default() does not set sys_modules.enabled in its data tree, so
+    // `config.get("sys_modules.enabled")` returns None and the fallback applies.
+    let config = Config::default();
+    assert!(
+        config.get("sys_modules.enabled").is_none(),
+        "precondition: key must be absent for this test"
+    );
+    let executor = Executor::new(Arc::clone(&registry), Config::default());
+    let ctx =
+        register_sys_modules(Arc::clone(&registry), &executor, &config, None).expect("Ok expected");
+    assert!(
+        ctx.registered_modules.is_empty(),
+        "absent sys_modules.enabled must default to disabled (zero modules)"
+    );
+}
+
 // clause: system_modules.register_sys_modules.return.context_components
 // DIVERGENCE: Rust returns a typed `SysModulesContext` struct (not a dict). The
 // Python keys map to struct fields: error_history, usage_collector, emitter,

@@ -401,10 +401,14 @@ pub fn register_sys_modules_with_options(
 
     let toggle_state = Arc::new(ToggleState::new());
 
+    // Spec default is FALSE: system modules are opt-in. Mirrors apcore-python
+    // registration.py:335 and apcore-typescript registration.ts:250 (sync
+    // finding A-D-11). Previously defaulted to true, registering system
+    // modules even when the config omitted `sys_modules.enabled`.
     let enabled = config
         .get("sys_modules.enabled")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     if !enabled {
         return Ok(SysModulesContext {
             registered_modules: HashMap::new(),
