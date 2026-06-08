@@ -20,9 +20,9 @@
 // Cross-language API notes (Rust surface vs. Python canonical):
 //   - Python `register()` returns None; Rust `register_module()` returns
 //     `Result<(), ModuleError>` (success == `Ok(())`).
-//   - Python rejects invalid IDs with code INVALID_MODULE_ID; Rust emits
-//     GENERAL_INVALID_INPUT (validate_module_id, registry.rs:300). Asserted as
-//     the ACTUAL Rust code per the contract-test rules.
+//   - Python rejects invalid IDs with code INVALID_MODULE_ID; Rust now emits
+//     INVALID_MODULE_ID too (validate_module_id, registry.rs). Cross-language
+//     parity per error-system.md §560 (normative MUST).
 //   - Python `get()`/`get_definition()` raise on empty id; Rust returns
 //     `Err(ModuleError { code: ModuleNotFound })`.
 //   - Python `list(tags, prefix)`; Rust `list(tags, prefix, visibility)`.
@@ -216,9 +216,9 @@ fn register_input_module_id_empty_rejected() {
     let reg = Registry::new();
     let err =
         register_spec(&reg, "", SpecModule::new()).expect_err("empty module_id must be rejected");
-    // Rust emits GENERAL_INVALID_INPUT (Python: INVALID_MODULE_ID).
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-    assert_eq!(code_str(&err), "GENERAL_INVALID_INPUT");
+    // Rust emits INVALID_MODULE_ID (cross-language parity with Python/TS).
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
+    assert_eq!(code_str(&err), "INVALID_MODULE_ID");
 }
 
 // clause: registry_system.register.input.module_id.malformed
@@ -229,8 +229,8 @@ fn register_input_module_id_malformed_rejected() {
     assert!(!module_id_pattern().is_match("Bad-ID"));
     let err = register_spec(&reg, "Bad-ID", SpecModule::new())
         .expect_err("malformed module_id must be rejected");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-    assert_eq!(code_str(&err), "GENERAL_INVALID_INPUT");
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
+    assert_eq!(code_str(&err), "INVALID_MODULE_ID");
 }
 
 // clause: registry_system.register.input.module_id.reserved
@@ -240,8 +240,8 @@ fn register_input_module_id_reserved_rejected() {
     // `system.*` is reserved; only register_internal() may use it.
     let err = register_spec(&reg, "system.thing", SpecModule::new())
         .expect_err("reserved-word module_id must be rejected");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-    assert_eq!(code_str(&err), "GENERAL_INVALID_INPUT");
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
+    assert_eq!(code_str(&err), "INVALID_MODULE_ID");
 }
 
 // clause: registry_system.register.error.INVALID_MODULE_ID
@@ -251,8 +251,8 @@ fn register_error_invalid_module_id() {
     // Must start with a lowercase letter.
     let err = register_spec(&reg, "9bad", SpecModule::new())
         .expect_err("id not starting with a letter must be rejected");
-    // Cross-language: Python INVALID_MODULE_ID; Rust GENERAL_INVALID_INPUT.
-    assert_eq!(code_str(&err), "GENERAL_INVALID_INPUT");
+    // Cross-language: Python/TS and Rust all emit INVALID_MODULE_ID.
+    assert_eq!(code_str(&err), "INVALID_MODULE_ID");
 }
 
 // clause: registry_system.register.error.DUPLICATE_MODULE_ID
@@ -373,7 +373,7 @@ fn register_side_effect_1_validate_before_mutation() {
     // An invalid id must leave the store untouched.
     let reg = Registry::new();
     let err = register_spec(&reg, "Bad-ID", SpecModule::new()).expect_err("invalid id must error");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
     assert_eq!(reg.list(None, None, None), Vec::<String>::new());
     assert_eq!(reg.count(), 0);
 }

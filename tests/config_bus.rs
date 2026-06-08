@@ -226,15 +226,15 @@ fn test_namespace_method_returns_subtree() {
         serde_json::json!({"color": "blue", "size": 42}),
     );
 
-    let ns = config.namespace("widget").unwrap();
+    let ns = config.namespace("widget");
     assert_eq!(ns["color"], serde_json::json!("blue"));
     assert_eq!(ns["size"], serde_json::json!(42));
 }
 
 #[test]
-fn test_namespace_method_returns_none_for_unknown() {
+fn test_namespace_method_returns_empty_for_unknown() {
     let config = Config::from_defaults();
-    assert!(config.namespace("nonexistent_ns_xyz").is_none());
+    assert!(config.namespace("nonexistent_ns_xyz").is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +257,7 @@ fn test_mount_dict_merges_into_namespace() {
         )
         .unwrap();
 
-    let ns = config.namespace("plugins").unwrap();
+    let ns = config.namespace("plugins");
     assert_eq!(ns["existing_key"], serde_json::json!(true));
     assert_eq!(ns["new_key"], serde_json::json!("hello"));
 }
@@ -711,7 +711,7 @@ fn test_mount_deep_merges_nested_objects() {
         .insert("db".to_string(), serde_json::json!({"port": 5432}));
     cfg.mount("db", MountSource::Dict(serde_json::json!({"host": "a"})))
         .unwrap();
-    let db = cfg.namespace("db").unwrap();
+    let db = cfg.namespace("db");
     assert_eq!(db["host"], "a");
     assert_eq!(
         db["port"], 5432,
@@ -735,7 +735,7 @@ fn test_mount_deep_merges_recursively_under_nested_keys() {
         })),
     )
     .unwrap();
-    let auth = cfg.namespace("services").unwrap()["auth"].clone();
+    let auth = cfg.namespace("services")["auth"].clone();
     assert_eq!(auth["host"], "auth.local", "peer key preserved at depth 2");
     assert_eq!(auth["port"], 8080);
     assert_eq!(auth["tls"], true);

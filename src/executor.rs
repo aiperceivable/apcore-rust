@@ -575,7 +575,7 @@ impl Executor {
     fn validate_module_id(module_id: &str) -> Result<(), ModuleError> {
         if module_id.is_empty() || !module_id_pattern().is_match(module_id) {
             return Err(ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
+                ErrorCode::InvalidModuleId,
                 format!(
                     "Invalid module ID: '{}'. Must match pattern: {}",
                     module_id,

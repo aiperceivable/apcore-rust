@@ -136,15 +136,39 @@ impl Module for UpdateConfigModule {
             .with_details([("key".to_string(), json!(key))].into_iter().collect()));
         }
 
+        // Ordered side-effects (system-modules.md §311-348):
+        //   1. read current value (old_value)
+        //   2. set key=value
+        //   3. validate the registered constraint for key (if any); on failure
+        //      roll back to old_value and raise ConfigError.
         let old_value = {
-            let cfg = self.config.lock().await;
-            cfg.get(&key)
-        };
-
-        {
             let mut cfg = self.config.lock().await;
+            let old_value = cfg.get(&key);
             cfg.set(&key, value.clone());
-        }
+
+            if let Some(Err(reason)) = Config::validate_key_constraint(&key, &value) {
+                // Roll back the in-memory mutation before surfacing the error so
+                // the runtime config is never left in a constraint-violating
+                // state. Mirrors apcore-python `_validate_post_set`.
+                match &old_value {
+                    Some(prev) => cfg.set(&key, prev.clone()),
+                    // No prior value: restore to JSON null so the bad write does
+                    // not linger. Python's `Config.set(key, None)` is equivalent.
+                    None => cfg.set(&key, serde_json::Value::Null),
+                }
+                drop(cfg);
+                // ConfigError maps to CONFIG_INVALID (apcore-python `ConfigError`).
+                let mut details = std::collections::HashMap::new();
+                details.insert("key".to_string(), json!(key));
+                details.insert("value".to_string(), value.clone());
+                return Err(ModuleError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("Invalid value for '{key}': {reason} (got {value})"),
+                )
+                .with_details(details));
+            }
+            old_value
+        };
 
         // Persist *after* the in-memory mutation succeeded so a write failure
         // cannot poison the runtime state. Errors are logged and not

@@ -301,7 +301,7 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
     // 1. empty check
     if name.is_empty() {
         return Err(ModuleError::new(
-            crate::errors::ErrorCode::GeneralInvalidInput,
+            crate::errors::ErrorCode::InvalidModuleId,
             "module_id must be a non-empty string".to_string(),
         ));
     }
@@ -309,7 +309,7 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
     // 2. EBNF pattern check
     if !module_id_pattern().is_match(name) {
         return Err(ModuleError::new(
-            crate::errors::ErrorCode::GeneralInvalidInput,
+            crate::errors::ErrorCode::InvalidModuleId,
             format!(
                 "Invalid module ID: '{name}'. Must match pattern: ^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$ (lowercase, digits, underscores, dots only; no hyphens)"
             ),
@@ -319,7 +319,7 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
     // 3. length check
     if name.len() > MAX_MODULE_ID_LENGTH {
         return Err(ModuleError::new(
-            crate::errors::ErrorCode::GeneralInvalidInput,
+            crate::errors::ErrorCode::InvalidModuleId,
             format!(
                 "Module ID exceeds maximum length of {}: {}",
                 MAX_MODULE_ID_LENGTH,
@@ -334,7 +334,7 @@ fn validate_module_id(name: &str, allow_reserved: bool) -> Result<(), ModuleErro
         let first_segment = name.split('.').next().unwrap();
         if RESERVED_WORDS.contains(&first_segment) {
             return Err(ModuleError::new(
-                crate::errors::ErrorCode::GeneralInvalidInput,
+                crate::errors::ErrorCode::InvalidModuleId,
                 format!("Module ID contains reserved word: '{first_segment}'"),
             ));
         }

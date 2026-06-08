@@ -150,15 +150,15 @@ fn strategy_with(names: &[&str]) -> ExecutionStrategy {
 #[tokio::test]
 async fn call_input_module_id_empty() {
     // Empty module_id fails entry-guard validation BEFORE the pipeline runs.
-    // Rust surfaces the entry-guard rejection as GENERAL_INVALID_INPUT
-    // (cross-language note: Python/TS use INVALID_MODULE_ID).
+    // Rust surfaces the entry-guard rejection as INVALID_MODULE_ID
+    // (cross-language: Python/TS also use INVALID_MODULE_ID).
     let ex = make_executor("test.echo");
     let err = ex
         .call("", json!({ "name": "x" }), None, None)
         .await
         .expect_err("empty module_id must error");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-    assert_eq!(code_str(&err), "GENERAL_INVALID_INPUT");
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
+    assert_eq!(code_str(&err), "INVALID_MODULE_ID");
 }
 
 // clause: core_executor.call.input.module_id.malformed
@@ -170,22 +170,21 @@ async fn call_input_module_id_malformed() {
         .call("not a valid id!!", json!({ "name": "x" }), None, None)
         .await
         .expect_err("malformed module_id must error");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
-    assert_eq!(code_str(&err), "GENERAL_INVALID_INPUT");
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
+    assert_eq!(code_str(&err), "INVALID_MODULE_ID");
 }
 
 // clause: core_executor.call.error.INVALID_MODULE_ID
 #[tokio::test]
 async fn call_error_invalid_module_id() {
     // Errors: entry-guard rejection of an invalid module_id. Rust code is
-    // GENERAL_INVALID_INPUT (Python/TS: INVALID_MODULE_ID) — assert the real
-    // Rust code exactly.
+    // INVALID_MODULE_ID (cross-language: Python/TS also use INVALID_MODULE_ID).
     let ex = make_executor("test.echo");
     let err = ex
         .call("   ", json!({}), None, None)
         .await
         .expect_err("blank module_id must error");
-    assert_eq!(code_str(&err), "GENERAL_INVALID_INPUT");
+    assert_eq!(code_str(&err), "INVALID_MODULE_ID");
 }
 
 // clause: core_executor.call.error.MODULE_NOT_FOUND
@@ -235,7 +234,7 @@ async fn call_side_effect_1_validate_module_id() {
         .await
         .expect_err("entry-guard must fire first");
     assert_ne!(err.code, ErrorCode::ModuleNotFound);
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
 }
 
 // clause: core_executor.call.side_effect.2.run_pipeline

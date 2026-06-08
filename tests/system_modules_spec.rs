@@ -13,9 +13,10 @@
 //! Notable Rust/Python divergences (handled, not faked):
 //!   * `update_config.execute` is `async` in Rust (Module trait), so the Python
 //!     `*.property.async_false` clauses invert — Rust asserts the call resolves.
-//!   * Rust `Config::set` is infallible and performs no constraint validation or
-//!     rollback, so `update_config.error.config_constraint` /
-//!     `side_effect.rollback_on_constraint` have no Rust execution path (ignored).
+//!   * `update_config.execute` validates the per-key constraint after setting
+//!     (Config::validate_key_constraint) and rolls back to old_value on
+//!     violation, raising ConfigError (CONFIG_INVALID) — matching Python's
+//!     `_validate_post_set` (system-modules.md §311-348).
 //!   * `check_module_disabled` / `is_module_disabled` are single-arg free functions
 //!     reading a process-global toggle state; the spec's `registry` parameter does
 //!     not exist (ignored, matching the Python skip).
@@ -186,34 +187,42 @@ async fn update_config_error_config_key_restricted() {
 }
 
 // clause: system_modules.update_config.error.config_constraint
-// DIVERGENCE: Rust `Config::set` is infallible and performs no constraint
-// validation, so `update_config.execute` has no `ConfigError` path. The Python
-// clause has no faithful Rust counterpart.
+// A value that violates the registered constraint for the key is rejected with
+// a ConfigError (CONFIG_INVALID) per system-modules.md §311-348.
 #[tokio::test]
-#[ignore = "system_modules.update_config.error.config_constraint: Rust Config::set is infallible (no constraint validation in update_config.execute) (contract gap; src/sys_modules/control.rs:144)"]
 async fn update_config_error_config_constraint() {
-    let module = update_module();
-    let _ = module
+    let config = make_config();
+    // Seed a valid value so the rollback has a prior value to restore.
+    config.lock().await.set("acl.default_effect", json!("deny"));
+    let module = UpdateConfigModule::new(Arc::clone(&config), make_emitter());
+    let err = module
         .execute(
-            json!({"key": "executor.default_timeout", "value": -5, "reason": "r"}),
+            json!({"key": "acl.default_effect", "value": "maybe", "reason": "r"}),
             &dummy_ctx(),
         )
-        .await;
+        .await
+        .expect_err("constraint violation must be rejected");
+    assert_eq!(err.code, ErrorCode::ConfigInvalid);
+    assert_eq!(code_str(err.code), "CONFIG_INVALID");
 }
 
 // clause: system_modules.update_config.side_effect.rollback_on_constraint
-// DIVERGENCE: with no constraint validation there is nothing to roll back; the
-// Rust impl never raises `ConfigError` from `execute`.
+// On constraint failure the Config is rolled back to old_value (§311-348 step 3).
 #[tokio::test]
-#[ignore = "system_modules.update_config.side_effect.rollback_on_constraint: no constraint validation => no rollback path in Rust (contract gap; src/sys_modules/control.rs:144)"]
 async fn update_config_side_effect_rollback_on_constraint() {
-    let module = update_module();
+    let config = make_config();
+    config.lock().await.set("acl.default_effect", json!("deny"));
+    let module = UpdateConfigModule::new(Arc::clone(&config), make_emitter());
     let _ = module
         .execute(
-            json!({"key": "executor.default_timeout", "value": -5, "reason": "r"}),
+            json!({"key": "acl.default_effect", "value": "maybe", "reason": "r"}),
             &dummy_ctx(),
         )
-        .await;
+        .await
+        .expect_err("constraint violation must be rejected");
+    // The config still returns the pre-update value (rollback succeeded).
+    let value = config.lock().await.get("acl.default_effect");
+    assert_eq!(value, Some(json!("deny")));
 }
 
 // clause: system_modules.update_config.side_effect.set_and_emit_event

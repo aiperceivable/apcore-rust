@@ -65,6 +65,14 @@ pub enum ErrorCode {
     CircularCall,
     CallFrequencyExceeded,
     GeneralInvalidInput,
+    /// Raised when a `module_id` is empty or fails the canonical ID grammar
+    /// (empty / pattern / length / reserved-word checks in
+    /// `validate_module_id`). Distinct from [`Self::GeneralInvalidInput`] so
+    /// consumers can match module-id format failures separately from generic
+    /// input errors. Normative MUST per error-system.md §560 (core-executor.md
+    /// §261/267, registry-system.md §136, async-tasks.md §259). Cross-language:
+    /// Python/TS `INVALID_MODULE_ID`.
+    InvalidModuleId,
     GeneralInternalError,
     GeneralNotImplemented,
     FuncMissingTypeHint,
@@ -245,6 +253,7 @@ impl ErrorCode {
         ErrorCode::CircularCall,
         ErrorCode::CallFrequencyExceeded,
         ErrorCode::GeneralInvalidInput,
+        ErrorCode::InvalidModuleId,
         ErrorCode::GeneralInternalError,
         ErrorCode::GeneralNotImplemented,
         ErrorCode::FuncMissingTypeHint,

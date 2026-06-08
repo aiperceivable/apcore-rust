@@ -191,8 +191,8 @@ async fn async_tasks_submit_input_module_id_malformed() {
     // A malformed module_id must surface as a failed task. Rust validates
     // module_id inside the spawned executor call, so the failure is observable
     // as the task's terminal FAILED state carrying the "Invalid module ID"
-    // message. Rust uses GENERAL_INVALID_INPUT (validate_module_id is private);
-    // there is no distinct INVALID_MODULE_ID code (see DIVERGENCES).
+    // message. Rust uses INVALID_MODULE_ID (validate_module_id is private),
+    // matching Python/TS per error-system.md §560.
     let manager = make_manager();
     let task_id = manager
         .submit("Bad-ID!", json!({"x": 1}), None)

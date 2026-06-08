@@ -379,6 +379,80 @@ impl Config {
         }
     }
 
+    /// Validate a single config key against its registered constraint, if any.
+    ///
+    /// Mirrors apcore-python `_CONSTRAINTS` (config.py): a per-key
+    /// `(check_fn, err_msg)` table. Returns:
+    ///   - `None` — the key has no registered constraint (nothing to check).
+    ///   - `Some(Ok(()))` — the value satisfies the constraint.
+    ///   - `Some(Err(msg))` — the value violates the constraint; `msg` is the
+    ///     human-readable reason (e.g. `"must be 'allow' or 'deny'"`).
+    ///
+    /// Used by `system.control.update_config` to validate-after-set and roll
+    /// back on violation (system-modules.md §311-348).
+    #[must_use]
+    pub fn validate_key_constraint(
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Option<Result<(), String>> {
+        // A JSON number that is integral (no fractional part) and within i64.
+        fn is_integer(v: &serde_json::Value) -> bool {
+            v.is_i64() || v.is_u64()
+        }
+        fn as_int(v: &serde_json::Value) -> Option<i64> {
+            v.as_i64()
+                .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+        }
+        // A JSON number (int or float), excluding booleans (serde_json never
+        // treats `true`/`false` as numbers, so `as_f64` already excludes them).
+        fn as_number(v: &serde_json::Value) -> Option<f64> {
+            v.as_f64()
+        }
+
+        let (ok, err_msg): (bool, &str) = match key {
+            "acl.default_effect" => (
+                value.as_str() == Some("allow") || value.as_str() == Some("deny"),
+                "must be 'allow' or 'deny'",
+            ),
+            "observability.tracing.sampling_rate"
+            | "sys_modules.events.thresholds.error_rate"
+            | "middleware.circuit_breaker.open_threshold" => (
+                as_number(value).is_some_and(|n| (0.0..=1.0).contains(&n)),
+                "must be a number in [0.0, 1.0]",
+            ),
+            "sys_modules.events.thresholds.latency_p99_ms" => (
+                as_number(value).is_some_and(|n| n > 0.0),
+                "must be a positive number",
+            ),
+            "extensions.max_depth" => (
+                as_int(value).is_some_and(|n| (1..=16).contains(&n)),
+                "must be an integer in [1, 16]",
+            ),
+            "executor.default_timeout"
+            | "executor.global_timeout"
+            | "middleware.circuit_breaker.recovery_window_ms" => (
+                is_integer(value) && as_int(value).is_some_and(|n| n >= 0),
+                "must be a non-negative integer (milliseconds)",
+            ),
+            "executor.max_call_depth"
+            | "executor.max_module_repeat"
+            | "sys_modules.error_history.max_entries_per_module"
+            | "sys_modules.error_history.max_total_entries"
+            | "middleware.circuit_breaker.window_size"
+            | "middleware.circuit_breaker.min_samples" => (
+                is_integer(value) && as_int(value).is_some_and(|n| n >= 1),
+                "must be a positive integer",
+            ),
+            _ => return None,
+        };
+
+        if ok {
+            Some(Ok(()))
+        } else {
+            Some(Err(err_msg.to_string()))
+        }
+    }
+
     /// Validate config constraints. Returns an error listing all violations.
     ///
     /// Sync CB-001: validates the spec-mandated field set beyond
@@ -745,9 +819,36 @@ impl Config {
 
     // --- Namespace instance methods ---
 
+    /// Return the merged value map for a namespace (config-bus.md §914/917/920).
+    ///
+    /// The returned map is "merged from defaults + YAML + env overrides": the
+    /// registered namespace `defaults` form the base, overlaid (deep-merged) by
+    /// the loaded `user_namespaces` subtree (which already carries YAML + env
+    /// overrides). An unregistered namespace with no loaded values returns an
+    /// EMPTY map (never `None`). Mirrors apcore-python `Config.namespace`, which
+    /// returns `self._data.get(name, {})` over its pre-merged data tree.
     #[must_use]
-    pub fn namespace(&self, name: &str) -> Option<serde_json::Value> {
-        self.user_namespaces.get(name).cloned()
+    pub fn namespace(&self, name: &str) -> HashMap<String, serde_json::Value> {
+        // Base: registered defaults (if the namespace is registered and its
+        // defaults are an object). Non-object defaults contribute nothing.
+        let mut merged = serde_json::Value::Object(serde_json::Map::new());
+        if let Some(reg) = global_ns_registry().read().get(name) {
+            if let Some(defaults @ serde_json::Value::Object(_)) = reg.defaults.as_ref() {
+                deep_merge_value(&mut merged, defaults);
+            }
+        }
+
+        // Overlay: loaded YAML + env values for this namespace.
+        if let Some(loaded @ serde_json::Value::Object(_)) = self.user_namespaces.get(name) {
+            deep_merge_value(&mut merged, loaded);
+        }
+
+        match merged {
+            serde_json::Value::Object(map) => map.into_iter().collect(),
+            // Unreachable: `merged` is initialized as an object and
+            // `deep_merge_value` only overlays object members onto it.
+            _ => HashMap::new(),
+        }
     }
 
     pub fn mount(&mut self, namespace: &str, source: MountSource) -> Result<(), ModuleError> {

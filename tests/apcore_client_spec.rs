@@ -13,9 +13,9 @@
 // TESTS ONLY — production source is never modified here.
 //
 // Cross-language notes on Rust divergences (asserting REAL Rust behavior):
-//   * INVALID_MODULE_ID: Rust has no dedicated INVALID_MODULE_ID code. A
-//     malformed/empty module_id surfaces ErrorCode::GeneralInvalidInput
-//     (wire string GENERAL_INVALID_INPUT). Tests assert the REAL Rust code.
+//   * INVALID_MODULE_ID: a malformed/empty module_id surfaces
+//     ErrorCode::InvalidModuleId (wire string INVALID_MODULE_ID), matching
+//     Python/TS per error-system.md §560 (normative MUST).
 //   * SYS_MODULES_DISABLED: disable()/enable() without sys_modules return
 //     Err(ModuleError{code: SysModulesDisabled}) — matching the spec's Rust
 //     row. on()/off() take &mut self and lazily create a local emitter; they
@@ -190,8 +190,8 @@ async fn call_input_module_id_invalid_pattern() {
         .call("!!not a valid id!!", json!({"a": 1, "b": 2}), None, None)
         .await
         .expect_err("malformed module_id must error");
-    // Rust surfaces malformed IDs as GeneralInvalidInput (no INVALID_MODULE_ID code).
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    // Rust surfaces malformed IDs as InvalidModuleId (cross-language parity).
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
 }
 
 // clause: apcore_client.call.input.module_id.empty
@@ -202,7 +202,7 @@ async fn call_input_module_id_empty() {
         .call("", json!({"a": 1, "b": 2}), None, None)
         .await
         .expect_err("empty module_id must error");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
 }
 
 // clause: apcore_client.call.error.INVALID_MODULE_ID
@@ -213,7 +213,7 @@ async fn call_error_invalid_module_id() {
         .call("UPPER.Reserved Bad", json!({}), None, None)
         .await
         .expect_err("malformed module_id must error");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
 }
 
 // clause: apcore_client.call.error.MODULE_NOT_FOUND
@@ -557,7 +557,7 @@ async fn stream_input_module_id_invalid_pattern() {
     let mut s = client.stream("!!bad!!", json!({}), None, None);
     let item = s.next().await.expect("stream yields a terminal error item");
     let err = item.expect_err("malformed module_id must surface as Err");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
 }
 
 // clause: apcore_client.stream.error.MODULE_NOT_FOUND
@@ -577,7 +577,7 @@ async fn stream_error_invalid_module_id() {
     let mut s = client.stream("", json!({}), None, None);
     let item = s.next().await.expect("stream yields a terminal error item");
     let err = item.expect_err("empty module_id must surface as Err");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    assert_eq!(err.code, ErrorCode::InvalidModuleId);
 }
 
 // clause: apcore_client.stream.property.async
@@ -643,7 +643,7 @@ async fn validate_input_module_id_invalid_pattern() {
     );
     assert_eq!(
         module_id_check.error.as_ref().unwrap()["code"],
-        json!("GENERAL_INVALID_INPUT")
+        json!("INVALID_MODULE_ID")
     );
 }
 
@@ -666,7 +666,7 @@ async fn validate_error_invalid_module_id() {
     assert!(!module_id_check.passed);
     assert_eq!(
         module_id_check.error.as_ref().unwrap()["code"],
-        json!("GENERAL_INVALID_INPUT")
+        json!("INVALID_MODULE_ID")
     );
 }
 
@@ -947,7 +947,7 @@ async fn module_input_id_invalid_pattern() {
     assert!(
         matches!(
             err.code,
-            ErrorCode::GeneralInvalidInput | ErrorCode::InvalidSegment | ErrorCode::ModuleLoadError
+            ErrorCode::InvalidModuleId | ErrorCode::InvalidSegment | ErrorCode::ModuleLoadError
         ),
         "unexpected error code for malformed id: {:?}",
         err.code
@@ -1019,7 +1019,7 @@ async fn register_input_module_id_invalid_pattern() {
     assert!(
         matches!(
             err.code,
-            ErrorCode::GeneralInvalidInput | ErrorCode::InvalidSegment | ErrorCode::ModuleLoadError
+            ErrorCode::InvalidModuleId | ErrorCode::InvalidSegment | ErrorCode::ModuleLoadError
         ),
         "unexpected error code: {:?}",
         err.code

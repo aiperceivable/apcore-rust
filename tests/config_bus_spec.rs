@@ -407,42 +407,50 @@ async fn config_bus_get_property_thread_safe() {
 // ===========================================================================
 
 // clause: config_bus.namespace.input.name.unregistered
-// Unregistered/empty namespace never raises. Python returns an empty dict; this
-// Rust SDK returns `None` for an absent namespace (asserted as actual behavior).
+// Unregistered/empty namespace never raises and returns an EMPTY map (never
+// None) per config-bus.md §914 — cross-language parity with Python's empty dict.
 #[test]
 fn config_bus_namespace_input_name_unregistered() {
     let config = Config::from_defaults();
-    assert_eq!(config.namespace("never_registered_ns_xyz"), None);
+    assert!(config.namespace("never_registered_ns_xyz").is_empty());
 }
 
 // clause: config_bus.namespace.returns.merged
-// Returns all values under the namespace. In Rust, namespace() reads the loaded
-// user_namespaces subtree; registered defaults are not auto-merged into the
-// namespace map (cross-language note), so we assert the YAML-loaded values.
+// Returns the namespace map merged from defaults + YAML + env overrides
+// (config-bus.md §917/920): registered defaults form the base, overlaid by the
+// loaded YAML values. A default-only key (`retries`) and a YAML-only key
+// (`timeout`) both appear, and YAML overrides defaults on shared keys.
 #[test]
 fn config_bus_namespace_returns_merged() {
     let ns = uniq("nsret");
-    Config::register_namespace(reg_with_defaults(&ns, serde_json::json!({"retries": 3}))).unwrap();
+    Config::register_namespace(reg_with_defaults(
+        &ns,
+        serde_json::json!({"retries": 3, "timeout": 1}),
+    ))
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let body = format!("{NS_HEADER}{ns}:\n  timeout: 10000\n  retries: 3\n");
+    let body = format!("{NS_HEADER}{ns}:\n  timeout: 10000\n");
     let path = write_yaml(&dir, "n.yaml", &body);
     let config = Config::load(&path).unwrap();
-    let result = config.namespace(&ns).expect("namespace must be present");
+    let result = config.namespace(&ns);
+    // YAML override wins over the default for `timeout`.
     assert_eq!(result["timeout"], serde_json::json!(10000));
+    // Default-only key is merged in from the registered defaults.
     assert_eq!(result["retries"], serde_json::json!(3));
 }
 
 // clause: config_bus.namespace.property.async
-// async: false — `namespace` returns `Option<Value>` directly (no Future).
+// async: false — `namespace` returns a `HashMap` directly (no Future). An
+// unregistered namespace yields an empty map.
 #[test]
 fn config_bus_namespace_property_async() {
     let config = Config::from_defaults();
-    let result: Option<serde_json::Value> = config.namespace("anything");
-    assert_eq!(result, None);
+    let result = config.namespace("anything");
+    assert!(result.is_empty());
 }
 
 // clause: config_bus.namespace.property.pure
-// namespace() returns an owned clone: mutating the result must not affect config.
+// namespace() returns an owned map: mutating the result must not affect config.
 #[test]
 fn config_bus_namespace_property_pure() {
     let ns = uniq("nspure");
@@ -451,13 +459,13 @@ fn config_bus_namespace_property_pure() {
     let path = write_yaml(&dir, "np.yaml", &body);
     let config = Config::load(&path).unwrap();
 
-    let mut result = config.namespace(&ns).expect("namespace present");
-    result["a"] = serde_json::json!(999);
-    result["injected"] = serde_json::json!(true);
+    let mut result = config.namespace(&ns);
+    result.insert("a".to_string(), serde_json::json!(999));
+    result.insert("injected".to_string(), serde_json::json!(true));
 
-    let fresh = config.namespace(&ns).expect("namespace present");
+    let fresh = config.namespace(&ns);
     assert_eq!(fresh["a"], serde_json::json!(1));
-    assert!(fresh.get("injected").is_none());
+    assert!(!fresh.contains_key("injected"));
 }
 
 // clause: config_bus.namespace.property.thread_safe
@@ -477,7 +485,7 @@ async fn config_bus_namespace_property_thread_safe() {
         handles.push(tokio::spawn(async move { cfg.namespace(&ns) }));
     }
     for h in handles {
-        let r = h.await.expect("task must not panic").expect("ns present");
+        let r = h.await.expect("task must not panic");
         assert_eq!(r["v"], serde_json::json!(42));
     }
 }
