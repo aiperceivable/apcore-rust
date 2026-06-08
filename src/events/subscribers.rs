@@ -31,6 +31,36 @@ fn next_subscriber_id(type_name: &str) -> String {
     format!("{type_name}-{current}")
 }
 
+/// Process-wide shared `reqwest::Client` for webhook / A2A delivery.
+///
+/// Constructing a `reqwest::Client` is expensive and, on macOS, performs a
+/// blocking SystemConfiguration proxy lookup (`SCDynamicStoreCopyProxies`) on
+/// every build. Building a fresh client per `on_event` call (i.e. per retry
+/// attempt, per subscriber) serialized those blocking syscalls under load and
+/// could stall delivery for seconds. reqwest's own guidance is to build the
+/// `Client` once and reuse it: it is cheap to share (internally `Arc`-backed)
+/// and owns the connection pool. We therefore cache a single client per
+/// process and apply the per-subscriber timeout per request via
+/// `RequestBuilder::timeout`, preserving each subscriber's `timeout_ms`.
+#[cfg(feature = "events")]
+fn shared_http_client() -> Result<&'static reqwest::Client, ModuleError> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    // No global timeout here — the per-request timeout is applied by callers so
+    // a shared client honours each subscriber's own `timeout_ms`.
+    let built = reqwest::Client::builder().build().map_err(|e| {
+        ModuleError::new(
+            ErrorCode::GeneralInternalError,
+            format!("HTTP client error: {e}"),
+        )
+    })?;
+    // If another thread initialised it first, `built` is dropped and the
+    // already-stored client is returned — both are equivalent.
+    Ok(CLIENT.get_or_init(|| built))
+}
+
 /// Severity ranking used by `StdoutSubscriber` for `level_filter`.
 /// Unknown levels fall back to `info` (rank 0).
 fn severity_rank(level: &str) -> u8 {
@@ -216,17 +246,12 @@ impl EventSubscriber for WebhookSubscriber {
     #[cfg(feature = "events")]
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
         let body = serde_json::to_value(event).unwrap_or_default();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(self.timeout_ms))
-            .build()
-            .map_err(|e| {
-                ModuleError::new(
-                    ErrorCode::GeneralInternalError,
-                    format!("HTTP client error: {e}"),
-                )
-            })?;
+        let client = shared_http_client()?;
 
-        let mut req = client.post(&self.url).json(&body);
+        let mut req = client
+            .post(&self.url)
+            .timeout(std::time::Duration::from_millis(self.timeout_ms))
+            .json(&body);
         req = req.header("Content-Type", "application/json");
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
@@ -372,17 +397,12 @@ impl EventSubscriber for A2ASubscriber {
             }
         });
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(self.timeout_ms))
-            .build()
-            .map_err(|e| {
-                ModuleError::new(
-                    ErrorCode::GeneralInternalError,
-                    format!("HTTP client error: {e}"),
-                )
-            })?;
+        let client = shared_http_client()?;
 
-        let mut req = client.post(&self.platform_url).json(&payload);
+        let mut req = client
+            .post(&self.platform_url)
+            .timeout(std::time::Duration::from_millis(self.timeout_ms))
+            .json(&payload);
         req = req.header("Content-Type", "application/json");
         match &self.auth {
             Some(A2AAuth::Bearer(token)) => {
