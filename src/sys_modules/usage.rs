@@ -2,7 +2,9 @@
 // Spec reference: system.usage.summary, system.usage.module
 
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::context::Context;
@@ -10,6 +12,66 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::module::Module;
 use crate::observability::usage::UsageCollector;
 use crate::registry::registry::Registry;
+
+/// Hour-key format matching `UsageCollector` bucket hours
+/// (`YYYY-MM-DDTHH:00:00Z`).
+const HOUR_KEY_FORMAT: &str = "%Y-%m-%dT%H:00:00Z";
+
+/// Pad an hourly distribution to exactly 24 entries, zero-filling gaps.
+///
+/// Generates the 24 hourly keys covering the last 24 hours (`now-23h .. now`),
+/// merges in any actual data buckets, sorts and dedups, then keeps the latest
+/// 24. Missing hours are filled with zero counts. Spec MUST: `system.usage.module`
+/// always returns 24 hourly entries. Mirrors apcore-python
+/// `_pad_hourly_distribution` (usage.py:172) — sync finding A-D-13.
+fn pad_hourly_distribution(hourly: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let now = Utc::now();
+
+    // Map existing hour-key -> (call_count, error_count).
+    let mut existing: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
+    for h in hourly {
+        if let Some(hour) = h.get("hour").and_then(serde_json::Value::as_str) {
+            let calls = h
+                .get("call_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let errors = h
+                .get("error_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            existing.insert(hour.to_string(), (calls, errors));
+        }
+    }
+
+    // Generate the 24 hourly keys for now-23h .. now, then union with any
+    // data keys not already present, sort+dedup, and take the latest 24.
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for i in 0..24i64 {
+        let hour_dt = now - Duration::hours(23 - i);
+        keys.insert(hour_dt.format(HOUR_KEY_FORMAT).to_string());
+    }
+    for k in existing.keys() {
+        keys.insert(k.clone());
+    }
+    let latest_24: Vec<String> = {
+        let all: Vec<String> = keys.into_iter().collect();
+        let start = all.len().saturating_sub(24);
+        all[start..].to_vec()
+    };
+
+    latest_24
+        .into_iter()
+        .map(|key| {
+            let (call_count, error_count) = existing.get(&key).copied().unwrap_or((0, 0));
+            json!({
+                "hour": key,
+                "call_count": call_count,
+                "error_count": error_count,
+            })
+        })
+        .collect()
+}
 
 /// system.usage.summary — Usage overview with trend detection across all modules.
 pub struct UsageSummaryModule {
@@ -169,6 +231,10 @@ impl Module for UsageModule {
             })
             .collect();
 
+        // Spec MUST: always return exactly 24 hourly entries, zero-filling
+        // gaps (sync finding A-D-13).
+        let hourly = pad_hourly_distribution(&hourly);
+
         match stats {
             Some(s) => Ok(json!({
                 "module_id": module_id,
@@ -190,7 +256,7 @@ impl Module for UsageModule {
                 "p99_latency_ms": 0.0,
                 "trend": "inactive",
                 "callers": [],
-                "hourly_distribution": [],
+                "hourly_distribution": hourly,
             })),
         }
     }
