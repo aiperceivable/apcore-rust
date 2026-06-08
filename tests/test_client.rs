@@ -34,8 +34,11 @@ impl Module for Echo {
 
 #[tokio::test]
 async fn test_apcore_new_returns_usable_client() {
-    let apcore = APCore::new();
-    // Fresh client should expose at least the built-in sys modules.
+    // System modules are opt-in (default false; sync finding A-D-11) — enable
+    // them so the client exposes the built-in sys modules.
+    let mut config = Config::default();
+    config.set("sys_modules.enabled", json!(true));
+    let apcore = APCore::with_config(config);
     let modules = apcore.list_modules(None, None);
     assert!(!modules.is_empty());
 }
@@ -125,22 +128,26 @@ async fn test_apcore_list_modules_prefix_filter() {
 #[tokio::test]
 async fn test_apcore_disable_enable_signature_takes_reason() {
     // disable/enable route through `system.control.toggle_feature`, which is
-    // only auto-registered when sys_modules.events.enabled=true.
+    // only auto-registered when sys_modules is enabled (opt-in; default false,
+    // sync finding A-D-11) and sys_modules.events.enabled=true.
     let mut config = Config::default();
+    config.set("sys_modules.enabled", json!(true));
     config.set("sys_modules.events.enabled", json!(true));
     let apcore = APCore::with_config(config);
 
+    // Unique id: the disabled-set is a process-global ToggleState (A-D-12).
+    let module_id = "demo.toggle.signature_test";
     apcore
-        .register("demo.toggle", Box::new(Echo))
+        .register(module_id, Box::new(Echo))
         .expect("register");
 
     // None reason path — must succeed (default reason injected by client).
-    let res = apcore.disable("demo.toggle", None).await;
+    let res = apcore.disable(module_id, None).await;
     assert!(res.is_ok(), "disable(None) should succeed: {:?}", res.err());
 
     // Some reason path — must succeed and return a status payload.
     let res = apcore
-        .enable("demo.toggle", Some("operator request"))
+        .enable(module_id, Some("operator request"))
         .await
         .expect("enable should succeed");
     // Returned payload should be an object (concrete shape is set by
