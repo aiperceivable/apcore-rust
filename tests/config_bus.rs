@@ -8,6 +8,19 @@ use apcore::config::{
 use apcore::errors::ErrorCode;
 use serde::Deserialize;
 
+/// Populate the spec-mandated required fields on a `from_defaults()` config so
+/// that legacy-mode `validate()` passes. Unlike apcore-python, Rust's
+/// `from_defaults()` does not seed these top-level fields, so tests that assert
+/// a successful `validate()` must supply them (A-D-03 required-field contract).
+fn with_required_fields(cfg: &mut Config) {
+    cfg.set("version", serde_json::json!("0.23.0"));
+    cfg.set("project.name", serde_json::json!("demo"));
+    cfg.set("extensions.root", serde_json::json!("./extensions"));
+    cfg.set("schema.root", serde_json::json!("./schemas"));
+    cfg.set("acl.root", serde_json::json!("./acl"));
+    cfg.set("acl.default_effect", serde_json::json!("deny"));
+}
+
 // ---------------------------------------------------------------------------
 // Namespace registration
 // ---------------------------------------------------------------------------
@@ -661,6 +674,7 @@ fn test_validate_rejects_invalid_acl_default_effect() {
 #[test]
 fn test_validate_accepts_allow_or_deny_for_default_effect() {
     let mut cfg = Config::from_defaults();
+    with_required_fields(&mut cfg);
     cfg.set("acl.default_effect", serde_json::json!("allow"));
     cfg.validate().unwrap();
     cfg.set("acl.default_effect", serde_json::json!("deny"));
@@ -683,6 +697,7 @@ fn test_validate_rejects_sampling_rate_out_of_range() {
 #[test]
 fn test_validate_accepts_sampling_rate_in_unit_interval() {
     let mut cfg = Config::from_defaults();
+    with_required_fields(&mut cfg);
     cfg.set(
         "observability.tracing.sampling_rate",
         serde_json::json!(0.0),

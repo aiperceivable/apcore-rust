@@ -85,6 +85,16 @@ fn write_yaml(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::Pat
 /// top-level `apcore:` key) with a valid executor block so `validate()` passes.
 const NS_HEADER: &str = "apcore:\n  version: '0.15.0'\n";
 
+/// Legacy-mode preamble carrying the spec-mandated required fields (A-D-03:
+/// version, project.name, extensions.root, schema.root, acl.root,
+/// acl.default_effect) so that `validate()` passes for legacy fixtures. Prepend
+/// this to a legacy YAML body that needs to load successfully.
+const LEGACY_REQUIRED: &str = "version: '0.15.0'\n\
+project:\n  name: demo\n\
+extensions:\n  root: ./extensions\n\
+schema:\n  root: ./schemas\n\
+acl:\n  root: ./acl\n  default_effect: deny\n";
+
 /// Plugin config mirroring Python's `_PluginCfg` dataclass. `deny_unknown_fields`
 /// makes an unexpected field a hard deserialization error, mirroring the
 /// dataclass behavior the Python suite relies on for CONFIG_BIND_ERROR.
@@ -270,7 +280,7 @@ fn config_bus_load_property_idempotent() {
     let path = write_yaml(
         &dir,
         "idem.yaml",
-        "executor:\n  default_timeout: 30000\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 30000\n  global_timeout: 60000\n"),
     );
     let first = Config::load(&path).unwrap();
     let second = Config::load(&path).unwrap();
@@ -290,7 +300,7 @@ fn config_bus_load_property_pure() {
     let path = write_yaml(
         &dir,
         "fs.yaml",
-        "executor:\n  default_timeout: 12345\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 12345\n  global_timeout: 60000\n"),
     );
     let config = Config::load(&path).unwrap();
     assert_eq!(
@@ -348,7 +358,7 @@ fn config_bus_get_property_idempotent() {
     let path = write_yaml(
         &dir,
         "g.yaml",
-        "executor:\n  default_timeout: 1234\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 1234\n  global_timeout: 60000\n"),
     );
     let config = Config::load(&path).unwrap();
     let first = config.get("executor.default_timeout");
@@ -365,7 +375,7 @@ fn config_bus_get_property_pure() {
     let path = write_yaml(
         &dir,
         "p.yaml",
-        "executor:\n  default_timeout: 77\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 77\n  global_timeout: 60000\n"),
     );
     let config = Config::load(&path).unwrap();
     let snapshot = config.data();
@@ -718,7 +728,7 @@ fn config_bus_reload_error_config_not_found() {
     let path = write_yaml(
         &dir,
         "r.yaml",
-        "executor:\n  default_timeout: 30000\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 30000\n  global_timeout: 60000\n"),
     );
     let mut config = Config::load(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
@@ -735,7 +745,7 @@ fn config_bus_reload_error_config_invalid() {
     let path = write_yaml(
         &dir,
         "ri.yaml",
-        "executor:\n  default_timeout: 30000\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 30000\n  global_timeout: 60000\n"),
     );
     let mut config = Config::load(&path).unwrap();
     std::fs::write(&path, "bad: [unterminated\n").unwrap();
@@ -752,7 +762,7 @@ fn config_bus_reload_property_async() {
     let path = write_yaml(
         &dir,
         "ra.yaml",
-        "executor:\n  default_timeout: 30000\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 30000\n  global_timeout: 60000\n"),
     );
     let mut config = Config::load(&path).unwrap();
     let result: Result<(), ModuleError> = config.reload();
@@ -767,7 +777,7 @@ fn config_bus_reload_property_idempotent() {
     let path = write_yaml(
         &dir,
         "rid.yaml",
-        "executor:\n  default_timeout: 2222\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 2222\n  global_timeout: 60000\n"),
     );
     let mut config = Config::load(&path).unwrap();
     config.reload().unwrap();
@@ -787,7 +797,7 @@ fn config_bus_reload_side_effect_1_reread_filesystem() {
     let path = write_yaml(
         &dir,
         "rc.yaml",
-        "executor:\n  default_timeout: 1\n  global_timeout: 60000\n",
+        &format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 1\n  global_timeout: 60000\n"),
     );
     let mut config = Config::load(&path).unwrap();
     assert_eq!(
@@ -798,7 +808,7 @@ fn config_bus_reload_side_effect_1_reread_filesystem() {
     // Edit on disk; pre-reload state must be unchanged.
     std::fs::write(
         &path,
-        "executor:\n  default_timeout: 999\n  global_timeout: 60000\n",
+        format!("{LEGACY_REQUIRED}executor:\n  default_timeout: 999\n  global_timeout: 60000\n"),
     )
     .unwrap();
     assert_eq!(

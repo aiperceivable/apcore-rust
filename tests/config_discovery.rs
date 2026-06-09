@@ -5,6 +5,19 @@ fn write_valid_yaml(dir: &TempDir, filename: &str) -> std::path::PathBuf {
     let path = dir.path().join(filename);
     let mut f = std::fs::File::create(&path).unwrap();
     // PROTOCOL_SPEC §9.1 canonical nested namespace form (v0.18.0+).
+    // Includes the spec-mandated required fields (A-D-03) so legacy-mode
+    // validate() passes: version, project.name, extensions.root, schema.root,
+    // acl.root, acl.default_effect.
+    writeln!(f, "version: '0.15.0'").unwrap();
+    writeln!(f, "project:").unwrap();
+    writeln!(f, "  name: demo").unwrap();
+    writeln!(f, "extensions:").unwrap();
+    writeln!(f, "  root: ./extensions").unwrap();
+    writeln!(f, "schema:").unwrap();
+    writeln!(f, "  root: ./schemas").unwrap();
+    writeln!(f, "acl:").unwrap();
+    writeln!(f, "  root: ./acl").unwrap();
+    writeln!(f, "  default_effect: deny").unwrap();
     writeln!(f, "executor:").unwrap();
     writeln!(f, "  max_call_depth: 32").unwrap();
     writeln!(f, "  max_module_repeat: 3").unwrap();
