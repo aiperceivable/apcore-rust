@@ -416,12 +416,16 @@ impl Default for MetricsCollector {
 
 /// Middleware that records execution metrics.
 ///
-/// WARNING: The internal start-time stack is not safe for concurrent use on
-/// the same middleware instance. Use separate instances per concurrent pipeline.
+/// Per-trace start times are kept as a **stack** (`Vec<Instant>`) so a nested
+/// call sharing the same `trace_id` pushes its own start without clobbering the
+/// outer call's. `after`/`on_error` pop the innermost start (LIFO), so each
+/// frame records its own duration. Mirrors the per-context stack used by
+/// apcore-python / apcore-typescript (sync finding [obs-nested-timing]); before
+/// this fix a single-slot map made the parent record a 0ms duration.
 #[derive(Debug)]
 pub struct MetricsMiddleware {
     collector: MetricsCollector,
-    starts: Mutex<HashMap<String, std::time::Instant>>,
+    starts: Mutex<HashMap<String, Vec<std::time::Instant>>>,
 }
 
 impl MetricsMiddleware {
@@ -438,6 +442,21 @@ impl MetricsMiddleware {
     pub fn collector(&self) -> &MetricsCollector {
         &self.collector
     }
+
+    /// Pop the innermost (LIFO) start time for `trace_id` and return its elapsed
+    /// duration in seconds, or 0.0 if no matching start was recorded. Empty
+    /// stacks are removed to avoid unbounded growth of the map.
+    fn pop_duration_secs(&self, trace_id: &str) -> f64 {
+        let mut starts = self.starts.lock();
+        let Some(stack) = starts.get_mut(trace_id) else {
+            return 0.0;
+        };
+        let duration = stack.pop().map_or(0.0, |s| s.elapsed().as_secs_f64());
+        if stack.is_empty() {
+            starts.remove(trace_id);
+        }
+        duration
+    }
 }
 
 #[async_trait]
@@ -453,7 +472,10 @@ impl Middleware for MetricsMiddleware {
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         let mut starts = self.starts.lock();
-        starts.insert(_ctx.trace_id.clone(), std::time::Instant::now());
+        starts
+            .entry(_ctx.trace_id.clone())
+            .or_default()
+            .push(std::time::Instant::now());
         Ok(None)
     }
 
@@ -464,12 +486,7 @@ impl Middleware for MetricsMiddleware {
         _output: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let duration_secs = {
-            let mut starts = self.starts.lock();
-            starts
-                .remove(&_ctx.trace_id)
-                .map_or(0.0, |s| s.elapsed().as_secs_f64())
-        };
+        let duration_secs = self.pop_duration_secs(&_ctx.trace_id);
 
         self.collector.increment_calls(module_id, "success");
         self.collector.observe_duration(module_id, duration_secs);
@@ -484,12 +501,7 @@ impl Middleware for MetricsMiddleware {
         _error: &ModuleError,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let duration_secs = {
-            let mut starts = self.starts.lock();
-            starts
-                .remove(&_ctx.trace_id)
-                .map_or(0.0, |s| s.elapsed().as_secs_f64())
-        };
+        let duration_secs = self.pop_duration_secs(&_ctx.trace_id);
 
         // Use the canonical wire code (SCREAMING_SNAKE_CASE) for the metric
         // label, not Debug (PascalCase), for cross-language parity (sync
@@ -535,6 +547,49 @@ mod tests {
         assert!(
             !exported.contains("ModuleExecuteError"),
             "metric label must NOT use Debug (PascalCase) formatting; got:\n{exported}"
+        );
+    }
+
+    // [obs-nested-timing] A nested call sharing the same trace_id must not
+    // clobber the outer call's start time: the outer call must record a
+    // non-zero duration.
+    #[tokio::test]
+    async fn nested_same_trace_call_records_outer_duration() {
+        let mw = MetricsMiddleware::new(MetricsCollector::new());
+        let mut ctx = Context::<serde_json::Value>::new(Identity::new(
+            "@test".to_string(),
+            "test".to_string(),
+            vec![],
+            HashMap::new(),
+        ));
+        // Force both frames onto the same trace.
+        ctx.trace_id = "shared-trace".to_string();
+
+        // Outer begins.
+        mw.before("outer", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        // Let some wall-clock time pass for the outer frame.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Nested call on the same trace: before + after.
+        mw.before("inner", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        mw.after("inner", serde_json::json!({}), serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        // Outer completes; its duration must still be > 0.
+        mw.after("outer", serde_json::json!({}), serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+
+        let snap = mw.collector().snapshot();
+        let outer_sum = snap["histograms"]["apcore_module_duration_seconds|module_id=outer"]["sum"]
+            .as_f64()
+            .expect("outer duration histogram present");
+        assert!(
+            outer_sum > 0.0,
+            "nested same-trace call must not zero out the outer duration; got {outer_sum}"
         );
     }
 

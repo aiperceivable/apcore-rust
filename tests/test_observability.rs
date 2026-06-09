@@ -1071,3 +1071,28 @@ async fn test_usage_middleware_no_caller_id() {
         "None caller_id should not count as unique"
     );
 }
+
+// [obs-nested-timing] A nested call sharing the same trace_id must not clobber
+// the outer call's start time: the outer call must record a non-zero latency.
+#[tokio::test]
+async fn test_usage_middleware_nested_same_trace_records_outer_latency() {
+    let mw = UsageMiddleware::new(UsageCollector::new());
+    let mut ctx = test_context();
+    ctx.trace_id = "shared-trace".to_string();
+
+    // Outer begins.
+    mw.before("outer", json!({}), &ctx).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // Nested call on the same trace.
+    mw.before("inner", json!({}), &ctx).await.unwrap();
+    mw.after("inner", json!({}), json!({}), &ctx).await.unwrap();
+    // Outer completes.
+    mw.after("outer", json!({}), json!({}), &ctx).await.unwrap();
+
+    let outer = mw.collector().get_module_summary("outer").unwrap();
+    assert!(
+        outer.avg_latency_ms > 0.0,
+        "nested same-trace call must not zero out the outer latency; got {}",
+        outer.avg_latency_ms
+    );
+}
