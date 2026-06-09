@@ -185,12 +185,11 @@ impl Module for UsageModule {
         inputs: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError> {
-        let module_id = inputs
-            .get("module_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ModuleError::new(ErrorCode::GeneralInvalidInput, "'module_id' is required")
-            })?;
+        // Reject an empty module_id with InvalidInput (GENERAL_INVALID_INPUT)
+        // rather than letting it fall through to ModuleNotFound, matching
+        // apcore-python / apcore-typescript.
+        let module_id = super::require_string(&inputs, "module_id")?;
+        let module_id = module_id.as_str();
         let period = inputs
             .get("period")
             .and_then(|v| v.as_str())

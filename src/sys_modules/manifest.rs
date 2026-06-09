@@ -49,12 +49,11 @@ impl Module for ManifestModule {
         inputs: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError> {
-        let module_id = inputs
-            .get("module_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ModuleError::new(ErrorCode::GeneralInvalidInput, "'module_id' is required")
-            })?;
+        // Reject an empty module_id with InvalidInput (GENERAL_INVALID_INPUT)
+        // rather than letting it fall through to ModuleNotFound, matching
+        // apcore-python / apcore-typescript.
+        let module_id = super::require_string(&inputs, "module_id")?;
+        let module_id = module_id.as_str();
 
         let descriptor = self.registry.get_definition(module_id)?.ok_or_else(|| {
             ModuleError::new(
@@ -76,10 +75,20 @@ impl Module for ManifestModule {
             format!("{}/{}.rs", source_root, module_id.replace('.', "/"))
         };
 
-        let module_ref = self.registry.get(module_id).ok().flatten();
-        let description = module_ref
-            .map(|m| m.description().to_string())
-            .unwrap_or_default();
+        // Source description from the descriptor (the canonical registered
+        // metadata, which YAML overrides may have set), matching apcore-python /
+        // apcore-typescript. Only fall back to the live instance when the
+        // descriptor has no description.
+        let description = if descriptor.description.is_empty() {
+            self.registry
+                .get(module_id)
+                .ok()
+                .flatten()
+                .map(|m| m.description().to_string())
+                .unwrap_or_default()
+        } else {
+            descriptor.description.clone()
+        };
 
         // Module trait doesn't expose documentation or metadata, so use defaults.
         let documentation = serde_json::Value::Null;
@@ -194,10 +203,20 @@ impl Module for ManifestFullModule {
                 }
             }
 
-            let module_ref = self.registry.get(mid).ok().flatten();
-            let description = module_ref
-                .map(|m| m.description().to_string())
-                .unwrap_or_default();
+            // Prefer the descriptor's description (canonical registered
+            // metadata, including YAML overrides); fall back to the live
+            // instance only when the descriptor lacks one. Matches
+            // apcore-python / apcore-typescript.
+            let description = if descriptor.description.is_empty() {
+                self.registry
+                    .get(mid)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.description().to_string())
+                    .unwrap_or_default()
+            } else {
+                descriptor.description.clone()
+            };
 
             let mut entry = json!({
                 "module_id": mid,
