@@ -623,7 +623,6 @@ impl Config {
 
         // Integers >= 1.
         for key in [
-            "extensions.max_depth",
             "executor.max_call_depth",
             "executor.max_module_repeat",
             "middleware.circuit_breaker.open_threshold",
@@ -632,6 +631,16 @@ impl Config {
                 if as_int(&v).is_none_or(|n| n < 1) {
                     errors.push(format!("{key} must be an integer >= 1 (got {v})"));
                 }
+            }
+        }
+
+        // Integers in [1, 16]. Mirrors `validate_key_constraint` and the spec so
+        // both Rust validation paths (validate / update_config) agree.
+        if let Some(v) = self.get("extensions.max_depth") {
+            if as_int(&v).is_none_or(|n| !(1..=16).contains(&n)) {
+                errors.push(format!(
+                    "extensions.max_depth must be an integer in [1, 16] (got {v})"
+                ));
             }
         }
     }
@@ -1874,6 +1883,17 @@ mod tests {
     fn validate_rejects_extensions_max_depth_zero() {
         let mut json = valid_legacy_config_json();
         json["extensions"]["max_depth"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_extensions_max_depth_above_range() {
+        // [config-maxdepth-residual] validate()'s collect_constraint_errors must
+        // use the [1, 16] range (matching validate_key_constraint and the spec),
+        // not an unbounded >= 1 check.
+        let mut json = valid_legacy_config_json();
+        json["extensions"]["max_depth"] = serde_json::json!(17);
         let cfg = config_from_json(&json);
         assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
     }
