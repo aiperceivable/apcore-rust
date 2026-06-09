@@ -789,6 +789,53 @@ fn test_usage_collector_default() {
     assert!(collector.get_all_summaries().is_empty());
 }
 
+// [obs-usage-window] export_prometheus must apply the same rolling 24h window
+// as system.usage.module: records older than 24h are excluded from the exported
+// counts and percentiles. Mirrors apcore-python.
+#[test]
+fn test_usage_export_prometheus_excludes_records_older_than_24h() {
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    let collector = UsageCollector::new();
+    let now = Utc::now();
+
+    // One recent record (in window) with a small latency.
+    collector.record_at(
+        "mod.a",
+        Some("c"),
+        10.0,
+        true,
+        now - ChronoDuration::hours(1),
+    );
+    // One stale record (older than 24h) with a huge latency that would dominate
+    // p99 if it were (incorrectly) included.
+    collector.record_at(
+        "mod.a",
+        Some("c"),
+        9_999.0,
+        true,
+        now - ChronoDuration::hours(30),
+    );
+
+    let output = collector.export_prometheus();
+
+    // The stale record's latency must not appear in the exported p99.
+    let p99_line = output
+        .lines()
+        .find(|l| l.starts_with("apcore_usage_p99_latency_ms{module_id=\"mod.a\"}"))
+        .expect("p99 line present");
+    assert!(
+        !p99_line.contains("9999"),
+        "stale (>24h) record must be excluded from exported p99; got: {p99_line}"
+    );
+
+    // Only the single in-window success should be counted.
+    assert!(
+        output.contains("apcore_usage_calls_total{module_id=\"mod.a\",status=\"success\"} 1"),
+        "only the in-window record should be counted; got:\n{output}"
+    );
+}
+
 #[test]
 fn test_usage_collector_record_and_summary() {
     let collector = UsageCollector::new();

@@ -451,6 +451,15 @@ impl UsageCollector {
         // Snapshot under the lock, drop the guard, then format. Keeps the
         // critical section short and avoids holding the mutex across the
         // sorts and writeln! calls below.
+        //
+        // Apply the same rolling 24h window as `system.usage.module` /
+        // apcore-python `export_prometheus`: records older than 24h are excluded
+        // from the exported counts, error rate, and percentiles. Without this,
+        // the exported gauges would aggregate the full retained history while
+        // the queryable sys-module reports a windowed view — a cross-language
+        // divergence.
+        let now = Utc::now();
+        let cutoff = now - Duration::hours(24);
         let snapshot: Vec<(String, u64, u64, Vec<f64>)> = {
             let data = self.data.lock();
             data.iter()
@@ -458,14 +467,12 @@ impl UsageCollector {
                     let mut latencies: Vec<f64> = Vec::new();
                     let mut total: u64 = 0;
                     let mut errors: u64 = 0;
-                    for recs in md.records.values() {
-                        for r in recs {
-                            total += 1;
-                            if !r.success {
-                                errors += 1;
-                            }
-                            latencies.push(r.latency_ms);
+                    for r in Self::collect_records_in_window(md, cutoff, now) {
+                        total += 1;
+                        if !r.success {
+                            errors += 1;
                         }
+                        latencies.push(r.latency_ms);
                     }
                     (mid.clone(), total, errors, latencies)
                 })
