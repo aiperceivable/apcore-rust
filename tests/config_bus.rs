@@ -338,6 +338,57 @@ fn test_bind_missing_namespace_uses_empty_object_for_serde_defaults() {
     assert_eq!(result, AllDefaultsConfig::default());
 }
 
+// Regression [config-bind-defaults]: bind() must deserialize from the merged
+// namespace view (registered defaults + loaded YAML), not the raw
+// user_namespaces entry. A registered default absent from YAML must be present
+// in the bound struct. Mirrors apcore-python / apcore-typescript.
+#[derive(Debug, Deserialize, PartialEq)]
+struct ServiceConfig {
+    host: String,
+    port: u16,
+}
+
+#[test]
+fn test_bind_includes_registered_defaults_absent_from_yaml() {
+    use apcore::{EnvStyle, NamespaceRegistration};
+
+    let ns_name = format!(
+        "svc-bind-defaults-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _ = Config::register_namespace(NamespaceRegistration {
+        name: ns_name.clone(),
+        env_prefix: None,
+        // `port` is a registered default; only `host` will be in the YAML.
+        defaults: Some(serde_json::json!({"port": 8080})),
+        schema: None,
+        env_style: EnvStyle::Auto,
+        max_depth: 5,
+        env_map: None,
+    });
+
+    let mut config = Config::from_defaults();
+    config.mode = ConfigMode::Namespace;
+    config
+        .user_namespaces
+        .insert(ns_name.clone(), serde_json::json!({"host": "db.internal"}));
+
+    let bound: ServiceConfig = config
+        .bind(&ns_name)
+        .expect("bind must merge registered defaults before deserializing");
+    assert_eq!(
+        bound,
+        ServiceConfig {
+            host: "db.internal".to_string(),
+            port: 8080,
+        },
+        "registered default 'port' must be present even though absent from YAML"
+    );
+}
+
 // Regression: sync finding A-D-017 — Config::get must perform longest-prefix
 // match against registered namespaces so hyphenated names route correctly.
 // Apcore-python and apcore-typescript both sort registered names by length

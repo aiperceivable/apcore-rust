@@ -1033,20 +1033,20 @@ impl Config {
             _ => {}
         }
 
-        // Sync finding A-D-018: when the namespace has no data registered,
-        // bind into an empty object so `T`'s serde defaults take effect —
-        // matching apcore-python's `_instantiate_model(model, {}, namespace)`
-        // and apcore-typescript's `new schema({})`. Previously Rust returned
-        // ConfigBindError("namespace not found"), which broke portable code
-        // that relied on default-fill behavior across SDKs.
-        let owned;
-        let value: &serde_json::Value = if let Some(v) = self.user_namespaces.get(namespace) {
-            v
-        } else {
-            owned = serde_json::Value::Object(serde_json::Map::new());
-            &owned
-        };
-        serde_json::from_value(value.clone())
+        // Bind from the merged namespace view (registered defaults + loaded
+        // YAML/env), not the raw `user_namespaces` entry. `namespace()` overlays
+        // loaded values onto registered defaults, so a registered default absent
+        // from YAML is still present in the bound struct. Mirrors apcore-python
+        // (`_instantiate_model(model, self.namespace(name), name)`) and
+        // apcore-typescript (`bind` over the merged namespace).
+        //
+        // Sync finding A-D-018: an unregistered namespace with no data yields an
+        // empty object, so `T`'s serde defaults take effect (matching
+        // `_instantiate_model(model, {}, namespace)` / `new schema({})`) rather
+        // than the old ConfigBindError("namespace not found").
+        let merged: serde_json::Map<String, serde_json::Value> =
+            self.namespace(namespace).into_iter().collect();
+        serde_json::from_value(serde_json::Value::Object(merged))
             .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
     }
 
