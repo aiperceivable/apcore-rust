@@ -493,6 +493,24 @@ async fn module_interface_execute_property_pure_false() {
 // Return-value constraints
 // ===========================================================================
 
+// [mod-describe-annotations] The default describe() must include an
+// `annotations` key (spec-default shape: description, input_schema,
+// output_schema, annotations). Mirrors apcore-python / apcore-typescript.
+#[test]
+fn module_interface_default_describe_includes_annotations() {
+    let module = ConformingModule;
+    let described = module.describe();
+    let obj = described.as_object().expect("describe() returns an object");
+    assert!(
+        obj.contains_key("annotations"),
+        "default describe() must include an 'annotations' key; got: {described}"
+    );
+    // The other spec-default keys must still be present.
+    for key in ["description", "input_schema", "output_schema"] {
+        assert!(obj.contains_key(key), "describe() must include '{key}'");
+    }
+}
+
 // clause: module_interface.execute.return.must_be_dict
 #[tokio::test]
 async fn module_interface_execute_return_must_be_dict() {
