@@ -603,6 +603,36 @@ fn test_metrics_collector_export_prometheus_histogram() {
     assert!(output.contains("le=\"+Inf\""));
 }
 
+// [obs-help-text] Exported HELP lines must use the per-metric-name description
+// table (matching apcore-python / apcore-typescript), not a generic
+// "Counter metric" / "Histogram metric".
+#[test]
+fn test_metrics_collector_export_prometheus_uses_per_metric_help_text() {
+    let collector = MetricsCollector::new();
+    collector.increment_calls("mod.a", "success");
+    collector.increment_errors("mod.a", "BOOM");
+    collector.observe_duration("mod.a", 0.25);
+
+    let output = collector.export_prometheus();
+    assert!(
+        output.contains("# HELP apcore_module_calls_total Total module calls"),
+        "calls HELP must be 'Total module calls'; got:\n{output}"
+    );
+    assert!(
+        output.contains("# HELP apcore_module_errors_total Total module errors"),
+        "errors HELP must be 'Total module errors'; got:\n{output}"
+    );
+    assert!(
+        output.contains("# HELP apcore_module_duration_seconds Module execution duration"),
+        "duration HELP must be 'Module execution duration'; got:\n{output}"
+    );
+    // Unknown metric names fall back to the name itself, not a generic label.
+    assert!(
+        !output.contains("Counter metric") && !output.contains("Histogram metric"),
+        "generic HELP text must no longer be emitted; got:\n{output}"
+    );
+}
+
 #[test]
 fn test_metrics_collector_export_prometheus_with_labels() {
     let collector = MetricsCollector::new();

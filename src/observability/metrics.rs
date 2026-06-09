@@ -250,7 +250,7 @@ impl MetricsCollector {
             std::collections::HashSet::new();
         for ((name, labels), value) in counters.iter() {
             if seen_counter_names.insert(name.clone()) {
-                let _ = writeln!(output, "# HELP {name} Counter metric");
+                let _ = writeln!(output, "# HELP {name} {}", metric_help_text(name));
                 let _ = writeln!(output, "# TYPE {name} counter");
             }
             let label_str = format_prometheus_labels(labels);
@@ -262,7 +262,7 @@ impl MetricsCollector {
             std::collections::HashSet::new();
         for ((name, labels), data) in histograms.iter() {
             if seen_hist_names.insert(name.clone()) {
-                let _ = writeln!(output, "# HELP {name} Histogram metric");
+                let _ = writeln!(output, "# HELP {name} {}", metric_help_text(name));
                 let _ = writeln!(output, "# TYPE {name} histogram");
             }
             let base_labels = format_prometheus_labels(labels);
@@ -312,6 +312,21 @@ impl MetricsCollector {
         let mut labels = HashMap::new();
         labels.insert("module_id".to_string(), module_id.to_string());
         self.observe("apcore_module_duration_seconds", labels, duration_secs);
+    }
+}
+
+/// Per-metric-name HELP description for Prometheus export.
+///
+/// Mirrors the description table used by apcore-python / apcore-typescript so
+/// the exported `# HELP` lines are identical across SDKs. Unknown metric names
+/// fall back to the metric name itself (rather than a generic
+/// "Counter metric" / "Histogram metric").
+fn metric_help_text(name: &str) -> &str {
+    match name {
+        "apcore_module_calls_total" => "Total module calls",
+        "apcore_module_errors_total" => "Total module errors",
+        "apcore_module_duration_seconds" => "Module execution duration",
+        other => other,
     }
 }
 
