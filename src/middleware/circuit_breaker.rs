@@ -316,6 +316,28 @@ impl CircuitBreakerMiddleware {
         entry.probe_started_at = None;
     }
 
+    /// Reset a circuit to CLOSED and clear its rolling window.
+    ///
+    /// Mirrors apcore-python / apcore-typescript `reset()`: returns the circuit
+    /// to a pristine CLOSED state, discarding accumulated outcomes and any
+    /// in-flight probe bookkeeping. `caller_id` defaults to the empty bucket
+    /// (top-level calls) when `None`. A reset on an unknown `(module, caller)`
+    /// pair is a no-op (the circuit is already CLOSED with an empty window).
+    pub fn reset(&self, module_id: &str, caller_id: Option<&str>) {
+        let key = (
+            module_id.to_string(),
+            caller_id.unwrap_or_default().to_string(),
+        );
+        let mut circuits = self.circuits.lock();
+        if let Some(circuit) = circuits.get_mut(&key) {
+            circuit.state = CircuitBreakerState::Closed;
+            circuit.window.clear();
+            circuit.opened_at = None;
+            circuit.probe_in_flight = false;
+            circuit.probe_started_at = None;
+        }
+    }
+
     fn key_of(module_id: &str, ctx: &Context<serde_json::Value>) -> (String, String) {
         (
             module_id.to_string(),
@@ -691,6 +713,43 @@ mod tests {
             data.get("_apcore.mw.circuit.state")
                 .and_then(|v| v.as_str()),
             Some("CLOSED")
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_returns_open_circuit_to_closed_with_cleared_window() {
+        // [mw-reset] reset() must return an OPEN circuit to CLOSED and clear its
+        // rolling window (parity with Python/TS reset()).
+        let mw = CircuitBreakerMiddleware::builder()
+            .open_threshold(0.5)
+            .window_size(10)
+            .min_samples(5)
+            .build();
+        let ctx = ctx_with_caller("orch");
+        let module = "mod.a";
+        let err = ModuleError::new(ErrorCode::ModuleExecuteError, "boom");
+
+        // Accumulate enough errors to OPEN the circuit (fills the window).
+        for _ in 0..6 {
+            mw.on_error(module, serde_json::json!({}), &err, &ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(mw.state(module, "orch"), CircuitBreakerState::Open);
+
+        // Reset: back to CLOSED.
+        mw.reset(module, Some("orch"));
+        assert_eq!(mw.state(module, "orch"), CircuitBreakerState::Closed);
+
+        // The window must be cleared: a single new failure cannot re-open the
+        // circuit because min_samples (5) is no longer met by the empty window.
+        mw.on_error(module, serde_json::json!({}), &err, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            mw.state(module, "orch"),
+            CircuitBreakerState::Closed,
+            "window should be cleared, so one failure must not re-open"
         );
     }
 
