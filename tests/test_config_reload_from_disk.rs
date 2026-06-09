@@ -16,12 +16,22 @@ fn reload_from_disk_picks_up_file_changes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.yaml");
 
+    // A valid legacy-mode config must carry the spec-required top-level fields
+    // (version/project/extensions/schema/acl), or `from_yaml_file`'s validation
+    // rejects it. Keep them stable across both writes; only the executor knobs
+    // change between loads.
+    let required_fields = "version: \"0.23.0\"\n\
+         project:\n  name: demo\n\
+         extensions:\n  root: ./extensions\n\
+         schema:\n  root: ./schemas\n\
+         acl:\n  root: ./acl\n  default_effect: deny\n";
+
     // Initial: max_call_depth = 8.
     {
         let mut f = std::fs::File::create(&path).expect("create");
         writeln!(
             f,
-            "executor:\n  max_call_depth: 8\n  default_timeout: 1000\n  global_timeout: 60000"
+            "{required_fields}executor:\n  max_call_depth: 8\n  default_timeout: 1000\n  global_timeout: 60000"
         )
         .unwrap();
     }
@@ -37,7 +47,7 @@ fn reload_from_disk_picks_up_file_changes() {
         let mut f = std::fs::File::create(&path).expect("rewrite");
         writeln!(
             f,
-            "executor:\n  max_call_depth: 16\n  default_timeout: 2000\n  global_timeout: 60000"
+            "{required_fields}executor:\n  max_call_depth: 16\n  default_timeout: 2000\n  global_timeout: 60000"
         )
         .unwrap();
     }
