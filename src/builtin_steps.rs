@@ -826,11 +826,12 @@ impl Step for BuiltinMiddlewareAfter {
             None => return Ok(StepResult::continue_step()),
         };
 
-        // INVARIANT: BuiltinExecute runs before this step and sets ctx.output.
-        let output = ctx
-            .output
-            .take()
-            .expect("output must be set before middleware_after");
+        // BuiltinExecute normally sets ctx.output before this step, but a custom
+        // strategy may reach here with no output (e.g. execute step omitted or
+        // skipped). Match Python/TS: pass through instead of panicking.
+        let Some(output) = ctx.output.take() else {
+            return Ok(StepResult::continue_step());
+        };
 
         match middleware_manager
             .execute_after(&ctx.module_id, ctx.inputs.clone(), output, &ctx.context)
@@ -949,4 +950,48 @@ pub fn build_minimal_strategy() -> ExecutionStrategy {
     s.remove("output_validation").ok();
     s.remove("middleware_after").ok();
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Context;
+    use crate::context::Identity;
+
+    fn empty_context() -> PipelineContext {
+        let identity = Identity::new(
+            "user-1".to_string(),
+            "user".to_string(),
+            vec![],
+            HashMap::new(),
+        );
+        let context: Context<serde_json::Value> = Context::new(identity);
+        PipelineContext::new("mod-x", serde_json::json!({}), context, "custom")
+    }
+
+    // [exec-none-output-panic] A custom strategy may reach the after-steps with
+    // ctx.output == None. Python/TS pass through; Rust must not panic.
+    #[tokio::test]
+    async fn output_validation_passes_through_when_output_none() {
+        let step = BuiltinOutputValidation;
+        let mut ctx = empty_context();
+        assert!(ctx.output.is_none());
+        let result = step.execute(&mut ctx).await;
+        assert!(result.is_ok(), "must not panic/err when output is None");
+    }
+
+    #[tokio::test]
+    async fn middleware_after_passes_through_when_output_none() {
+        use crate::middleware::manager::MiddlewareManager;
+        use std::sync::Arc;
+
+        let step = BuiltinMiddlewareAfter;
+        let mut ctx = empty_context();
+        // Attach a manager so the step reaches the output `take()` path; with
+        // output None it must pass through (continue) rather than panic.
+        ctx.middleware_manager = Some(Arc::new(MiddlewareManager::new()));
+        assert!(ctx.output.is_none());
+        let result = step.execute(&mut ctx).await;
+        assert!(result.is_ok(), "must not panic/err when output is None");
+    }
 }
