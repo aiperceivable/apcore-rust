@@ -273,7 +273,7 @@ async fn test_apcore_describe_module() {
     let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
 
-    let desc = client.describe("math.add");
+    let desc = client.describe("math.add").expect("module is registered");
     assert_eq!(desc, "Add two numbers");
 }
 

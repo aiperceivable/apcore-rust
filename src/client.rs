@@ -619,10 +619,18 @@ impl APCore {
     }
 
     /// Describe a module by ID.
-    pub fn describe(&self, module_id: &str) -> String {
+    ///
+    /// Returns the module's description on success. Per the spec contract,
+    /// `describe` MUST raise `ModuleNotFoundError` for a missing module rather
+    /// than returning a sentinel string — matching apcore-python /
+    /// apcore-typescript (which raise `ModuleNotFoundError`).
+    pub fn describe(&self, module_id: &str) -> Result<String, ModuleError> {
         match self.registry.get(module_id) {
-            Ok(Some(module)) => module.description().to_string(),
-            Ok(None) | Err(_) => format!("Module '{module_id}' not found"),
+            Ok(Some(module)) => Ok(module.description().to_string()),
+            Ok(None) | Err(_) => Err(ModuleError::new(
+                crate::errors::ErrorCode::ModuleNotFound,
+                format!("Module '{module_id}' not found"),
+            )),
         }
     }
 
