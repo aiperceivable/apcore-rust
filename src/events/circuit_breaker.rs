@@ -61,7 +61,7 @@ pub const DEFAULT_RECOVERY_WINDOW_MS: u64 = 60_000;
 /// transitions through `CLOSED → OPEN → HALF_OPEN → CLOSED`.
 pub struct CircuitBreakerWrapper {
     subscriber: Box<dyn EventSubscriber>,
-    sink: Option<Arc<dyn CircuitEventSink>>,
+    sink: Arc<dyn CircuitEventSink>,
     timeout_ms: u64,
     open_threshold: u32,
     recovery_window_ms: u64,
@@ -93,13 +93,13 @@ impl CircuitBreakerWrapper {
     /// Wrap `subscriber` with circuit-breaker behaviour.
     ///
     /// `sink` receives `apcore.subscriber.circuit_opened` and
-    /// `apcore.subscriber.circuit_closed` events on transitions; if `None`,
-    /// transitions still happen but no events are emitted.
+    /// `apcore.subscriber.circuit_closed` events on every transition. The sink
+    /// is mandatory: the spec requires these lifecycle events to ALWAYS be
+    /// emitted (cross-language parity with Python/TS, which take a mandatory
+    /// emitter — sync finding A-D-07). In production this is a thin wrapper
+    /// around the surrounding `EventEmitter`.
     #[must_use]
-    pub fn new(
-        subscriber: Box<dyn EventSubscriber>,
-        sink: Option<Arc<dyn CircuitEventSink>>,
-    ) -> Self {
+    pub fn new(subscriber: Box<dyn EventSubscriber>, sink: Arc<dyn CircuitEventSink>) -> Self {
         let subscriber_type_name = guess_subscriber_type_name(subscriber.as_ref());
         Self {
             subscriber,
@@ -272,9 +272,7 @@ impl CircuitBreakerWrapper {
     }
 
     fn dispatch_circuit_event(&self, event: ApCoreEvent) {
-        if let Some(sink) = &self.sink {
-            sink.emit_circuit_event(event);
-        }
+        self.sink.emit_circuit_event(event);
     }
 }
 
@@ -403,7 +401,7 @@ mod tests {
             Box::new(AlwaysFail {
                 id: "webhook-x".into(),
             }),
-            Some(sink.clone()),
+            sink.clone(),
         )
         .with_open_threshold(3)
         .with_subscriber_type_name("webhook");
@@ -427,7 +425,7 @@ mod tests {
             Box::new(AlwaysFail {
                 id: "webhook-x".into(),
             }),
-            Some(sink.clone()),
+            sink.clone(),
         );
         wrapper.force_state(CircuitState::Open);
         wrapper.force_last_failure_at(Some(Utc::now()));
@@ -446,7 +444,7 @@ mod tests {
             Box::new(AlwaysOk {
                 id: "webhook-x".into(),
             }),
-            Some(sink.clone()),
+            sink.clone(),
         );
         wrapper.force_state(CircuitState::HalfOpen);
 
@@ -464,7 +462,7 @@ mod tests {
             Box::new(AlwaysOk {
                 id: "webhook-x".into(),
             }),
-            None,
+            Arc::new(RecordingSink::default()),
         )
         .with_recovery_window_ms(30_000);
         wrapper.force_state(CircuitState::Open);
@@ -472,5 +470,76 @@ mod tests {
         wrapper.force_last_failure_at(Some(last));
         wrapper.check_recovery();
         assert_eq!(wrapper.state(), CircuitState::HalfOpen);
+    }
+
+    /// Subscriber that fails while the shared `fail` flag is set, then
+    /// succeeds once it is cleared. Sharing the flag via `Arc` lets the test
+    /// drive a full OPEN → HALF_OPEN → CLOSED cycle through one wrapper.
+    #[derive(Debug)]
+    struct Toggling {
+        id: String,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl EventSubscriber for Toggling {
+        fn subscriber_id(&self) -> &str {
+            &self.id
+        }
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn event_pattern(&self) -> &str {
+            "*"
+        }
+        async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+            if self.fail.load(Ordering::SeqCst) {
+                Err(ModuleError::new(ErrorCode::GeneralInternalError, "boom"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // A-D-07: tripping and then recovering the circuit MUST emit BOTH the
+    // circuit_opened and circuit_closed lifecycle events. Previously the sink
+    // was optional; a None sink transitioned state silently, violating the
+    // spec MUST.
+    #[tokio::test]
+    async fn tripping_then_recovering_emits_both_events() {
+        let sink = Arc::new(RecordingSink::default());
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let subscriber = Box::new(Toggling {
+            id: "webhook-x".into(),
+            fail: fail.clone(),
+        });
+        let wrapper = CircuitBreakerWrapper::new(subscriber, sink.clone())
+            .with_open_threshold(2)
+            .with_recovery_window_ms(30_000);
+
+        let event = make_event();
+        // Trip the circuit OPEN.
+        wrapper.on_event(&event).await.unwrap();
+        wrapper.on_event(&event).await.unwrap();
+        assert_eq!(wrapper.state(), CircuitState::Open);
+
+        // Advance past the recovery window so the next delivery probes HALF_OPEN,
+        // and stop failing so the probe succeeds and closes the circuit.
+        wrapper.force_last_failure_at(Some(Utc::now() - chrono::Duration::seconds(31)));
+        fail.store(false, Ordering::SeqCst);
+        wrapper.on_event(&event).await.unwrap();
+        assert_eq!(wrapper.state(), CircuitState::Closed);
+
+        let captured = sink.captured();
+        assert!(
+            captured
+                .iter()
+                .any(|e| e.event_type == "apcore.subscriber.circuit_opened"),
+            "expected circuit_opened, got {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|e| e.event_type == "apcore.subscriber.circuit_closed"),
+            "expected circuit_closed, got {captured:?}"
+        );
     }
 }

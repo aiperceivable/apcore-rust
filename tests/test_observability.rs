@@ -603,6 +603,36 @@ fn test_metrics_collector_export_prometheus_histogram() {
     assert!(output.contains("le=\"+Inf\""));
 }
 
+// [obs-help-text] Exported HELP lines must use the per-metric-name description
+// table (matching apcore-python / apcore-typescript), not a generic
+// "Counter metric" / "Histogram metric".
+#[test]
+fn test_metrics_collector_export_prometheus_uses_per_metric_help_text() {
+    let collector = MetricsCollector::new();
+    collector.increment_calls("mod.a", "success");
+    collector.increment_errors("mod.a", "BOOM");
+    collector.observe_duration("mod.a", 0.25);
+
+    let output = collector.export_prometheus();
+    assert!(
+        output.contains("# HELP apcore_module_calls_total Total module calls"),
+        "calls HELP must be 'Total module calls'; got:\n{output}"
+    );
+    assert!(
+        output.contains("# HELP apcore_module_errors_total Total module errors"),
+        "errors HELP must be 'Total module errors'; got:\n{output}"
+    );
+    assert!(
+        output.contains("# HELP apcore_module_duration_seconds Module execution duration"),
+        "duration HELP must be 'Module execution duration'; got:\n{output}"
+    );
+    // Unknown metric names fall back to the name itself, not a generic label.
+    assert!(
+        !output.contains("Counter metric") && !output.contains("Histogram metric"),
+        "generic HELP text must no longer be emitted; got:\n{output}"
+    );
+}
+
 #[test]
 fn test_metrics_collector_export_prometheus_with_labels() {
     let collector = MetricsCollector::new();
@@ -787,6 +817,53 @@ fn test_usage_collector_new() {
 fn test_usage_collector_default() {
     let collector = UsageCollector::default();
     assert!(collector.get_all_summaries().is_empty());
+}
+
+// [obs-usage-window] export_prometheus must apply the same rolling 24h window
+// as system.usage.module: records older than 24h are excluded from the exported
+// counts and percentiles. Mirrors apcore-python.
+#[test]
+fn test_usage_export_prometheus_excludes_records_older_than_24h() {
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    let collector = UsageCollector::new();
+    let now = Utc::now();
+
+    // One recent record (in window) with a small latency.
+    collector.record_at(
+        "mod.a",
+        Some("c"),
+        10.0,
+        true,
+        now - ChronoDuration::hours(1),
+    );
+    // One stale record (older than 24h) with a huge latency that would dominate
+    // p99 if it were (incorrectly) included.
+    collector.record_at(
+        "mod.a",
+        Some("c"),
+        9_999.0,
+        true,
+        now - ChronoDuration::hours(30),
+    );
+
+    let output = collector.export_prometheus();
+
+    // The stale record's latency must not appear in the exported p99.
+    let p99_line = output
+        .lines()
+        .find(|l| l.starts_with("apcore_usage_p99_latency_ms{module_id=\"mod.a\"}"))
+        .expect("p99 line present");
+    assert!(
+        !p99_line.contains("9999"),
+        "stale (>24h) record must be excluded from exported p99; got: {p99_line}"
+    );
+
+    // Only the single in-window success should be counted.
+    assert!(
+        output.contains("apcore_usage_calls_total{module_id=\"mod.a\",status=\"success\"} 1"),
+        "only the in-window record should be counted; got:\n{output}"
+    );
 }
 
 #[test]
@@ -992,5 +1069,30 @@ async fn test_usage_middleware_no_caller_id() {
     assert_eq!(
         stats.unique_callers, 0,
         "None caller_id should not count as unique"
+    );
+}
+
+// [obs-nested-timing] A nested call sharing the same trace_id must not clobber
+// the outer call's start time: the outer call must record a non-zero latency.
+#[tokio::test]
+async fn test_usage_middleware_nested_same_trace_records_outer_latency() {
+    let mw = UsageMiddleware::new(UsageCollector::new());
+    let mut ctx = test_context();
+    ctx.trace_id = "shared-trace".to_string();
+
+    // Outer begins.
+    mw.before("outer", json!({}), &ctx).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // Nested call on the same trace.
+    mw.before("inner", json!({}), &ctx).await.unwrap();
+    mw.after("inner", json!({}), json!({}), &ctx).await.unwrap();
+    // Outer completes.
+    mw.after("outer", json!({}), json!({}), &ctx).await.unwrap();
+
+    let outer = mw.collector().get_module_summary("outer").unwrap();
+    assert!(
+        outer.avg_latency_ms > 0.0,
+        "nested same-trace call must not zero out the outer latency; got {}",
+        outer.avg_latency_ms
     );
 }

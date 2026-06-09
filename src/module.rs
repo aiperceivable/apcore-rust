@@ -68,12 +68,15 @@ pub trait Module: Send + Sync {
     }
 
     /// Return a structured description of this module for AI/LLM consumption (spec §5.6).
-    /// Default: builds description from `input_schema`, `output_schema`, and description.
+    /// Default: builds description from `input_schema`, `output_schema`,
+    /// `description`, and `annotations` (the spec-default shape; mirrors
+    /// apcore-python / apcore-typescript).
     fn describe(&self) -> serde_json::Value {
         serde_json::json!({
             "description": self.description(),
             "input_schema": self.input_schema(),
             "output_schema": self.output_schema(),
+            "annotations": self.annotations(),
         })
     }
 

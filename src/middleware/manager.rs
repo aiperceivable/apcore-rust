@@ -181,6 +181,15 @@ impl MiddlewareManager {
         mws.iter().map(|m| m.name().to_string()).collect()
     }
 
+    /// Return the first middleware in the chain whose `name()` matches, as a
+    /// shared handle. Used by the extension-application path to locate an
+    /// existing `TracingMiddleware` and reconfigure its exporter in place
+    /// rather than appending a duplicate (sync finding A-D-18).
+    pub fn find_by_name(&self, name: &str) -> Option<Arc<dyn Middleware>> {
+        let mws = self.middlewares.lock();
+        mws.iter().find(|m| m.name() == name).map(Arc::clone)
+    }
+
     /// Run the before hooks for all middlewares in order.
     ///
     /// Returns the (possibly modified) input and the list of indices of
@@ -224,6 +233,15 @@ impl MiddlewareManager {
                     if let Ok(inner_json) = serde_json::to_value(&e) {
                         details.insert("inner_error".to_string(), inner_json);
                     }
+                    // Carry the list of middlewares that ran (including the
+                    // failing one) so the caller can run on_error over exactly
+                    // those — mirrors Python's `MiddlewareChainError.executed_middlewares`
+                    // and TS's `MiddlewareChainError.executedMiddlewares` (sync
+                    // finding A-D-01).
+                    details.insert(
+                        "executed_middlewares".to_string(),
+                        serde_json::json!(executed),
+                    );
                     return Err(ModuleError::new(
                         ErrorCode::MiddlewareChainError,
                         e.message.clone(),

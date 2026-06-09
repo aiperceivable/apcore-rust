@@ -451,6 +451,15 @@ impl UsageCollector {
         // Snapshot under the lock, drop the guard, then format. Keeps the
         // critical section short and avoids holding the mutex across the
         // sorts and writeln! calls below.
+        //
+        // Apply the same rolling 24h window as `system.usage.module` /
+        // apcore-python `export_prometheus`: records older than 24h are excluded
+        // from the exported counts, error rate, and percentiles. Without this,
+        // the exported gauges would aggregate the full retained history while
+        // the queryable sys-module reports a windowed view — a cross-language
+        // divergence.
+        let now = Utc::now();
+        let cutoff = now - Duration::hours(24);
         let snapshot: Vec<(String, u64, u64, Vec<f64>)> = {
             let data = self.data.lock();
             data.iter()
@@ -458,14 +467,12 @@ impl UsageCollector {
                     let mut latencies: Vec<f64> = Vec::new();
                     let mut total: u64 = 0;
                     let mut errors: u64 = 0;
-                    for recs in md.records.values() {
-                        for r in recs {
-                            total += 1;
-                            if !r.success {
-                                errors += 1;
-                            }
-                            latencies.push(r.latency_ms);
+                    for r in Self::collect_records_in_window(md, cutoff, now) {
+                        total += 1;
+                        if !r.success {
+                            errors += 1;
                         }
+                        latencies.push(r.latency_ms);
                     }
                     (mid.clone(), total, errors, latencies)
                 })
@@ -561,12 +568,16 @@ impl Default for UsageCollector {
 
 /// Middleware that tracks usage statistics.
 ///
-/// WARNING: The internal start-time stack is not safe for concurrent use on
-/// the same middleware instance. Use separate instances per concurrent pipeline.
+/// Per-trace start times are kept as a **stack** (`Vec<Instant>`) so a nested
+/// call sharing the same `trace_id` pushes its own start without clobbering the
+/// outer call's; `after`/`on_error` pop the innermost start (LIFO). Mirrors the
+/// per-context stack used by apcore-python / apcore-typescript (sync finding
+/// [obs-nested-timing]); before this fix a single-slot map made the parent
+/// record a 0ms latency.
 #[derive(Debug)]
 pub struct UsageMiddleware {
     collector: UsageCollector,
-    starts: Mutex<HashMap<String, std::time::Instant>>,
+    starts: Mutex<HashMap<String, Vec<std::time::Instant>>>,
 }
 
 impl UsageMiddleware {
@@ -583,6 +594,23 @@ impl UsageMiddleware {
     pub fn collector(&self) -> &UsageCollector {
         &self.collector
     }
+
+    /// Pop the innermost (LIFO) start time for `trace_id` and return its elapsed
+    /// latency in milliseconds, or 0.0 if no matching start was recorded. Empty
+    /// stacks are removed to avoid unbounded growth of the map.
+    fn pop_latency_ms(&self, trace_id: &str) -> f64 {
+        let mut starts = self.starts.lock();
+        let Some(stack) = starts.get_mut(trace_id) else {
+            return 0.0;
+        };
+        let latency = stack
+            .pop()
+            .map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
+        if stack.is_empty() {
+            starts.remove(trace_id);
+        }
+        latency
+    }
 }
 
 #[async_trait]
@@ -598,7 +626,10 @@ impl Middleware for UsageMiddleware {
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         let mut starts = self.starts.lock();
-        starts.insert(_ctx.trace_id.clone(), std::time::Instant::now());
+        starts
+            .entry(_ctx.trace_id.clone())
+            .or_default()
+            .push(std::time::Instant::now());
         Ok(None)
     }
 
@@ -609,12 +640,7 @@ impl Middleware for UsageMiddleware {
         _output: serde_json::Value,
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let latency_ms = {
-            let mut starts = self.starts.lock();
-            starts
-                .remove(&ctx.trace_id)
-                .map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)
-        };
+        let latency_ms = self.pop_latency_ms(&ctx.trace_id);
 
         self.collector
             .record(module_id, ctx.caller_id.as_deref(), latency_ms, true);
@@ -629,12 +655,7 @@ impl Middleware for UsageMiddleware {
         _error: &ModuleError,
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let latency_ms = {
-            let mut starts = self.starts.lock();
-            starts
-                .remove(&ctx.trace_id)
-                .map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)
-        };
+        let latency_ms = self.pop_latency_ms(&ctx.trace_id);
 
         self.collector
             .record(module_id, ctx.caller_id.as_deref(), latency_ms, false);

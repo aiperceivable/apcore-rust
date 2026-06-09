@@ -38,6 +38,7 @@ use apcore::errors::{ErrorCode, ModuleError};
 use apcore::extensions::{ExtensionKind, ExtensionManager};
 use apcore::middleware::base::Middleware;
 use apcore::observability::span::{Span, SpanExporter};
+use apcore::observability::tracing_middleware::TracingMiddleware;
 use apcore::observability::{CompositeExporter, InMemoryExporter};
 use apcore::{Config, Context, Executor, Registry};
 
@@ -586,10 +587,10 @@ fn apply_side_effect_5_use_middleware_in_order() {
 // clause: extension_system.apply.side_effect.6.single_span_exporter_direct
 #[test]
 fn apply_side_effect_6_single_span_exporter_direct() {
-    // Python wires a single exporter directly onto an existing TracingMiddleware.
-    // Rust wraps the single exporter in a (new) TracingMiddleware and adds it to
-    // the executor pipeline. Observe via executor.middlewares() containing
-    // "tracing".
+    // Canonical behavior (sync finding A-D-18): a single span exporter is set
+    // ONTO the EXISTING TracingMiddleware in the executor chain, not wrapped in
+    // a freshly-appended one. Pre-register a TracingMiddleware, then assert
+    // apply reconfigures it in place (still exactly one "tracing").
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
@@ -598,12 +599,18 @@ fn apply_side_effect_6_single_span_exporter_direct() {
     .expect("register exporter");
     let registry = Arc::new(Registry::new());
     let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+    executor
+        .use_middleware(Box::new(TracingMiddleware::new(Box::new(
+            InMemoryExporter::new(),
+        ))))
+        .expect("pre-register tracing middleware");
     mgr.apply(&registry, &mut executor).expect("apply");
 
     let names = executor.middlewares();
-    assert!(
-        names.contains(&"tracing".to_string()),
-        "single exporter must be wired through a TracingMiddleware: {names:?}"
+    let tracing_count = names.iter().filter(|n| *n == "tracing").count();
+    assert_eq!(
+        tracing_count, 1,
+        "single exporter must reconfigure the existing TracingMiddleware in place: {names:?}"
     );
 }
 
@@ -629,10 +636,22 @@ async fn apply_side_effect_6_multiple_span_exporters_composite() {
 
     let registry = Arc::new(Registry::new());
     let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+    executor
+        .use_middleware(Box::new(TracingMiddleware::new(Box::new(
+            InMemoryExporter::new(),
+        ))))
+        .expect("pre-register tracing middleware");
     mgr.apply(&registry, &mut executor).expect("apply");
-    assert!(
-        executor.middlewares().contains(&"tracing".to_string()),
-        "composite exporter must be wired through a TracingMiddleware"
+    // Canonical behavior (sync finding A-D-18): the composite exporter is set
+    // onto the existing TracingMiddleware in place — still exactly one.
+    let tracing_count = executor
+        .middlewares()
+        .iter()
+        .filter(|n| *n == "tracing")
+        .count();
+    assert_eq!(
+        tracing_count, 1,
+        "composite exporter must reconfigure the existing TracingMiddleware in place"
     );
 
     // Error isolation: failing exporter raises, good exporter still receives.
@@ -654,10 +673,9 @@ async fn apply_side_effect_6_multiple_span_exporters_composite() {
 #[test]
 fn apply_side_effect_6_no_tracing_middleware_no_raise() {
     // Spec lists ExtensionApplyError for a span exporter wired with no
-    // TracingMiddleware present. Like Python, Rust does NOT raise here. Rust goes
-    // further: it CREATES a TracingMiddleware to host the exporter. Assert apply()
-    // completes without error (cross-language note: Python leaves the executor
-    // unwired; Rust auto-creates the tracing middleware).
+    // TracingMiddleware present. Like Python, Rust does NOT raise here: it logs
+    // a warning and leaves the executor unwired (sync finding A-D-18). Assert
+    // apply() completes without error and adds no TracingMiddleware.
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
@@ -669,6 +687,11 @@ fn apply_side_effect_6_no_tracing_middleware_no_raise() {
     // Must not raise despite no pre-existing TracingMiddleware.
     mgr.apply(&registry, &mut executor)
         .expect("apply must not raise");
+    // And no TracingMiddleware is auto-created (warn-and-skip).
+    assert!(
+        !executor.middlewares().contains(&"tracing".to_string()),
+        "no TracingMiddleware should be appended when none pre-exists"
+    );
 }
 
 // clause: extension_system.apply.property.idempotent.false

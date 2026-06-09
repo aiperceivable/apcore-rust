@@ -23,7 +23,8 @@
 //     #[ignore] contract gaps where the Python clause asserts an error.
 //   * use_middleware() priority>1000 returns Err(ModuleError) not a panic.
 //   * register() takes Box<dyn Module>; there is no shared "module_obj" handle.
-//   * describe() returns a "not found" string rather than erroring.
+//   * describe() returns Ok(description) and raises ModuleNotFoundError for a
+//     missing module (parity with Python/TS).
 //   * start()/stop() do not exist on the Rust APCore — #[ignore] gaps.
 
 use std::sync::Arc;
@@ -1196,20 +1197,24 @@ async fn list_modules_property_idempotent() {
 // ===========================================================================
 
 // clause: apcore_client.describe.error.ModuleNotFoundError
+// [client-describe-raise] describe() MUST raise ModuleNotFoundError for a
+// missing module (parity with apcore-python / apcore-typescript), not return a
+// sentinel "not found" string.
 #[tokio::test]
-#[ignore = "apcore_client.describe.error.ModuleNotFoundError: Rust describe() returns a \
-'not found' String instead of erroring (contract gap vs Python ModuleNotFoundError)"]
 async fn describe_error_module_not_found() {
+    use apcore::errors::ErrorCode;
     let client = APCore::new();
-    // describe() returns a string ("... not found"), never an error in Rust.
-    let _ = client.describe("not.registered");
+    let err = client
+        .describe("not.registered")
+        .expect_err("describe on a missing module must error");
+    assert_eq!(err.code, ErrorCode::ModuleNotFound);
 }
 
 // clause: apcore_client.describe.returns.string
 #[tokio::test]
 async fn describe_returns_string() {
     let client = client_with_module();
-    let text = client.describe("math.add");
+    let text = client.describe("math.add").expect("module is registered");
     assert!(!text.is_empty(), "describe returns a non-empty string");
     assert!(
         text.contains("math.add") || text.contains("Add two numbers"),
@@ -1230,7 +1235,10 @@ async fn describe_property_pure() {
 #[tokio::test]
 async fn describe_property_idempotent() {
     let client = client_with_module();
-    assert_eq!(client.describe("math.add"), client.describe("math.add"));
+    assert_eq!(
+        client.describe("math.add").ok(),
+        client.describe("math.add").ok()
+    );
 }
 
 // ===========================================================================

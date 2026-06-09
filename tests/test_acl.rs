@@ -436,6 +436,25 @@ fn test_acl_load_uses_acl_rule_error_for_missing_rules_key() {
     assert_eq!(err.code, ErrorCode::ACLRuleError);
 }
 
+// A-D-09: a rule that omits `callers` (or `targets`) MUST be rejected at load
+// with ACL_RULE_ERROR, not silently loaded with an empty list (which would
+// make a deny rule inert).
+#[test]
+fn test_acl_load_rejects_rule_missing_callers() {
+    use apcore::errors::ErrorCode;
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    // Rule omits the `callers` key entirely.
+    writeln!(
+        tmp,
+        "default_effect: allow\nrules:\n  - targets: [\"secret.*\"]\n    effect: deny\n"
+    )
+    .expect("write tempfile");
+    let path = tmp.path().to_str().expect("utf8 path").to_string();
+    let err = ACL::load(&path).expect_err("load must reject rule missing 'callers'");
+    assert_eq!(err.code, ErrorCode::ACLRuleError);
+}
+
 // ---------------------------------------------------------------------------
 // A-D-303: ACL::reload doesn't deadlock (borrow scope released before file IO)
 // ---------------------------------------------------------------------------

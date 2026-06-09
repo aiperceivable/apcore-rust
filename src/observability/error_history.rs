@@ -26,10 +26,10 @@ use super::store::{InMemoryObservabilityStore, ObservabilityStore};
 /// are stable. Falls back to Debug formatting only if the enum lacks a serde
 /// representation, which should never occur in practice.
 fn error_code_string(code: ErrorCode) -> String {
-    serde_json::to_value(code)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("{code:?}"))
+    // Delegates to the shared canonical wire-string method on ErrorCode so the
+    // metrics middleware and error history use one source of truth (sync
+    // finding A-D-14).
+    code.wire_str()
 }
 
 /// A recorded error entry with deduplication support.

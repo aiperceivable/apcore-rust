@@ -465,12 +465,37 @@ impl Config {
     pub fn validate(&self) -> Result<(), ModuleError> {
         let mut errors: Vec<String> = Vec::new();
 
-        if self.executor.max_call_depth < 1 {
-            errors.push("executor.max_call_depth must be >= 1".to_string());
+        // --- 1. Required fields (legacy mode only) -------------------------
+        //
+        // Per the canonical contract (config-bus.md "Contract: Config.validate")
+        // and the reference SDK (apcore-python), required-field enforcement runs
+        // only in legacy mode. In namespace mode the `apcore:` block is metadata,
+        // not a standalone config, so a minimal namespace-mode YAML is accepted
+        // (apcore-python `_validate_namespace_mode` runs constraints only).
+        if self.mode != ConfigMode::Namespace {
+            const REQUIRED_FIELDS: &[&str] = &[
+                "version",
+                "project.name",
+                "extensions.root",
+                "schema.root",
+                "acl.root",
+                "acl.default_effect",
+            ];
+            for field in REQUIRED_FIELDS {
+                if self.get(field).is_none() {
+                    errors.push(format!("missing required field '{field}'"));
+                }
+            }
         }
-        if self.executor.max_module_repeat < 1 {
-            errors.push("executor.max_module_repeat must be >= 1".to_string());
-        }
+
+        // --- 2. Value constraints (both modes) -----------------------------
+        //
+        // Mirrors apcore-python `_CONSTRAINTS` and the canonical contract table.
+        // A constraint applies only when the field is present; absence is a
+        // required-field concern (handled above) or simply unset.
+        self.collect_constraint_errors(&mut errors);
+
+        // --- 3. Cross-field semantic check ---------------------------------
         // default_timeout == 0 means no timeout, which is allowed.
         if self.executor.global_timeout > 0
             && self.executor.default_timeout > 0
@@ -482,45 +507,53 @@ impl Config {
             ));
         }
 
-        // Sync CB-001: cross-language constraint set.
-        if let Some(de) = self.get("acl.default_effect") {
-            match de.as_str() {
-                Some("allow" | "deny") => {}
-                Some(other) => {
-                    errors.push(format!(
-                        "acl.default_effect must be 'allow' or 'deny' (got '{other}')"
-                    ));
+        // Namespace-mode validation (A12-NS, §9.14). Mirrors apcore-python
+        // `_validate_namespace_mode` (config.py:1106) and the TS equivalent
+        // (sync finding A-D-02). In namespace mode we additionally:
+        //   1. Validate each registered namespace that declares a schema
+        //      against its loaded subtree.
+        //   2. In strict mode (`_config.strict == true`) reject any top-level
+        //      namespace that is not registered (other than `apcore`/`_config`).
+        if self.mode == ConfigMode::Namespace {
+            let strict = self
+                .user_namespaces
+                .get("_config")
+                .and_then(|v| v.get("strict"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            // Snapshot the global namespace registry once so we can look up
+            // schemas without re-acquiring the lock per namespace.
+            let registry_snapshot: HashMap<String, NamespaceRegistration> =
+                global_ns_registry().read().clone();
+
+            for (key, value) in &self.user_namespaces {
+                if key == "apcore" || key == "_config" {
+                    continue;
                 }
-                None => {
-                    errors.push("acl.default_effect must be a string".to_string());
+                // Only object-valued top-level keys are namespaces.
+                if !value.is_object() {
+                    continue;
                 }
-            }
-        }
-
-        if let Some(rate) = self.get("observability.tracing.sampling_rate") {
-            let rate_ok = rate.as_f64().is_some_and(|f| (0.0..=1.0).contains(&f));
-            if !rate_ok {
-                errors.push(format!(
-                    "observability.tracing.sampling_rate must be a number in [0.0, 1.0] (got {rate})"
-                ));
-            }
-        }
-
-        if let Some(threshold) = self.get("sys_modules.events.thresholds.error_rate") {
-            let ok = threshold.as_f64().is_some_and(|f| (0.0..=1.0).contains(&f));
-            if !ok {
-                errors.push(format!(
-                    "sys_modules.events.thresholds.error_rate must be a number in [0.0, 1.0] (got {threshold})"
-                ));
-            }
-        }
-
-        if let Some(latency) = self.get("sys_modules.events.thresholds.latency_p99_ms") {
-            let ok = latency.as_f64().is_some_and(|f| f > 0.0);
-            if !ok {
-                errors.push(format!(
-                    "sys_modules.events.thresholds.latency_p99_ms must be a positive number (got {latency})"
-                ));
+                match registry_snapshot.get(key) {
+                    None => {
+                        if strict {
+                            errors.push(format!("unknown namespace '{key}' in strict mode"));
+                        }
+                    }
+                    Some(reg) => {
+                        if let Some(schema) = reg.schema.as_ref() {
+                            if let Err(e) =
+                                crate::executor::validate_against_schema(value, schema, "Config")
+                            {
+                                errors.push(format!(
+                                    "namespace '{key}' failed schema validation: {}",
+                                    e.message
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -529,6 +562,86 @@ impl Config {
         } else {
             let message = format!("Config validation failed: {}", errors.join("; "));
             Err(ModuleError::new(ErrorCode::ConfigInvalid, message))
+        }
+    }
+
+    /// Append a validation error for every present-but-out-of-range field in
+    /// the canonical constraint table (config-bus.md "Contract: Config.validate";
+    /// mirrors apcore-python `_CONSTRAINTS`). A field is checked only when
+    /// present — absence is governed by the required-field set, not here.
+    fn collect_constraint_errors(&self, errors: &mut Vec<String>) {
+        // A JSON number (int or float); serde_json never treats booleans as
+        // numbers, so `as_f64` already excludes `true`/`false`.
+        fn as_number(v: &serde_json::Value) -> Option<f64> {
+            v.as_f64()
+        }
+        // An integral JSON number within i64 range (excludes floats/booleans).
+        fn as_int(v: &serde_json::Value) -> Option<i64> {
+            if v.is_i64() || v.is_u64() {
+                v.as_i64()
+                    .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+            } else {
+                None
+            }
+        }
+
+        // acl.default_effect ∈ {allow, deny}
+        if let Some(de) = self.get("acl.default_effect") {
+            let ok = matches!(de.as_str(), Some("allow" | "deny"));
+            if !ok {
+                errors.push(format!(
+                    "acl.default_effect must be 'allow' or 'deny' (got {de})"
+                ));
+            }
+        }
+
+        // Numbers in [0.0, 1.0].
+        for key in [
+            "observability.tracing.sampling_rate",
+            "sys_modules.events.thresholds.error_rate",
+        ] {
+            if let Some(v) = self.get(key) {
+                if as_number(&v).is_none_or(|n| !(0.0..=1.0).contains(&n)) {
+                    errors.push(format!("{key} must be a number in [0.0, 1.0] (got {v})"));
+                }
+            }
+        }
+
+        // Non-negative numbers (>= 0).
+        for key in [
+            "sys_modules.events.thresholds.latency_p99_ms",
+            "executor.default_timeout",
+            "executor.global_timeout",
+            "middleware.circuit_breaker.recovery_window_ms",
+        ] {
+            if let Some(v) = self.get(key) {
+                if as_number(&v).is_none_or(|n| n < 0.0) {
+                    errors.push(format!("{key} must be a number >= 0 (got {v})"));
+                }
+            }
+        }
+
+        // Integers >= 1.
+        for key in [
+            "executor.max_call_depth",
+            "executor.max_module_repeat",
+            "middleware.circuit_breaker.open_threshold",
+        ] {
+            if let Some(v) = self.get(key) {
+                if as_int(&v).is_none_or(|n| n < 1) {
+                    errors.push(format!("{key} must be an integer >= 1 (got {v})"));
+                }
+            }
+        }
+
+        // Integers in [1, 16]. Mirrors `validate_key_constraint` and the spec so
+        // both Rust validation paths (validate / update_config) agree.
+        if let Some(v) = self.get("extensions.max_depth") {
+            if as_int(&v).is_none_or(|n| !(1..=16).contains(&n)) {
+                errors.push(format!(
+                    "extensions.max_depth must be an integer in [1, 16] (got {v})"
+                ));
+            }
         }
     }
 
@@ -920,20 +1033,20 @@ impl Config {
             _ => {}
         }
 
-        // Sync finding A-D-018: when the namespace has no data registered,
-        // bind into an empty object so `T`'s serde defaults take effect —
-        // matching apcore-python's `_instantiate_model(model, {}, namespace)`
-        // and apcore-typescript's `new schema({})`. Previously Rust returned
-        // ConfigBindError("namespace not found"), which broke portable code
-        // that relied on default-fill behavior across SDKs.
-        let owned;
-        let value: &serde_json::Value = if let Some(v) = self.user_namespaces.get(namespace) {
-            v
-        } else {
-            owned = serde_json::Value::Object(serde_json::Map::new());
-            &owned
-        };
-        serde_json::from_value(value.clone())
+        // Bind from the merged namespace view (registered defaults + loaded
+        // YAML/env), not the raw `user_namespaces` entry. `namespace()` overlays
+        // loaded values onto registered defaults, so a registered default absent
+        // from YAML is still present in the bound struct. Mirrors apcore-python
+        // (`_instantiate_model(model, self.namespace(name), name)`) and
+        // apcore-typescript (`bind` over the merged namespace).
+        //
+        // Sync finding A-D-018: an unregistered namespace with no data yields an
+        // empty object, so `T`'s serde defaults take effect (matching
+        // `_instantiate_model(model, {}, namespace)` / `new schema({})`) rather
+        // than the old ConfigBindError("namespace not found").
+        let merged: serde_json::Map<String, serde_json::Value> =
+            self.namespace(namespace).into_iter().collect();
+        serde_json::from_value(serde_json::Value::Object(merged))
             .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
     }
 
@@ -1408,9 +1521,19 @@ mod tests {
     }
 
     #[test]
-    fn default_config_validates_successfully() {
+    fn bare_default_config_fails_required_field_check() {
+        // Canonical contract (A-D-03): a bare struct-`default()` Config is in
+        // legacy mode but carries none of the spec-mandated required fields
+        // (version, project.name, extensions.root, schema.root, acl.root,
+        // acl.default_effect). It MUST now be rejected with CONFIG_INVALID.
+        // (Previously this asserted the old lax behavior where it passed.)
         let cfg = Config::default();
-        assert!(cfg.validate().is_ok());
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "bare default config lacks required fields and must fail validation"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
     }
 
     // -------------------------------------------------------------------------
@@ -1505,9 +1628,18 @@ mod tests {
 
     #[test]
     fn validate_allows_zero_global_timeout_meaning_no_deadline() {
-        let mut cfg = Config::default();
-        cfg.executor.global_timeout = 0; // 0 = no global deadline
-        assert!(cfg.validate().is_ok());
+        // Build a complete, valid legacy config, then set global_timeout = 0
+        // (0 = no global deadline). This must still pass. Uses a populated
+        // config because required-field enforcement (A-D-03) now rejects bare
+        // defaults that lack version/project/extensions/schema/acl.
+        let mut json = valid_legacy_config_json();
+        json["executor"]["global_timeout"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        assert!(
+            cfg.validate().is_ok(),
+            "zero global_timeout (no deadline) must be allowed: {:?}",
+            cfg.validate()
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1602,5 +1734,233 @@ mod tests {
         // which relies on from_defaults path. Test via from_defaults behavior:
         // Just verify the config parsed correctly.
         assert_eq!(cfg.executor.max_call_depth, 8);
+    }
+
+    // -------------------------------------------------------------------------
+    // A-D-02: namespace-mode validation (strict unknown-namespace rejection
+    // and registered-namespace schema validation).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn strict_mode_rejects_unknown_namespace() {
+        // Namespace mode (apcore key present) + _config.strict=true +
+        // an unregistered top-level namespace MUST fail with CONFIG_INVALID.
+        let json_str = r#"{
+            "apcore": {},
+            "_config": {"strict": true},
+            "totally-unregistered-ns-ad02": {"foo": "bar"}
+        }"#;
+        let cfg: Config = serde_json::from_str(json_str).expect("should parse");
+        assert_eq!(cfg.mode, ConfigMode::Namespace);
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "strict mode must reject unknown namespace, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    // -------------------------------------------------------------------------
+    // A-D-03: required-field enforcement + full constraint set (legacy mode).
+    // Canonical contract: docs/features/config-bus.md "Contract: Config.validate".
+    // -------------------------------------------------------------------------
+
+    /// A complete, spec-valid legacy-mode config. Mutate a clone to test that a
+    /// single violation is rejected while the baseline passes.
+    fn valid_legacy_config_json() -> serde_json::Value {
+        serde_json::json!({
+            "version": "0.23.0",
+            "project": { "name": "demo" },
+            "extensions": { "root": "./extensions", "max_depth": 8 },
+            "schema": { "root": "./schemas" },
+            "acl": { "root": "./acl", "default_effect": "deny" },
+            "executor": {
+                "default_timeout": 30000,
+                "global_timeout": 60000,
+                "max_call_depth": 32,
+                "max_module_repeat": 3
+            },
+            "observability": { "tracing": { "enabled": false, "sampling_rate": 1.0 } },
+            "middleware": {
+                "circuit_breaker": { "open_threshold": 5, "recovery_window_ms": 30000 }
+            },
+            "sys_modules": {
+                "events": { "thresholds": { "error_rate": 0.1, "latency_p99_ms": 5000.0 } }
+            }
+        })
+    }
+
+    fn config_from_json(value: &serde_json::Value) -> Config {
+        serde_json::from_value(value.clone()).expect("fixture should deserialize")
+    }
+
+    #[test]
+    fn validate_accepts_fully_valid_legacy_config() {
+        let cfg = config_from_json(&valid_legacy_config_json());
+        assert!(
+            cfg.validate().is_ok(),
+            "fully-valid config must pass: {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_legacy_config_missing_acl_root() {
+        let mut json = valid_legacy_config_json();
+        json["acl"].as_object_mut().unwrap().remove("root");
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(result.is_err(), "missing acl.root must be rejected");
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_each_missing_required_field() {
+        // version, project.name, extensions.root, schema.root, acl.root,
+        // acl.default_effect — absence of any one is CONFIG_INVALID.
+        let removals: &[(&str, &str)] = &[
+            ("version", ""),
+            ("project", "name"),
+            ("extensions", "root"),
+            ("schema", "root"),
+            ("acl", "root"),
+            ("acl", "default_effect"),
+        ];
+        for (top, nested) in removals {
+            let mut json = valid_legacy_config_json();
+            if nested.is_empty() {
+                json.as_object_mut().unwrap().remove(*top);
+            } else {
+                json[*top].as_object_mut().unwrap().remove(*nested);
+            }
+            let cfg = config_from_json(&json);
+            let result = cfg.validate();
+            let field = if nested.is_empty() {
+                (*top).to_string()
+            } else {
+                format!("{top}.{nested}")
+            };
+            assert!(
+                result.is_err(),
+                "missing required field '{field}' must be rejected"
+            );
+            assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_circuit_breaker_open_threshold_zero() {
+        let mut json = valid_legacy_config_json();
+        json["middleware"]["circuit_breaker"]["open_threshold"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "open_threshold = 0 must be rejected (>= 1)"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_events_error_rate_above_one() {
+        let mut json = valid_legacy_config_json();
+        json["sys_modules"]["events"]["thresholds"]["error_rate"] = serde_json::json!(1.5);
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(result.is_err(), "error_rate = 1.5 must be rejected ([0,1])");
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_bad_default_effect_value() {
+        let mut json = valid_legacy_config_json();
+        json["acl"]["default_effect"] = serde_json::json!("maybe");
+        let cfg = config_from_json(&json);
+        assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_extensions_max_depth_zero() {
+        let mut json = valid_legacy_config_json();
+        json["extensions"]["max_depth"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_extensions_max_depth_above_range() {
+        // [config-maxdepth-residual] validate()'s collect_constraint_errors must
+        // use the [1, 16] range (matching validate_key_constraint and the spec),
+        // not an unbounded >= 1 check.
+        let mut json = valid_legacy_config_json();
+        json["extensions"]["max_depth"] = serde_json::json!(17);
+        let cfg = config_from_json(&json);
+        assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_circuit_breaker_negative_recovery_window() {
+        let mut json = valid_legacy_config_json();
+        json["middleware"]["circuit_breaker"]["recovery_window_ms"] = serde_json::json!(-1);
+        let cfg = config_from_json(&json);
+        assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_namespace_mode_skips_required_fields() {
+        // Per the anchor (apcore-python `_validate_namespace_mode`), namespace
+        // mode runs constraints only — NOT required fields. A minimal
+        // namespace-mode config (no version/project/etc.) must still pass.
+        let json_str = r#"{ "apcore": {} }"#;
+        let cfg: Config = serde_json::from_str(json_str).expect("should parse");
+        assert_eq!(cfg.mode, ConfigMode::Namespace);
+        assert!(
+            cfg.validate().is_ok(),
+            "namespace mode must not require legacy required fields: {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn registered_namespace_with_schema_rejects_invalid_data() {
+        // Register a namespace with a schema requiring `count` to be an integer.
+        let ns_name = "schema-ns-ad02";
+        let reg = NamespaceRegistration {
+            name: ns_name.to_string(),
+            env_prefix: None,
+            defaults: None,
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"]
+            })),
+            env_style: EnvStyle::Auto,
+            max_depth: DEFAULT_MAX_DEPTH,
+            env_map: None,
+        };
+        // Ignore duplicate-registration error if a prior test registered it.
+        let _ = Config::register_namespace(reg);
+
+        // Invalid: `count` is a string, not an integer.
+        let json_str = r#"{
+            "apcore": {},
+            "schema-ns-ad02": {"count": "not-an-integer"}
+        }"#;
+        let cfg: Config = serde_json::from_str(json_str).expect("should parse");
+        assert_eq!(cfg.mode, ConfigMode::Namespace);
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "registered namespace with invalid data must fail, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+
+        // Sanity: valid data passes the same schema.
+        let valid_str = r#"{
+            "apcore": {},
+            "schema-ns-ad02": {"count": 5}
+        }"#;
+        let cfg_ok: Config = serde_json::from_str(valid_str).expect("should parse");
+        assert!(cfg_ok.validate().is_ok());
     }
 }

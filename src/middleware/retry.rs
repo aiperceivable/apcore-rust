@@ -3,13 +3,11 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use parking_lot::Mutex;
 
 use super::base::Middleware;
 use crate::context::Context;
+use crate::context_keys::RETRY_COUNT_BASE;
 use crate::errors::ModuleError;
 
 /// Configuration for retry behavior.
@@ -67,22 +65,38 @@ impl Default for RetryConfig {
 /// the pipeline to retry execution. After `max_retries` attempts or for non-retryable
 /// errors, it returns `None` so the error propagates.
 ///
-/// Retry state is tracked per-module internally via a `Mutex<HashMap>`
-/// within the middleware instance.
+/// Retry state is tracked per-call in `context.data` under the
+/// `_apcore.mw.retry.count.{module_id}` key (see [`RETRY_COUNT_BASE`]),
+/// matching apcore-python / apcore-typescript. Storing the counter in the
+/// per-call context (rather than a shared instance map) keeps concurrent
+/// invocations of the same module isolated and makes the count visible to
+/// peer middleware on the same context.
 #[derive(Debug)]
 pub struct RetryMiddleware {
     pub config: RetryConfig,
-    retry_counts: Mutex<HashMap<String, u32>>,
 }
 
 impl RetryMiddleware {
     /// Create a new retry middleware with the given config.
     #[must_use]
     pub fn new(config: RetryConfig) -> Self {
-        Self {
-            config,
-            retry_counts: Mutex::new(HashMap::new()),
-        }
+        Self { config }
+    }
+
+    /// Read the current retry count for `module_id` from `context.data`.
+    fn retry_count(ctx: &Context<serde_json::Value>, module_id: &str) -> u32 {
+        RETRY_COUNT_BASE
+            .scoped(module_id)
+            .get(ctx)
+            .and_then(|n: i64| u32::try_from(n).ok())
+            .unwrap_or(0)
+    }
+
+    /// Store `count` as the retry count for `module_id` in `context.data`.
+    fn set_retry_count(ctx: &Context<serde_json::Value>, module_id: &str, count: u32) {
+        RETRY_COUNT_BASE
+            .scoped(module_id)
+            .set(ctx, i64::from(count));
     }
 
     /// Calculate delay in milliseconds for the given attempt number.
@@ -140,11 +154,11 @@ impl Middleware for RetryMiddleware {
         module_id: &str,
         _inputs: serde_json::Value,
         _output: serde_json::Value,
-        _ctx: &Context<serde_json::Value>,
+        ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Reset retry count on successful execution so retries don't persist
         // across separate call sequences.
-        self.retry_counts.lock().remove(module_id);
+        RETRY_COUNT_BASE.scoped(module_id).delete(ctx);
         Ok(None)
     }
 
@@ -153,17 +167,14 @@ impl Middleware for RetryMiddleware {
         module_id: &str,
         inputs: serde_json::Value,
         error: &ModuleError,
-        _ctx: &Context<serde_json::Value>,
+        ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Only retry if the error is explicitly marked as retryable.
         if error.retryable != Some(true) {
             return Ok(None);
         }
 
-        let retry_count = {
-            let counts = self.retry_counts.lock();
-            *counts.get(module_id).unwrap_or(&0)
-        };
+        let retry_count = Self::retry_count(ctx, module_id);
 
         if retry_count >= self.config.max_retries {
             tracing::warn!(
@@ -190,11 +201,8 @@ impl Middleware for RetryMiddleware {
         let delay_ms_u64 = delay_ms as u64;
         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms_u64)).await;
 
-        // Increment the retry count.
-        {
-            let mut counts = self.retry_counts.lock();
-            *counts.entry(module_id.to_string()).or_insert(0) += 1;
-        }
+        // Increment the retry count in context.data.
+        Self::set_retry_count(ctx, module_id, retry_count + 1);
 
         // Return the original inputs to signal retry.
         Ok(Some(inputs))
@@ -299,10 +307,11 @@ mod tests {
     #[tokio::test]
     async fn test_after_resets_retry_count() {
         let mw = RetryMiddleware::new(RetryConfig::default());
-        mw.retry_counts.lock().insert("mod.a".to_string(), 2);
         let ctx = Context::<serde_json::Value>::anonymous();
+        RetryMiddleware::set_retry_count(&ctx, "mod.a", 2);
         mw.after("mod.a", json!({}), json!({}), &ctx).await.unwrap();
-        assert!(mw.retry_counts.lock().get("mod.a").is_none());
+        assert_eq!(RetryMiddleware::retry_count(&ctx, "mod.a"), 0);
+        assert!(!RETRY_COUNT_BASE.scoped("mod.a").exists(&ctx));
     }
 
     #[tokio::test]
@@ -337,7 +346,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, Some(inputs));
-        assert_eq!(*mw.retry_counts.lock().get("mod.a").unwrap(), 1);
+        assert_eq!(RetryMiddleware::retry_count(&ctx, "mod.a"), 1);
     }
 
     #[tokio::test]
@@ -349,10 +358,48 @@ mod tests {
             max_delay_ms: 1,
             jitter: false,
         });
-        mw.retry_counts.lock().insert("mod.a".to_string(), 2);
         let ctx = Context::<serde_json::Value>::anonymous();
+        RetryMiddleware::set_retry_count(&ctx, "mod.a", 2);
         let err = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
         let result = mw.on_error("mod.a", json!({}), &err, &ctx).await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_retry_count_isolated_per_context() {
+        // [mw-retry-counter] Two contexts for the same module_id must track
+        // retry counts independently (the counter lives in context.data, not a
+        // shared instance map), matching Python/TS.
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 5,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+        });
+        let ctx_a = Context::<serde_json::Value>::anonymous();
+        let ctx_b = Context::<serde_json::Value>::anonymous();
+        let err = ModuleError::new(ErrorCode::ModuleExecuteError, "fail").with_retryable(true);
+
+        // Drive ctx_a twice, ctx_b once — same module_id.
+        mw.on_error("mod.a", json!({}), &err, &ctx_a).await.unwrap();
+        mw.on_error("mod.a", json!({}), &err, &ctx_a).await.unwrap();
+        mw.on_error("mod.a", json!({}), &err, &ctx_b).await.unwrap();
+
+        assert_eq!(RetryMiddleware::retry_count(&ctx_a, "mod.a"), 2);
+        assert_eq!(RetryMiddleware::retry_count(&ctx_b, "mod.a"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_retry_count_uses_canonical_context_key() {
+        // The key must be exactly `_apcore.mw.retry.count.{module_id}` (parity).
+        let ctx = Context::<serde_json::Value>::anonymous();
+        RetryMiddleware::set_retry_count(&ctx, "mod.a", 3);
+        let data = ctx.data.read();
+        assert_eq!(
+            data.get("_apcore.mw.retry.count.mod.a")
+                .and_then(serde_json::Value::as_i64),
+            Some(3)
+        );
     }
 }

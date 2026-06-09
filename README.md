@@ -33,7 +33,7 @@ A schema-enforced module standard for the AI-Perceivable era.
 ## Cross-Language Feature Parity
 
 The Rust SDK tracks the apcore protocol spec and ships full feature parity
-with the Python and TypeScript SDKs. The table below highlights the v0.22
+with the Python and TypeScript SDKs. The table below highlights the v0.23
 hardening items (#60–#65) plus the long-standing background-task and
 extension surfaces.
 
@@ -114,7 +114,7 @@ tests at `tests/test_async_task.rs` and `tests/test_extensions.rs`.
 | `BindingLoader` | Load modules from YAML binding files |
 
 > See [Cross-Language Feature Parity](#cross-language-feature-parity) for the
-> full v0.22 parity matrix across Python, TypeScript, and Rust.
+> full v0.23 parity matrix across Python, TypeScript, and Rust.
 
 ## Documentation
 
@@ -132,7 +132,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-apcore = "0.22"
+apcore = "0.23"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```

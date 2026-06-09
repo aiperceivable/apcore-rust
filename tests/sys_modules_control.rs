@@ -266,6 +266,48 @@ async fn test_toggle_feature_module_disables_and_enables() {
     assert!(!toggle_state.is_disabled("my.module"));
 }
 
+// A-D-12: a feature toggle MUST survive a registry reload. Disabling a module
+// flips only the ToggleState (not the registry descriptor's `enabled` flag),
+// so re-registering the descriptor (as a reload does) leaves the module
+// disabled.
+#[tokio::test]
+async fn test_toggle_disable_survives_descriptor_reregister() {
+    let registry = make_registry();
+    register_dummy(&registry, "my.module");
+
+    let emitter = make_emitter();
+    let toggle_state = Arc::new(ToggleState::new());
+    let module =
+        ToggleFeatureModule::new(Arc::clone(&registry), emitter, Arc::clone(&toggle_state));
+    let ctx = dummy_ctx();
+
+    // Disable the module via the toggle.
+    module
+        .execute(
+            serde_json::json!({
+                "module_id": "my.module",
+                "enabled": false,
+                "reason": "disable for reload test"
+            }),
+            &ctx,
+        )
+        .await
+        .expect("disable should succeed");
+    assert!(toggle_state.is_disabled("my.module"));
+
+    // Simulate a reload: re-register the descriptor with enabled=true.
+    registry
+        .unregister("my.module")
+        .expect("unregister should succeed");
+    register_dummy(&registry, "my.module");
+
+    // The toggle MUST still report the module as disabled.
+    assert!(
+        toggle_state.is_disabled("my.module"),
+        "toggle disable must survive a descriptor re-register (reload)"
+    );
+}
+
 #[tokio::test]
 async fn test_toggle_feature_module_not_found_returns_error() {
     let registry = make_registry();

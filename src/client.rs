@@ -66,8 +66,9 @@ impl APCore {
     /// and every built-in sys module — there is exactly one registry
     /// instance per `APCore` client.
     ///
-    /// When `sys_modules.enabled` is true in the config (the default), built-in
-    /// system modules are automatically registered into the executor pipeline.
+    /// When `sys_modules.enabled` is true in the config (default: false; system
+    /// modules are opt-in), built-in system modules are automatically
+    /// registered into the executor pipeline.
     /// This registration is now fully synchronous and runtime-agnostic because
     /// `Registry` uses `parking_lot::RwLock` for interior mutability.
     ///
@@ -124,13 +125,15 @@ impl APCore {
     }
 
     /// Return whether the `sys_modules` auto-registration is enabled
-    /// according to the given config. Defaults to `true` when the key
-    /// is absent.
+    /// according to the given config. Defaults to `false` (opt-in) when the
+    /// key is absent, matching the spec and the Python/TS peers
+    /// (registration.py:335 / registration.ts:250). Kept consistent with
+    /// `register_sys_modules` (sync finding A-D-11).
     fn sys_modules_enabled(config: &Config) -> bool {
         config
             .get("sys_modules.enabled")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Create a new `APCore` client with the given configuration.
@@ -616,10 +619,18 @@ impl APCore {
     }
 
     /// Describe a module by ID.
-    pub fn describe(&self, module_id: &str) -> String {
+    ///
+    /// Returns the module's description on success. Per the spec contract,
+    /// `describe` MUST raise `ModuleNotFoundError` for a missing module rather
+    /// than returning a sentinel string — matching apcore-python /
+    /// apcore-typescript (which raise `ModuleNotFoundError`).
+    pub fn describe(&self, module_id: &str) -> Result<String, ModuleError> {
         match self.registry.get(module_id) {
-            Ok(Some(module)) => module.description().to_string(),
-            Ok(None) | Err(_) => format!("Module '{module_id}' not found"),
+            Ok(Some(module)) => Ok(module.description().to_string()),
+            Ok(None) | Err(_) => Err(ModuleError::new(
+                crate::errors::ErrorCode::ModuleNotFound,
+                format!("Module '{module_id}' not found"),
+            )),
         }
     }
 

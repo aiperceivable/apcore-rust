@@ -262,8 +262,17 @@ impl Step for BuiltinModuleLookup {
                 format!("Module '{}' not found in registry", ctx.module_id),
             )
         })?;
-        // Check if the module is disabled before proceeding.
-        if let Some(false) = registry.is_enabled(&ctx.module_id) {
+        // Check if the module is disabled before proceeding. Two sources:
+        //   1. The registry descriptor's `enabled` flag (direct registry-level
+        //      disable).
+        //   2. The process-global ToggleState, which is the authoritative store
+        //      written by `ToggleFeatureModule` and survives registry reloads
+        //      (sync finding A-D-12). The pipeline MUST consult it because the
+        //      toggle no longer mutates the descriptor flag. Mirrors
+        //      apcore-python BuiltinModuleLookup (builtin_steps.py:252).
+        if matches!(registry.is_enabled(&ctx.module_id), Some(false))
+            || crate::sys_modules::is_module_disabled(&ctx.module_id)
+        {
             return Err(ModuleError::new(
                 ErrorCode::ModuleDisabled,
                 format!("Module '{}' is disabled", ctx.module_id),
@@ -579,9 +588,28 @@ impl Step for BuiltinMiddlewareBefore {
         {
             Ok((inputs, executed)) => (inputs, executed),
             Err(e) => {
+                // Recover the list of middlewares that ran during execute_before
+                // from the MiddlewareChainError details so on_error runs over
+                // exactly those (mirrors Python builtin_steps.py:483 setting
+                // ctx.executed_middlewares = exc.executed_middlewares and TS
+                // builtin-steps.ts:442) — sync finding A-D-01. Without this the
+                // recovery middleware's on_error is skipped (empty &[]) and the
+                // executor-level on_error/RetrySignal loop is bypassed.
+                let executed: Vec<usize> = e
+                    .details
+                    .get("executed_middlewares")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                ctx.executed_middlewares.clone_from(&executed);
                 // On middleware before error, run on_error for recovery.
                 let recovery = middleware_manager
-                    .execute_on_error(&ctx.module_id, ctx.inputs.clone(), &e, &ctx.context, &[])
+                    .execute_on_error(
+                        &ctx.module_id,
+                        ctx.inputs.clone(),
+                        &e,
+                        &ctx.context,
+                        &executed,
+                    )
                     .await;
                 if let Some(recovery_value) = recovery {
                     ctx.output = Some(recovery_value);
@@ -624,14 +652,31 @@ impl Step for BuiltinExecute {
         // D-11), fall back to `config.executor.default_timeout`. Both are
         // then clamped against the remaining global deadline below.
         // Spec: docs/features/core-executor.md §Step 8 (dual-timeout model).
-        let per_module_timeout_ms: Option<u64> = ctx
+        let declared_timeout: Option<serde_json::Value> = ctx
             .registry
             .as_ref()
             .and_then(|reg| reg.get_definition(&ctx.module_id).ok().flatten())
             .and_then(|desc| desc.annotations)
             .and_then(|ann| ann.extra.get("resources").cloned())
-            .and_then(|res| res.get("timeout").cloned())
-            .and_then(|v| v.as_u64());
+            .and_then(|res| res.get("timeout").cloned());
+        // A negative declared timeout is invalid and MUST be rejected rather
+        // than silently swallowed (`as_u64()` would return None and fall back
+        // to the default). Spec Edge Cases table; peer Python builtin_steps.py:620
+        // raises InvalidInputError (sync finding A-D-W1).
+        if let Some(ref v) = declared_timeout {
+            let is_negative =
+                v.as_i64().is_some_and(|n| n < 0) || v.as_f64().is_some_and(|f| f < 0.0);
+            if is_negative {
+                return Err(ModuleError::new(
+                    ErrorCode::GeneralInvalidInput,
+                    format!(
+                        "Module '{}' declares a negative timeout ({}); timeout must be non-negative",
+                        ctx.module_id, v
+                    ),
+                ));
+            }
+        }
+        let per_module_timeout_ms: Option<u64> = declared_timeout.and_then(|v| v.as_u64());
         let mut timeout_ms = per_module_timeout_ms.unwrap_or(config.executor.default_timeout);
         if let Some(deadline) = ctx.context.global_deadline {
             let now = std::time::SystemTime::now()
@@ -781,11 +826,12 @@ impl Step for BuiltinMiddlewareAfter {
             None => return Ok(StepResult::continue_step()),
         };
 
-        // INVARIANT: BuiltinExecute runs before this step and sets ctx.output.
-        let output = ctx
-            .output
-            .take()
-            .expect("output must be set before middleware_after");
+        // BuiltinExecute normally sets ctx.output before this step, but a custom
+        // strategy may reach here with no output (e.g. execute step omitted or
+        // skipped). Match Python/TS: pass through instead of panicking.
+        let Some(output) = ctx.output.take() else {
+            return Ok(StepResult::continue_step());
+        };
 
         match middleware_manager
             .execute_after(&ctx.module_id, ctx.inputs.clone(), output, &ctx.context)
@@ -904,4 +950,48 @@ pub fn build_minimal_strategy() -> ExecutionStrategy {
     s.remove("output_validation").ok();
     s.remove("middleware_after").ok();
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Context;
+    use crate::context::Identity;
+
+    fn empty_context() -> PipelineContext {
+        let identity = Identity::new(
+            "user-1".to_string(),
+            "user".to_string(),
+            vec![],
+            HashMap::new(),
+        );
+        let context: Context<serde_json::Value> = Context::new(identity);
+        PipelineContext::new("mod-x", serde_json::json!({}), context, "custom")
+    }
+
+    // [exec-none-output-panic] A custom strategy may reach the after-steps with
+    // ctx.output == None. Python/TS pass through; Rust must not panic.
+    #[tokio::test]
+    async fn output_validation_passes_through_when_output_none() {
+        let step = BuiltinOutputValidation;
+        let mut ctx = empty_context();
+        assert!(ctx.output.is_none());
+        let result = step.execute(&mut ctx).await;
+        assert!(result.is_ok(), "must not panic/err when output is None");
+    }
+
+    #[tokio::test]
+    async fn middleware_after_passes_through_when_output_none() {
+        use crate::middleware::manager::MiddlewareManager;
+        use std::sync::Arc;
+
+        let step = BuiltinMiddlewareAfter;
+        let mut ctx = empty_context();
+        // Attach a manager so the step reaches the output `take()` path; with
+        // output None it must pass through (continue) rather than panic.
+        ctx.middleware_manager = Some(Arc::new(MiddlewareManager::new()));
+        assert!(ctx.output.is_none());
+        let result = step.execute(&mut ctx).await;
+        assert!(result.is_ok(), "must not panic/err when output is None");
+    }
 }

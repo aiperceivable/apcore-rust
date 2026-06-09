@@ -250,7 +250,7 @@ impl MetricsCollector {
             std::collections::HashSet::new();
         for ((name, labels), value) in counters.iter() {
             if seen_counter_names.insert(name.clone()) {
-                let _ = writeln!(output, "# HELP {name} Counter metric");
+                let _ = writeln!(output, "# HELP {name} {}", metric_help_text(name));
                 let _ = writeln!(output, "# TYPE {name} counter");
             }
             let label_str = format_prometheus_labels(labels);
@@ -262,7 +262,7 @@ impl MetricsCollector {
             std::collections::HashSet::new();
         for ((name, labels), data) in histograms.iter() {
             if seen_hist_names.insert(name.clone()) {
-                let _ = writeln!(output, "# HELP {name} Histogram metric");
+                let _ = writeln!(output, "# HELP {name} {}", metric_help_text(name));
                 let _ = writeln!(output, "# TYPE {name} histogram");
             }
             let base_labels = format_prometheus_labels(labels);
@@ -312,6 +312,21 @@ impl MetricsCollector {
         let mut labels = HashMap::new();
         labels.insert("module_id".to_string(), module_id.to_string());
         self.observe("apcore_module_duration_seconds", labels, duration_secs);
+    }
+}
+
+/// Per-metric-name HELP description for Prometheus export.
+///
+/// Mirrors the description table used by apcore-python / apcore-typescript so
+/// the exported `# HELP` lines are identical across SDKs. Unknown metric names
+/// fall back to the metric name itself (rather than a generic
+/// "Counter metric" / "Histogram metric").
+fn metric_help_text(name: &str) -> &str {
+    match name {
+        "apcore_module_calls_total" => "Total module calls",
+        "apcore_module_errors_total" => "Total module errors",
+        "apcore_module_duration_seconds" => "Module execution duration",
+        other => other,
     }
 }
 
@@ -401,12 +416,16 @@ impl Default for MetricsCollector {
 
 /// Middleware that records execution metrics.
 ///
-/// WARNING: The internal start-time stack is not safe for concurrent use on
-/// the same middleware instance. Use separate instances per concurrent pipeline.
+/// Per-trace start times are kept as a **stack** (`Vec<Instant>`) so a nested
+/// call sharing the same `trace_id` pushes its own start without clobbering the
+/// outer call's. `after`/`on_error` pop the innermost start (LIFO), so each
+/// frame records its own duration. Mirrors the per-context stack used by
+/// apcore-python / apcore-typescript (sync finding [obs-nested-timing]); before
+/// this fix a single-slot map made the parent record a 0ms duration.
 #[derive(Debug)]
 pub struct MetricsMiddleware {
     collector: MetricsCollector,
-    starts: Mutex<HashMap<String, std::time::Instant>>,
+    starts: Mutex<HashMap<String, Vec<std::time::Instant>>>,
 }
 
 impl MetricsMiddleware {
@@ -423,6 +442,21 @@ impl MetricsMiddleware {
     pub fn collector(&self) -> &MetricsCollector {
         &self.collector
     }
+
+    /// Pop the innermost (LIFO) start time for `trace_id` and return its elapsed
+    /// duration in seconds, or 0.0 if no matching start was recorded. Empty
+    /// stacks are removed to avoid unbounded growth of the map.
+    fn pop_duration_secs(&self, trace_id: &str) -> f64 {
+        let mut starts = self.starts.lock();
+        let Some(stack) = starts.get_mut(trace_id) else {
+            return 0.0;
+        };
+        let duration = stack.pop().map_or(0.0, |s| s.elapsed().as_secs_f64());
+        if stack.is_empty() {
+            starts.remove(trace_id);
+        }
+        duration
+    }
 }
 
 #[async_trait]
@@ -438,7 +472,10 @@ impl Middleware for MetricsMiddleware {
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         let mut starts = self.starts.lock();
-        starts.insert(_ctx.trace_id.clone(), std::time::Instant::now());
+        starts
+            .entry(_ctx.trace_id.clone())
+            .or_default()
+            .push(std::time::Instant::now());
         Ok(None)
     }
 
@@ -449,12 +486,7 @@ impl Middleware for MetricsMiddleware {
         _output: serde_json::Value,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let duration_secs = {
-            let mut starts = self.starts.lock();
-            starts
-                .remove(&_ctx.trace_id)
-                .map_or(0.0, |s| s.elapsed().as_secs_f64())
-        };
+        let duration_secs = self.pop_duration_secs(&_ctx.trace_id);
 
         self.collector.increment_calls(module_id, "success");
         self.collector.observe_duration(module_id, duration_secs);
@@ -469,14 +501,12 @@ impl Middleware for MetricsMiddleware {
         _error: &ModuleError,
         _ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
-        let duration_secs = {
-            let mut starts = self.starts.lock();
-            starts
-                .remove(&_ctx.trace_id)
-                .map_or(0.0, |s| s.elapsed().as_secs_f64())
-        };
+        let duration_secs = self.pop_duration_secs(&_ctx.trace_id);
 
-        let error_code = format!("{:?}", _error.code);
+        // Use the canonical wire code (SCREAMING_SNAKE_CASE) for the metric
+        // label, not Debug (PascalCase), for cross-language parity (sync
+        // finding A-D-14).
+        let error_code = _error.code.wire_str();
         self.collector.increment_calls(module_id, "error");
         self.collector.increment_errors(module_id, &error_code);
         self.collector.observe_duration(module_id, duration_secs);
@@ -488,6 +518,88 @@ impl Middleware for MetricsMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::{Context, Identity};
+    use crate::errors::ErrorCode;
+
+    // A-D-14: the error metric label MUST be the canonical wire code
+    // (SCREAMING_SNAKE_CASE), not Debug formatting (PascalCase).
+    #[tokio::test]
+    async fn on_error_uses_canonical_wire_code_label() {
+        let collector = MetricsCollector::new();
+        let mw = MetricsMiddleware::new(collector);
+        let ctx = Context::<serde_json::Value>::new(Identity::new(
+            "@test".to_string(),
+            "test".to_string(),
+            vec![],
+            HashMap::new(),
+        ));
+        let error = ModuleError::new(ErrorCode::ModuleExecuteError, "boom");
+
+        mw.on_error("demo.module", serde_json::json!({}), &error, &ctx)
+            .await
+            .expect("on_error must not fail");
+
+        let exported = mw.collector().export_prometheus();
+        assert!(
+            exported.contains("error_code=\"MODULE_EXECUTE_ERROR\""),
+            "metric label must use canonical wire code; got:\n{exported}"
+        );
+        assert!(
+            !exported.contains("ModuleExecuteError"),
+            "metric label must NOT use Debug (PascalCase) formatting; got:\n{exported}"
+        );
+    }
+
+    // [obs-nested-timing] A nested call sharing the same trace_id must not
+    // clobber the outer call's start time: the outer call must record a
+    // non-zero duration.
+    #[tokio::test]
+    async fn nested_same_trace_call_records_outer_duration() {
+        let mw = MetricsMiddleware::new(MetricsCollector::new());
+        let mut ctx = Context::<serde_json::Value>::new(Identity::new(
+            "@test".to_string(),
+            "test".to_string(),
+            vec![],
+            HashMap::new(),
+        ));
+        // Force both frames onto the same trace.
+        ctx.trace_id = "shared-trace".to_string();
+
+        // Outer begins.
+        mw.before("outer", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        // Let some wall-clock time pass for the outer frame.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Nested call on the same trace: before + after.
+        mw.before("inner", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        mw.after("inner", serde_json::json!({}), serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        // Outer completes; its duration must still be > 0.
+        mw.after("outer", serde_json::json!({}), serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+
+        let snap = mw.collector().snapshot();
+        let outer_sum = snap["histograms"]["apcore_module_duration_seconds|module_id=outer"]["sum"]
+            .as_f64()
+            .expect("outer duration histogram present");
+        assert!(
+            outer_sum > 0.0,
+            "nested same-trace call must not zero out the outer duration; got {outer_sum}"
+        );
+    }
+
+    #[test]
+    fn error_code_wire_str_is_screaming_snake_case() {
+        assert_eq!(
+            ErrorCode::ModuleExecuteError.wire_str(),
+            "MODULE_EXECUTE_ERROR"
+        );
+    }
 
     // -------------------------------------------------------------------------
     // p99 helper — correctness regression tests for Issue 23 refactor

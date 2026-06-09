@@ -395,6 +395,31 @@ impl ACL {
             )
         })?;
 
+        // A12-ACL: every rule MUST explicitly declare `callers` and `targets`.
+        // `#[serde(default)]` on those fields would otherwise let an omitted
+        // key load as an empty Vec, silently turning a deny rule inert. Reject
+        // a missing key here (the key may be an empty list — only OMISSION is
+        // rejected), matching apcore-python acl.py:270 and apcore-typescript
+        // acl.ts:74 which raise ACLRuleError at load (sync finding A-D-09).
+        if let Some(rules_arr) = rules_val.as_array() {
+            for (i, raw_rule) in rules_arr.iter().enumerate() {
+                let Some(obj) = raw_rule.as_object() else {
+                    return Err(ModuleError::new(
+                        ErrorCode::ACLRuleError,
+                        format!("ACL rule {i} in '{path}' must be a mapping"),
+                    ));
+                };
+                for key in ["callers", "targets"] {
+                    if !obj.contains_key(key) {
+                        return Err(ModuleError::new(
+                            ErrorCode::ACLRuleError,
+                            format!("ACL rule {i} in '{path}' missing required key '{key}'"),
+                        ));
+                    }
+                }
+            }
+        }
+
         let rules: Vec<ACLRule> = serde_json::from_value(rules_val.clone()).map_err(|e| {
             ModuleError::new(
                 ErrorCode::ACLRuleError,
@@ -471,7 +496,10 @@ impl ACL {
 
         self.rules = reloaded.rules;
         self.default_effect = reloaded.default_effect;
-        self.yaml_path = reloaded.yaml_path;
+        // `self.yaml_path` is intentionally left untouched: reload re-reads the
+        // *stored* path, so reassigning it is a no-op (reloaded.yaml_path always
+        // equals the existing path). Matches apcore-python / apcore-typescript,
+        // which do not re-set the path on reload.
         Ok(())
     }
 
@@ -824,5 +852,31 @@ impl ACL {
 impl Default for ACL {
     fn default() -> Self {
         Self::new(vec![], "deny", None)
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use std::io::Write;
+
+    // [acl-reload-yamlpath] reload() must leave `yaml_path` unchanged (it
+    // re-reads the stored path). Matches apcore-python / apcore-typescript,
+    // which do not re-set the path on reload.
+    #[test]
+    fn reload_leaves_yaml_path_unchanged() {
+        let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+        writeln!(tmp, "default_effect: deny\nrules: []\n").expect("write tempfile");
+        let path = tmp.path().to_str().expect("utf8").to_string();
+
+        let mut acl = ACL::load(&path).expect("initial load");
+        let before = acl.yaml_path.clone();
+        assert_eq!(before, Some(path.clone()));
+
+        acl.reload().expect("reload");
+        assert_eq!(
+            acl.yaml_path, before,
+            "reload must not change the stored yaml_path"
+        );
     }
 }
