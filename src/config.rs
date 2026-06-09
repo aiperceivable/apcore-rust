@@ -595,10 +595,12 @@ impl Config {
             }
         }
 
-        // Numbers in [0.0, 1.0].
+        // Numbers in [0.0, 1.0]. Includes circuit_breaker.open_threshold, which
+        // is an error RATE (default 0.5), NOT an integer count.
         for key in [
             "observability.tracing.sampling_rate",
             "sys_modules.events.thresholds.error_rate",
+            "middleware.circuit_breaker.open_threshold",
         ] {
             if let Some(v) = self.get(key) {
                 if as_number(&v).is_none_or(|n| !(0.0..=1.0).contains(&n)) {
@@ -607,16 +609,24 @@ impl Config {
             }
         }
 
-        // Non-negative numbers (>= 0).
+        // Positive numbers (> 0).
+        if let Some(v) = self.get("sys_modules.events.thresholds.latency_p99_ms") {
+            if as_number(&v).is_none_or(|n| n <= 0.0) {
+                errors.push(format!(
+                    "sys_modules.events.thresholds.latency_p99_ms must be a positive number (got {v})"
+                ));
+            }
+        }
+
+        // Non-negative integers (>= 0, milliseconds).
         for key in [
-            "sys_modules.events.thresholds.latency_p99_ms",
             "executor.default_timeout",
             "executor.global_timeout",
             "middleware.circuit_breaker.recovery_window_ms",
         ] {
             if let Some(v) = self.get(key) {
-                if as_number(&v).is_none_or(|n| n < 0.0) {
-                    errors.push(format!("{key} must be a number >= 0 (got {v})"));
+                if as_int(&v).is_none_or(|n| n < 0) {
+                    errors.push(format!("{key} must be a non-negative integer (got {v})"));
                 }
             }
         }
@@ -625,7 +635,10 @@ impl Config {
         for key in [
             "executor.max_call_depth",
             "executor.max_module_repeat",
-            "middleware.circuit_breaker.open_threshold",
+            "sys_modules.error_history.max_entries_per_module",
+            "sys_modules.error_history.max_total_entries",
+            "middleware.circuit_breaker.window_size",
+            "middleware.circuit_breaker.min_samples",
         ] {
             if let Some(v) = self.get(key) {
                 if as_int(&v).is_none_or(|n| n < 1) {
@@ -1782,7 +1795,12 @@ mod tests {
             },
             "observability": { "tracing": { "enabled": false, "sampling_rate": 1.0 } },
             "middleware": {
-                "circuit_breaker": { "open_threshold": 5, "recovery_window_ms": 30000 }
+                "circuit_breaker": {
+                    "open_threshold": 0.5,
+                    "recovery_window_ms": 30000,
+                    "window_size": 20,
+                    "min_samples": 5
+                }
             },
             "sys_modules": {
                 "events": { "thresholds": { "error_rate": 0.1, "latency_p99_ms": 5000.0 } }
@@ -1849,16 +1867,136 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_circuit_breaker_open_threshold_zero() {
+    fn validate_accepts_circuit_breaker_open_threshold_default_rate() {
+        // [review-followup] open_threshold is an ERROR RATE in [0.0, 1.0]
+        // (default 0.5), not an integer count. The valid default must pass.
+        let mut json = valid_legacy_config_json();
+        json["middleware"]["circuit_breaker"]["open_threshold"] = serde_json::json!(0.5);
+        let cfg = config_from_json(&json);
+        assert!(
+            cfg.validate().is_ok(),
+            "open_threshold = 0.5 must be accepted (rate in [0,1]): {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_circuit_breaker_open_threshold_zero_rate() {
+        // 0.0 is a valid error rate (matches apcore-python: open_threshold 0
+        // accepted).
         let mut json = valid_legacy_config_json();
         json["middleware"]["circuit_breaker"]["open_threshold"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        assert!(
+            cfg.validate().is_ok(),
+            "open_threshold = 0 must be accepted (rate in [0,1]): {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_circuit_breaker_open_threshold_above_one() {
+        // A count-like value (5) is out of [0,1] and MUST be rejected — this is
+        // the bug the review caught (was previously accepted as integer >= 1).
+        let mut json = valid_legacy_config_json();
+        json["middleware"]["circuit_breaker"]["open_threshold"] = serde_json::json!(5);
         let cfg = config_from_json(&json);
         let result = cfg.validate();
         assert!(
             result.is_err(),
-            "open_threshold = 0 must be rejected (>= 1)"
+            "open_threshold = 5 must be rejected ([0,1])"
         );
         assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_circuit_breaker_open_threshold_fractional_above_one() {
+        let mut json = valid_legacy_config_json();
+        json["middleware"]["circuit_breaker"]["open_threshold"] = serde_json::json!(1.5);
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "open_threshold = 1.5 must be rejected ([0,1])"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_circuit_breaker_window_size_zero() {
+        // window_size is the integer threshold (>= 1).
+        let mut json = valid_legacy_config_json();
+        json["middleware"]["circuit_breaker"]["window_size"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(result.is_err(), "window_size = 0 must be rejected (>= 1)");
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_circuit_breaker_min_samples_zero() {
+        let mut json = valid_legacy_config_json();
+        json["middleware"]["circuit_breaker"]["min_samples"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(result.is_err(), "min_samples = 0 must be rejected (>= 1)");
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_error_history_max_entries_per_module_zero() {
+        let mut json = valid_legacy_config_json();
+        json["sys_modules"]["error_history"] = serde_json::json!({ "max_entries_per_module": 0 });
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "max_entries_per_module = 0 must be rejected"
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_error_history_max_total_entries_zero() {
+        let mut json = valid_legacy_config_json();
+        json["sys_modules"]["error_history"] = serde_json::json!({ "max_total_entries": 0 });
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(result.is_err(), "max_total_entries = 0 must be rejected");
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_rejects_events_latency_p99_zero() {
+        // latency_p99_ms must be a positive number (> 0), not merely >= 0.
+        let mut json = valid_legacy_config_json();
+        json["sys_modules"]["events"]["thresholds"]["latency_p99_ms"] = serde_json::json!(0);
+        let cfg = config_from_json(&json);
+        let result = cfg.validate();
+        assert!(result.is_err(), "latency_p99_ms = 0 must be rejected (> 0)");
+        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn validate_key_constraint_open_threshold_is_rate() {
+        // The update_config path must agree with validate().
+        let ok = Config::validate_key_constraint(
+            "middleware.circuit_breaker.open_threshold",
+            &serde_json::json!(0.5),
+        );
+        assert_eq!(
+            ok,
+            Some(Ok(())),
+            "0.5 must be accepted via update_config path"
+        );
+        let bad = Config::validate_key_constraint(
+            "middleware.circuit_breaker.open_threshold",
+            &serde_json::json!(5),
+        );
+        assert!(
+            matches!(bad, Some(Err(_))),
+            "5 must be rejected via update_config path"
+        );
     }
 
     #[test]
