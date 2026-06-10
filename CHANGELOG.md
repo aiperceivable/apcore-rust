@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Cross-language conformance coverage for agent governance and toggle isolation (#72).** Wired two canonical fixtures from the apcore spec repo into `tests/conformance_test.rs`: `toggle_state_isolation.json` (constructs real `APCore` instances in one process, drives each instance's toggle write path, and asserts the disabled-set via that instance's read path — proving disabling on A does not affect B and that toggles survive reload) and `acl_agent_scoping.json` (one shared default-deny ruleset scoping tool access by caller pattern + identity roles + call-chain depth; all 19 decision cases pass, locking the agent-tool-governance scenario as a cross-language contract). The depth cap is inclusive (`call_depth == max_call_depth` is allowed), matching apcore-python / apcore-typescript.
 
+### Fixed
+
+- **`Registry::register_module` and `register_versioned` now derive the descriptor's annotations from `module.annotations()` instead of discarding them with `ModuleAnnotations::default()`.** Previously a sensitive module declaring `requires_approval = true` registered via the canonical two-argument `register_module` ended up with `requires_approval = false` in its descriptor. Because the approval gate decides whether to fire from `registry.get_definition().annotations.requires_approval`, the gate was **silently bypassed** — a security-relevant divergence from apcore-python / apcore-typescript, whose `register` paths derive annotations from the module. Regression test: `tests/test_register_module_annotations.rs` (includes an end-to-end check that the gate now fires).
+
 ---
 
 ## [0.23.0] - 2026-06-10

@@ -624,7 +624,12 @@ impl Registry {
             // A-D-017: populate tags from module.tags() like register_versioned,
             // instead of dropping them. Matches Python/TS register().
             tags: module.tags(),
-            annotations: Some(ModuleAnnotations::default()),
+            // Derive annotations from the module's `annotations()` trait method
+            // instead of discarding them with `default()`. Matches Python
+            // (`merge_module_metadata` reads `module.annotations`) and TS
+            // (`register` merges the module's annotations), so declarations like
+            // `requires_approval` survive the two-argument register path.
+            annotations: Some(module.annotations()),
             examples: vec![],
             metadata: HashMap::new(),
             display: None,
@@ -651,7 +656,7 @@ impl Registry {
     /// All other descriptor fields are auto-derived from the module —
     /// schemas from `input_schema()` / `output_schema()`, description
     /// from `description()`, tags from the new `tags()` trait method
-    /// (D11-003), default annotations otherwise.
+    /// (D11-003), and annotations from `annotations()`.
     ///
     /// Sync alignment: D10-010.
     pub fn register_versioned(
@@ -671,7 +676,10 @@ impl Registry {
             version: version
                 .map_or_else(|| DEFAULT_MODULE_VERSION.to_string(), ToString::to_string),
             tags: module.tags(),
-            annotations: Some(ModuleAnnotations::default()),
+            // Derive annotations from the module's `annotations()` trait method
+            // (matches Python/TS register), so `requires_approval` and other
+            // declarations are not silently dropped.
+            annotations: Some(module.annotations()),
             examples: vec![],
             metadata: metadata.unwrap_or_default(),
             display: None,
