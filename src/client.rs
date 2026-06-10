@@ -17,7 +17,7 @@ use crate::middleware::base::Middleware;
 use crate::module::ModuleAnnotations;
 use crate::observability::metrics::MetricsCollector;
 use crate::registry::registry::{ModuleDescriptor, Registry, DEFAULT_MODULE_VERSION};
-use crate::sys_modules::SysModulesContext;
+use crate::sys_modules::{SysModulesContext, ToggleState};
 
 /// Main entry point for interacting with the `APCore` system.
 pub struct APCore {
@@ -30,6 +30,12 @@ pub struct APCore {
     event_emitter: Option<EventEmitter>,
     metrics_collector: Option<MetricsCollector>,
     sys_modules_context: Option<SysModulesContext>,
+    /// Per-instance toggle store (issue #71). Each `APCore` owns one
+    /// `Arc<ToggleState>`, injected into BOTH the pipeline `module_lookup` step
+    /// (read path, via `Executor::set_toggle_state`) and `ToggleFeatureModule`
+    /// (write path, via `register_sys_modules`). Disabling a module on one
+    /// instance MUST NOT affect another instance in the same process.
+    toggle_state: Arc<ToggleState>,
 }
 
 impl std::fmt::Debug for APCore {
@@ -44,6 +50,7 @@ impl std::fmt::Debug for APCore {
                 "sys_modules_registered",
                 &self.sys_modules_context.is_some(),
             )
+            .field("toggle_state", &self.toggle_state)
             .finish()
     }
 }
@@ -91,15 +98,27 @@ impl APCore {
             None => Arc::new(registry.unwrap_or_default()),
         };
 
-        let executor = executor
+        let mut executor = executor
             .unwrap_or_else(|| Executor::new(Arc::clone(&registry), Arc::new(config.clone())));
 
+        // Issue #71: this instance owns exactly one toggle store. Bind it to the
+        // executor so the pipeline `module_lookup` step (read path) consults it,
+        // and hand the same Arc to `register_sys_modules` so
+        // `ToggleFeatureModule` (write path) mutates the same store. Disabling a
+        // module on this instance must not leak into another `APCore`.
+        let toggle_state = Arc::new(ToggleState::new());
+        executor.set_toggle_state(Arc::clone(&toggle_state));
+
         let sys_modules_context = if Self::sys_modules_enabled(&config) {
-            match crate::sys_modules::register_sys_modules(
+            match crate::sys_modules::register_sys_modules_with_options(
                 Arc::clone(&registry),
                 &executor,
                 &config,
                 metrics_collector.clone(),
+                crate::sys_modules::SysModulesOptions {
+                    toggle_state: Some(Arc::clone(&toggle_state)),
+                    ..Default::default()
+                },
             ) {
                 Ok(ctx) => Some(ctx),
                 Err(e) => {
@@ -121,7 +140,20 @@ impl APCore {
             event_emitter: None,
             metrics_collector,
             sys_modules_context,
+            toggle_state,
         }
+    }
+
+    /// Shared handle to this instance's per-instance toggle store (issue #71).
+    ///
+    /// The returned `Arc<ToggleState>` is the SAME store consulted by the
+    /// pipeline `module_lookup` read path and mutated by the
+    /// `ToggleFeatureModule` write path for this `APCore`. Reading
+    /// `toggle_state().is_disabled(id)` reflects this instance's view, isolated
+    /// from other `APCore` instances in the same process.
+    #[must_use]
+    pub fn toggle_state(&self) -> Arc<ToggleState> {
+        Arc::clone(&self.toggle_state)
     }
 
     /// Return whether the `sys_modules` auto-registration is enabled

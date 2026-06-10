@@ -111,7 +111,9 @@ fn test_builtin_pipeline_steps_at_crate_root() {
     // Compile-time references — if any aren't at the crate root, this test fails to compile.
     let _ = BuiltinContextCreation;
     let _ = BuiltinCallChainGuard;
-    let _ = BuiltinModuleLookup;
+    // BuiltinModuleLookup carries a per-instance toggle store (issue #71), so it
+    // is constructed via Default rather than referenced as a unit value.
+    let _ = BuiltinModuleLookup::default();
     let _ = BuiltinACLCheck;
     let _ = BuiltinApprovalGate;
     let _ = BuiltinInputValidation;

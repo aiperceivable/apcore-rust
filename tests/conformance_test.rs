@@ -2465,3 +2465,267 @@ fn conformance_error_recovery_user_fixable() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ACL agent tool-governance (issue #72)
+//
+// One shared default-deny ruleset scopes tool access by caller pattern +
+// identity roles + call-chain depth. Each case is a
+// (caller_id, caller_identity, call_depth, target_id) -> decision tuple.
+// Mirrors `conformance_acl_evaluation` machinery, but `default_effect`/`rules`
+// are shared at the top level rather than per-case.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conformance_acl_agent_scoping() {
+    ACL::init_builtin_handlers();
+    let fixture = load_fixture("acl_agent_scoping");
+
+    let default_effect = fixture["default_effect"].as_str().unwrap();
+    let rules: Vec<ACLRule> = fixture["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| ACLRule {
+            callers: r["callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect(),
+            targets: r["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect(),
+            effect: r["effect"].as_str().unwrap().to_string(),
+            description: r
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            conditions: r.get("conditions").cloned(),
+        })
+        .collect();
+
+    // Build the ACL once from the shared ruleset (spec §6 first-match-wins).
+    let acl = ACL::new(rules, default_effect, None);
+
+    for tc in fixture["test_cases"].as_array().unwrap() {
+        let id = tc["id"].as_str().unwrap();
+        let caller_id_val = &tc["caller_id"];
+        let target_id = tc["target_id"].as_str().unwrap();
+        let expected = tc["expected"].as_bool().unwrap();
+
+        // `caller_identity` may be present-and-an-object, or present-and-null
+        // (the "agent without identity" case). Only a real object yields an
+        // identity; null/absent means no identity on the context.
+        let identity_obj = tc.get("caller_identity").filter(|v| v.is_object());
+
+        // A context is needed whenever the case carries identity or a call
+        // depth — same condition shape as `conformance_acl_evaluation`.
+        let call_depth = tc
+            .get("call_depth")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let needs_context = identity_obj.is_some() || call_depth > 0;
+
+        let ctx: Option<Context<Value>> = if needs_context {
+            let identity = identity_obj.map(|id_data| {
+                Identity::new(
+                    caller_id_val.as_str().unwrap_or("unknown").to_string(),
+                    id_data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("user")
+                        .to_string(),
+                    id_data
+                        .get("roles")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|v| v.as_str().unwrap().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    HashMap::new(),
+                )
+            });
+
+            let mut ctx: Context<Value> =
+                Context::create(identity, None, None, None, Value::Null, None);
+            for i in 0..call_depth {
+                ctx.call_chain.push(format!("_depth_{i}"));
+            }
+            Some(ctx)
+        } else {
+            None
+        };
+
+        let caller_id = if caller_id_val.is_null() {
+            None
+        } else {
+            Some(caller_id_val.as_str().unwrap())
+        };
+
+        let result = acl.check(caller_id, target_id, ctx.as_ref());
+
+        assert_eq!(
+            result, expected,
+            "FAIL [{id}]: ACL check(caller={caller_id:?}, target={target_id:?}) returned {result}, expected {expected}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-instance ToggleState isolation (issue #71)
+//
+// Each named instance is a real `APCore` constructed in this single process.
+// Operations drive the owning instance's toggle WRITE path
+// (`system.control.toggle_feature` via `disable`/`enable`); `reload`
+// re-registers that instance's modules while preserving its ToggleState. The
+// disabled-set is then asserted via each instance's READ path (its own
+// `Arc<ToggleState>`), proving disabling on A does not affect B.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // fixture-driven runner: construct, drive, assert per case
+async fn conformance_toggle_state_isolation() {
+    use apcore::config::Config;
+    use apcore::context::Context;
+    use apcore::errors::ModuleError;
+    use apcore::module::Module;
+    use apcore::APCore;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+
+    /// Trivial no-op module: the toggle write path requires the referenced
+    /// module to exist in the registry, so each `module_id` is registered as
+    /// one of these before being toggled.
+    struct NoopModule;
+
+    #[async_trait]
+    impl Module for NoopModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn output_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn description(&self) -> &'static str {
+            "no-op module for toggle isolation conformance"
+        }
+        async fn execute(
+            &self,
+            inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, ModuleError> {
+            Ok(inputs)
+        }
+    }
+
+    /// Production-like config: sys_modules + events enabled so Rust
+    /// auto-registers `system.control.toggle_feature` (the write path).
+    fn sys_config() -> Config {
+        let mut config = Config::default();
+        config.set("sys_modules.enabled", json!(true));
+        config.set("sys_modules.events.enabled", json!(true));
+        config
+    }
+
+    let fixture = load_fixture("toggle_state_isolation");
+
+    for tc in fixture["test_cases"].as_array().unwrap() {
+        let id = tc["id"].as_str().unwrap();
+
+        // Collect every module_id referenced by this case so each instance can
+        // pre-register them (reload re-registers this same set).
+        let mut referenced: HashSet<String> = HashSet::new();
+        for op in tc["operations"].as_array().unwrap() {
+            if let Some(m) = op.get("module_id").and_then(|v| v.as_str()) {
+                referenced.insert(m.to_string());
+            }
+        }
+        for ids in tc["expected_disabled"].as_object().unwrap().values() {
+            for m in ids.as_array().unwrap() {
+                referenced.insert(m.as_str().unwrap().to_string());
+            }
+        }
+
+        // Helper: (re-)register the referenced modules on an instance.
+        let register_modules = |client: &APCore| {
+            for m in &referenced {
+                // Re-registration is idempotent at the toggle level: a reload
+                // resets the descriptor but ToggleState is preserved.
+                let _ = client.register(m, Box::new(NoopModule));
+            }
+        };
+
+        // Construct one real APCore per instance name, in the SAME process.
+        let mut instances: HashMap<String, APCore> = HashMap::new();
+        for name in tc["instances"].as_array().unwrap() {
+            let name = name.as_str().unwrap().to_string();
+            let client = APCore::with_config(sys_config());
+            register_modules(&client);
+            instances.insert(name, client);
+        }
+
+        // Apply each operation in order through the owning instance's write path.
+        for op in tc["operations"].as_array().unwrap() {
+            let inst_name = op["instance"].as_str().unwrap();
+            let action = op["action"].as_str().unwrap();
+            let client = instances
+                .get(inst_name)
+                .unwrap_or_else(|| panic!("FAIL [{id}]: unknown instance '{inst_name}'"));
+            match action {
+                "disable" => {
+                    let module_id = op["module_id"].as_str().unwrap();
+                    client.disable(module_id, None).await.unwrap_or_else(|e| {
+                        panic!("FAIL [{id}]: disable {module_id} on {inst_name}: {e:?}")
+                    });
+                }
+                "enable" => {
+                    let module_id = op["module_id"].as_str().unwrap();
+                    client.enable(module_id, None).await.unwrap_or_else(|e| {
+                        panic!("FAIL [{id}]: enable {module_id} on {inst_name}: {e:?}")
+                    });
+                }
+                "reload" => {
+                    // Re-register modules on this instance; its ToggleState must
+                    // survive (the instance store is independent of registry
+                    // re-registration — A-D-12 re-scoped to instance-scope).
+                    register_modules(client);
+                }
+                other => panic!("FAIL [{id}]: unknown action '{other}'"),
+            }
+        }
+
+        // Assert each instance's disabled-set via its READ path (instance store),
+        // NOT the process-global fallback.
+        for (name, expected_ids) in tc["expected_disabled"].as_object().unwrap() {
+            let client = instances.get(name).unwrap_or_else(|| {
+                panic!("FAIL [{id}]: expected instance '{name}' not constructed")
+            });
+            let toggle = client.toggle_state();
+
+            let expected_set: HashSet<String> = expected_ids
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+
+            // Every referenced module either is or is not disabled — check both
+            // directions so a stray disable on the wrong instance is caught.
+            for m in &referenced {
+                let is_disabled = toggle.is_disabled(m);
+                let should_be_disabled = expected_set.contains(m);
+                assert_eq!(
+                    is_disabled, should_be_disabled,
+                    "FAIL [{id}]: instance '{name}' module '{m}' disabled={is_disabled}, expected {should_be_disabled}"
+                );
+            }
+        }
+    }
+}

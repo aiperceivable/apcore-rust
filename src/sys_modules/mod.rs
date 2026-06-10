@@ -42,6 +42,7 @@ pub use usage::{UsageModule, UsageSummaryModule};
 // ---------------------------------------------------------------------------
 
 /// Thread-safe set of disabled module IDs.
+#[derive(Debug)]
 pub struct ToggleState {
     disabled: RwLock<HashSet<String>>,
 }
@@ -359,6 +360,13 @@ pub struct SysModulesOptions {
     /// `Err(SysModuleError::RegistrationFailed)`. Default is `false`, which
     /// matches the lenient behavior of the Python/TypeScript SDKs.
     pub fail_on_error: bool,
+    /// Per-instance toggle store shared with the execution pipeline's
+    /// `module_lookup` step (issue #71). When `None` (the default), the
+    /// process-global store is used, preserving pre-#71 behavior. `APCore`
+    /// passes its own `Arc<ToggleState>` here so the write path
+    /// (`ToggleFeatureModule`) and the read path (pipeline lookup) share one
+    /// instance-scoped store.
+    pub toggle_state: Option<Arc<ToggleState>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -413,12 +421,15 @@ pub fn register_sys_modules_with_options(
         overrides_store,
         audit_store,
         fail_on_error,
+        toggle_state,
     } = options;
 
-    // Use the process-global toggle store so toggles made via
-    // ToggleFeatureModule are observed by the execution pipeline
-    // (BuiltinModuleLookup) and survive registry reloads (sync finding A-D-12).
-    let toggle_state = global_toggle_state_arc();
+    // Use the caller-supplied per-instance toggle store (issue #71) so toggles
+    // made via ToggleFeatureModule are observed by THIS instance's execution
+    // pipeline (BuiltinModuleLookup) and survive registry reloads (sync finding
+    // A-D-12). Fall back to the process-global store when no instance store is
+    // provided, preserving pre-#71 behavior.
+    let toggle_state = toggle_state.unwrap_or_else(global_toggle_state_arc);
 
     // Spec default is FALSE: system modules are opt-in. Mirrors apcore-python
     // registration.py:335 and apcore-typescript registration.ts:250 (sync

@@ -64,10 +64,10 @@ pub use bindings::{
 };
 pub use builtin_steps::{
     build_internal_strategy, build_minimal_strategy, build_performance_strategy,
-    build_standard_strategy, build_testing_strategy, BuiltinACLCheck, BuiltinApprovalGate,
-    BuiltinCallChainGuard, BuiltinContextCreation, BuiltinExecute, BuiltinInputValidation,
-    BuiltinMiddlewareAfter, BuiltinMiddlewareBefore, BuiltinModuleLookup, BuiltinOutputValidation,
-    BuiltinReturnResult,
+    build_standard_strategy, build_standard_strategy_with_toggle, build_testing_strategy,
+    BuiltinACLCheck, BuiltinApprovalGate, BuiltinCallChainGuard, BuiltinContextCreation,
+    BuiltinExecute, BuiltinInputValidation, BuiltinMiddlewareAfter, BuiltinMiddlewareBefore,
+    BuiltinModuleLookup, BuiltinOutputValidation, BuiltinReturnResult,
 };
 pub use cancel::{CancelToken, ExecutionCancelledError};
 pub use client::APCore;

@@ -436,6 +436,13 @@ pub struct Executor {
     /// would produce a fresh handle by design — Executors are meant to be
     /// shared via `Arc<Executor>`, not duplicated.
     instance_handle: Arc<()>,
+    /// Per-instance toggle store consulted by the `module_lookup` step to
+    /// reject disabled modules (issue #71). Defaults to the process-global
+    /// store so executors built outside an `APCore` keep working; `APCore`
+    /// rebinds this to its own store via [`Executor::set_toggle_state`] so the
+    /// read path (pipeline lookup) and the write path
+    /// (`ToggleFeatureModule`) share one instance-scoped store.
+    toggle_state: Arc<crate::sys_modules::ToggleState>,
 }
 
 impl Executor {
@@ -445,14 +452,18 @@ impl Executor {
     /// Accepts either an owned `Registry`/`Config` (convenient for tests) or a
     /// pre-shared `Arc<Registry>`/`Arc<Config>` (required for runtime wiring).
     pub fn new(registry: impl Into<Arc<Registry>>, config: impl Into<Arc<Config>>) -> Self {
+        let toggle_state = crate::sys_modules::global_toggle_state_arc();
         Self {
             registry: registry.into(),
             config: config.into(),
             acl: None,
             approval_handler: None,
             middleware_manager: Arc::new(MiddlewareManager::new()),
-            strategy: build_standard_strategy(),
+            strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
+                &toggle_state,
+            )),
             instance_handle: Arc::new(()),
+            toggle_state,
         }
     }
 
@@ -474,6 +485,7 @@ impl Executor {
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
             instance_handle: Arc::new(()),
+            toggle_state: crate::sys_modules::global_toggle_state_arc(),
         })
     }
 
@@ -491,6 +503,7 @@ impl Executor {
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
             instance_handle: Arc::new(()),
+            toggle_state: crate::sys_modules::global_toggle_state_arc(),
         }
     }
 
@@ -512,14 +525,18 @@ impl Executor {
                 }
             }
         }
+        let toggle_state = crate::sys_modules::global_toggle_state_arc();
         Self {
             registry: registry.into(),
             config: config.into(),
             acl: acl.map(Arc::new),
             approval_handler: approval_handler.map(|h| Arc::from(h) as Arc<dyn ApprovalHandler>),
             middleware_manager: Arc::new(middleware_manager),
-            strategy: build_standard_strategy(),
+            strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
+                &toggle_state,
+            )),
             instance_handle: Arc::new(()),
+            toggle_state,
         }
     }
 
@@ -538,6 +555,32 @@ impl Executor {
     /// `TracingMiddleware` and reconfigure it (sync finding A-D-18).
     pub fn find_middleware(&self, name: &str) -> Option<Arc<dyn Middleware>> {
         self.middleware_manager.find_by_name(name)
+    }
+
+    /// Rebind the per-instance toggle store consulted by the `module_lookup`
+    /// step (issue #71).
+    ///
+    /// `APCore::with_options` calls this so the pipeline read path and the
+    /// `ToggleFeatureModule` write path share one instance-scoped
+    /// [`ToggleState`](crate::sys_modules::ToggleState). When the executor is
+    /// still running the default `"standard"` strategy, the `module_lookup`
+    /// step is rebuilt to read the new store; for any customized strategy the
+    /// stored handle is updated but the existing steps are left untouched
+    /// (callers that customize the pipeline are expected to wire the toggle
+    /// store themselves via [`build_standard_strategy_with_toggle`]).
+    pub fn set_toggle_state(&mut self, toggle_state: Arc<crate::sys_modules::ToggleState>) {
+        if self.strategy.name() == "standard" {
+            self.strategy = crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
+                &toggle_state,
+            ));
+        }
+        self.toggle_state = toggle_state;
+    }
+
+    /// Shared handle to this executor's per-instance toggle store (issue #71).
+    #[must_use]
+    pub fn toggle_state(&self) -> Arc<crate::sys_modules::ToggleState> {
+        Arc::clone(&self.toggle_state)
     }
 
     /// Set the ACL for access control.

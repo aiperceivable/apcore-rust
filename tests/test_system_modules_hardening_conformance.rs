@@ -613,6 +613,7 @@ fn regression_options_warn_when_events_disabled() {
                 overrides_store: None,
                 audit_store: Some(store),
                 fail_on_error: false,
+                ..Default::default()
             },
         )
     });
@@ -682,6 +683,7 @@ fn regression_no_warn_when_events_enabled() {
                 overrides_store: None,
                 audit_store: Some(store),
                 fail_on_error: false,
+                ..Default::default()
             },
         )
         .expect("should succeed")

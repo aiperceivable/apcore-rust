@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.24.0] - 2026-06-10
+
+### Changed
+
+- **`ToggleState` is now per-`APCore`-instance instead of process-global (#71).** Each `APCore` owns one `Arc<ToggleState>`, created fresh in `APCore::with_options`, and threads it into BOTH the execution-pipeline read path and the toggle write path. The pipeline `module_lookup` step (`BuiltinModuleLookup`) gained an `Arc<ToggleState>` field and now reads `self.toggle_state.is_disabled(id)` rather than the free `is_module_disabled()` global; the instance store is wired through `Executor::set_toggle_state` and `build_standard_strategy_with_toggle(...)`. The same `Arc` is passed to `ToggleFeatureModule` via the new `SysModulesOptions::toggle_state` field, so write and read share one store and toggles survive that instance's reload (A-D-12, re-scoped from process-global to instance-scoped). Disabling a module on one `APCore` no longer affects another instance in the same process. The free `is_module_disabled()` function keeps reading the process-global store as a fallback (unchanged signature); strategies built without an `APCore` default to that global store, preserving back-compat. New accessors: `APCore::toggle_state()` and `Executor::toggle_state()`.
+
+### Added
+
+- **Cross-language conformance coverage for agent governance and toggle isolation (#72).** Wired two canonical fixtures from the apcore spec repo into `tests/conformance_test.rs`: `toggle_state_isolation.json` (constructs real `APCore` instances in one process, drives each instance's toggle write path, and asserts the disabled-set via that instance's read path — proving disabling on A does not affect B and that toggles survive reload) and `acl_agent_scoping.json` (one shared default-deny ruleset scoping tool access by caller pattern + identity roles + call-chain depth; all 19 decision cases pass, locking the agent-tool-governance scenario as a cross-language contract). The depth cap is inclusive (`call_depth == max_call_depth` is allowed), matching apcore-python / apcore-typescript.
+
+---
+
 ## [0.23.0] - 2026-06-10
 
 ### Added

@@ -73,14 +73,34 @@ step_meta!(
     replaceable = true,
     pure = true
 );
-step_meta!(
-    BuiltinModuleLookup,
-    "module_lookup",
-    "Resolve module from registry by ID",
-    removable = false,
-    replaceable = false,
-    pure = true
-);
+/// Resolve a module from the registry by ID and reject disabled modules.
+///
+/// Unlike the other unit-struct steps, this step carries a per-instance
+/// `Arc<ToggleState>` (issue #71). The strategy factory injects the owning
+/// `APCore` instance's toggle store so that toggling a module on one instance
+/// does not affect another instance in the same process. When no instance
+/// handle is available (e.g. `build_standard_strategy()` called directly, or a
+/// custom strategy built without an `APCore`), it falls back to the
+/// process-global toggle store via [`Default`].
+pub struct BuiltinModuleLookup {
+    toggle_state: std::sync::Arc<crate::sys_modules::ToggleState>,
+}
+
+impl BuiltinModuleLookup {
+    /// Build a lookup step bound to a specific toggle store (read path).
+    #[must_use]
+    pub fn new(toggle_state: std::sync::Arc<crate::sys_modules::ToggleState>) -> Self {
+        Self { toggle_state }
+    }
+}
+
+impl Default for BuiltinModuleLookup {
+    /// Fall back to the process-global toggle store, preserving back-compat for
+    /// callers that construct the standard strategy without an `APCore`.
+    fn default() -> Self {
+        Self::new(crate::sys_modules::global_toggle_state_arc())
+    }
+}
 step_meta!(
     BuiltinACLCheck,
     "acl_check",
@@ -245,7 +265,21 @@ impl Step for BuiltinCallChainGuard {
 
 #[async_trait]
 impl Step for BuiltinModuleLookup {
-    impl_step_meta!(BuiltinModuleLookup);
+    fn name(&self) -> &'static str {
+        "module_lookup"
+    }
+    fn description(&self) -> &'static str {
+        "Resolve module from registry by ID"
+    }
+    fn removable(&self) -> bool {
+        false
+    }
+    fn replaceable(&self) -> bool {
+        false
+    }
+    fn pure(&self) -> bool {
+        true
+    }
     fn provides(&self) -> &[&str] {
         &["module"]
     }
@@ -265,13 +299,16 @@ impl Step for BuiltinModuleLookup {
         // Check if the module is disabled before proceeding. Two sources:
         //   1. The registry descriptor's `enabled` flag (direct registry-level
         //      disable).
-        //   2. The process-global ToggleState, which is the authoritative store
-        //      written by `ToggleFeatureModule` and survives registry reloads
-        //      (sync finding A-D-12). The pipeline MUST consult it because the
-        //      toggle no longer mutates the descriptor flag. Mirrors
-        //      apcore-python BuiltinModuleLookup (builtin_steps.py:252).
+        //   2. The per-instance ToggleState owned by the `APCore` that built
+        //      this strategy (issue #71). It is the authoritative store written
+        //      by that instance's `ToggleFeatureModule` and survives registry
+        //      reloads (sync finding A-D-12). The pipeline MUST consult it
+        //      because the toggle no longer mutates the descriptor flag, and it
+        //      MUST read the instance store (not the process-global) so toggles
+        //      stay isolated per `APCore`. Mirrors apcore-python
+        //      BuiltinModuleLookup (builtin_steps.py:252).
         if matches!(registry.is_enabled(&ctx.module_id), Some(false))
-            || crate::sys_modules::is_module_disabled(&ctx.module_id)
+            || self.toggle_state.is_disabled(&ctx.module_id)
         {
             return Err(ModuleError::new(
                 ErrorCode::ModuleDisabled,
@@ -880,15 +917,31 @@ impl Step for BuiltinReturnResult {
 // ---------------------------------------------------------------------------
 
 /// Build the standard 11-step execution strategy.
+///
+/// The `module_lookup` step defaults to the process-global toggle store. To
+/// bind a per-`APCore` toggle store (issue #71) use
+/// [`build_standard_strategy_with_toggle`].
 #[must_use]
 pub fn build_standard_strategy() -> ExecutionStrategy {
+    build_standard_strategy_with_toggle(crate::sys_modules::global_toggle_state_arc())
+}
+
+/// Build the standard 11-step execution strategy bound to a specific toggle
+/// store for the `module_lookup` read path (issue #71).
+///
+/// `APCore::with_options` passes its own `Arc<ToggleState>` here so the
+/// pipeline observes per-instance toggles rather than the process-global store.
+#[must_use]
+pub fn build_standard_strategy_with_toggle(
+    toggle_state: std::sync::Arc<crate::sys_modules::ToggleState>,
+) -> ExecutionStrategy {
     // INVARIANT: all step names are unique literals, so `new()` cannot fail.
     ExecutionStrategy::new(
         "standard",
         vec![
             Box::new(BuiltinContextCreation),
             Box::new(BuiltinCallChainGuard),
-            Box::new(BuiltinModuleLookup),
+            Box::new(BuiltinModuleLookup::new(toggle_state)),
             Box::new(BuiltinACLCheck),
             Box::new(BuiltinApprovalGate),
             Box::new(BuiltinMiddlewareBefore),
