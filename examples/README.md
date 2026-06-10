@@ -21,6 +21,11 @@ cargo run --example simple_client
 | [`send_email.rs`](send_email.rs) | Full-featured module: `ModuleAnnotations`, `ModuleExample`, sensitive-field redaction. | `cargo run --example send_email` |
 | [`cancel_token.rs`](cancel_token.rs) | Cooperative cancellation: cancel a long-running module via `CancelToken`. | `cargo run --example cancel_token` |
 | [`pipeline_demo.rs`](pipeline_demo.rs) | The 11-step `ExecutionStrategy` pipeline — introspection, step-middleware tracing, and orchestration via `insert_after` / `replace`. See note below. | `cargo run --example pipeline_demo` |
+| [`acl_agent_governance.rs`](acl_agent_governance.rs) | End-to-end AI-agent tool governance (issue #72): registers real tools, wires a default-deny ACL into the `Executor`, has agents of different roles actually call the tools (allowed → real result, denied → `ACLDenied`), and prints the audit trail. Self-checks every decision against the cross-language contract. | `cargo run --example acl_agent_governance` |
+| [`approval.rs`](approval.rs) | Human-in-the-loop approval gate: a `requires_approval` tool, an `ApprovalHandler` that approves/rejects per request, calls that execute or fail with `ErrorCode::ApprovalDenied`. Companion to the ACL demo (ACL = who may call; approval = sensitive-op gate). | `cargo run --example approval` |
+| [`feature_toggle.rs`](feature_toggle.rs) | Runtime feature toggle: `disable()` / `enable()` a tool (blocked calls fail with `ErrorCode::ModuleDisabled`), plus per-instance `ToggleState` isolation across two `APCore` instances (issue #71). | `cargo run --example feature_toggle` |
+| [`middleware.rs`](middleware.rs) | User-facing `use_before` / `use_after` middleware: a before hook augments inputs, an after hook transforms output, with an ordered trace proving hook order. | `cargo run --example middleware` |
+| [`events.rs`](events.rs) | Lifecycle event bus: subscribe via `on(...)` and observe `apcore.registry.module_registered` / `apcore.module.toggled` events (see the in-file note on the Rust local-emitter vs sys-bus split). | `cargo run --example events` |
 
 ### Bindings
 
