@@ -307,14 +307,10 @@ fn schema_system_resolve_error_circular_ref() {
 // clause: schema_system.resolve.error.ref_not_found
 #[test]
 fn schema_system_resolve_error_ref_not_found() {
-    // A referenced schema that cannot be resolved MUST error.
-    //
-    // SPEC DIVERGENCE (flagged): the contract declares
-    // `SchemaRefNotFoundError(code=SCHEMA_REF_NOT_FOUND)`. Neither that variant
-    // nor that code exists in apcore-rust; the SDK emits
-    // `ErrorCode::SchemaNotFound` (wire `SCHEMA_NOT_FOUND`) instead — the same
-    // divergence flagged in the canonical Python suite. This test asserts the
-    // ACTUAL behavior; the spec-named symbol is covered by the skip below.
+    // A referenced schema that cannot be resolved MUST error with
+    // `ErrorCode::SchemaNotFound` (wire `SCHEMA_NOT_FOUND`) — the symbol named
+    // by the schema-system Contract ### Errors block, emitted identically
+    // across all three SDKs.
     let resolver = RefResolver::new();
     let schema = json!({ "$ref": "#/definitions/DoesNotExist", "definitions": {} });
     let err = resolver
@@ -322,16 +318,6 @@ fn schema_system_resolve_error_ref_not_found() {
         .expect_err("missing ref must error");
     assert_eq!(err.code, ErrorCode::SchemaNotFound);
     assert_eq!(wire_code(&err), "SCHEMA_NOT_FOUND");
-}
-
-// clause: schema_system.resolve.error.ref_not_found_spec_symbol
-#[test]
-#[ignore = "schema_system.resolve.error.ref_not_found_spec_symbol: missing symbol SchemaRefNotFoundError/SCHEMA_REF_NOT_FOUND (contract gap; SDK emits SchemaNotFound/SCHEMA_NOT_FOUND)"]
-fn schema_system_resolve_error_ref_not_found_spec_symbol() {
-    // The contract names SchemaRefNotFoundError(code=SCHEMA_REF_NOT_FOUND).
-    // That variant is absent from apcore-rust's ErrorCode enum -> MISSING-SYMBOL.
-    // Ignored so the crate compiles; see ref_not_found test for actual behavior.
-    panic!("unreachable: SCHEMA_REF_NOT_FOUND now exists; revisit divergence");
 }
 
 // clause: schema_system.resolve_ref.property.async_false
