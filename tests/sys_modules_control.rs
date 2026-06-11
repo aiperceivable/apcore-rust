@@ -25,8 +25,8 @@ fn make_config() -> Arc<Mutex<Config>> {
     Arc::new(Mutex::new(Config::default()))
 }
 
-fn make_emitter() -> Arc<Mutex<EventEmitter>> {
-    Arc::new(Mutex::new(EventEmitter::new()))
+fn make_emitter() -> Arc<EventEmitter> {
+    Arc::new(EventEmitter::new())
 }
 
 fn make_registry() -> Arc<Registry> {
@@ -439,7 +439,7 @@ async fn test_reload_module_captures_actual_previous_version_from_descriptor() {
     }
 
     let registry = Arc::new(Registry::new());
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
 
     // Register a dummy module with a non-default version. The descriptor's
     // version field is what reload_module should capture as previous_version.
@@ -491,7 +491,7 @@ async fn test_reload_module_unknown_module_returns_module_not_found() {
     use apcore::events::emitter::EventEmitter;
 
     let registry = Arc::new(Registry::new());
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let reload = ReloadModule::new(registry, emitter);
     let err = reload
         .execute(

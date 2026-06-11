@@ -178,7 +178,7 @@ async fn retry_before_exhaustion_succeeds_on_third_attempt() {
 
     let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-1");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
     emitter.subscribe(Box::new(dlq_sub));
 
@@ -208,7 +208,7 @@ async fn permanent_failure_emits_dlq_event() {
     let (sub, attempt_count, failure_recorded) = AlwaysFailSubscriber::new("sub-fail", retry_cfg);
     let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-2");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
     emitter.subscribe(Box::new(dlq_sub));
 
@@ -256,7 +256,7 @@ async fn single_attempt_failure_emits_dlq() {
         AlwaysFailSubscriber::new("sub-single", EventRetryConfig::no_retry());
     let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-single");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
     emitter.subscribe(Box::new(dlq_sub));
 
@@ -290,7 +290,7 @@ async fn shutdown_drops_event_as_noop() {
     };
     let (sub, attempt_count, _received) = CountingSubscriber::new("sub-shutdown", 0, retry_cfg);
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     // Shut down before emitting.
@@ -372,7 +372,7 @@ async fn dlq_payload_original_event_uses_name_payload_metadata() {
     let (sub, _attempts, _failure) = AlwaysFailSubscriber::new("sub-dlq-payload", retry_cfg);
     let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-payload");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
     emitter.subscribe(Box::new(dlq_sub));
 
@@ -473,7 +473,7 @@ async fn emit_returns_before_slow_subscriber_completes() {
         done: Arc::clone(&done),
         retry_config: EventRetryConfig::no_retry(),
     };
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     let start = std::time::Instant::now();
@@ -538,7 +538,7 @@ async fn wildcard_subscriber_excluded_from_dlq() {
     // Also add an explicit DLQ subscriber to prove the DLQ WAS emitted.
     let (dlq_sub, dlq_received) = DlqSubscriber::new("explicit-dlq");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(fail_sub));
     emitter.subscribe(Box::new(wildcard));
     emitter.subscribe(Box::new(dlq_sub));
@@ -605,7 +605,7 @@ async fn dlq_payload_uses_declared_subscriber_type() {
     };
     let (dlq_sub, dlq_received) = DlqSubscriber::new("dlq-type");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
     emitter.subscribe(Box::new(dlq_sub));
 

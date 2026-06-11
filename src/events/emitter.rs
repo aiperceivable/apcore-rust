@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -63,7 +63,13 @@ impl ApCoreEvent {
 /// fire-and-forget dispatch model (sync finding A-D-501).
 #[derive(Debug)]
 pub struct EventEmitter {
-    subscribers: Vec<Arc<dyn EventSubscriber>>,
+    // Interior-mutable so a shared `Arc<EventEmitter>` supports BOTH subscribe
+    // (`&self`, write-lock) and emit (`&self`, read-lock) — letting the client,
+    // registry, and sys-modules share one bus (D1-011). A sync `parking_lot`
+    // lock is used (not `tokio::Mutex`) because emit runs from both sync
+    // (`Registry::register` -> `emit_spawn`) and async contexts; emit snapshots
+    // the subscriber list under a short read-lock and never holds it across `.await`.
+    subscribers: RwLock<Vec<Arc<dyn EventSubscriber>>>,
     pub max_workers: usize,
     /// Set to `true` by [`Self::shutdown`]. Once set, all `emit*` methods
     /// drop incoming events as no-ops (sync finding A-D-502).
@@ -80,7 +86,7 @@ impl EventEmitter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            subscribers: vec![],
+            subscribers: RwLock::new(vec![]),
             max_workers: 4,
             is_shutdown: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -88,10 +94,10 @@ impl EventEmitter {
     }
 
     /// Add a subscriber (matching Python's void return signature).
-    pub fn subscribe(&mut self, subscriber: Box<dyn EventSubscriber>) {
+    pub fn subscribe(&self, subscriber: Box<dyn EventSubscriber>) {
         // Convert Box -> Arc so subscribers can be cloned into spawned
         // tasks by `emit_spawn` (sync finding A-D-501).
-        self.subscribers.push(Arc::from(subscriber));
+        self.subscribers.write().push(Arc::from(subscriber));
     }
 
     /// Remove the first subscriber whose `subscriber_id()` matches the given
@@ -105,19 +111,17 @@ impl EventEmitter {
     /// handle-returning API. Identity is therefore approximated by
     /// `subscriber_id()`; callers needing independent removal MUST assign each
     /// subscriber a unique id.
-    pub fn unsubscribe(&mut self, subscriber: &dyn EventSubscriber) -> bool {
+    pub fn unsubscribe(&self, subscriber: &dyn EventSubscriber) -> bool {
         let target_id = subscriber.subscriber_id();
         self.unsubscribe_by_id(target_id)
     }
 
     /// Remove the first subscriber whose `subscriber_id()` matches the given ID string.
-    pub fn unsubscribe_by_id(&mut self, subscriber_id: &str) -> bool {
-        let pos = self
-            .subscribers
-            .iter()
-            .position(|s| s.subscriber_id() == subscriber_id);
+    pub fn unsubscribe_by_id(&self, subscriber_id: &str) -> bool {
+        let mut subs = self.subscribers.write();
+        let pos = subs.iter().position(|s| s.subscriber_id() == subscriber_id);
         if let Some(i) = pos {
-            self.subscribers.remove(i);
+            subs.remove(i);
             true
         } else {
             false
@@ -129,11 +133,11 @@ impl EventEmitter {
     /// Returns the number of subscribers removed. Matches Python/TypeScript
     /// `off(event_type)` semantics where passing an event-type string removes
     /// all handlers bound to that type.
-    pub fn unsubscribe_by_event_type(&mut self, event_type: &str) -> usize {
-        let before = self.subscribers.len();
-        self.subscribers
-            .retain(|s| s.event_type_filter().is_none_or(|t| t != event_type));
-        before - self.subscribers.len()
+    pub fn unsubscribe_by_event_type(&self, event_type: &str) -> usize {
+        let mut subs = self.subscribers.write();
+        let before = subs.len();
+        subs.retain(|s| s.event_type_filter().is_none_or(|t| t != event_type));
+        before - subs.len()
     }
 
     /// Emit an event to all subscribers whose pattern matches the event type.
@@ -164,9 +168,9 @@ impl EventEmitter {
         if self.is_shutdown.load(Ordering::SeqCst) {
             return;
         }
-        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
+        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
-        for subscriber in &self.subscribers {
+        for subscriber in &all_subscribers {
             if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 let sub = Arc::clone(subscriber);
                 let evt = event.clone();
@@ -195,7 +199,9 @@ impl EventEmitter {
         if self.is_shutdown.load(Ordering::SeqCst) {
             return;
         }
-        for subscriber in &self.subscribers {
+        // Snapshot under a short read-lock; never hold the lock across `.await`.
+        let subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
+        for subscriber in &subscribers {
             if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 if let Err(e) = subscriber.on_event(event).await {
                     tracing::warn!(
@@ -224,8 +230,8 @@ impl EventEmitter {
         if self.is_shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
-        for subscriber in &self.subscribers {
+        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
+        for subscriber in &all_subscribers {
             if Self::matches_pattern(pattern, &event.event_type)
                 && Self::matches_pattern(subscriber.event_pattern(), &event.event_type)
             {
@@ -320,7 +326,8 @@ impl EventEmitter {
         if self.is_shutdown.load(Ordering::SeqCst) {
             return;
         }
-        for subscriber in &self.subscribers {
+        let subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
+        for subscriber in &subscribers {
             if !Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 continue;
             }
@@ -351,7 +358,7 @@ impl EventEmitter {
     /// [`Self::flush`]. After the flush completes (or times out), no new
     /// events are accepted (sync finding A-D-502). Kept for API parity with
     /// apcore-python and apcore-typescript.
-    pub async fn shutdown(&mut self, timeout_ms: u64) -> Result<(), ModuleError> {
+    pub async fn shutdown(&self, timeout_ms: u64) -> Result<(), ModuleError> {
         if self.is_shutdown.swap(true, Ordering::SeqCst) {
             // Already shut down — idempotent.
             return Ok(());
@@ -383,10 +390,10 @@ impl EventEmitter {
             return;
         }
         // Capture a snapshot for both the delivery loop and DLQ delivery.
-        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.clone();
+        let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
-        for subscriber in &self.subscribers {
+        for subscriber in &all_subscribers {
             if !Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
                 continue;
             }
@@ -599,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_to_matching_subscriber() {
-        let mut emitter = EventEmitter::new();
+        let emitter = EventEmitter::new();
         let sub = RecordingSubscriber::new("sub1", "test.*");
         let received = sub.received.clone();
         emitter.subscribe(Box::new(sub));
@@ -613,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_skips_non_matching_subscriber() {
-        let mut emitter = EventEmitter::new();
+        let emitter = EventEmitter::new();
         let sub = RecordingSubscriber::new("sub1", "other.*");
         let received = sub.received.clone();
         emitter.subscribe(Box::new(sub));
@@ -625,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_wildcard_matches_all() {
-        let mut emitter = EventEmitter::new();
+        let emitter = EventEmitter::new();
         let sub = RecordingSubscriber::new("sub1", "*");
         let received = sub.received.clone();
         emitter.subscribe(Box::new(sub));
@@ -638,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_by_id() {
-        let mut emitter = EventEmitter::new();
+        let emitter = EventEmitter::new();
         let sub = RecordingSubscriber::new("sub1", "*");
         emitter.subscribe(Box::new(sub));
         assert!(emitter.unsubscribe_by_id("sub1"));
@@ -647,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_removes_subscriber() {
-        let mut emitter = EventEmitter::new();
+        let emitter = EventEmitter::new();
         let sub = RecordingSubscriber::new("sub1", "*");
         let received = sub.received.clone();
         emitter.subscribe(Box::new(sub.clone()));
@@ -660,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_filtered() {
-        let mut emitter = EventEmitter::new();
+        let emitter = EventEmitter::new();
         let sub = RecordingSubscriber::new("sub1", "test.*");
         let received = sub.received.clone();
         emitter.subscribe(Box::new(sub));
@@ -731,7 +738,7 @@ mod tests {
             }
         }
 
-        let mut emitter = EventEmitter::new();
+        let emitter = EventEmitter::new();
         emitter.subscribe(Box::new(FailingSub));
         let good_sub = RecordingSubscriber::new("good", "*");
         let received = good_sub.received.clone();

@@ -16,7 +16,7 @@ use tokio::sync::Mutex as TokioMutex;
 #[tokio::test]
 async fn update_config_returns_config_key_restricted() {
     let cfg = Arc::new(TokioMutex::new(Config::default()));
-    let emitter = Arc::new(TokioMutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let module = UpdateConfigModule::new(cfg, emitter);
 
     let inputs = json!({

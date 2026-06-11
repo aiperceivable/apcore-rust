@@ -365,7 +365,7 @@ impl EventSubscriber for CapturingSubscriber {
 #[tokio::test]
 async fn on_load_failure_emits_module_load_failed_event() {
     let received: Arc<Mutex<Vec<ApCoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(CapturingSubscriber {
         received: Arc::clone(&received),
     }));

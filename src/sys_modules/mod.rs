@@ -175,7 +175,7 @@ pub(crate) fn missing_field_error(field: &str) -> ModuleError {
 
 /// Emit an event; errors are logged and not propagated (error isolation).
 pub(crate) async fn emit_event(
-    emitter: &Arc<Mutex<EventEmitter>>,
+    emitter: &Arc<EventEmitter>,
     event_type: &str,
     module_id: &str,
     timestamp: &str,
@@ -188,8 +188,8 @@ pub(crate) async fn emit_event(
         module_id: Some(module_id.to_string()),
         severity: "info".to_string(),
     };
-    let em = emitter.lock().await;
-    em.emit(&event).await;
+    // EventEmitter is interior-mutable (D1-011) — emit without an external lock.
+    emitter.emit(&event).await;
 }
 
 /// Default `caller_id` when the `Context` has none (Issue #45.2 — contextual
@@ -322,7 +322,7 @@ impl SysModuleError {
 /// Holds references to components created during sys-module registration.
 pub struct SysModulesContext {
     pub registered_modules: HashMap<String, serde_json::Value>,
-    pub emitter: Arc<Mutex<EventEmitter>>,
+    pub emitter: Arc<EventEmitter>,
     pub toggle_state: Arc<ToggleState>,
     pub error_history: ErrorHistory,
     pub usage_collector: UsageCollector,
@@ -442,7 +442,7 @@ pub fn register_sys_modules_with_options(
     if !enabled {
         return Ok(SysModulesContext {
             registered_modules: HashMap::new(),
-            emitter: Arc::new(Mutex::new(EventEmitter::new())),
+            emitter: Arc::new(EventEmitter::new()),
             toggle_state,
             error_history: ErrorHistory::with_limits(50, 1000),
             usage_collector: UsageCollector::new(),
@@ -485,7 +485,7 @@ pub fn register_sys_modules_with_options(
     // Build the EventEmitter up-front as an owned value so we can populate
     // its subscribers from config synchronously, then wrap it in the Arc<Mutex<_>>
     // shared with sys modules.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
 
     let events_enabled = effective_config
         .get("sys_modules.events.enabled")
@@ -528,7 +528,7 @@ pub fn register_sys_modules_with_options(
         }
     }
 
-    let emitter_arc = Arc::new(Mutex::new(emitter));
+    let emitter_arc = Arc::new(emitter);
 
     // --- Step 4: Build module list (health + manifest + usage always) ---
     let mut modules: Vec<(&str, Box<dyn Module>, Vec<String>)> = vec![
@@ -721,8 +721,7 @@ pub fn register_sys_modules_with_options(
                                 &module_id_owned,
                                 "info",
                             );
-                            let em = emitter.lock().await;
-                            em.emit(&canonical).await;
+                            emitter.emit(&canonical).await;
                             return;
                         }
                         let canonical = ApCoreEvent::with_module(
@@ -740,9 +739,8 @@ pub fn register_sys_modules_with_options(
                             &module_id_owned,
                             "info",
                         );
-                        let em = emitter.lock().await;
-                        em.emit(&canonical).await;
-                        em.emit(&legacy).await;
+                        emitter.emit(&canonical).await;
+                        emitter.emit(&legacy).await;
                     });
                 }
             }),
@@ -767,8 +765,7 @@ pub fn register_sys_modules_with_options(
                                 &module_id_owned,
                                 "info",
                             );
-                            let em = emitter.lock().await;
-                            em.emit(&canonical).await;
+                            emitter.emit(&canonical).await;
                             return;
                         }
                         let canonical = ApCoreEvent::with_module(
@@ -786,9 +783,8 @@ pub fn register_sys_modules_with_options(
                             &module_id_owned,
                             "info",
                         );
-                        let em = emitter.lock().await;
-                        em.emit(&canonical).await;
-                        em.emit(&legacy).await;
+                        emitter.emit(&canonical).await;
+                        emitter.emit(&legacy).await;
                     });
                 }
             }),

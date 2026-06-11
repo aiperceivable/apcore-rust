@@ -198,7 +198,7 @@ async fn test_webhook_4xx_is_not_retried_single_request() {
 
     let (dlq, dlq_events) = DlqSubscriber::new("dlq-4xx");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(webhook));
     emitter.subscribe(Box::new(dlq));
 
@@ -228,7 +228,7 @@ async fn test_webhook_5xx_is_retried_to_exhaustion_then_dlq() {
 
     let (dlq, dlq_events) = DlqSubscriber::new("dlq-5xx");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(webhook));
     emitter.subscribe(Box::new(dlq));
 
@@ -283,7 +283,7 @@ async fn test_a2a_4xx_is_not_retried_single_request() {
 
     let (dlq, dlq_events) = DlqSubscriber::new("dlq-a2a-4xx");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(a2a));
     emitter.subscribe(Box::new(dlq));
 
@@ -313,7 +313,7 @@ async fn test_a2a_5xx_is_retried_to_exhaustion_then_dlq() {
 
     let (dlq, dlq_events) = DlqSubscriber::new("dlq-a2a-5xx");
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(a2a));
     emitter.subscribe(Box::new(dlq));
 

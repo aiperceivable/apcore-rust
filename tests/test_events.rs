@@ -134,7 +134,7 @@ async fn test_emitter_subscribe_and_emit() {
     let sub = RecordingSubscriber::new("sub-1", "*");
     let received = sub.received.clone();
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     let event = ApCoreEvent::new("test.ping", json!({}));
@@ -156,7 +156,7 @@ async fn test_emitter_pattern_filtering() {
     let recv_mod = sub_mod.received.clone();
     let recv_exact = sub_exact.received.clone();
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub_all));
     emitter.subscribe(Box::new(sub_mod));
     emitter.subscribe(Box::new(sub_exact));
@@ -182,7 +182,7 @@ async fn test_emitter_unsubscribe_by_id() {
     let sub = RecordingSubscriber::new("remove-me", "*");
     let received = sub.received.clone();
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub.clone()));
 
     assert!(emitter.unsubscribe_by_id("remove-me"));
@@ -199,7 +199,7 @@ async fn test_emitter_unsubscribe_by_id() {
 #[tokio::test]
 async fn test_emitter_unsubscribe_via_trait() {
     let sub = RecordingSubscriber::new("trait-unsub", "*");
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub.clone()));
 
     assert!(emitter.unsubscribe(&sub));
@@ -210,8 +210,7 @@ async fn test_emitter_unsubscribe_via_trait() {
 async fn test_emitter_unsubscribe_nonexistent_returns_false() {
     let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("ghost", "*");
-    // No mutable needed — we check a non-mutating path; but unsubscribe_by_id needs &mut.
-    let mut emitter = emitter;
+    // `unsubscribe` is `&self` (interior-mutable subscribers, D1-011).
     assert!(!emitter.unsubscribe(&sub));
 }
 
@@ -221,7 +220,7 @@ async fn test_emitter_error_isolation() {
     let good = RecordingSubscriber::new("good", "*");
     let received = good.received.clone();
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(FailingSubscriber {
         id: "bad".into(),
         pattern: "*".into(),
@@ -267,7 +266,7 @@ async fn test_emitter_emit_filtered() {
     let sub = RecordingSubscriber::new("s1", "module.*");
     let received = sub.received.clone();
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     // Caller filter "module.loaded" AND subscriber pattern "module.*" both match.
@@ -312,7 +311,7 @@ fn test_emitter_default_trait() {
 async fn test_pattern_wildcard_matches_everything() {
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.received.clone();
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     emitter
@@ -326,7 +325,7 @@ async fn test_pattern_wildcard_matches_everything() {
 async fn test_pattern_exact_match() {
     let sub = RecordingSubscriber::new("s", "exact.match");
     let received = sub.received.clone();
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     emitter
@@ -346,7 +345,7 @@ async fn test_pattern_exact_match() {
 async fn test_pattern_prefix_wildcard() {
     let sub = RecordingSubscriber::new("s", "foo.*");
     let received = sub.received.clone();
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     emitter.emit(&ApCoreEvent::new("foo.bar", json!({}))).await;
@@ -364,7 +363,7 @@ async fn test_pattern_prefix_wildcard() {
 async fn test_pattern_no_match() {
     let sub = RecordingSubscriber::new("s", "alpha.beta");
     let received = sub.received.clone();
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     emitter
@@ -516,7 +515,7 @@ async fn test_emit_spawn_returns_immediately() {
         finished: Arc::clone(&finished),
     };
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     let event = ApCoreEvent::new("spawn.test", json!({}));
@@ -586,7 +585,7 @@ async fn test_emit_spawn_dispatches_subscribers_concurrently() {
     }
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     for i in 0..3 {
         emitter.subscribe(Box::new(SlowSub {
             id: format!("slow-{i}"),
@@ -618,7 +617,7 @@ async fn test_emit_spawn_dispatches_subscribers_concurrently() {
 
 #[tokio::test]
 async fn test_emit_spawn_subscriber_error_does_not_propagate() {
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(FailingSubscriber {
         id: "fail-1".into(),
         pattern: "*".into(),
@@ -649,7 +648,7 @@ async fn test_emit_spawn_subscriber_error_does_not_propagate() {
 
 #[tokio::test]
 async fn test_shutdown_is_idempotent() {
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.shutdown(100).await.expect("first shutdown");
     // Second call must succeed without error.
     emitter
@@ -663,7 +662,7 @@ async fn test_emit_spawn_after_shutdown_is_dropped() {
     let sub = RecordingSubscriber::new("post-shutdown", "*");
     let received = sub.received.clone();
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     emitter.shutdown(100).await.expect("shutdown");
@@ -684,7 +683,7 @@ async fn test_emit_async_after_shutdown_is_dropped() {
     let sub = RecordingSubscriber::new("post-shutdown-async", "*");
     let received = sub.received.clone();
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
 
     emitter.shutdown(100).await.expect("shutdown");

@@ -172,7 +172,7 @@ fn emit_input_event_type_not_empty() {
 async fn emit_error_none_raised() {
     // emit() is fire-and-forget: a throwing subscriber must not surface to the
     // caller of emit() (the return type is unit — there is no Err to inspect).
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(FailingSubscriber::new("boom")));
     let event = make_event();
     // Must not panic even though the wrapped subscriber returns Err.
@@ -188,7 +188,7 @@ async fn emit_error_none_raised() {
 async fn emit_property_async() {
     // Rust emit() is async (spec: "async in Rust") and its future resolves to
     // `()` without blocking the caller on subscriber execution.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -205,7 +205,7 @@ async fn emit_property_async() {
 async fn emit_property_thread_safe() {
     // Concurrent emits with distinct payloads from >=8 spawned tasks must not
     // corrupt state; every event must be delivered exactly once.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -239,7 +239,7 @@ async fn emit_property_thread_safe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn emit_property_pure() {
     // emit() is NOT pure: it invokes subscriber callbacks (observable effect).
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -253,7 +253,7 @@ async fn emit_property_pure() {
 #[tokio::test(flavor = "multi_thread")]
 async fn emit_property_idempotent() {
     // emit() is NOT idempotent: two identical emits deliver twice.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -268,7 +268,7 @@ async fn emit_property_idempotent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn emit_side_effect_1_subscriber_invoked() {
     // Observable side effect: matching subscribers receive the emitted event.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "apcore.test.*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -297,7 +297,7 @@ fn subscribe_input_subscriber_async_on_event() {
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_error_none_raised() {
     // A correctly-typed EventSubscriber subscribes without error.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub)); // must not panic
@@ -311,7 +311,7 @@ async fn subscribe_error_none_raised() {
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_property_async() {
     // subscribe() is synchronous (not async) and returns unit.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let result: () = emitter.subscribe(Box::new(sub));
     assert_eq!(result, ());
@@ -321,17 +321,18 @@ async fn subscribe_property_async() {
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_property_thread_safe() {
     // Concurrent subscribe() from >=8 tasks must register every subscriber
-    // without loss. Rust's &mut self on subscribe forces external
-    // synchronization (a Mutex), so we serialize the registrations through it
-    // and assert the registry holds every subscriber (observed via delivery).
-    let emitter = Arc::new(tokio::sync::Mutex::new(EventEmitter::new()));
+    // without loss. `subscribe` is `&self` (interior-mutable subscribers,
+    // D1-011), so tasks subscribe directly through a shared `Arc<EventEmitter>`
+    // with no external lock; assert the registry holds every subscriber
+    // (observed via delivery).
+    let emitter = Arc::new(EventEmitter::new());
     let n = 12usize;
     let mut handles = Vec::new();
     for i in 0..n {
         let em = Arc::clone(&emitter);
         handles.push(tokio::spawn(async move {
             let sub = RecordingSubscriber::new(&format!("s{i}"), "*");
-            em.lock().await.subscribe(Box::new(sub));
+            em.subscribe(Box::new(sub));
         }));
     }
     for h in handles {
@@ -340,7 +341,7 @@ async fn subscribe_property_thread_safe() {
     // Observe consistent state: emit once, every registered subscriber fires.
     let counter = Arc::new(AtomicUsize::new(0));
     {
-        let mut guard = emitter.lock().await;
+        let guard = &emitter;
         let counting = CountingSubscriber::new("counter", Arc::clone(&counter));
         guard.subscribe(Box::new(counting));
         let event = make_event();
@@ -388,7 +389,7 @@ async fn subscribe_property_idempotent() {
     // Each subscribe() call creates a new subscription: subscribing two
     // subscribers (same event_pattern) delivers each event to both. Rust stores
     // subscribers by value, so two distinct boxed subscribers both receive.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let s1 = RecordingSubscriber::new("a", "*");
     let s2 = RecordingSubscriber::new("b", "*");
     let r1 = s1.handle();
@@ -722,7 +723,7 @@ async fn circuit_on_failure_property_idempotent() {
 async fn unsubscribe_input_subscriber_same_reference() {
     // unsubscribe removes the subscriber (Rust: by subscriber_id, an accepted
     // cross-language divergence); afterwards no more events are delivered to it.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub.clone()));
@@ -738,7 +739,7 @@ async fn unsubscribe_input_subscriber_same_reference() {
 async fn unsubscribe_error_unregistered_no_raise() {
     // Unsubscribing an unregistered subscriber MUST NOT panic — it is a no-op
     // returning false.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let never = RecordingSubscriber::new("never", "*");
     let removed = emitter.unsubscribe(&never);
     assert!(!removed);
@@ -748,7 +749,7 @@ async fn unsubscribe_error_unregistered_no_raise() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unsubscribe_property_async() {
     // unsubscribe() is synchronous and returns a bool (not a future).
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     emitter.subscribe(Box::new(sub.clone()));
     let result: bool = emitter.unsubscribe(&sub);
@@ -759,10 +760,11 @@ async fn unsubscribe_property_async() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unsubscribe_property_thread_safe() {
     // >=8 concurrent unsubscribe() calls (each removing a distinct subscriber,
-    // by unique id) leave the registry consistent and empty. Rust's &mut self
-    // forces external synchronization; serialize through a Mutex and assert no
-    // event is delivered after all removals.
-    let mut emitter = EventEmitter::new();
+    // by unique id) leave the registry consistent and empty. `unsubscribe` is
+    // `&self` (interior-mutable subscribers, D1-011), so the calls run directly
+    // through a shared `Arc<EventEmitter>`; assert no event is delivered after
+    // all removals.
+    let emitter = EventEmitter::new();
     let n = 10usize;
     let mut handles_to_remove: Vec<RecordingSubscriber> = Vec::new();
     let mut received_handles = Vec::new();
@@ -772,13 +774,11 @@ async fn unsubscribe_property_thread_safe() {
         handles_to_remove.push(sub.clone());
         emitter.subscribe(Box::new(sub));
     }
-    let emitter = Arc::new(tokio::sync::Mutex::new(emitter));
+    let emitter = Arc::new(emitter);
     let mut tasks = Vec::new();
     for sub in handles_to_remove {
         let em = Arc::clone(&emitter);
-        tasks.push(tokio::spawn(
-            async move { em.lock().await.unsubscribe(&sub) },
-        ));
+        tasks.push(tokio::spawn(async move { em.unsubscribe(&sub) }));
     }
     let mut removed_count = 0usize;
     for t in tasks {
@@ -789,7 +789,7 @@ async fn unsubscribe_property_thread_safe() {
     assert_eq!(removed_count, n);
     // Registry empty: emit delivers to nobody.
     {
-        let guard = emitter.lock().await;
+        let guard = &emitter;
         guard.emit(&make_event()).await;
         guard.flush(2000).await.unwrap();
     }
@@ -802,7 +802,7 @@ async fn unsubscribe_property_thread_safe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unsubscribe_property_pure() {
     // unsubscribe mutates the subscriber list (observable: delivery stops).
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub.clone()));
@@ -823,7 +823,7 @@ async fn unsubscribe_property_pure() {
 async fn unsubscribe_property_idempotent() {
     // Repeated unsubscribe of the same subscriber is a safe no-op. The first
     // call removes (true); the second is a no-op (false), and neither panics.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     emitter.subscribe(Box::new(sub.clone()));
     let first = emitter.unsubscribe(&sub);
@@ -840,7 +840,7 @@ async fn unsubscribe_property_idempotent() {
 async fn flush_input_timeout_positive() {
     // flush(timeout_ms) waits up to `timeout_ms`; a positive timeout lets a
     // fast in-flight delivery complete before flush returns.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -854,7 +854,7 @@ async fn flush_input_timeout_positive() {
 async fn flush_error_none_raised() {
     // Subscriber errors surfacing during the flush window are silently
     // discarded; flush MUST return Ok (never error).
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(FailingSubscriber::new("boom")));
     emitter.emit(&make_event()).await;
     let result = emitter.flush(2000).await;
@@ -876,7 +876,7 @@ async fn flush_property_async() {
 async fn flush_property_thread_safe() {
     // >=8 concurrent flush() calls (with emits in flight) all return Ok and the
     // pending set drains.
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -901,7 +901,7 @@ async fn flush_property_pure() {
     // flush waits on shared pending tasks and drains completed ones — it
     // mutates shared state (observable: a second flush has nothing to wait on
     // and returns immediately with the deliveries already done).
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));
@@ -917,7 +917,7 @@ async fn flush_property_idempotent() {
     // Calling flush() again on an already-drained pending set returns
     // immediately with the same observable outcome (no error, no extra
     // deliveries).
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
     let received = sub.handle();
     emitter.subscribe(Box::new(sub));

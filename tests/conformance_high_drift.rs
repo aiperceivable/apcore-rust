@@ -344,7 +344,7 @@ async fn invoke_module(
     inputs: Value,
     ctx: &Context<Value>,
     config: Arc<Mutex<Config>>,
-    emitter: Arc<Mutex<EventEmitter>>,
+    emitter: Arc<EventEmitter>,
 ) -> Result<Value, ModuleError> {
     match fixture_module_id {
         "system.control.update_config" => {
@@ -386,9 +386,9 @@ async fn conformance_contextual_audit() {
         // Capture subscriber per case so events don't leak across iterations.
         let captured: Arc<parking_lot::Mutex<Vec<ApCoreEvent>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+        let emitter = Arc::new(EventEmitter::new());
         {
-            let mut em = emitter.lock().await;
+            let em = &emitter;
             em.subscribe(Box::new(CaptureSubscriber {
                 events: Arc::clone(&captured),
             }));

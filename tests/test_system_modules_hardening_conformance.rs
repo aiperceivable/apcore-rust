@@ -126,7 +126,7 @@ async fn case_overrides_persisted_on_update() {
 
     let config = Config::default();
     let config_arc = Arc::new(Mutex::new(config));
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
 
     let module = UpdateConfigModule::new(Arc::clone(&config_arc), Arc::clone(&emitter))
         .with_overrides_path(Some(path.clone()));
@@ -193,7 +193,7 @@ async fn case_audit_entry_records_actor() {
     let store: Arc<dyn AuditStore> = inspect.clone();
 
     let config = Arc::new(Mutex::new(Config::default()));
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let module = UpdateConfigModule::new(Arc::clone(&config), Arc::clone(&emitter))
         .with_audit_store(Some(Arc::clone(&store)));
 
@@ -231,7 +231,7 @@ async fn case_audit_entry_records_change() {
     let registry = Arc::new(Registry::new());
     register_dummy_module(&registry, "risky.module");
 
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let toggle_state = Arc::new(ToggleState::new());
     let module = ToggleFeatureModule::new(
         Arc::clone(&registry),
@@ -313,7 +313,7 @@ async fn case_reload_with_path_filter() {
     register_dummy_module(&registry, "executor.pdf.render");
     register_dummy_module(&registry, "orchestrator.main");
 
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let module = ReloadModule::new(Arc::clone(&registry), emitter);
 
     let inputs = json!({
@@ -356,7 +356,7 @@ async fn case_reload_module_id_and_filter_conflict() {
     let _case = fixture_case(&fixture, "reload_module_id_and_filter_conflict");
 
     let registry = Arc::new(Registry::new());
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let module = ReloadModule::new(Arc::clone(&registry), emitter);
 
     let inputs = json!({
@@ -489,7 +489,7 @@ async fn regression_update_config_redacts_sensitive_keys() {
     let mut base_config = Config::default();
     base_config.set("auth.api_key", json!("OLD_SECRET"));
     let config = Arc::new(Mutex::new(base_config));
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
 
     let module = UpdateConfigModule::new(Arc::clone(&config), Arc::clone(&emitter))
         .with_audit_store(Some(Arc::clone(&store)));
@@ -536,7 +536,7 @@ async fn regression_update_config_does_not_redact_normal_keys() {
     let mut base_config = Config::default();
     base_config.set("executor.default_timeout", json!(30000));
     let config = Arc::new(Mutex::new(base_config));
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
 
     let module = UpdateConfigModule::new(Arc::clone(&config), Arc::clone(&emitter))
         .with_audit_store(Some(Arc::clone(&store)));

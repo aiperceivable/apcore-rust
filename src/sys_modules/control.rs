@@ -38,14 +38,14 @@ use super::{
 /// Update a runtime configuration value by dot-path key (F11).
 pub struct UpdateConfigModule {
     config: Arc<Mutex<Config>>,
-    emitter: Arc<Mutex<EventEmitter>>,
+    emitter: Arc<EventEmitter>,
     overrides_path: Option<PathBuf>,
     overrides_store: Option<Arc<dyn OverridesStore>>,
     audit_store: Option<Arc<dyn AuditStore>>,
 }
 
 impl UpdateConfigModule {
-    pub fn new(config: Arc<Mutex<Config>>, emitter: Arc<Mutex<EventEmitter>>) -> Self {
+    pub fn new(config: Arc<Mutex<Config>>, emitter: Arc<EventEmitter>) -> Self {
         Self {
             config,
             emitter,
@@ -275,13 +275,13 @@ impl Module for UpdateConfigModule {
 /// binary restart.
 pub struct ReloadModule {
     registry: Arc<Registry>,
-    emitter: Arc<Mutex<EventEmitter>>,
+    emitter: Arc<EventEmitter>,
     audit_store: Option<Arc<dyn AuditStore>>,
     config: Option<Arc<Mutex<Config>>>,
 }
 
 impl ReloadModule {
-    pub fn new(registry: Arc<Registry>, emitter: Arc<Mutex<EventEmitter>>) -> Self {
+    pub fn new(registry: Arc<Registry>, emitter: Arc<EventEmitter>) -> Self {
         Self {
             registry,
             emitter,
@@ -745,7 +745,7 @@ impl Module for ReloadModule {
 /// Disable or enable a module without unloading it from the Registry (F19).
 pub struct ToggleFeatureModule {
     registry: Arc<Registry>,
-    emitter: Arc<Mutex<EventEmitter>>,
+    emitter: Arc<EventEmitter>,
     toggle_state: Arc<ToggleState>,
     overrides_path: Option<PathBuf>,
     overrides_store: Option<Arc<dyn OverridesStore>>,
@@ -755,7 +755,7 @@ pub struct ToggleFeatureModule {
 impl ToggleFeatureModule {
     pub fn new(
         registry: Arc<Registry>,
-        emitter: Arc<Mutex<EventEmitter>>,
+        emitter: Arc<EventEmitter>,
         toggle_state: Arc<ToggleState>,
     ) -> Self {
         Self {

@@ -148,7 +148,7 @@ impl EventSubscriber for RecordingHandle {
 
 fn build_emitter_with_recorder() -> (Arc<EventEmitter>, Arc<RecordingSubscriber>) {
     let recorder = Arc::new(RecordingSubscriber::default());
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(RecordingHandle {
         inner: Arc::clone(&recorder),
         id: "recorder".to_string(),

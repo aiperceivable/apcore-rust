@@ -127,7 +127,7 @@ async fn error_threshold_emits_canonical_and_legacy_events() {
     labels.insert("status".to_string(), "error".to_string());
     metrics.increment("apcore_module_calls_total", labels.clone(), 10.0);
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let (sub, received) = RecordingSub::new("apcore.health.*");
     let (legacy_sub, legacy_received) = RecordingSub::new("error_threshold_exceeded");
     emitter.subscribe(sub);
@@ -201,7 +201,7 @@ async fn latency_threshold_emits_canonical_and_legacy_events() {
     // Push a high-latency observation.
     metrics.observe("apcore_module_duration_seconds", labels, 10.0);
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     let (sub, received) = RecordingSub::new("apcore.health.*");
     let (legacy_sub, legacy_received) = RecordingSub::new("latency_threshold_exceeded");
     emitter.subscribe(sub);
@@ -271,7 +271,7 @@ async fn registry_register_emits_apcore_event_canonical_and_legacy() {
     let (canonical_sub, canonical_received) = RecordingSub::new("apcore.registry.*");
     let (legacy_sub, legacy_received) = RecordingSub::new("module_registered");
     {
-        let mut emitter = ctx_result.emitter.lock().await;
+        let emitter = &ctx_result.emitter;
         emitter.subscribe(canonical_sub);
         emitter.subscribe(legacy_sub);
     }
@@ -329,7 +329,7 @@ async fn registry_unregister_emits_apcore_event_canonical_and_legacy() {
     let (canonical_sub, canonical_received) = RecordingSub::new("apcore.registry.*");
     let (legacy_sub, legacy_received) = RecordingSub::new("module_unregistered");
     {
-        let mut emitter = ctx_result.emitter.lock().await;
+        let emitter = &ctx_result.emitter;
         emitter.subscribe(canonical_sub);
         emitter.subscribe(legacy_sub);
     }
@@ -367,7 +367,7 @@ async fn update_config_audit_event_includes_caller_id_from_context() {
     use apcore::config::Config;
 
     let config = Arc::new(TokioMutex::new(Config::default()));
-    let emitter = Arc::new(TokioMutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let store: Arc<dyn AuditStore> = Arc::new(InMemoryAuditStore::new());
     let store_clone_for_assert = Arc::clone(&store);
 
@@ -377,7 +377,7 @@ async fn update_config_audit_event_includes_caller_id_from_context() {
     // Subscribe so we can also assert the emitted event payload.
     let (sub, received) = RecordingSub::new("apcore.config.updated");
     {
-        let mut em = emitter.lock().await;
+        let em = &emitter;
         em.subscribe(sub);
     }
 

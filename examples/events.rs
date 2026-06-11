@@ -16,20 +16,17 @@
 //!    `apcore.module.toggled` — collecting each into a shared list,
 //! 3. performs real lifecycle actions: registers a tool, calls it, and
 //!    disables + re-enables it through the executor pipeline, and
-//! 4. delivers the canonical lifecycle events to the subscribers, prints the
-//!    collected stream, and unsubscribes via `client.off()`.
+//! 4. observes the canonical lifecycle events arriving at the subscribers,
+//!    prints the collected stream, and unsubscribes via `client.off()`.
+//!
+//! `client.on()` subscribes to the SAME bus the sys modules and registry
+//! callbacks publish to (D1-011 resolved), so the real `register()` /
+//! `disable()` / `enable()` actions deliver straight to the subscribers —
+//! matching the Python and TypeScript SDKs. Delivery is fire-and-forget on
+//! spawned tasks, so the demo flushes the bus before asserting.
 //!
 //! Each expected event carries its count, so this example doubles as a smoke
 //! test: it exits non-zero if the observed lifecycle stream drifts.
-//!
-//! Cross-language note (apcore-rust D1-011): the Rust facade's `on()` /
-//! `events()` bind a *local* `EventEmitter` that is distinct from the
-//! sys-modules bus that `disable()` / `enable()` publish to. The Python and
-//! TypeScript SDKs surface a single bus, so `client.disable()` there delivers
-//! straight to `client.on()` subscribers. Until the Rust emitters are unified,
-//! this example performs the real lifecycle actions AND emits the matching
-//! canonical events onto `client.events()` so the subscriber-delivery contract
-//! (`on` / `events` / `off`) is exercised end-to-end on the same SDK.
 //!
 //! Run (from the apcore-rust repo root):
 //!     cargo run --example events
@@ -39,6 +36,7 @@ use apcore::{APCore, Config, Context, Module, ModuleError};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// A trivial tool module returning a canned result — stands in for a real
 /// `executor.*` capability so the demo exercises actual registration + calls.
@@ -75,12 +73,13 @@ fn build_client() -> APCore {
     APCore::with_config(config)
 }
 
-/// Drive the real lifecycle actions, then emit the matching canonical events
-/// onto the local emitter so `on()` subscribers receive them (see D1-011 note).
+/// Drive the real lifecycle actions; the unified bus delivers the resulting
+/// canonical events to the `on()` subscribers (no manual emit, D1-011 resolved).
 async fn run_lifecycle(client: &APCore) {
     let module_id = "executor.crm.read";
 
-    // Real registration + call + toggle actions through the pipeline.
+    // Real registration fires `apcore.registry.module_registered`; the toggle
+    // calls each fire `apcore.module.toggled`.
     client
         .register(module_id, Box::new(CrmRead))
         .expect("register tool");
@@ -97,29 +96,13 @@ async fn run_lifecycle(client: &APCore) {
         .await
         .expect("enable");
 
-    // Deliver the canonical lifecycle events to the client's subscribers.
-    let registered = ApCoreEvent::with_module(
-        "apcore.registry.module_registered",
-        json!({}),
-        module_id,
-        "info",
-    );
-    let disabled = ApCoreEvent::with_module(
-        "apcore.module.toggled",
-        json!({ "module_id": module_id, "enabled": false }),
-        module_id,
-        "info",
-    );
-    let enabled = ApCoreEvent::with_module(
-        "apcore.module.toggled",
-        json!({ "module_id": module_id, "enabled": true }),
-        module_id,
-        "info",
-    );
-    let emitter = client.events().expect("local emitter exists after on()");
-    emitter.emit_sequential(&registered).await;
-    emitter.emit_sequential(&disabled).await;
-    emitter.emit_sequential(&enabled).await;
+    // The bus delivers on spawned tasks (fire-and-forget). Let the registry
+    // callback + toggle emits dispatch, then flush pending deliveries so the
+    // assertions observe a complete stream.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    if let Some(bus) = client.events() {
+        bus.flush(2000).await.expect("flush deliveries");
+    }
 }
 
 /// Print the collected stream and return the failure count against expectations.

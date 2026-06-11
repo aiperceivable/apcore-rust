@@ -27,7 +27,14 @@ pub struct APCore {
     /// all sys modules. Interior mutability on `Registry` removes the need
     /// for `Arc::get_mut` or an external `Mutex`.
     registry: Arc<Registry>,
-    event_emitter: Option<EventEmitter>,
+    // The event bus (D1-011). When sys_modules is enabled this is the SAME
+    // `Arc<EventEmitter>` the sys modules + registry callbacks emit to, so
+    // `on()`/`events()` receive system events. When sys_modules is disabled it
+    // is `None` until `on()` lazily creates a standalone local bus (matching the
+    // Python/TS contract that the emitter is surfaced only once events exist).
+    // EventEmitter is interior-mutable, so subscribe/emit both work through the
+    // shared `Arc` without an external lock.
+    event_emitter: Option<Arc<EventEmitter>>,
     metrics_collector: Option<MetricsCollector>,
     sys_modules_context: Option<SysModulesContext>,
     /// Per-instance toggle store (issue #71). Each `APCore` owns one
@@ -133,11 +140,17 @@ impl APCore {
             None
         };
 
+        // Share ONE event bus across the client, registry callbacks, and sys
+        // modules (D1-011). When sys_modules is enabled, reuse its emitter so
+        // `on()`/`events()` receive module-registration and toggle events; when
+        // disabled, leave it `None` (a standalone bus is created lazily on `on()`).
+        let event_emitter = sys_modules_context.as_ref().map(|c| Arc::clone(&c.emitter));
+
         Self {
             config,
             executor,
             registry,
-            event_emitter: None,
+            event_emitter,
             metrics_collector,
             sys_modules_context,
             toggle_state,
@@ -545,7 +558,9 @@ impl APCore {
             event_type: event_type.to_string(),
             inner: subscriber,
         });
-        let emitter = self.event_emitter.get_or_insert_with(EventEmitter::new);
+        let emitter = self
+            .event_emitter
+            .get_or_insert_with(|| Arc::new(EventEmitter::new()));
         let id = wrapped.subscriber_id().to_string();
         emitter.subscribe(wrapped);
         id
@@ -575,11 +590,9 @@ impl APCore {
     /// To remove all handlers bound to a given event type, use
     /// [`off_by_type()`](Self::off_by_type).
     pub fn off(&mut self, subscriber_id: &str) -> bool {
-        if let Some(ref mut emitter) = self.event_emitter {
-            emitter.unsubscribe_by_id(subscriber_id)
-        } else {
-            false
-        }
+        self.event_emitter
+            .as_ref()
+            .is_some_and(|e| e.unsubscribe_by_id(subscriber_id))
     }
 
     /// Unsubscribe all handlers registered for `event_type`.
@@ -588,29 +601,21 @@ impl APCore {
     /// type string removes every handler bound to that type in a single call.
     /// Returns the number of handlers removed.
     pub fn off_by_type(&mut self, event_type: &str) -> usize {
-        if let Some(ref mut emitter) = self.event_emitter {
-            emitter.unsubscribe_by_event_type(event_type)
-        } else {
-            0
-        }
+        self.event_emitter
+            .as_ref()
+            .map_or(0, |e| e.unsubscribe_by_event_type(event_type))
     }
 
-    /// Get the event emitter, if configured.
+    /// Get this client's event bus, if one exists.
     ///
-    /// **Limitation:** when system modules are enabled via config, the canonical
-    /// event emitter is `sys_modules_context.emitter` (an `Arc<Mutex<EventEmitter>>`).
-    /// This method returns the *local* emitter created by `on_fn`/`on` calls, which
-    /// is a separate instance and does NOT receive system events.
-    ///
-    /// To receive system events you **MUST** subscribe via [`APCore::on`] or
-    /// [`APCore::on_fn`] — those methods route subscriptions to the correct emitter
-    /// once this divergence is resolved. Tracked as D1-011 in the apcore-rust issue tracker.
-    ///
-    /// Python and TypeScript SDKs surface the sys-modules emitter here; this Rust
-    /// implementation will align in a future minor release when `event_emitter` is
-    /// migrated to `Option<Arc<Mutex<EventEmitter>>>`.
+    /// D1-011 resolved: when system modules are enabled, this returns the SAME
+    /// bus that emits `apcore.module.toggled`, `apcore.registry.module_registered`,
+    /// and the other system events — so a subscriber added via [`on()`](Self::on)
+    /// receives them, matching the Python and TypeScript SDKs which surface the
+    /// sys-modules emitter here. With sys_modules disabled it is `None` until the
+    /// first [`on()`](Self::on) call creates a standalone local bus.
     pub fn events(&self) -> Option<&EventEmitter> {
-        self.event_emitter.as_ref()
+        self.event_emitter.as_deref()
     }
 
     /// Reload configuration from disk.

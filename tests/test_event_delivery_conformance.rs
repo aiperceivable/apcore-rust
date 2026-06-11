@@ -200,7 +200,7 @@ async fn conformance_retry_succeeds_before_exhaustion() {
         received: Arc::clone(&dlq_received),
     };
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
     emitter.subscribe(Box::new(dlq_sub));
 
@@ -280,7 +280,7 @@ async fn conformance_permanent_failure_emits_dlq_event() {
         received: Arc::clone(&dlq_received),
     };
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(sub));
     emitter.subscribe(Box::new(dlq_sub));
 
@@ -404,7 +404,7 @@ async fn conformance_dlq_event_subscriber_failure_is_not_retried() {
         },
     };
 
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(primary_sub));
     emitter.subscribe(Box::new(dlq_sub));
 

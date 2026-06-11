@@ -49,8 +49,8 @@ fn make_config() -> Arc<Mutex<Config>> {
     Arc::new(Mutex::new(Config::from_defaults()))
 }
 
-fn make_emitter() -> Arc<Mutex<EventEmitter>> {
-    Arc::new(Mutex::new(EventEmitter::new()))
+fn make_emitter() -> Arc<EventEmitter> {
+    Arc::new(EventEmitter::new())
 }
 
 fn make_registry() -> Arc<Registry> {
@@ -566,11 +566,11 @@ async fn toggle_feature_side_effect_emits_toggled_event() {
     }
 
     let toggled = Arc::new(AtomicUsize::new(0));
-    let mut emitter = EventEmitter::new();
+    let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(RecordingSubscriber {
         toggled: Arc::clone(&toggled),
     }));
-    let emitter_arc = Arc::new(Mutex::new(emitter));
+    let emitter_arc = Arc::new(emitter);
     let module = ToggleFeatureModule::new(
         registry_with_module("math.add"),
         Arc::clone(&emitter_arc),
@@ -585,12 +585,7 @@ async fn toggle_feature_side_effect_emits_toggled_event() {
         .expect("toggle must succeed");
     // `emit` dispatches subscribers on spawned tasks; flush awaits them so the
     // assertion observes the delivered event deterministically.
-    emitter_arc
-        .lock()
-        .await
-        .flush(2000)
-        .await
-        .expect("flush must succeed");
+    emitter_arc.flush(2000).await.expect("flush must succeed");
     assert_eq!(toggled.load(Ordering::SeqCst), 1);
 }
 

@@ -11,7 +11,6 @@ use apcore::events::emitter::EventEmitter;
 use apcore::module::{Module, ModuleAnnotations};
 use apcore::registry::registry::{ModuleDescriptor, Registry};
 use apcore::sys_modules::control::ReloadModule;
-use tokio::sync::Mutex;
 
 fn dummy_ctx() -> Context<serde_json::Value> {
     Context::<serde_json::Value>::new(Identity::new(
@@ -68,7 +67,7 @@ fn register_dummy(registry: &Arc<Registry>, id: &str) {
 #[tokio::test]
 async fn path_filter_only_reloads_matching_modules() {
     let registry = Arc::new(Registry::new());
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
 
     register_dummy(&registry, "executor.email.send");
     register_dummy(&registry, "executor.email.recv");
@@ -121,7 +120,7 @@ async fn path_filter_only_reloads_matching_modules() {
 #[tokio::test]
 async fn module_id_and_path_filter_are_mutually_exclusive() {
     let registry = Arc::new(Registry::new());
-    let emitter = Arc::new(Mutex::new(EventEmitter::new()));
+    let emitter = Arc::new(EventEmitter::new());
     let reload = ReloadModule::new(registry, emitter);
     let err = reload
         .execute(
