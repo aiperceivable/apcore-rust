@@ -626,3 +626,108 @@ async fn dlq_payload_uses_declared_subscriber_type() {
         Some("noDashId")
     );
 }
+
+// ---------------------------------------------------------------------------
+// A-D-013: the Registry MUST dispatch its events via the DLQ-bearing path so a
+// failing subscriber on a registry event produces an
+// `apcore.event.delivery_failed` event rather than a silent drop. Previously
+// the registry used `emit_spawn` (single attempt, no retry, no DLQ).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RegistryEventFailSubscriber {
+    id: String,
+    attempts: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl EventSubscriber for RegistryEventFailSubscriber {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn event_pattern(&self) -> &str {
+        // Match only the registry event, NOT the DLQ event it generates.
+        "apcore.registry.module_load_failed"
+    }
+    fn retry(&self) -> EventRetryConfig {
+        EventRetryConfig::no_retry()
+    }
+    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(ModuleError::new(
+            apcore::errors::ErrorCode::GeneralInternalError,
+            "registry subscriber always fails",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn registry_event_failure_is_dead_lettered_not_dropped() {
+    use apcore::context::Context;
+    use apcore::module::Module;
+    use apcore::registry::Registry;
+    use serde_json::Value;
+
+    // A module whose on_load() fails — this drives the registry to emit
+    // `apcore.registry.module_load_failed`.
+    #[derive(Debug)]
+    struct OnLoadFailModule;
+    #[async_trait]
+    impl Module for OnLoadFailModule {
+        fn description(&self) -> &'static str {
+            "on_load fails"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn on_load(&self) -> Result<(), ModuleError> {
+            Err(ModuleError::new(
+                apcore::errors::ErrorCode::GeneralInternalError,
+                "boom",
+            ))
+        }
+        async fn execute(&self, _i: Value, _c: &Context<Value>) -> Result<Value, ModuleError> {
+            Ok(json!({}))
+        }
+    }
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let fail_sub = RegistryEventFailSubscriber {
+        id: "registry-fail-sub".into(),
+        attempts: Arc::clone(&attempts),
+    };
+    let (dlq_sub, dlq_received) = DlqSubscriber::new("registry-dlq");
+
+    let emitter = Arc::new(EventEmitter::new());
+    emitter.subscribe(Box::new(fail_sub));
+    emitter.subscribe(Box::new(dlq_sub));
+
+    let registry = Registry::new();
+    registry.set_event_emitter(Arc::clone(&emitter));
+
+    // Registering a module whose on_load fails emits module_load_failed.
+    let _ = registry.register_module("executor.fail.mod", Box::new(OnLoadFailModule));
+
+    // Let the spawned delivery + DLQ tasks run.
+    emitter.flush(5000).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 1,
+        "the failing registry-event subscriber must have been invoked"
+    );
+    let dlq_events = dlq_received.lock();
+    assert_eq!(
+        dlq_events.len(),
+        1,
+        "a failing registry-event subscriber must produce exactly one DLQ event (no silent drop)"
+    );
+    assert_eq!(
+        dlq_events[0].event_type, "apcore.event.delivery_failed",
+        "the dead-letter event type must be apcore.event.delivery_failed"
+    );
+}

@@ -638,20 +638,16 @@ impl Step for BuiltinMiddlewareBefore {
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
                 ctx.executed_middlewares.clone_from(&executed);
-                // On middleware before error, run on_error for recovery.
-                let recovery = middleware_manager
-                    .execute_on_error(
-                        &ctx.module_id,
-                        ctx.inputs.clone(),
-                        &e,
-                        &ctx.context,
-                        &executed,
-                    )
-                    .await;
-                if let Some(recovery_value) = recovery {
-                    ctx.output = Some(recovery_value);
-                    return Ok(StepResult::skip_to("return_result"));
-                }
+                // A-D-010 / A-D-012: do NOT run step-level on_error recovery
+                // here. Record which middlewares ran (above) and propagate the
+                // error so the executor-level loop is the SOLE on_error site —
+                // it runs `execute_on_error_outcome` over `executed` and honors
+                // both Recovery and Retry. Step-level `execute_on_error` mapped
+                // RetrySignal→None (dropping retries) and, combined with the
+                // executor pass, fired on_error twice. Mirrors apcore-python
+                // (chain errors store executed_middlewares + raise) and
+                // apcore-typescript.
+                let _ = &middleware_manager; // retained for the Ok-path borrow above
                 return Err(e);
             }
         };
@@ -789,22 +785,13 @@ impl Step for BuiltinExecute {
                 if matches!(e.code, ErrorCode::ExecutionCancelled) {
                     return Err(e);
                 }
-                // On execution error, attempt middleware recovery.
-                if let Some(ref mm) = ctx.middleware_manager {
-                    let recovery = mm
-                        .execute_on_error(
-                            &ctx.module_id,
-                            ctx.inputs.clone(),
-                            &e,
-                            &ctx.context,
-                            &ctx.executed_middlewares,
-                        )
-                        .await;
-                    if let Some(recovery_value) = recovery {
-                        ctx.output = Some(recovery_value);
-                        return Ok(StepResult::skip_to("return_result"));
-                    }
-                }
+                // A-D-010 / A-D-012: do NOT run step-level on_error recovery
+                // here. The executor-level loop is the sole recovery site (it
+                // runs `execute_on_error_outcome` over `ctx.executed_middlewares`
+                // and honors Recovery + Retry). Step-level recovery double-fired
+                // on_error and silently dropped RetrySignals. Mirrors
+                // apcore-python `BuiltinExecute` (raises; no step-level on_error)
+                // and apcore-typescript.
                 Err(e)
             }
         }
@@ -879,20 +866,17 @@ impl Step for BuiltinMiddlewareAfter {
                 Ok(StepResult::continue_step())
             }
             Err(e) => {
-                // On middleware after error, run on_error for recovery.
-                let recovery = middleware_manager
-                    .execute_on_error(
-                        &ctx.module_id,
-                        ctx.inputs.clone(),
-                        &e,
-                        &ctx.context,
-                        &ctx.executed_middlewares,
-                    )
-                    .await;
-                if let Some(recovery_value) = recovery {
-                    ctx.output = Some(recovery_value);
-                    return Ok(StepResult::skip_to("return_result"));
-                }
+                // A-D-010 / A-D-012: do NOT run step-level on_error here. The
+                // sole on_error recovery site is the executor-level loop
+                // (`Executor::call`), which runs `execute_on_error_outcome` over
+                // `ctx.executed_middlewares` and honors both Recovery and Retry
+                // outcomes. Running it at the step level too made on_error fire
+                // twice on an after()-failure (step + executor) and dropped any
+                // RetrySignal (step-level `execute_on_error` maps Retry→None).
+                // Mirrors apcore-python `BuiltinMiddlewareAfter` (no step-level
+                // recovery — it raises) and apcore-typescript. The before-step
+                // already populated `ctx.executed_middlewares`, so the executor
+                // recovers over exactly the middlewares that ran.
                 Err(e)
             }
         }

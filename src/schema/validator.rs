@@ -18,9 +18,21 @@ use crate::module::{ValidationErrorDetail, ValidationResult};
 use crate::schema::hardening::{content_hash, format_warnings, FormatWarning};
 
 /// Validates JSON values against JSON Schema documents (Draft 2020-12).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SchemaValidator {
     cache: Arc<Mutex<HashMap<String, Arc<Validator>>>>,
+    /// When `true` (the default), a coercion pre-pass mirrors pydantic lax mode
+    /// (and apcore-python `model_validate(strict=False)` / apcore-typescript
+    /// `Value.Decode`): string→number/bool, int↔float widening, applied
+    /// recursively per the schema's declared scalar types before validation.
+    /// When `false`, validation is the raw jsonschema check (no coercion).
+    coerce_types: bool,
+}
+
+impl Default for SchemaValidator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Outcome of [`SchemaValidator::validate_detailed`] — keeps richer error metadata
@@ -42,11 +54,31 @@ pub struct DetailedValidationResult {
 
 impl SchemaValidator {
     /// Create a new validator with an empty internal compile cache.
+    ///
+    /// Type coercion is **enabled by default** (`coerce_types = true`), matching
+    /// apcore-python (`SchemaValidator(coerce_types=True)`) and apcore-typescript
+    /// (`new SchemaValidator(true)`). Use [`Self::with_coerce_types`] to opt out.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_coerce_types(true)
+    }
+
+    /// Create a new validator with explicit coercion behavior.
+    ///
+    /// `coerce_types = true` enables the pydantic-lax-style coercion pre-pass;
+    /// `false` performs the raw jsonschema check with no coercion.
+    #[must_use]
+    pub fn with_coerce_types(coerce_types: bool) -> Self {
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),
+            coerce_types,
         }
+    }
+
+    /// Whether this validator coerces types before validating.
+    #[must_use]
+    pub fn coerce_types(&self) -> bool {
+        self.coerce_types
     }
 
     /// Legacy API: validate `value` against `schema` and return a coarse-grained
@@ -66,6 +98,15 @@ impl SchemaValidator {
     /// with mapped error codes and format warnings.
     #[must_use]
     pub fn validate_detailed(&self, value: &Value, schema: &Value) -> DetailedValidationResult {
+        if self.coerce_types {
+            let coerced = coerce_value(value, schema);
+            return self.validate_detailed_raw(&coerced, schema);
+        }
+        self.validate_detailed_raw(value, schema)
+    }
+
+    /// Validate `value` against `schema` with NO coercion pre-pass.
+    fn validate_detailed_raw(&self, value: &Value, schema: &Value) -> DetailedValidationResult {
         let validator = match self.compile_cached(schema) {
             Ok(v) => v,
             Err(message) => {
@@ -101,26 +142,40 @@ impl SchemaValidator {
         }
     }
 
-    /// Validate inputs against a schema, returning the input value on success
-    /// or a [`ModuleError`] carrying the mapped apcore [`ErrorCode`] on failure.
+    /// Validate inputs against a schema, returning the validated (and, when
+    /// `coerce_types` is enabled, coerced) value on success or a [`ModuleError`]
+    /// carrying the mapped apcore [`ErrorCode`] on failure.
     ///
     /// Cross-language parity with apcore-python `SchemaValidator.validate_input`
-    /// (`validator.py:69`) and apcore-typescript `SchemaValidator.validateInput`
-    /// (`validator.ts:78`). Those SDKs return the validated/normalized data;
-    /// Rust uses raw JSON Schema (no Pydantic-style normalization), so the
-    /// returned value is the input cloned. Provided for API surface symmetry —
-    /// user code porting between SDKs gets the same call shape (D11-010).
+    /// (returns `model_dump()`) and apcore-typescript `SchemaValidator.validateInput`
+    /// (returns `Value.Decode(...)`). When coercion is enabled the returned value
+    /// reflects the coerced types (e.g. `{"age":"42"}` → `{"age":42}`); when
+    /// disabled the input is returned unchanged (A-D-017).
     pub fn validate_input(&self, data: &Value, schema: &Value) -> Result<Value, ModuleError> {
-        self.validate_or_error(data, schema)?;
-        Ok(data.clone())
+        self.validate_and_coerce(data, schema)
     }
 
-    /// Validate outputs against a schema, returning the output value on success
-    /// or a [`ModuleError`] on failure. Mirror of [`Self::validate_input`] for
-    /// the executor's output-validation step (D11-010).
+    /// Validate outputs against a schema, returning the validated/coerced value
+    /// on success or a [`ModuleError`] on failure. Mirror of [`Self::validate_input`]
+    /// for the executor's output-validation step (A-D-017).
     pub fn validate_output(&self, data: &Value, schema: &Value) -> Result<Value, ModuleError> {
-        self.validate_or_error(data, schema)?;
-        Ok(data.clone())
+        self.validate_and_coerce(data, schema)
+    }
+
+    /// Coerce (if enabled), validate, and return the resulting value, or a
+    /// `ModuleError` on validation failure.
+    fn validate_and_coerce(&self, data: &Value, schema: &Value) -> Result<Value, ModuleError> {
+        let candidate = if self.coerce_types {
+            coerce_value(data, schema)
+        } else {
+            data.clone()
+        };
+        // Validate the (possibly coerced) candidate with no second coercion pass.
+        let detailed = self.validate_detailed_raw(&candidate, schema);
+        if detailed.valid {
+            return Ok(candidate);
+        }
+        Err(Self::detailed_to_error(&detailed))
     }
 
     /// Validate and return `Ok(())` on success, or a `ModuleError` carrying the
@@ -130,6 +185,11 @@ impl SchemaValidator {
         if detailed.valid {
             return Ok(());
         }
+        Err(Self::detailed_to_error(&detailed))
+    }
+
+    /// Build a `ModuleError` from a failed [`DetailedValidationResult`].
+    fn detailed_to_error(detailed: &DetailedValidationResult) -> ModuleError {
         let error_maps: Vec<HashMap<String, String>> = detailed
             .errors
             .iter()
@@ -153,7 +213,7 @@ impl SchemaValidator {
         if let Some(code) = detailed.error_code {
             err.code = code;
         }
-        Err(err)
+        err
     }
 
     fn compile_cached(&self, schema: &Value) -> Result<Arc<Validator>, String> {
@@ -185,6 +245,137 @@ impl SchemaValidator {
     #[must_use]
     pub fn cache_len(&self) -> usize {
         self.cache.lock().len()
+    }
+}
+
+/// Recursively coerce `value` toward the scalar types declared by `schema`,
+/// mirroring pydantic's lax mode (apcore-python `model_validate(strict=False)`)
+/// and apcore-typescript `Value.Decode`.
+///
+/// Coercions applied (and ONLY these — matching pydantic lax mode):
+/// - string → integer: `"42"` → `42`, `"42.0"` → `42` (trailing whitespace
+///   trimmed); rejected (left unchanged) if not an integral numeric string.
+/// - string → number: `"3.14"` → `3.14`.
+/// - string → boolean: `true/false/yes/no/on/off/y/n/t/f/1/0` (case-insensitive).
+/// - integer → number: widening is a no-op for serde_json (numbers are unified),
+///   so no transformation is needed.
+///
+/// NOT applied (pydantic lax mode does not do these): number → string,
+/// boolean → string, non-integral float → integer.
+///
+/// Unrecognized / non-coercible values are returned unchanged so the downstream
+/// jsonschema validator produces the canonical rejection. Recurses into object
+/// `properties` and array `items` per the schema shape; `oneOf`/`anyOf`/`allOf`
+/// branches are left untouched (the raw validator handles unions).
+fn coerce_value(value: &Value, schema: &Value) -> Value {
+    let Some(schema_obj) = schema.as_object() else {
+        return value.clone();
+    };
+
+    // Determine the declared scalar type(s). `type` may be a string or an array.
+    let declared_types: Vec<&str> = match schema_obj.get("type") {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(arr)) => arr.iter().filter_map(|t| t.as_str()).collect(),
+        _ => Vec::new(),
+    };
+
+    // Object: recurse into declared properties.
+    if declared_types.contains(&"object") {
+        if let Some(map) = value.as_object() {
+            let props = schema_obj.get("properties").and_then(|p| p.as_object());
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                match props.and_then(|p| p.get(k)) {
+                    Some(prop_schema) => out.insert(k.clone(), coerce_value(v, prop_schema)),
+                    None => out.insert(k.clone(), v.clone()),
+                };
+            }
+            return Value::Object(out);
+        }
+        return value.clone();
+    }
+
+    // Array: recurse into items.
+    if declared_types.contains(&"array") {
+        if let (Some(arr), Some(items_schema)) = (value.as_array(), schema_obj.get("items")) {
+            let coerced: Vec<Value> = arr
+                .iter()
+                .map(|item| coerce_value(item, items_schema))
+                .collect();
+            return Value::Array(coerced);
+        }
+        return value.clone();
+    }
+
+    // Scalar coercion: only attempt when the value is a string and the schema
+    // declares a numeric/boolean target (pydantic only coerces FROM string for
+    // these). If the value already satisfies one of the declared types, leave it.
+    if let Value::String(s) = value {
+        // boolean target
+        if declared_types.contains(&"boolean") {
+            if let Some(b) = coerce_str_to_bool(s) {
+                return Value::Bool(b);
+            }
+        }
+        // integer target
+        if declared_types.contains(&"integer") {
+            if let Some(n) = coerce_str_to_integer(s) {
+                return Value::Number(n.into());
+            }
+        }
+        // number target (float)
+        if declared_types.contains(&"number") {
+            if let Some(f) = coerce_str_to_number(s) {
+                if let Some(num) = serde_json::Number::from_f64(f) {
+                    return Value::Number(num);
+                }
+            }
+        }
+    }
+
+    value.clone()
+}
+
+/// Coerce a string to an integer iff it represents an integral numeric value.
+/// Mirrors pydantic: `"42"` → 42, `"42.0"` → 42, `" 42 "` → 42; rejects
+/// `"3.14"`, `"abc"`, `""`.
+fn coerce_str_to_integer(s: &str) -> Option<i64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return Some(i);
+    }
+    // Accept integral float strings like "42.0". The range/`fract` guards make
+    // the cast exact for the values we accept; precision loss only affects the
+    // bounds comparison (acceptable — out-of-range values are rejected anyway).
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    if let Ok(f) = trimmed.parse::<f64>() {
+        if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return Some(f as i64);
+        }
+    }
+    None
+}
+
+/// Coerce a string to a float. Mirrors pydantic: `"3.14"` → 3.14, `" 42 "` → 42.0.
+fn coerce_str_to_number(s: &str) -> Option<f64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<f64>().ok().filter(|f| f.is_finite())
+}
+
+/// Coerce a string to a boolean, mirroring pydantic's accepted set
+/// (case-insensitive, no surrounding whitespace): true/false, yes/no, on/off,
+/// y/n, t/f, 1/0.
+fn coerce_str_to_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "y" | "t" | "1" => Some(true),
+        "false" | "no" | "off" | "n" | "f" | "0" => Some(false),
+        _ => None,
     }
 }
 

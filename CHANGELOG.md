@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.24.0] - 2026-06-10
+## [0.24.0] - 2026-06-12
 
 ### Changed
 
@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`Registry::register_module` and `register_versioned` now derive the descriptor's annotations from `module.annotations()` instead of discarding them with `ModuleAnnotations::default()`.** Previously a sensitive module declaring `requires_approval = true` registered via the canonical two-argument `register_module` ended up with `requires_approval = false` in its descriptor. Because the approval gate decides whether to fire from `registry.get_definition().annotations.requires_approval`, the gate was **silently bypassed** — a security-relevant divergence from apcore-python / apcore-typescript, whose `register` paths derive annotations from the module. Regression test: `tests/test_register_module_annotations.rs` (includes an end-to-end check that the gate now fires).
 - **`APCore::on()` / `events()` now share the system event bus (D1-011 resolved).** Previously the client held a separate local `EventEmitter`, so subscribers added via `on()` never received `apcore.module.toggled`, `apcore.registry.module_registered`, or other system events — diverging from apcore-python / apcore-typescript, which expose a single bus. `EventEmitter` is now interior-mutable (`subscribers` behind a `RwLock`, so `subscribe`/`unsubscribe`/`shutdown` take `&self`), letting one shared `Arc<EventEmitter>` serve the registry (sync `emit_spawn`), the sys modules (async `emit`), and the client (`subscribe`) without an external lock. When `sys_modules` is enabled, `on()`/`events()` bind that shared bus; when disabled, a standalone bus is created lazily on first `on()`. The earlier documented plan (`Arc<Mutex<EventEmitter>>`) was unworkable because the registry emits from synchronous functions and cannot `.await` a lock. `events()` keeps its `Option<&EventEmitter>` signature (non-breaking).
+
+#### Cross-SDK sync (2026-06-11) — Rust outlier convergence
+
+- **Schema type coercion is now enabled by default (A-D-005/006).** `SchemaValidator::new()` defaults to `coerce_types = true` and a pydantic-lax-style pre-pass now coerces values toward the schema's declared scalar types before validation: string→integer (`"42"` → `42`, `"42.0"` → `42`), string→number (`"3.14"` → `3.14`), string→boolean (`true/false/yes/no/on/off/y/n/t/f/1/0`, case-insensitive), recursively through object `properties` and array `items`. Non-coercible values (e.g. `"abc"` for an integer, `5.5` for an integer) are left unchanged so the validator rejects them, and int→string is NOT coerced (matching pydantic). Opt out via the new `SchemaValidator::with_coerce_types(false)`. Mirrors apcore-python (`model_validate(strict=not coerce_types)`) and apcore-typescript (`Value.Decode`).
+- **`SchemaValidator::validate_input` / `validate_output` now return the coerced value (A-D-017)** instead of the raw input clone, so `validate_input({"age":"42"})` returns `{"age":42}` (parity with Python `model_dump()` / TS `Value.Decode`).
+- **Streaming honors the two-point cancellation invariant (A-D-002).** `Executor::stream` now checks `context.cancel_token` immediately before `module.stream()`, so a token cancelled during Phase-1 setup aborts with `ExecutionCancelled` before any chunk is yielded — matching the unary Step-8 check and Python/TS.
+- **`_secret_`-prefix redaction recurses into array elements (A-D-003).** `redact_sensitive` now redacts sensitive keys in objects nested inside arrays (and nested arrays), mirroring apcore-python `_redact_in_list`.
+- **`MaxCallDepthHandler` accepts integral float thresholds (A-D-005).** `max_call_depth: 5.0` is now treated as depth 5 (YAML/JSON often parse a bare integer as a float); non-integral floats (`5.5`) remain rejected. Matches apcore-typescript.
+- **Legacy-mode config now applies the global env_map (A-D-007).** `Config::apply_env_overrides` consults `global_env_map()` (bare env var → dot-path) in legacy mode too, not only namespace mode — matching apcore-python (`config.py:266`) and apcore-typescript.
+- **Namespace-mode `Config::get` falls back to the implicit `apcore` namespace (A-D-009).** A user key stored under `apcore.<key>` is now reachable by its bare name (§9.9.1), mirroring Python/TS.
+- **Registry events are delivered-or-dead-lettered, never silently dropped (A-D-013).** The registry now dispatches via the DLQ-bearing path (retry + `apcore.event.delivery_failed`) instead of `emit_spawn` (single attempt, silent drop), matching the Python/TS registries.
+- **Middleware `on_error` fires exactly once and honors `RetrySignal` (A-D-010/012).** Removed the step-level `on_error` recovery from the before/execute/after pipeline steps so the executor-level loop is the SOLE recovery site. Previously an after()-failure fired `on_error` twice (step + executor) and step-level recovery silently dropped `RetrySignal` (mapped to `None`). The executor handles both Recovery and Retry. Matches apcore-python / apcore-typescript.
+- **Mid-stream errors run the middleware `on_error` recovery chain (A-D-015).** A non-cancellation error raised while iterating chunks now runs `execute_on_error_outcome` over the executed middlewares and yields a recovery value before the stream ends (Retry is ignored mid-stream and the original error surfaces), matching Python (`executor.py:1069`) and TS.
+- **Middleware identity is recorded on first registration regardless of `allow_duplicate` (A-D-020).** `MiddlewareManager::add_with_opts` now always records the identity on first sight; only the duplicate warning is suppressed by `allow_duplicate`. Previously a first `allow_duplicate(true)` registration was never recorded, so a later duplicate went undetected. Matches Python/TS. Added `MiddlewareManager::identity_registered`.
+- **README:** bumped the install snippet to `apcore = "0.24"` and fixed the `ModuleDescriptor` import (it is re-exported from `apcore::registry`, not `apcore::module`).
 
 ---
 

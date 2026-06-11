@@ -694,6 +694,30 @@ impl Config {
     /// hyphenated prefix on the first segment.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<serde_json::Value> {
+        if let Some(val) = self.get_direct(key) {
+            return Some(val);
+        }
+
+        // A-D-009: §9.9.1 implicit-apcore fallback. In Namespace mode, when the
+        // key's first segment does not resolve to a top-level namespace, retry
+        // under the implicit `apcore` namespace so a user key stored under
+        // `apcore.<key>` is reachable by its bare name. Mirrors apcore-python
+        // (`_get_namespace_mode`, config.py:858/866) and apcore-typescript
+        // (config.ts:774). Guarded against recursion: never re-prefix a key that
+        // already targets `apcore`.
+        if self.mode == ConfigMode::Namespace
+            && key != "apcore"
+            && !key.starts_with("apcore.")
+            && self.user_namespaces.contains_key("apcore")
+        {
+            return self.get_direct(&format!("apcore.{key}"));
+        }
+
+        None
+    }
+
+    /// Direct lookup with no implicit-apcore fallback (the pre-A-D-009 path).
+    fn get_direct(&self, key: &str) -> Option<serde_json::Value> {
         // Check canonical typed fields first.
         if let Some(val) = self.get_typed_field(key) {
             return Some(val);
@@ -1092,11 +1116,26 @@ impl Config {
             self.apply_namespace_env_overrides();
             return;
         }
-        // Legacy mode: flat APCORE_ prefix stripping.
+        // Legacy mode: global env_map (bare env var → dot-path) takes
+        // precedence, then flat APCORE_ prefix stripping. A-D-007: previously
+        // the legacy branch ignored the global env_map entirely; apcore-python
+        // (`_apply_env_overrides`, config.py:266) and apcore-typescript
+        // (config.ts:240) consult it in every mode, so a `Config::env_map`
+        // registration was silently dropped in legacy mode.
+        let gmap = global_env_map().read();
         for (key, value) in std::env::vars() {
+            let parsed = Self::coerce_env_value(&value);
+
+            // 1. Global env_map (bare env var → top-level/dot-path key).
+            if let Some(config_key) = gmap.get(&key) {
+                tracing::debug!(env = %key, path = %config_key, "Applying legacy env override (global env_map)");
+                self.set(config_key, parsed);
+                continue;
+            }
+
+            // 2. Standard APCORE_ prefix stripping.
             if let Some(suffix) = key.strip_prefix("APCORE_") {
                 let dot_path = Self::env_key_to_dot_path(suffix);
-                let parsed = Self::coerce_env_value(&value);
                 tracing::debug!(env = %key, path = %dot_path, "Applying legacy env override");
                 self.set(&dot_path, parsed);
             }

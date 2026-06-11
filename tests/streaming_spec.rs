@@ -759,3 +759,97 @@ async fn stream_side_effect_deep_merge_depth_capped() {
     // Spec mandates right-value-wins at the depth cap.
     assert_eq!(node["leaf"], json!("b"));
 }
+
+// ===========================================================================
+// A-D-015 — Phase-2 (mid-stream) non-cancel error runs middleware on_error
+// recovery and yields the recovery value (parity with Python executor.py:1069
+// and TS). Without the fix the raw error propagated as a stream Err item.
+// ===========================================================================
+
+/// Yields one Ok chunk, then an Err chunk (non-cancellation error).
+#[derive(Debug)]
+struct ErrorMidStreamModule;
+
+#[async_trait]
+impl Module for ErrorMidStreamModule {
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn output_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn description(&self) -> &'static str {
+        "yields one chunk then errors mid-stream"
+    }
+    async fn execute(&self, _i: Value, _c: &Context<Value>) -> Result<Value, ModuleError> {
+        Ok(json!({}))
+    }
+    fn stream(&self, _i: Value, _c: &Context<Value>) -> Option<ChunkStream> {
+        Some(Box::pin(stream! {
+            yield Ok(json!({ "partial": "first" }));
+            yield Err(ModuleError::new(
+                ErrorCode::ModuleExecuteError,
+                "mid-stream failure",
+            ));
+        }))
+    }
+}
+
+/// Middleware whose on_error returns a recovery value.
+#[derive(Debug)]
+struct RecoveryMiddleware;
+
+#[async_trait]
+impl Middleware for RecoveryMiddleware {
+    fn name(&self) -> &'static str {
+        "Recovery"
+    }
+    async fn before(
+        &self,
+        _m: &str,
+        inputs: Value,
+        _c: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        // Must run a before() so the executor records this middleware as
+        // "executed" and runs its on_error during Phase-2 recovery.
+        Ok(Some(inputs))
+    }
+    async fn after(
+        &self,
+        _m: &str,
+        _i: Value,
+        _o: Value,
+        _c: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(None)
+    }
+    async fn on_error(
+        &self,
+        _m: &str,
+        _i: Value,
+        _e: &ModuleError,
+        _c: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(Some(json!({ "recovered": true })))
+    }
+}
+
+#[tokio::test]
+async fn stream_phase2_error_runs_on_error_recovery_and_yields_recovery_value() {
+    let ex = make_executor("err.mid", Box::new(ErrorMidStreamModule));
+    ex.use_middleware(Box::new(RecoveryMiddleware))
+        .expect("add middleware");
+    let ctx = external_context();
+    let (chunks, err) = drain(ex.stream("err.mid", json!({}), Some(&ctx), None)).await;
+
+    // The recovery value is yielded; no Err item surfaces.
+    assert!(
+        err.is_none(),
+        "Phase-2 error must be recovered, not surfaced as a stream Err: {err:?}"
+    );
+    assert_eq!(
+        chunks,
+        vec![json!({ "partial": "first" }), json!({ "recovered": true })],
+        "first chunk then the on_error recovery value"
+    );
+}

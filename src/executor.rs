@@ -215,6 +215,10 @@ struct StreamSetup {
     context: Context<Value>,
     output_schema: Value,
     middleware_manager: Option<Arc<MiddlewareManager>>,
+    /// Indices of the middlewares that ran during Phase-1 setup, so a Phase-2
+    /// (mid-stream) error can run on_error recovery over exactly those
+    /// (A-D-015 — parity with `call()` and Python/TS stream()).
+    executed_middlewares: Vec<usize>,
 }
 
 /// Internal: outcome of `Executor::prepare_stream`. A Phase-1 (pre-execute)
@@ -284,6 +288,28 @@ pub fn validate_against_schema(
     .with_ai_guidance(format!(
         "{direction} failed schema validation. Check the 'errors' field in details for specific validation failures."
     )))
+}
+
+/// Return a `ModuleTimeout` error if `deadline` (epoch-seconds) has passed.
+///
+/// STREAM-003 / A-D-007: uses strict `>` to match apcore-python
+/// (`time.monotonic() > global_deadline`) and apcore-typescript
+/// (`Date.now() > globalDeadline`). The unit here is internal epoch-seconds
+/// (set+compared consistently via `as_secs_f64`); the cross-SDK clocks differ
+/// but each is self-consistent — only the comparator is normalized.
+fn stream_deadline_exceeded(deadline: Option<f64>, module_id: &str) -> Option<ModuleError> {
+    let deadline = deadline?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    if now > deadline {
+        return Some(ModuleError::new(
+            ErrorCode::ModuleTimeout,
+            format!("Module '{module_id}' streaming aborted: global deadline exceeded"),
+        ));
+    }
+    None
 }
 
 /// Redact fields marked with `x-sensitive: true` in the schema.
@@ -357,7 +383,11 @@ fn redact_fields(data: &mut serde_json::Map<String, Value>, schema: &Value) {
     }
 }
 
-/// In-place redaction of keys starting with `_secret_`.
+/// In-place redaction of keys starting with `_secret_`, at any depth.
+///
+/// A-D-003: recurses into both nested objects AND array elements so sensitive
+/// keys inside objects nested in arrays are redacted. Mirrors apcore-python
+/// `utils/redaction.py` (`_redact_by_keys_and_regex` + `_redact_in_list`).
 fn redact_secret_prefix(data: &mut serde_json::Map<String, Value>) {
     let keys: Vec<String> = data.keys().cloned().collect();
     for key in keys {
@@ -367,8 +397,24 @@ fn redact_secret_prefix(data: &mut serde_json::Map<String, Value>) {
                     data.insert(key, Value::String(REDACTED_VALUE.to_string()));
                 }
             }
-        } else if let Some(obj) = data.get_mut(&key).and_then(|v| v.as_object_mut()) {
-            redact_secret_prefix(obj);
+        } else if let Some(val) = data.get_mut(&key) {
+            match val {
+                Value::Object(obj) => redact_secret_prefix(obj),
+                Value::Array(arr) => redact_secret_prefix_in_list(arr),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Traverse a list, redacting `_secret_`-prefixed keys in dict children and
+/// recursing into nested lists. Mirrors apcore-python `_redact_in_list`.
+fn redact_secret_prefix_in_list(items: &mut [Value]) {
+    for item in items.iter_mut() {
+        match item {
+            Value::Object(obj) => redact_secret_prefix(obj),
+            Value::Array(nested) => redact_secret_prefix_in_list(nested),
+            _ => {}
         }
     }
 }
@@ -999,7 +1045,7 @@ impl Executor {
             // middleware on_error recovery chain (A-D-001): a recovery value is
             // yielded as the stream's chunk; otherwise the error short-circuits
             // the whole stream.
-            let mut setup = match self
+            let setup = match self
                 .prepare_stream(
                     &module_id_owned,
                     inputs,
@@ -1029,35 +1075,59 @@ impl Executor {
             // to Module::execute() and yield the result as a single chunk.
             // Mirrors apcore-python/src/apcore/executor.py:862-865 and
             // apcore-typescript/src/executor.ts:519-522.
+            // A-D-002: two-point cancellation invariant (Step 2 + Step 8). The
+            // unary pipeline checks the cancel token immediately before
+            // `module.execute()` (`BuiltinExecute`, builtin_steps.rs §"Cancel
+            // Token Mid-Pipeline Check", point 2). The streaming path bypasses
+            // that step, so we replicate the check here, immediately before
+            // `module.stream()`, so a token cancelled while Phase-1 setup ran
+            // aborts before any chunk is produced — matching apcore-python
+            // (builtin_steps.py:607) and apcore-typescript (builtin-steps.ts:502).
+            if let Some(token) = setup.context.cancel_token.as_ref() {
+                token.check_for(&module_id_owned)?;
+            }
+
             let stream_handle = setup.module.stream(setup.inputs.clone(), &setup.context);
             let mut accumulated: Vec<Value> = Vec::new();
 
             if let Some(mut inner) = stream_handle {
                 while let Some(chunk_result) = inner.next().await {
                     // STREAM-003 (sync): enforce global_deadline between chunks.
-                    // A-D-007: use strict `>` to match apcore-python
-                    // (`time.monotonic() > global_deadline`) and apcore-typescript
-                    // (`Date.now() > globalDeadline`). The unit here is internal
-                    // epoch-seconds (set+compared consistently via as_secs_f64);
-                    // the cross-SDK clocks differ (Python monotonic-seconds, TS
-                    // epoch-ms) but each is self-consistent — only the comparator
-                    // is normalized.
-                    if let Some(deadline) = setup.context.global_deadline {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs_f64();
-                        if now > deadline {
-                            Err(ModuleError::new(
-                                ErrorCode::ModuleTimeout,
-                                format!(
-                                    "Module '{module_id_owned}' streaming aborted: global deadline exceeded"
-                                ),
-                            ))?;
+                    if let Some(err) =
+                        stream_deadline_exceeded(setup.context.global_deadline, &module_id_owned)
+                    {
+                        Err(err)?;
+                        return;
+                    }
+                    let chunk = match chunk_result {
+                        Ok(c) => c,
+                        Err(chunk_err) => {
+                            // A-D-015: a non-cancellation error raised while
+                            // iterating chunks runs the middleware on_error
+                            // recovery chain over the Phase-1 executed
+                            // middlewares; a recovery value is yielded as the
+                            // stream's next chunk before the stream ends.
+                            // Mirrors apcore-python (executor.py:1069) and
+                            // apcore-typescript. Cancellation short-circuits
+                            // (D-20): it bypasses on_error and surfaces raw.
+                            let decorated = propagate_module_error(
+                                chunk_err,
+                                &module_id_owned,
+                                &setup.context,
+                            );
+                            // `recover_stream_chunk_error` returns Some(recovery)
+                            // to yield, or None to surface `decorated` raw
+                            // (cancellation, no middleware, no/Retry outcome).
+                            if let Some(recovery) =
+                                Self::recover_stream_chunk_error(&setup, &decorated, &module_id_owned).await
+                            {
+                                yield recovery;
+                                return;
+                            }
+                            Err(decorated)?;
                             return;
                         }
-                    }
-                    let chunk = chunk_result?;
+                    };
                     // Audit D10-001: reject a non-object chunk BEFORE delivering
                     // it. The canonical contract is "reject before deliver +
                     // raise": a chunk is valid iff it is a JSON object. On the
@@ -1084,54 +1154,50 @@ impl Executor {
             }
 
             // Phase 3: post-stream validation + middleware_after on the merged
-            // output. Chunks are already delivered, so failures here are
-            // SWALLOWED with a tracing::warn rather than yielded as a final
-            // Err item — matches apcore-python (executor.py:920 emits
-            // `apcore.stream.post_validation_failed` event and does not raise)
-            // and apcore-typescript (console.warn + swallow) behavior
-            // (sync finding A-D-012).
-            // D-58: enforce that all chunks are objects before merging. A
-            // non-object chunk is logged and skips post-stream validation
-            // (chunks have already been delivered to the consumer).
-            let merged = match deep_merge_chunks_checked(&accumulated) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        module_id = %module_id_owned,
-                        error = %e.message,
-                        "stream phase-3 chunk shape check failed (chunks already delivered, swallowed)"
-                    );
-                    let _ = &mut setup;
-                    return;
-                }
-            };
-            if let Err(e) = validate_against_schema(&merged, &setup.output_schema, "Output") {
-                tracing::warn!(
-                    module_id = %module_id_owned,
-                    error = %e.message,
-                    "stream phase-3 output schema validation failed (chunks already delivered, swallowed)"
-                );
-            } else if let Some(ref mm) = setup.middleware_manager {
-                if let Err(e) = mm
-                    .execute_after(
-                        &module_id_owned,
-                        setup.inputs.clone(),
-                        merged,
-                        &setup.context,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        module_id = %module_id_owned,
-                        error = %e.message,
-                        "stream phase-3 middleware_after failed (chunks already delivered, swallowed)"
-                    );
-                }
-            }
-            // We intentionally do NOT yield the merged result — chunks are the
-            // payload, Phase 3 is pure side effects (validation + observation).
-            let _ = &mut setup; // silence unused-mut on the no-error path
+            // output (pure side effects — chunks are already delivered, so
+            // failures are swallowed, never yielded; sync finding A-D-012).
+            Self::run_stream_phase3(&setup, &accumulated, &module_id_owned).await;
         })
+    }
+
+    /// Phase 3 of streaming: deep-merge the delivered chunks, validate the
+    /// merged result against the output schema, and run the after-middleware
+    /// chain. All failures are SWALLOWED (logged via `tracing::warn`) rather
+    /// than surfaced — the chunks have already been delivered to the consumer.
+    /// Matches apcore-python (`apcore.stream.post_validation_failed` event,
+    /// no raise) and apcore-typescript (console.warn + swallow).
+    async fn run_stream_phase3(setup: &StreamSetup, accumulated: &[Value], module_id: &str) {
+        // D-58: enforce that all chunks are objects before merging. A non-object
+        // chunk is logged and skips post-stream validation.
+        let merged = match deep_merge_chunks_checked(accumulated) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    module_id = %module_id,
+                    error = %e.message,
+                    "stream phase-3 chunk shape check failed (chunks already delivered, swallowed)"
+                );
+                return;
+            }
+        };
+        if let Err(e) = validate_against_schema(&merged, &setup.output_schema, "Output") {
+            tracing::warn!(
+                module_id = %module_id,
+                error = %e.message,
+                "stream phase-3 output schema validation failed (chunks already delivered, swallowed)"
+            );
+        } else if let Some(ref mm) = setup.middleware_manager {
+            if let Err(e) = mm
+                .execute_after(module_id, setup.inputs.clone(), merged, &setup.context)
+                .await
+            {
+                tracing::warn!(
+                    module_id = %module_id,
+                    error = %e.message,
+                    "stream phase-3 middleware_after failed (chunks already delivered, swallowed)"
+                );
+            }
+        }
     }
 
     /// Run Phase 1 of the streaming pipeline: every step up to (but not
@@ -1144,6 +1210,43 @@ impl Executor {
     /// purity filtering, `skip_to` targets) behaves identically to the
     /// non-streaming `call()` path. A prior audit found this path had a
     /// bespoke loop that ignored those declarations and silently diverged.
+    /// Run the middleware on_error recovery chain for a Phase-2 (mid-stream)
+    /// chunk error. Returns `Some(recovery_value)` to yield as the stream's
+    /// next chunk, or `None` when the original (decorated) error should be
+    /// surfaced raw — i.e. there is no middleware manager, no middleware ran,
+    /// the outcome was `None`, or the outcome was `Retry` (not meaningful
+    /// mid-stream; re-raise per Python/TS). A-D-015.
+    async fn recover_stream_chunk_error(
+        setup: &StreamSetup,
+        decorated: &ModuleError,
+        module_id: &str,
+    ) -> Option<Value> {
+        let mm = setup.middleware_manager.as_ref()?;
+        if setup.executed_middlewares.is_empty() {
+            return None;
+        }
+        let outcome = mm
+            .execute_on_error_outcome(
+                module_id,
+                setup.inputs.clone(),
+                decorated,
+                &setup.context,
+                &setup.executed_middlewares,
+            )
+            .await;
+        match outcome {
+            Some(crate::middleware::base::OnErrorOutcome::Recovery(value)) => Some(value),
+            Some(crate::middleware::base::OnErrorOutcome::Retry(_)) => {
+                tracing::warn!(
+                    module_id = %module_id,
+                    "Retry requested during stream phase 2 — ignored; surfacing original error"
+                );
+                None
+            }
+            None => None,
+        }
+    }
+
     async fn prepare_stream(
         &self,
         module_id: &str,
@@ -1269,12 +1372,14 @@ impl Executor {
         })?;
         let output_schema = module.output_schema();
 
+        let executed_middlewares = pipe_ctx.executed_middlewares.clone();
         Ok(StreamPrep::Setup(Box::new(StreamSetup {
             module,
             inputs: pipe_ctx.inputs,
             context: pipe_ctx.context,
             output_schema,
             middleware_manager: pipe_ctx.middleware_manager.clone(),
+            executed_middlewares,
         })))
     }
 
@@ -1842,6 +1947,33 @@ mod tests {
         let result = redact_sensitive(&data, &schema);
         assert_eq!(result["_secret_api_key"], REDACTED_VALUE);
         assert_eq!(result["public_field"], "visible");
+    }
+
+    #[test]
+    fn test_redact_secret_prefix_recurses_into_arrays() {
+        // A-D-003: the _secret_ prefix walk must recurse into ARRAY elements,
+        // not only objects — mirroring apcore-python `_redact_in_list`.
+        let schema = json!({});
+        let data = json!({
+            "items": [
+                { "_secret_api_key": "k", "name": "ok" },
+                { "nested": { "_secret_token": "t" } }
+            ]
+        });
+        let result = redact_sensitive(&data, &schema);
+        let arr = result["items"].as_array().unwrap();
+        assert_eq!(arr[0]["_secret_api_key"], REDACTED_VALUE);
+        assert_eq!(arr[0]["name"], "ok");
+        assert_eq!(arr[1]["nested"]["_secret_token"], REDACTED_VALUE);
+    }
+
+    #[test]
+    fn test_redact_secret_prefix_recurses_into_nested_arrays() {
+        // Arrays nested inside arrays must also be traversed.
+        let schema = json!({});
+        let data = json!({ "outer": [[{ "_secret_x": "v" }]] });
+        let result = redact_sensitive(&data, &schema);
+        assert_eq!(result["outer"][0][0]["_secret_x"], REDACTED_VALUE);
     }
 
     #[test]

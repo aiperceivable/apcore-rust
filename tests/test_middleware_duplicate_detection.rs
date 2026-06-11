@@ -132,6 +132,25 @@ fn allow_duplicate_true_suppresses_warning_path() {
 }
 
 #[test]
+fn first_allow_duplicate_registration_is_still_recorded() {
+    // A-D-020: an identity must be recorded on first sight even when the first
+    // registration sets allow_duplicate(true). Only the warning is suppressed.
+    // Previously the recording lived inside `if !allow_duplicate`, so the
+    // identity was never stored and a later duplicate could not be detected.
+    let mgr = MiddlewareManager::new();
+    mgr.add_with_opts(
+        MiddlewareRegistration::new(AlphaMiddleware)
+            .identity_key("shared")
+            .allow_duplicate(true),
+    )
+    .unwrap();
+    assert!(
+        mgr.identity_registered("shared"),
+        "identity must be recorded even when the first registration is allow_duplicate(true)"
+    );
+}
+
+#[test]
 fn distinct_identity_keys_treat_instances_as_different() {
     // Providing distinct explicit identity_key values means each instance
     // is treated as a distinct identity — no duplicate warning path is taken.

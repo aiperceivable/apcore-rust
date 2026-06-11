@@ -288,19 +288,48 @@ impl ACLConditionHandler for RolesHandler {
     }
 }
 
+/// Extract a non-negative integer threshold from a JSON number, accepting
+/// integral floats (`5.0` → `5`) but rejecting non-integral floats (`5.5`).
+///
+/// A-D-005: YAML/JSON configs frequently parse a bare `5` as a float (`5.0`).
+/// `as_u64()` returns `None` for any float, which previously caused the handler
+/// to fail-closed and reject a legitimate integral threshold. We now accept any
+/// number whose value is a non-negative integer, matching apcore-typescript.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn integral_threshold(value: &Value) -> Option<u64> {
+    let n = value.as_number()?;
+    if let Some(u) = n.as_u64() {
+        return Some(u);
+    }
+    let f = n.as_f64()?;
+    // The `fract`/sign/range guards make the cast exact for accepted values;
+    // precision loss only affects the `u64::MAX` bound comparison (harmless —
+    // out-of-range values are rejected).
+    if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= u64::MAX as f64 {
+        return Some(f as u64);
+    }
+    None
+}
+
 /// Check call chain length does not exceed threshold.
 ///
 /// Accepts both the bare-integer form `max_call_depth: 5` and the dict form
 /// `max_call_depth: { lte: 5 }`, mirroring apcore-python and apcore-typescript
-/// (sync finding A-D-024). Other forms are rejected (fail-closed) per spec.
+/// (sync finding A-D-024). Integral float thresholds (`5.0`) are accepted as the
+/// equivalent integer (A-D-005). Non-integral floats and non-numeric forms are
+/// rejected (fail-closed) per spec.
 pub struct MaxCallDepthHandler;
 
 #[async_trait]
 impl ACLConditionHandler for MaxCallDepthHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
         let threshold = match value {
-            Value::Number(n) => n.as_u64(),
-            Value::Object(map) => map.get("lte").and_then(serde_json::Value::as_u64),
+            Value::Number(_) => integral_threshold(value),
+            Value::Object(map) => map.get("lte").and_then(integral_threshold),
             _ => None,
         };
         match threshold {
@@ -498,6 +527,41 @@ mod tests {
         let ctx = make_ctx("user", vec![], 0);
         let value = serde_json::json!("five"); // not a number
         assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn max_call_depth_accepts_integral_float_threshold() {
+        // A-D-005: `max_call_depth: 5.0` is an integral float; it must be
+        // treated as depth 5 (matches TS). Caller at depth 5 → ALLOW.
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 5);
+        let value = serde_json::json!(5.0);
+        assert!(handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn max_call_depth_integral_float_rejects_over_limit() {
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 6);
+        let value = serde_json::json!(5.0);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn max_call_depth_rejects_non_integral_float() {
+        // 5.5 is not an integer threshold — fail-closed.
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 5);
+        let value = serde_json::json!(5.5);
+        assert!(!handler.evaluate(&value, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn max_call_depth_accepts_integral_float_in_lte_form() {
+        let handler = MaxCallDepthHandler;
+        let ctx = make_ctx("user", vec![], 5);
+        let value = serde_json::json!({ "lte": 5.0 });
+        assert!(handler.evaluate(&value, &ctx).await);
     }
 
     // -------------------------------------------------------------------------

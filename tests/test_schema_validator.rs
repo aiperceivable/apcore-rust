@@ -436,6 +436,155 @@ fn test_schema_validator_default() {
 }
 
 // ---------------------------------------------------------------------------
+// A-D-005 / A-D-006: type-coercion engine (default-on), cross-language parity
+// with apcore-python (model_validate(strict=not coerce_types)) and
+// apcore-typescript (Value.Decode when coerceTypes). Mirrors pydantic lax mode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_coerce_string_to_integer_accepted_by_default() {
+    // new() defaults coerce_types=true — "42" against {type:integer} is accepted.
+    let v = SchemaValidator::new();
+    let schema = json!({
+        "type": "object",
+        "properties": { "age": { "type": "integer" } },
+        "required": ["age"]
+    });
+    let result = v.validate(&json!({ "age": "42" }), &schema);
+    assert!(
+        result.valid,
+        "coerce_types defaults true: \"42\" should coerce to 42 (matches Py/TS)"
+    );
+}
+
+#[test]
+fn test_coerce_string_to_integer_rejected_when_disabled() {
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({
+        "type": "object",
+        "properties": { "age": { "type": "integer" } },
+        "required": ["age"]
+    });
+    let result = v.validate(&json!({ "age": "42" }), &schema);
+    assert!(
+        !result.valid,
+        "coerce_types=false: raw jsonschema rejects \"42\" for integer"
+    );
+}
+
+#[test]
+fn test_coerce_non_numeric_string_to_integer_rejected() {
+    // "abc" cannot coerce — always invalid (matches Py/TS + fixture).
+    let v = SchemaValidator::new();
+    let schema = json!({
+        "type": "object",
+        "properties": { "count": { "type": "integer" } },
+        "required": ["count"]
+    });
+    let result = v.validate(&json!({ "count": "abc" }), &schema);
+    assert!(!result.valid, "non-numeric string is never coerced");
+}
+
+#[test]
+fn test_coerce_string_to_number_float() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "object", "properties": { "x": { "type": "number" } } });
+    assert!(v.validate(&json!({ "x": "3.14" }), &schema).valid);
+}
+
+#[test]
+fn test_coerce_string_to_bool() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "object", "properties": { "flag": { "type": "boolean" } } });
+    assert!(v.validate(&json!({ "flag": "true" }), &schema).valid);
+    assert!(v.validate(&json!({ "flag": "false" }), &schema).valid);
+    assert!(v.validate(&json!({ "flag": "1" }), &schema).valid);
+    assert!(v.validate(&json!({ "flag": "0" }), &schema).valid);
+}
+
+#[test]
+fn test_coerce_does_not_widen_int_to_string() {
+    // pydantic lax mode does NOT coerce int->str; this must stay invalid.
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "string" });
+    assert!(!v.validate(&json!(42), &schema).valid);
+}
+
+#[test]
+fn test_coerce_int_to_float_widening() {
+    let v = SchemaValidator::new();
+    let schema = json!({ "type": "object", "properties": { "x": { "type": "number" } } });
+    // integer already valid for number; widening is a no-op but must stay valid.
+    assert!(v.validate(&json!({ "x": 42 }), &schema).valid);
+}
+
+#[test]
+fn test_coerce_recurses_into_nested_objects_and_arrays() {
+    let v = SchemaValidator::new();
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "nested": {
+                "type": "object",
+                "properties": { "n": { "type": "integer" } }
+            },
+            "items": {
+                "type": "array",
+                "items": { "type": "integer" }
+            }
+        }
+    });
+    let result = v.validate(
+        &json!({ "nested": { "n": "7" }, "items": ["1", "2"] }),
+        &schema,
+    );
+    assert!(
+        result.valid,
+        "coercion must recurse into nested objects and array items"
+    );
+}
+
+// A-D-017: validate_input/validate_output must RETURN the coerced value.
+#[test]
+fn test_validate_input_returns_coerced_value() {
+    let v = SchemaValidator::new();
+    let schema = json!({
+        "type": "object",
+        "properties": { "age": { "type": "integer" } },
+        "required": ["age"]
+    });
+    let returned = v
+        .validate_input(&json!({ "age": "42" }), &schema)
+        .expect("valid after coercion");
+    assert_eq!(
+        returned,
+        json!({ "age": 42 }),
+        "validate_input must return the coerced value, not the raw input"
+    );
+}
+
+#[test]
+fn test_validate_output_returns_coerced_value() {
+    let v = SchemaValidator::new();
+    let schema = json!({
+        "type": "object",
+        "properties": { "n": { "type": "number" } }
+    });
+    let returned = v
+        .validate_output(&json!({ "n": "2.5" }), &schema)
+        .expect("valid after coercion");
+    assert_eq!(returned, json!({ "n": 2.5 }));
+}
+
+#[test]
+fn test_validate_input_no_coercion_returns_raw_when_disabled() {
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({ "type": "string" });
+    let returned = v.validate_input(&json!("hello"), &schema).expect("valid");
+    assert_eq!(returned, json!("hello"));
+}
+
+// ---------------------------------------------------------------------------
 // D10-002: structured per-failure error details (path/message/constraint),
 // cross-language parity with apcore-python/typescript SchemaValidationResult.
 // ---------------------------------------------------------------------------

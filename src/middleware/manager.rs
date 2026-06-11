@@ -134,21 +134,43 @@ impl MiddlewareManager {
             .clone()
             .unwrap_or_else(|| std::any::type_name::<M>().to_string());
 
-        if !opts.allow_duplicate {
+        // A-D-020: always record the identity on first sight, regardless of
+        // `allow_duplicate`. Only the WARNING is suppressed by `allow_duplicate`
+        // — not the recording. Previously the recording lived inside the
+        // `if !allow_duplicate` guard, so a first registration via
+        // `allow_duplicate(true)` was never recorded and a subsequent
+        // non-allow-duplicate registration could not be detected as a duplicate.
+        // Mirrors apcore-python (`if first_site is None: record`) and
+        // apcore-typescript (identity recorded even when allowDuplicate is true).
+        {
             let mut ids = self.registered_identities.lock();
-            if let Some(first_site) = ids.get(&identity) {
-                tracing::warn!(
-                    identity = %identity,
-                    first_registration = %first_site,
-                    duplicate_registration = %location,
-                    "duplicate middleware registration detected"
-                );
-            } else {
-                ids.insert(identity, location);
+            match ids.get(&identity) {
+                Some(first_site) => {
+                    if !opts.allow_duplicate {
+                        tracing::warn!(
+                            identity = %identity,
+                            first_registration = %first_site,
+                            duplicate_registration = %location,
+                            "duplicate middleware registration detected"
+                        );
+                    }
+                }
+                None => {
+                    ids.insert(identity, location);
+                }
             }
         }
 
         self.add(Box::new(opts.middleware))
+    }
+
+    /// Returns `true` if `identity` (an explicit `identity_key` or a type name)
+    /// has been recorded by a prior `add_with_opts` call. Used to verify the
+    /// A-D-020 contract: an identity is recorded on first sight regardless of
+    /// `allow_duplicate`, so a later non-allow-duplicate registration is detected.
+    #[must_use]
+    pub fn identity_registered(&self, identity: &str) -> bool {
+        self.registered_identities.lock().contains_key(identity)
     }
 
     /// Remove the first middleware whose `name()` matches `name`.

@@ -132,7 +132,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-apcore = "0.23"
+apcore = "0.24"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -384,8 +384,8 @@ The Rust `Registry` exposes two registration entry points:
   loaded from YAML).
 
 ```rust
-use apcore::module::{Module, ModuleAnnotations, ModuleDescriptor};
-use apcore::registry::Registry;
+use apcore::module::{Module, ModuleAnnotations};
+use apcore::registry::{ModuleDescriptor, Registry};
 use std::collections::HashMap;
 
 // (1) Auto descriptor — parity with Python / TypeScript `register`.

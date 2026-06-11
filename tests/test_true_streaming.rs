@@ -267,3 +267,44 @@ async fn phase3_validation_failure_is_swallowed_chunks_still_delivered() {
         "Phase-3 validation failure must be swallowed (logged) — chunks already delivered"
     );
 }
+
+/// A-D-002: the streaming path must honor the two-point cancellation invariant.
+/// A token cancelled before the stream begins must abort BEFORE any chunk is
+/// yielded — mirroring the unary Step-8 check in `BuiltinExecute`
+/// (apcore-python builtin_steps.py:607, apcore-typescript builtin-steps.ts:502).
+#[tokio::test]
+async fn streaming_pre_cancelled_token_aborts_before_first_chunk() {
+    use apcore::cancel::CancelToken;
+    use apcore::context::Identity;
+
+    let apcore = APCore::new();
+    apcore
+        .register("slow.stream", Box::new(SlowStreamingModule))
+        .unwrap();
+
+    let token = CancelToken::new();
+    token.cancel(); // pre-cancelled before streaming starts
+
+    let mut ctx = Context::<Value>::new(Identity::new(
+        "@external".to_string(),
+        "external".to_string(),
+        vec![],
+        std::collections::HashMap::new(),
+    ));
+    ctx.caller_id = Some("@external".to_string());
+    ctx.cancel_token = Some(token);
+
+    let mut s = apcore
+        .executor()
+        .stream("slow.stream", json!({}), Some(&ctx), None);
+
+    let first = s.next().await.expect("stream must yield at least one item");
+    match first {
+        Ok(chunk) => panic!("pre-cancelled stream must NOT yield a data chunk, got {chunk:?}"),
+        Err(e) => assert_eq!(
+            e.code,
+            apcore::errors::ErrorCode::ExecutionCancelled,
+            "pre-cancelled stream must surface ExecutionCancelled before any chunk"
+        ),
+    }
+}

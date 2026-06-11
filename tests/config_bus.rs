@@ -704,6 +704,93 @@ fn test_namespace_env_map() {
 }
 
 // ---------------------------------------------------------------------------
+// A-D-007 — legacy mode consults the global env_map (parity with Python/TS)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_legacy_mode_applies_global_env_map() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // Unique env var name → unique top-level config key, to avoid cross-test
+    // contamination of the global env_map / process environment.
+    let env_var = format!("ADPORT_{ts}");
+    let config_key = format!("adport_{ts}");
+
+    Config::env_map(HashMap::from([(env_var.clone(), config_key.clone())])).unwrap();
+    std::env::set_var(&env_var, "8080");
+
+    // Legacy-mode YAML: NO `apcore:` mapping key, so detect_mode() => Legacy.
+    let tmp_dir = std::env::temp_dir().join(format!("apcore-legacy-envmap-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let yaml_path = tmp_dir.join("cfg.yaml");
+    // Legacy YAML must satisfy validate()'s required fields (legacy-mode only).
+    std::fs::write(
+        &yaml_path,
+        "version: '1.0.0'\n\
+         project:\n  name: 'demo'\n\
+         extensions:\n  root: './ext'\n\
+         schema:\n  root: './schema'\n\
+         acl:\n  root: './acl'\n  default_effect: 'deny'\n\
+         executor:\n  max_call_depth: 32\n  max_module_repeat: 3\n",
+    )
+    .unwrap();
+    let config = Config::load(&yaml_path).unwrap();
+
+    assert_eq!(
+        config.mode,
+        ConfigMode::Legacy,
+        "YAML without an apcore mapping must be legacy mode"
+    );
+    // A-D-007: the bare env var, mapped via the global env_map, must apply even
+    // in legacy mode (was silently dropped before the fix).
+    assert_eq!(
+        config.get(&config_key),
+        Some(serde_json::json!(8080)),
+        "global env_map must be honored in legacy mode"
+    );
+
+    std::env::remove_var(&env_var);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// A-D-009 — namespace mode implicit-apcore fallback for bare keys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_namespace_mode_implicit_apcore_fallback() {
+    // A config in namespace mode (apcore.* is a mapping) where a user key is
+    // stored under `apcore.custom_key`. A bare `get("custom_key")` must resolve
+    // it via the implicit-apcore fallback (§9.9.1), matching Python/TS.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp_dir = std::env::temp_dir().join(format!("apcore-ns-fallback-{ts}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let yaml_path = tmp_dir.join("cfg.yaml");
+    std::fs::write(
+        &yaml_path,
+        "apcore:\n  version: '1.0.0'\n  custom_key: 42\n",
+    )
+    .unwrap();
+    let config = Config::load(&yaml_path).unwrap();
+
+    assert_eq!(config.mode, ConfigMode::Namespace);
+    assert_eq!(
+        config.get("custom_key"),
+        Some(serde_json::json!(42)),
+        "bare key must resolve via implicit-apcore fallback"
+    );
+    // The explicit path must still work too.
+    assert_eq!(config.get("apcore.custom_key"), Some(serde_json::json!(42)));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
 // Sync CB-001 — validate() spec-required field constraints
 // ---------------------------------------------------------------------------
 

@@ -620,8 +620,11 @@ fn conformance_schema_validation() {
         // Determine expected validity
         let expected_valid = if let Some(v) = tc.get("expected_valid") {
             v.as_bool().unwrap()
+        } else if tc.get("expected_valid_coerce").is_some() {
+            // SchemaValidator::new() coerces types by default (A-D-005/006),
+            // matching apcore-python's default (coerce_types=True).
+            tc["expected_valid_coerce"].as_bool().unwrap()
         } else if tc.get("expected_valid_strict").is_some() {
-            // Rust validator is strict mode (no type coercion)
             tc["expected_valid_strict"].as_bool().unwrap()
         } else {
             true
@@ -638,6 +641,20 @@ fn conformance_schema_validation() {
             "FAIL [{}]: valid={}, expected={}, errors={:?}",
             id, result.valid, expected_valid, result.errors
         );
+
+        // When the fixture pins a coerced value, validate_input must return it.
+        if let Some(expected_coerced) = tc.get("expected_coerced_value") {
+            let coerced = validator
+                .validate_input(input, schema)
+                .unwrap_or_else(|e| panic!("FAIL [{id}]: coercion errored: {e:?}"));
+            if let Some(obj) = coerced.as_object() {
+                let found = obj.values().any(|v| v == expected_coerced);
+                assert!(
+                    found,
+                    "FAIL [{id}]: expected coerced value {expected_coerced:?} in {coerced:?}"
+                );
+            }
+        }
 
         // Verify error path when expected
         if !expected_valid {

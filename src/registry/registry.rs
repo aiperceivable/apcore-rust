@@ -567,7 +567,13 @@ impl Registry {
             module_id,
             "error",
         );
-        emitter.emit_spawn(event);
+        // A-D-013: dispatch via the DLQ-bearing path (retry + dead-letter)
+        // rather than `emit_spawn` (single attempt, silent drop on failure).
+        // Spec: events MUST deliver-or-dead-letter and MUST NOT silently drop.
+        // Mirrors apcore-python (`emitter.emit(...)`) and apcore-typescript
+        // (`emitter.emit(event)`), both of which route through the sole emit
+        // that always retries and emits `apcore.event.delivery_failed`.
+        emitter.emit_delivery_semantics(event);
     }
 
     /// Snapshot the callbacks for a given event name so they can be invoked
