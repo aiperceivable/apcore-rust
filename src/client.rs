@@ -105,6 +105,9 @@ impl APCore {
             None => Arc::new(registry.unwrap_or_default()),
         };
 
+        // Track whether the caller supplied their own Executor: if so, respect
+        // its ACL wiring as-is and skip config-driven ACL discovery below.
+        let executor_supplied = executor.is_some();
         let mut executor = executor
             .unwrap_or_else(|| Executor::new(Arc::clone(&registry), Arc::new(config.clone())));
 
@@ -115,6 +118,22 @@ impl APCore {
         // module on this instance must not leak into another `APCore`.
         let toggle_state = Arc::new(ToggleState::new());
         executor.set_toggle_state(Arc::clone(&toggle_state));
+
+        // Config-driven ACL discovery (D-64, Recommendation A). Resolve
+        // `acl.root` and attach an ACL only when the path exists; a missing path
+        // is a no-op that preserves today's no-enforcement default (it must NOT
+        // synthesize an empty default-deny ACL). Wired before sys_modules
+        // registration so system modules execute under the discovered policy.
+        // A caller-supplied Executor is respected as-is and never overwritten.
+        if !executor_supplied {
+            match crate::acl::ACL::discover(&config) {
+                Ok(Some(acl)) => executor.set_acl(acl),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "ACL discovery failed; continuing without ACL");
+                }
+            }
+        }
 
         let sys_modules_context = if Self::sys_modules_enabled(&config) {
             match crate::sys_modules::register_sys_modules_with_options(

@@ -98,6 +98,16 @@ fn env_map_claimed() -> &'static RwLock<HashMap<String, String>> {
 /// perspective, satisfying §9.9.5 requirement (3).
 pub const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
 
+/// Canonical default values for config keys that resolve to a default when
+/// omitted, rather than being hard-required.
+///
+/// Currently this is just `acl.root` (D-64, Recommendation A): the key defaults
+/// to `"./acl"` so a config that omits it remains VALID and ACL discovery
+/// (`ACL::discover`) anchors at the conventional directory. This mirrors the
+/// deep-merged `_DEFAULTS["acl"]["root"]` in apcore-python and the equivalent
+/// default in apcore-typescript, unifying the cross-SDK contract.
+const CONFIG_DEFAULTS: &[(&str, &str)] = &[("acl.root", "./acl")];
+
 /// Executor namespace configuration (`PROTOCOL_SPEC` §9.1).
 ///
 /// All timeouts are in milliseconds.
@@ -320,6 +330,7 @@ impl Config {
                 format!("Failed to parse JSON config: {}: {}", path.display(), e),
             )
         })?;
+        config.yaml_path = Some(path.to_path_buf());
         config.detect_mode();
         init_builtin_namespaces();
         config.apply_env_overrides();
@@ -473,12 +484,17 @@ impl Config {
         // not a standalone config, so a minimal namespace-mode YAML is accepted
         // (apcore-python `_validate_namespace_mode` runs constraints only).
         if self.mode != ConfigMode::Namespace {
+            // D-64 (Recommendation A): `acl.root` is no longer hard-required.
+            // It now carries a default of `"./acl"` (see `CONFIG_DEFAULTS` /
+            // `get()`), unifying Rust with apcore-python and apcore-typescript
+            // which default the key rather than rejecting its omission. A config
+            // omitting `acl.root` is VALID; ACL discovery (`ACL::discover`)
+            // simply finds no file at the default path and attaches nothing.
             const REQUIRED_FIELDS: &[&str] = &[
                 "version",
                 "project.name",
                 "extensions.root",
                 "schema.root",
-                "acl.root",
                 "acl.default_effect",
             ];
             for field in REQUIRED_FIELDS {
@@ -668,6 +684,20 @@ impl Config {
         config
     }
 
+    /// Return the filesystem path the config was loaded from, if any.
+    ///
+    /// Returns the path passed to (or discovered by) [`Config::load`] /
+    /// [`Config::from_yaml_file`] / [`Config::from_json_file`], or `None` for
+    /// in-memory configs (deserialized directly) and those produced by
+    /// [`Config::from_defaults`]. Consumers that resolve relative paths (e.g.
+    /// `acl.root` via [`crate::acl::ACL::discover`]) use this to anchor
+    /// resolution at the config file's directory rather than the current
+    /// working directory. Mirrors apcore-python's `Config.source_path`.
+    #[must_use]
+    pub fn source_path(&self) -> Option<&std::path::Path> {
+        self.yaml_path.as_deref()
+    }
+
     /// Discover and load config using the §9.14 search order.
     ///
     /// If no file is found, returns `Config::from_defaults()`.
@@ -710,10 +740,28 @@ impl Config {
             && !key.starts_with("apcore.")
             && self.user_namespaces.contains_key("apcore")
         {
-            return self.get_direct(&format!("apcore.{key}"));
+            if let Some(val) = self.get_direct(&format!("apcore.{key}")) {
+                return Some(val);
+            }
         }
 
-        None
+        // D-64: fall back to a canonical default for keys that resolve to a
+        // default when omitted (currently `acl.root` -> `"./acl"`). This keeps
+        // a config that omits the key VALID and gives `ACL::discover` a path to
+        // anchor at, matching apcore-python/-typescript which default the key.
+        Self::default_for(key)
+    }
+
+    /// Resolve the canonical default value for a config key, if one exists.
+    ///
+    /// Mirrors apcore-python's `Config.get_default`. Returns `None` for keys
+    /// without a defined default.
+    #[must_use]
+    pub fn default_for(key: &str) -> Option<serde_json::Value> {
+        CONFIG_DEFAULTS
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| serde_json::Value::String((*v).to_string()))
     }
 
     /// Direct lookup with no implicit-apcore fallback (the pre-A-D-009 path).
@@ -1576,7 +1624,7 @@ mod tests {
     fn bare_default_config_fails_required_field_check() {
         // Canonical contract (A-D-03): a bare struct-`default()` Config is in
         // legacy mode but carries none of the spec-mandated required fields
-        // (version, project.name, extensions.root, schema.root, acl.root,
+        // (version, project.name, extensions.root, schema.root,
         // acl.default_effect). It MUST now be rejected with CONFIG_INVALID.
         // (Previously this asserted the old lax behavior where it passed.)
         let cfg = Config::default();
@@ -1862,25 +1910,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_legacy_config_missing_acl_root() {
+    fn validate_accepts_legacy_config_missing_acl_root_with_default() {
+        // D-64 (Recommendation A): `acl.root` is no longer hard-required. A
+        // config omitting it is VALID, and `get("acl.root")` resolves to the
+        // canonical default `"./acl"` (matching apcore-python/-typescript).
         let mut json = valid_legacy_config_json();
         json["acl"].as_object_mut().unwrap().remove("root");
         let cfg = config_from_json(&json);
-        let result = cfg.validate();
-        assert!(result.is_err(), "missing acl.root must be rejected");
-        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
+        assert!(
+            cfg.validate().is_ok(),
+            "config omitting acl.root must now be valid: {:?}",
+            cfg.validate()
+        );
+        assert_eq!(
+            cfg.get("acl.root"),
+            Some(serde_json::json!("./acl")),
+            "omitted acl.root must resolve to the default \"./acl\""
+        );
     }
 
     #[test]
     fn validate_rejects_each_missing_required_field() {
-        // version, project.name, extensions.root, schema.root, acl.root,
+        // version, project.name, extensions.root, schema.root,
         // acl.default_effect — absence of any one is CONFIG_INVALID.
+        // `acl.root` is intentionally absent here: D-64 made it default-valued,
+        // not hard-required (see `validate_accepts_legacy_config_missing_acl_root_with_default`).
         let removals: &[(&str, &str)] = &[
             ("version", ""),
             ("project", "name"),
             ("extensions", "root"),
             ("schema", "root"),
-            ("acl", "root"),
             ("acl", "default_effect"),
         ];
         for (top, nested) in removals {
