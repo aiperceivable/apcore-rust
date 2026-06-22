@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.0] - 2026-06-22
+
+### Added
+
+- **Config-driven ACL discovery (#74, D-64).** New `ACL::discover(&config) -> Result<Option<ACL>, ModuleError>` resolves `acl.root` (now defaulting to `./acl`) relative to the config file's directory and loads an ACL only when that path exists, returning `Ok(None)` otherwise — it errors solely when a *found* file is structurally invalid. An `acl.root` pointing at a directory loads `<root>/global_acl.yaml`; pointing at a file loads that file directly. CRITICAL invariant: a missing path attaches NO ACL (never a synthesized default-deny). Discovery is auto-wired in `APCore::with_options` and skipped when the caller supplies their own `Executor`. New tests plus `examples/acl_config_driven.rs`; cross-language contract locked by the apcore conformance fixture `acl_root_discovery.json`.
+
+### Changed
+
+- **`acl.root` is no longer hard-required (#74, D-64).** Previously omitting `acl.root` failed config validation with `CONFIG_INVALID`; it now defaults to `./acl`, matching apcore-python / apcore-typescript, so a config that omits the key is valid (and simply attaches no ACL when the default path does not exist). This is a non-breaking, more-permissive default change.
+- **README:** bumped the install snippet to `apcore = "0.25"`.
+
+---
+
 ## [0.24.0] - 2026-06-12
 
 ### Changed

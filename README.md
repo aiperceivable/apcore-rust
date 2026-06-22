@@ -132,7 +132,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-apcore = "0.24"
+apcore = "0.25"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
