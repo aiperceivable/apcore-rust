@@ -11,8 +11,10 @@ use crate::approval::ApprovalHandler;
 use crate::config::Config;
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
+use crate::events::emitter::EventEmitter;
 use crate::middleware::manager::MiddlewareManager;
 use crate::module::Module;
+use crate::policy::ExecutionPolicy;
 use crate::registry::registry::Registry;
 use crate::utils::helpers::match_pattern;
 
@@ -250,6 +252,16 @@ pub struct PipelineContext {
     pub acl: Option<Arc<ACL>>,
     /// Approval handler, if configured.
     pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// Execution-time governance policy for the approval gate (apcore#76 RFC pilot).
+    pub policy: Option<Arc<ExecutionPolicy>>,
+    /// Event emitter for governance events (apcore#77). When present, the ACL
+    /// and approval-gate steps publish `apcore.acl.denied` /
+    /// `apcore.approval.decision` / `apcore.policy.override` events.
+    pub event_emitter: Option<Arc<EventEmitter>>,
+    /// Executor-owned dedup set backing the approval gate's fail-loud
+    /// warn-once-per-module governance warnings (apcore#76). Threaded from the
+    /// Executor so dedup persists across calls; `None` for standalone steps.
+    pub governance_warned: Option<Arc<parking_lot::Mutex<std::collections::HashSet<String>>>>,
     /// Middleware manager for before/after chains.
     pub middleware_manager: Option<Arc<MiddlewareManager>>,
 
@@ -286,6 +298,9 @@ impl PipelineContext {
             config: None,
             acl: None,
             approval_handler: None,
+            policy: None,
+            event_emitter: None,
+            governance_warned: None,
             middleware_manager: None,
             strategy_name,
         }

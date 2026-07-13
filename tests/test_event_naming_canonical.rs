@@ -2,9 +2,10 @@
 // Issue #45.2 — contextual auditing (caller_id auto-extraction).
 //
 // These tests assert:
-//   1. The four legacy events (module_registered, module_unregistered,
-//      error_threshold_exceeded, latency_threshold_exceeded) emit BOTH the
-//      legacy name AND the canonical apcore.<subsystem>.<event> name.
+//   1. The four events (module_registered, module_unregistered,
+//      error_threshold_exceeded, latency_threshold_exceeded) emit ONLY the
+//      canonical apcore.<subsystem>.<event> name — the legacy bare-name alias
+//      was removed per the v0.22.0 spec MUST (apcore#78).
 //   2. The canonical names match the apcore.registry.* and apcore.health.*
 //      glob subscription patterns.
 //   3. Registry events are emitted as ApCoreEvent (not just tracing logs)
@@ -119,7 +120,8 @@ fn build_ctx_with_caller(caller_id: Option<String>, identity_id: Option<&str>) -
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn error_threshold_emits_canonical_and_legacy_events() {
+async fn error_threshold_emits_canonical_only() {
+    // v0.22.0 spec MUST: canonical-only, no legacy dual-emission (apcore#78).
     // Pre-populate metrics so error rate > 0.5
     let metrics = MetricsCollector::new();
     let mut labels = HashMap::new();
@@ -148,15 +150,10 @@ async fn error_threshold_emits_canonical_and_legacy_events() {
         )
         .await;
 
-    // emit() dispatches asynchronously (A-D-024); wait for both events to land.
+    // emit() dispatches asynchronously (A-D-024); wait for the canonical event.
     wait_for_events(&received, |evts| {
         evts.iter()
             .any(|e| e.event_type == "apcore.health.error_threshold_exceeded")
-    })
-    .await;
-    wait_for_events(&legacy_received, |evts| {
-        evts.iter()
-            .any(|e| e.event_type == "error_threshold_exceeded")
     })
     .await;
 
@@ -175,26 +172,14 @@ async fn error_threshold_emits_canonical_and_legacy_events() {
         "expected canonical apcore.health.error_threshold_exceeded event"
     );
     assert_eq!(
-        legacy_count, 1,
-        "expected legacy error_threshold_exceeded event for backward compat"
-    );
-
-    // Legacy event payload must signal deprecation.
-    let legacy_evt = legacy_received
-        .lock()
-        .iter()
-        .find(|e| e.event_type == "error_threshold_exceeded")
-        .cloned()
-        .unwrap();
-    assert_eq!(
-        legacy_evt.data.get("deprecated"),
-        Some(&json!(true)),
-        "legacy event must include deprecated:true marker"
+        legacy_count, 0,
+        "legacy error_threshold_exceeded alias must not be emitted (apcore#78)"
     );
 }
 
 #[tokio::test]
-async fn latency_threshold_emits_canonical_and_legacy_events() {
+async fn latency_threshold_emits_canonical_only() {
+    // v0.22.0 spec MUST: canonical-only, no legacy dual-emission (apcore#78).
     let metrics = MetricsCollector::new();
     let mut labels = HashMap::new();
     labels.insert("module_id".to_string(), "mod.b".to_string());
@@ -212,15 +197,10 @@ async fn latency_threshold_emits_canonical_and_legacy_events() {
     let ctx = build_ctx_with_caller(None, None);
     let _ = pn.after("mod.b", json!({}), json!({}), &ctx).await;
 
-    // emit() dispatches asynchronously (A-D-024); wait for both events to land.
+    // emit() dispatches asynchronously (A-D-024); wait for the canonical event.
     wait_for_events(&received, |evts| {
         evts.iter()
             .any(|e| e.event_type == "apcore.health.latency_threshold_exceeded")
-    })
-    .await;
-    wait_for_events(&legacy_received, |evts| {
-        evts.iter()
-            .any(|e| e.event_type == "latency_threshold_exceeded")
     })
     .await;
 
@@ -236,8 +216,8 @@ async fn latency_threshold_emits_canonical_and_legacy_events() {
         .count();
     assert_eq!(canonical, 1, "expected canonical latency event");
     assert_eq!(
-        legacy, 1,
-        "expected legacy latency event for backward compat"
+        legacy, 0,
+        "legacy latency_threshold_exceeded alias must not be emitted (apcore#78)"
     );
 }
 
@@ -246,7 +226,8 @@ async fn latency_threshold_emits_canonical_and_legacy_events() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn registry_register_emits_apcore_event_canonical_and_legacy() {
+async fn registry_register_emits_apcore_event_canonical_only() {
+    // v0.22.0 spec MUST: canonical-only, no legacy dual-emission (apcore#78).
     use apcore::config::Config;
     use apcore::executor::Executor;
     use apcore::registry::registry::Registry;
@@ -298,14 +279,15 @@ async fn registry_register_emits_apcore_event_canonical_and_legacy() {
         canonical >= 1,
         "expected at least one canonical apcore.registry.module_registered event"
     );
-    assert!(
-        legacy >= 1,
-        "expected at least one legacy module_registered event"
+    assert_eq!(
+        legacy, 0,
+        "legacy module_registered alias must not be emitted (apcore#78)"
     );
 }
 
 #[tokio::test]
-async fn registry_unregister_emits_apcore_event_canonical_and_legacy() {
+async fn registry_unregister_emits_apcore_event_canonical_only() {
+    // v0.22.0 spec MUST: canonical-only, no legacy dual-emission (apcore#78).
     use apcore::config::Config;
     use apcore::executor::Executor;
     use apcore::registry::registry::Registry;
@@ -355,7 +337,10 @@ async fn registry_unregister_emits_apcore_event_canonical_and_legacy() {
         canonical >= 1,
         "expected canonical apcore.registry.module_unregistered event"
     );
-    assert!(legacy >= 1, "expected legacy module_unregistered event");
+    assert_eq!(
+        legacy, 0,
+        "legacy module_unregistered alias must not be emitted (apcore#78)"
+    );
 }
 
 // ---------------------------------------------------------------------------

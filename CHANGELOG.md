@@ -12,6 +12,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.26.0] - 2026-07-13
+
+### Added
+
+- **Execution-time governance policy (#76 RFC pilot).** New `ExecutionPolicy`, `PolicyRule`, and `PolicyDecision` types (exported from the crate root) let a platform operator override the governance annotations of already-registered modules at execution time — independent of how they were registered. A policy attaches to the `Executor` via the runtime `Executor::set_policy(Option<ExecutionPolicy>)` setter and is consulted by the approval gate (Step 5). Pattern matching reuses the ACL wildcard semantics (Algorithm A08, `utils::match_pattern`) and specificity scoring (Algorithm A10, `utils::calculate_specificity`); on a specificity tie the more restrictive rule wins. A matched rule overrides the module's own declared/scanned `requires_approval` / `destructive` annotations, and every policy-driven override is recorded in the audit trail (tracing log + span event). `ExecutionPolicy::from_value` parses a YAML/JSON governance document **strictly** — unknown keys (via serde `deny_unknown_fields`), a missing `pattern`, or an empty `pattern` error so a typo cannot silently disable a control. `Executor::validate()` preflight now reports the same `requires_approval` verdict the gate will enforce under a policy. When the gate is policy-forced, the `ApprovalRequest.annotations` handed to the handler carries the **effective** governance values, preserving the "requires_approval is guaranteed true" contract (PROTOCOL_SPEC §7).
+
+- **Governance events on the event bus (#77 pilot).** When the `Executor` has an event emitter (`Executor::set_event_emitter`; auto-wired from the shared bus in `APCore::with_options`), the governance chain publishes three canonical events: `apcore.approval.decision` on every approval adjudication (handler decisions and the strict fail-closed rejection; severity `info` for approved/pending, `warn` for rejected/timeout), `apcore.policy.override` whenever a policy changes a module's effective governance, and `apcore.acl.denied` (severity `warn`) when an ACL check denies a call. Payloads carry `module_id`, `trace_id`, and event-specific keys (`status`/`approved_by`/`approval_id`, `pattern`/`requires_approval`/`destructive`, or `caller_id`). Canonical names are proposed in apcore#77, pending the PROTOCOL_SPEC §9.16.2 amendment. A skipped approval gate emits nothing (parity with the no-audit-log-when-skipped contract), and the `apcore.acl.denied` event is suppressed during `validate()` preflight (dry-run) so a probe never emits a spurious denial.
+
+### Fixed
+
+- **`apcore.stream.post_validation_failed` is now actually emitted (#78).** A swallowed post-stream failure (output-schema validation or `middleware_after` failing after chunks were already delivered) previously only produced a `tracing::warn` — the `apcore.stream.post_validation_failed` event that apcore-python and apcore-typescript emit was a comment-only stub. `Executor` now threads its event emitter into the streaming Phase-3 path and publishes the event (payload `error_type` / `message` / `trace_id`, severity `error`) while still swallowing the failure from the chunk stream. Achieves cross-SDK observability parity for post-stream failures.
+
+### Removed
+
+- **Legacy dual-emission of unprefixed event names (#78).** The registry bridge and `PlatformNotifyMiddleware` no longer emit the deprecated unprefixed aliases `module_registered` / `module_unregistered` / `error_threshold_exceeded` / `latency_threshold_exceeded` alongside their canonical `apcore.registry.*` / `apcore.health.*` names. PROTOCOL_SPEC §9.16 declared these removed as of v0.22.0 (`MUST` emit only canonical names); the code had kept dual-emitting them (with a `deprecated: true` marker) for a back-compat window. An ecosystem audit found no remaining subscriber to the bare names, so the aliases are now gone — subscribers must use the canonical `apcore.<subsystem>.<event>` names (a `*` / `apcore.*` glob subscription is unaffected). Aligns Rust with the TypeScript SDK, which already emitted canonical-only.
+
+### Changed
+
+- **Resolve `destructive` ↔ approval semantics (#76).** `ExecutionPolicy::new(rules).with_gate_destructive(true)` makes any module whose effective `destructive` annotation is true require approval even when `requires_approval` is false — the opt-in resolution of the long-standing footgun where an inferred `DELETE` was `destructive=true` yet ungated. Orthogonality remains the default (no behavior change without a policy).
+
+- **Approval gate fails loud, not silent (#76, security principle).** When a module needs approval but no `ApprovalHandler` is configured, the gate keeps the PROTOCOL_SPEC §7.4 skip behavior but now logs a `tracing::warn` (once per module, deduped via an executor-owned set) instead of silently continuing. `ExecutionPolicy::new(..).with_strict(true)` upgrades this to fail **closed** (returns `ErrorCode::ApprovalDenied`). A module annotated `destructive=true` that no approval gate covers is likewise warned about once per module. Existing behavior without a policy and with a handler configured is unchanged.
+
+- **README:** bumped the install snippet to `apcore = "0.26"`.
+
 ## [0.25.0] - 2026-06-22
 
 ### Added

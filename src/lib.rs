@@ -34,6 +34,7 @@ pub mod module;
 pub mod observability;
 pub mod pipeline;
 pub mod pipeline_config;
+pub mod policy;
 pub mod registry;
 pub mod schema;
 pub mod sys_modules;
@@ -146,6 +147,7 @@ pub use pipeline::{
 pub use pipeline_config::{
     build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,
 };
+pub use policy::{ExecutionPolicy, PolicyDecision, PolicyRule};
 pub use registry::registry::{
     is_ephemeral_module_id, module_id_pattern, registry_events, Registry, RegistryEvents,
     DEFAULT_MODULE_VERSION, EPHEMERAL_NAMESPACE_PREFIX, MAX_MODULE_ID_LENGTH, MODULE_ID_PATTERN,

@@ -19,6 +19,7 @@ use crate::builtin_steps::{
 use crate::config::Config;
 use crate::context::{Context, Identity};
 use crate::errors::{ErrorCode, ModuleError};
+use crate::events::emitter::{ApCoreEvent, EventEmitter};
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
 use crate::middleware::manager::MiddlewareManager;
@@ -27,6 +28,7 @@ use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::pipeline::{
     ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
+use crate::policy::ExecutionPolicy;
 use crate::registry::registry::{module_id_pattern, Registry};
 use crate::utils::propagate_module_error;
 
@@ -219,6 +221,10 @@ struct StreamSetup {
     /// (mid-stream) error can run on_error recovery over exactly those
     /// (A-D-015 — parity with `call()` and Python/TS stream()).
     executed_middlewares: Vec<usize>,
+    /// Optional event emitter, threaded from the pipeline context so Phase 3
+    /// can publish `apcore.stream.post_validation_failed` when a post-stream
+    /// failure is swallowed (parity with apcore-python / apcore-typescript).
+    event_emitter: Option<Arc<EventEmitter>>,
 }
 
 /// Internal: outcome of `Executor::prepare_stream`. A Phase-1 (pre-execute)
@@ -472,6 +478,17 @@ pub struct Executor {
     pub config: Arc<Config>,
     pub acl: Option<Arc<ACL>>,
     pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// Execution-time governance policy consulted by the Step-5 approval gate
+    /// (apcore#76 RFC pilot). Flows to the gate via `PipelineContext`.
+    pub policy: Option<Arc<ExecutionPolicy>>,
+    /// Event emitter for governance events (apcore#77). When set, the ACL and
+    /// approval-gate steps publish `apcore.acl.denied` /
+    /// `apcore.approval.decision` / `apcore.policy.override` on the bus.
+    pub event_emitter: Option<Arc<EventEmitter>>,
+    /// Dedup set backing the approval gate's fail-loud warn-once-per-module
+    /// governance warnings (apcore#76). Executor-owned so dedup persists across
+    /// calls; threaded into each `PipelineContext` by `inject_resources`.
+    governance_warned: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     pub middleware_manager: Arc<MiddlewareManager>,
     /// Execution strategy — all calls go through PipelineEngine.
     strategy: ExecutionStrategy,
@@ -504,6 +521,9 @@ impl Executor {
             config: config.into(),
             acl: None,
             approval_handler: None,
+            policy: None,
+            event_emitter: None,
+            governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
                 &toggle_state,
@@ -528,6 +548,9 @@ impl Executor {
             config: config.into(),
             acl: None,
             approval_handler: None,
+            policy: None,
+            event_emitter: None,
+            governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
             instance_handle: Arc::new(()),
@@ -546,6 +569,9 @@ impl Executor {
             config: config.into(),
             acl: None,
             approval_handler: None,
+            policy: None,
+            event_emitter: None,
+            governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
             instance_handle: Arc::new(()),
@@ -577,6 +603,9 @@ impl Executor {
             config: config.into(),
             acl: acl.map(Arc::new),
             approval_handler: approval_handler.map(|h| Arc::from(h) as Arc<dyn ApprovalHandler>),
+            policy: None,
+            event_emitter: None,
+            governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             middleware_manager: Arc::new(middleware_manager),
             strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
                 &toggle_state,
@@ -637,6 +666,22 @@ impl Executor {
     /// Set the approval handler.
     pub fn set_approval_handler(&mut self, handler: Box<dyn ApprovalHandler>) {
         self.approval_handler = Some(Arc::from(handler));
+    }
+
+    /// Set (or clear) the execution-time governance policy consulted by the
+    /// Step-5 approval gate (apcore#76 RFC pilot). Mirrors
+    /// [`Self::set_approval_handler`]; the policy flows to the gate via
+    /// `PipelineContext` at each invocation, so this takes effect immediately
+    /// for subsequent calls. Pass `None` to remove the policy.
+    pub fn set_policy(&mut self, policy: Option<ExecutionPolicy>) {
+        self.policy = policy.map(Arc::new);
+    }
+
+    /// Set (or clear) the event emitter used to publish governance events
+    /// (apcore#77): `apcore.acl.denied`, `apcore.approval.decision`, and
+    /// `apcore.policy.override`.
+    pub fn set_event_emitter(&mut self, emitter: Option<Arc<EventEmitter>>) {
+        self.event_emitter = emitter;
     }
 
     /// Add a middleware to the pipeline.
@@ -903,17 +948,25 @@ impl Executor {
             }
         }
 
-        // Detect requires_approval from module annotations.
-        let mut requires_approval = false;
-        if let Ok(Some(desc)) = self.registry.get_definition(module_id) {
-            if desc
-                .annotations
+        // Detect requires_approval from module annotations. Under an
+        // ExecutionPolicy (apcore#76) the preflight MUST report the
+        // policy-effective verdict (`PolicyDecision::needs_approval`) so it
+        // matches what the Step-5 gate will actually enforce.
+        let desc_annotations = self
+            .registry
+            .get_definition(module_id)
+            .ok()
+            .flatten()
+            .and_then(|desc| desc.annotations);
+        let requires_approval = if let Some(policy) = self.policy.as_ref() {
+            policy
+                .resolve(module_id, desc_annotations.as_ref())
+                .needs_approval
+        } else {
+            desc_annotations
                 .as_ref()
                 .is_some_and(|a| a.requires_approval)
-            {
-                requires_approval = true;
-            }
-        }
+        };
 
         // Invoke module-level preflight — matches apcore-python executor.py:547-571
         // and apcore-typescript executor.ts:632-653 (D11-009 alignment).
@@ -1177,6 +1230,7 @@ impl Executor {
                     error = %e.message,
                     "stream phase-3 chunk shape check failed (chunks already delivered, swallowed)"
                 );
+                Self::emit_post_stream_failure(setup, module_id, &e).await;
                 return;
             }
         };
@@ -1186,6 +1240,7 @@ impl Executor {
                 error = %e.message,
                 "stream phase-3 output schema validation failed (chunks already delivered, swallowed)"
             );
+            Self::emit_post_stream_failure(setup, module_id, &e).await;
         } else if let Some(ref mm) = setup.middleware_manager {
             if let Err(e) = mm
                 .execute_after(module_id, setup.inputs.clone(), merged, &setup.context)
@@ -1196,8 +1251,30 @@ impl Executor {
                     error = %e.message,
                     "stream phase-3 middleware_after failed (chunks already delivered, swallowed)"
                 );
+                Self::emit_post_stream_failure(setup, module_id, &e).await;
             }
         }
+    }
+
+    /// Publish `apcore.stream.post_validation_failed` when a post-stream failure
+    /// is swallowed (chunks already delivered, cannot be un-sent). Best-effort:
+    /// a no-op when no event emitter is configured. Mirrors apcore-python's
+    /// `_emit_post_stream_failure` payload (`error_type`, `message`, `trace_id`).
+    async fn emit_post_stream_failure(setup: &StreamSetup, module_id: &str, error: &ModuleError) {
+        let Some(emitter) = setup.event_emitter.as_ref() else {
+            return;
+        };
+        let event = ApCoreEvent::with_module(
+            "apcore.stream.post_validation_failed",
+            serde_json::json!({
+                "error_type": format!("{:?}", error.code),
+                "message": error.message.clone(),
+                "trace_id": setup.context.trace_id.clone(),
+            }),
+            module_id,
+            "error",
+        );
+        emitter.emit(&event).await;
     }
 
     /// Run Phase 1 of the streaming pipeline: every step up to (but not
@@ -1373,6 +1450,7 @@ impl Executor {
         let output_schema = module.output_schema();
 
         let executed_middlewares = pipe_ctx.executed_middlewares.clone();
+        let event_emitter = pipe_ctx.event_emitter.clone();
         Ok(StreamPrep::Setup(Box::new(StreamSetup {
             module,
             inputs: pipe_ctx.inputs,
@@ -1380,6 +1458,7 @@ impl Executor {
             output_schema,
             middleware_manager: pipe_ctx.middleware_manager.clone(),
             executed_middlewares,
+            event_emitter,
         })))
     }
 
@@ -1518,6 +1597,9 @@ impl Executor {
         ctx.config = Some(Arc::clone(&self.config));
         ctx.acl = self.acl.as_ref().map(Arc::clone);
         ctx.approval_handler = self.approval_handler.as_ref().map(Arc::clone);
+        ctx.policy = self.policy.as_ref().map(Arc::clone);
+        ctx.event_emitter = self.event_emitter.as_ref().map(Arc::clone);
+        ctx.governance_warned = Some(Arc::clone(&self.governance_warned));
         ctx.middleware_manager = Some(Arc::clone(&self.middleware_manager));
     }
 

@@ -683,13 +683,11 @@ pub fn register_sys_modules_with_options(
         }
     }
 
-    // Step 5d: Bridge registry events to ApCoreEvents (Issue #36).
+    // Step 5d: Bridge registry events to ApCoreEvents.
     //
-    // Each registry hook dual-emits the canonical
-    // `apcore.registry.<event>` name AND the legacy bare-name event
-    // (`module_registered`, `module_unregistered`) so existing subscribers
-    // continue to fire while consumers migrate to the canonical names. The
-    // legacy event payload includes `deprecated: true`.
+    // Each registry hook emits only the canonical `apcore.registry.<event>`
+    // name per the v0.22.0 spec MUST; the legacy bare-name aliases
+    // (`module_registered`, `module_unregistered`) were removed (apcore#78).
     //
     // Registry callbacks are synchronous, so each hook spawns a task to
     // dispatch the async emit — fire-and-forget, error-isolated.
@@ -730,17 +728,7 @@ pub fn register_sys_modules_with_options(
                             &module_id_owned,
                             "info",
                         );
-                        let legacy = ApCoreEvent::with_module(
-                            "module_registered",
-                            json!({
-                                "deprecated": true,
-                                "canonical_event": "apcore.registry.module_registered",
-                            }),
-                            &module_id_owned,
-                            "info",
-                        );
                         emitter.emit(&canonical).await;
-                        emitter.emit(&legacy).await;
                     });
                 }
             }),
@@ -774,17 +762,7 @@ pub fn register_sys_modules_with_options(
                             &module_id_owned,
                             "info",
                         );
-                        let legacy = ApCoreEvent::with_module(
-                            "module_unregistered",
-                            json!({
-                                "deprecated": true,
-                                "canonical_event": "apcore.registry.module_unregistered",
-                            }),
-                            &module_id_owned,
-                            "info",
-                        );
                         emitter.emit(&canonical).await;
-                        emitter.emit(&legacy).await;
                     });
                 }
             }),

@@ -268,6 +268,57 @@ async fn phase3_validation_failure_is_swallowed_chunks_still_delivered() {
     );
 }
 
+#[tokio::test]
+async fn phase3_validation_failure_emits_post_validation_event() {
+    // apcore#78: the swallowed Phase-3 failure must still surface an
+    // observability event on the bus — `apcore.stream.post_validation_failed`
+    // — matching apcore-python / apcore-typescript. Previously Rust only
+    // tracing::warn-logged it (comment-only stub).
+    use std::sync::Arc;
+
+    use apcore::config::Config;
+    use parking_lot::Mutex;
+
+    let mut config = Config::default();
+    config.set("sys_modules.enabled", json!(true));
+    config.set("sys_modules.events.enabled", json!(true));
+    let mut apcore = APCore::with_options(None, None, Some(config), None);
+    apcore
+        .register("bad.stream", Box::new(BadSchemaStreamingModule))
+        .unwrap();
+
+    let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    apcore.on("apcore.stream.post_validation_failed", move |event| {
+        sink.lock().push(event.data.clone());
+    });
+
+    let mut s = apcore
+        .executor()
+        .stream("bad.stream", json!({}), None, None);
+    while s.next().await.is_some() {}
+
+    // emit() dispatches on a spawned task; give it a moment to drain.
+    sleep(Duration::from_millis(100)).await;
+
+    let events = captured.lock();
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one apcore.stream.post_validation_failed event expected, got {events:?}"
+    );
+    assert!(
+        events[0].get("message").is_some(),
+        "event payload must carry a message field: {:?}",
+        events[0]
+    );
+    assert!(
+        events[0].get("error_type").is_some(),
+        "event payload must carry an error_type field: {:?}",
+        events[0]
+    );
+}
+
 /// A-D-002: the streaming path must honor the two-point cancellation invariant.
 /// A token cancelled before the stream begins must abort BEFORE any chunk is
 /// yielded — mirroring the unary Step-8 check in `BuiltinExecute`

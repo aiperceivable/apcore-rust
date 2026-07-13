@@ -57,12 +57,9 @@ use crate::observability::metrics::{estimate_p99_from_histogram, MetricsCollecto
 /// when p99 latency exceeds the limit, and `apcore.health.recovered` when a
 /// previously alerted module recovers below `threshold * 0.5`.
 ///
-/// **Issue #36 — canonical event-name standardization:** every threshold
-/// event is dual-emitted under both the canonical `apcore.health.*` name and
-/// its legacy bare-name alias (e.g. `error_threshold_exceeded`) so that
-/// existing subscribers continue to fire while consumers migrate to the
-/// canonical names. The legacy event payload carries a `deprecated: true`
-/// marker.
+/// Emits only the canonical `apcore.health.*` names per the v0.22.0 spec MUST.
+/// The legacy bare-name aliases (e.g. `error_threshold_exceeded`) were removed
+/// (apcore#78); subscribers must use the canonical names.
 ///
 /// Hysteresis prevents repeated alerts until recovery is observed.
 #[derive(Debug)]
@@ -144,12 +141,11 @@ impl PlatformNotifyMiddleware {
         errors / total
     }
 
-    /// Check error rate threshold; returns the canonical + legacy event pair
-    /// to emit if threshold exceeded (with hysteresis).
+    /// Check error rate threshold; returns the canonical event to emit if the
+    /// threshold is exceeded (with hysteresis).
     ///
-    /// Issue #36 — canonical events use the `apcore.<subsystem>.<event>` form;
-    /// the legacy bare-name event is dual-emitted with a `deprecated: true`
-    /// marker so existing subscribers continue to fire during migration.
+    /// Emits only the canonical `apcore.<subsystem>.<event>` name per the
+    /// v0.22.0 spec MUST; the legacy bare-name alias was removed (apcore#78).
     fn check_error_rate_threshold(&self, module_id: &str) -> Vec<ApCoreEvent> {
         let error_rate = self.compute_error_rate(module_id);
         let mut alerted = self.alerted.lock();
@@ -165,28 +161,15 @@ impl PlatformNotifyMiddleware {
                 module_id,
                 "error",
             );
-            // Legacy alias — kept for one major release per Issue #36
-            // deprecation policy.
-            let legacy = ApCoreEvent::with_module(
-                "error_threshold_exceeded",
-                serde_json::json!({
-                    "error_rate": error_rate,
-                    "threshold": self.error_rate_threshold,
-                    "deprecated": true,
-                    "canonical_event": "apcore.health.error_threshold_exceeded",
-                }),
-                module_id,
-                "error",
-            );
             module_alerts.insert("error_rate".to_string());
-            vec![canonical, legacy]
+            vec![canonical]
         } else {
             vec![]
         }
     }
 
-    /// Check latency threshold; returns canonical + legacy events if p99
-    /// exceeds the configured limit (Issue #36 — dual emission).
+    /// Check latency threshold; returns the canonical event if p99 exceeds the
+    /// configured limit.
     fn check_latency_threshold(&self, module_id: &str) -> Vec<ApCoreEvent> {
         let Some(collector) = self.metrics_collector.as_ref() else {
             return vec![];
@@ -227,19 +210,8 @@ impl PlatformNotifyMiddleware {
                 module_id,
                 "warn",
             );
-            let legacy = ApCoreEvent::with_module(
-                "latency_threshold_exceeded",
-                serde_json::json!({
-                    "p99_latency_ms": p99_ms,
-                    "threshold": self.latency_p99_threshold_ms,
-                    "deprecated": true,
-                    "canonical_event": "apcore.health.latency_threshold_exceeded",
-                }),
-                module_id,
-                "warn",
-            );
             module_alerts.insert("latency".to_string());
-            return vec![canonical, legacy];
+            return vec![canonical];
         }
         vec![]
     }

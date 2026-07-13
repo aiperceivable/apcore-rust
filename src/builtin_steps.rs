@@ -8,8 +8,10 @@ use async_trait::async_trait;
 
 use crate::context::Identity;
 use crate::errors::{ErrorCode, ModuleError};
+use crate::events::emitter::ApCoreEvent;
 use crate::executor::{has_schema, redact_sensitive, validate_against_schema};
 use crate::pipeline::{ExecutionStrategy, PipelineContext, Step, StepResult};
+use crate::policy::PolicyDecision;
 
 // Macro for step metadata — execute is implemented manually per step.
 macro_rules! step_meta {
@@ -353,10 +355,30 @@ impl Step for BuiltinACLCheck {
     }
 
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
-        if let Some(ref acl) = ctx.acl {
-            let caller_id = ctx.context.caller_id.as_deref();
-            let allowed = acl.check(caller_id, &ctx.module_id, Some(&ctx.context));
+        if let Some(acl) = ctx.acl.clone() {
+            let caller_id = ctx.context.caller_id.clone();
+            let allowed = acl.check(caller_id.as_deref(), &ctx.module_id, Some(&ctx.context));
             if !allowed {
+                // Publish a governance event on denial (canonical name proposed
+                // in apcore#77). Guarded by dry_run so a validate() preflight
+                // probe never emits a spurious denial event; fires only on deny
+                // (allows are high-volume and already covered by tracing spans).
+                if !ctx.dry_run {
+                    if let Some(emitter) = ctx.event_emitter.clone() {
+                        let event = ApCoreEvent::with_module(
+                            "apcore.acl.denied",
+                            serde_json::json!({
+                                "module_id": ctx.module_id,
+                                "caller_id": caller_id,
+                                "reason": "ACL denied",
+                                "trace_id": ctx.context.trace_id,
+                            }),
+                            ctx.module_id.clone(),
+                            "warn",
+                        );
+                        emitter.emit(&event).await;
+                    }
+                }
                 return Err(ModuleError::new(
                     ErrorCode::ACLDenied,
                     format!(
@@ -414,6 +436,123 @@ impl BuiltinApprovalGate {
             }
         }
     }
+
+    /// Publish `apcore.approval.decision` on the event bus (apcore#77) when an
+    /// event emitter is configured. Emitted for every adjudication (handler
+    /// decisions AND strict fail-closed rejections). Severity mirrors the
+    /// outcome: `approved`/`pending` are `info`; `rejected`/`timeout`
+    /// (governance interventions) are `warn`. Emitted ALONGSIDE the log/span.
+    async fn emit_approval_decision_event(
+        ctx: &PipelineContext,
+        result: &crate::approval::ApprovalResult,
+    ) {
+        let Some(emitter) = ctx.event_emitter.clone() else {
+            return;
+        };
+        let severity = if matches!(result.status.as_str(), "approved" | "pending") {
+            "info"
+        } else {
+            "warn"
+        };
+        let event = ApCoreEvent::with_module(
+            "apcore.approval.decision",
+            serde_json::json!({
+                "module_id": ctx.module_id,
+                "status": result.status,
+                "approved_by": result.approved_by,
+                "reason": result.reason,
+                "approval_id": result.approval_id,
+                "trace_id": ctx.context.trace_id,
+            }),
+            ctx.module_id.clone(),
+            severity,
+        );
+        emitter.emit(&event).await;
+    }
+
+    /// Audit a policy-driven override: structured log + active-span event.
+    /// Publishes to the bus separately via [`Self::emit_policy_override_event`].
+    fn emit_policy_override(ctx: &PipelineContext, decision: &PolicyDecision) {
+        let pattern = decision.rule.as_ref().map_or("", |r| r.pattern());
+        let reason = decision
+            .rule
+            .as_ref()
+            .and_then(|r| r.reason())
+            .unwrap_or_default();
+
+        tracing::info!(
+            module_id = %decision.module_id,
+            pattern = %pattern,
+            requires_approval = decision.requires_approval,
+            destructive = decision.destructive,
+            needs_approval = decision.needs_approval,
+            reason = %reason,
+            "policy_override"
+        );
+
+        if let Some(mut spans) = crate::context_keys::TRACING_SPANS.get(&ctx.context) {
+            if let Some(last) = spans.last_mut() {
+                if let Some(events) = last.as_object_mut().and_then(|obj| {
+                    obj.entry("events")
+                        .or_insert_with(|| serde_json::json!([]))
+                        .as_array_mut()
+                }) {
+                    events.push(serde_json::json!({
+                        "name": "policy_override",
+                        "module_id": decision.module_id,
+                        "pattern": pattern,
+                        "requires_approval": decision.requires_approval,
+                        "destructive": decision.destructive,
+                        "needs_approval": decision.needs_approval,
+                        "reason": reason,
+                    }));
+                    crate::context_keys::TRACING_SPANS.set(&ctx.context, spans);
+                }
+            }
+        }
+    }
+
+    /// Publish `apcore.policy.override` on the event bus (apcore#77) when an
+    /// event emitter is configured. Emitted whenever a policy rule/gate changed
+    /// a base governance value (`PolicyDecision::overridden`).
+    async fn emit_policy_override_event(ctx: &PipelineContext, decision: &PolicyDecision) {
+        let Some(emitter) = ctx.event_emitter.clone() else {
+            return;
+        };
+        let pattern = decision.rule.as_ref().map_or("", |r| r.pattern());
+        let reason = decision
+            .rule
+            .as_ref()
+            .and_then(|r| r.reason())
+            .unwrap_or_default();
+        let event = ApCoreEvent::with_module(
+            "apcore.policy.override",
+            serde_json::json!({
+                "module_id": decision.module_id,
+                "pattern": pattern,
+                "requires_approval": decision.requires_approval,
+                "destructive": decision.destructive,
+                "needs_approval": decision.needs_approval,
+                "reason": reason,
+                "trace_id": ctx.context.trace_id,
+            }),
+            decision.module_id.clone(),
+            "info",
+        );
+        emitter.emit(&event).await;
+    }
+
+    /// Log a fail-loud governance warning once per dedup `key`
+    /// (module/kind pair), using the executor-owned dedup set threaded via
+    /// `ctx.governance_warned`. Without a set (standalone step) it always warns.
+    fn warn_once(ctx: &PipelineContext, key: &str, message: &str) {
+        if let Some(warned) = ctx.governance_warned.as_ref() {
+            if !warned.lock().insert(key.to_string()) {
+                return;
+            }
+        }
+        tracing::warn!("{}", message);
+    }
 }
 
 #[async_trait]
@@ -425,27 +564,107 @@ impl Step for BuiltinApprovalGate {
 
     #[allow(clippy::too_many_lines)] // approval gate logic is inherently multi-step; splitting would obscure the protocol flow
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
-        let handler = match ctx.approval_handler {
-            Some(ref h) => h.clone(),
-            None => return Ok(StepResult::continue_step()),
-        };
-
         // INVARIANT: Executor::inject_resources sets registry before any step runs.
         let registry = ctx
             .registry
             .as_ref()
             .expect("registry must be injected into PipelineContext");
 
-        // Gate firing is decided from the registered descriptor's
-        // `requires_approval` flag; the ApprovalRequest metadata, however, is
-        // sourced from the live module instance below (PROTOCOL_SPEC §7.4).
-        let requires_approval = matches!(
-            registry.get_definition(&ctx.module_id),
-            Ok(Some(d)) if d.annotations.as_ref().is_some_and(|a| a.requires_approval)
-        );
-        if !requires_approval {
+        // Base governance annotations from the registered descriptor. Gate
+        // firing is decided from these (the ApprovalRequest metadata, however,
+        // is sourced from the live module instance below — PROTOCOL_SPEC §7.4).
+        let desc_annotations = registry
+            .get_definition(&ctx.module_id)
+            .ok()
+            .flatten()
+            .and_then(|d| d.annotations);
+
+        // Consult the ExecutionPolicy (apcore#76). A matched rule (or
+        // gate_destructive) overrides the module's declared governance values.
+        let decision: Option<PolicyDecision> = ctx
+            .policy
+            .clone()
+            .map(|policy| policy.resolve(&ctx.module_id, desc_annotations.as_ref()));
+
+        let (needs_approval, effective_destructive) = match &decision {
+            Some(d) => (d.needs_approval, d.destructive),
+            None => (
+                desc_annotations
+                    .as_ref()
+                    .is_some_and(|a| a.requires_approval),
+                desc_annotations.as_ref().is_some_and(|a| a.destructive),
+            ),
+        };
+
+        // Audit a policy-driven override: log, span, and bus event (apcore#77).
+        if let Some(d) = &decision {
+            if d.overridden {
+                Self::emit_policy_override(ctx, d);
+                Self::emit_policy_override_event(ctx, d).await;
+            }
+        }
+
+        if !needs_approval {
+            // Fail-loud governance (apcore#76): a module that is effectively
+            // destructive but that no approval gate covers is warned about once.
+            if effective_destructive {
+                Self::warn_once(
+                    ctx,
+                    &format!("destructive_ungated:{}", ctx.module_id),
+                    &format!(
+                        "Module '{}' is annotated destructive=true but is not covered by the \
+                         approval gate (requires_approval is false and no policy gates \
+                         destructive modules). Consider requires_approval=true or \
+                         ExecutionPolicy(gate_destructive=true). (apcore#76)",
+                        ctx.module_id
+                    ),
+                );
+            }
             return Ok(StepResult::continue_step());
         }
+
+        // The module needs approval. Resolve the handler; when none is
+        // configured, FLIP the historical silent-skip to fail-loud (apcore#76).
+        let Some(handler) = ctx.approval_handler.clone() else {
+            if ctx.policy.as_ref().is_some_and(|p| p.strict) {
+                // strict=true fails CLOSED: build a rejected result, audit it,
+                // and deny.
+                let result = crate::approval::ApprovalResult {
+                    status: "rejected".to_string(),
+                    reason: Some(
+                        "Approval required but no ApprovalHandler is configured; \
+                         ExecutionPolicy(strict=true) fails closed"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                };
+                Self::emit_approval_decision(ctx, &result);
+                Self::emit_approval_decision_event(ctx, &result).await;
+                return Err(ModuleError::new(
+                    ErrorCode::ApprovalDenied,
+                    format!(
+                        "Approval denied for module '{}': {}",
+                        ctx.module_id,
+                        result.reason.unwrap_or_default()
+                    ),
+                ));
+            }
+            // Non-strict: keep the PROTOCOL_SPEC §7.4 skip behavior but warn
+            // once per module (fail-loud, not silent). Emits no decision event
+            // — parity with the "no audit log when gate skipped" contract.
+            Self::warn_once(
+                ctx,
+                &format!("no_handler:{}", ctx.module_id),
+                &format!(
+                    "Module '{}' requires approval but no ApprovalHandler is configured; \
+                     the approval gate is skipped per PROTOCOL_SPEC §7.4. Configure an \
+                     approval handler, or ExecutionPolicy(strict=true) to fail closed. \
+                     (apcore#76)",
+                    ctx.module_id
+                ),
+            );
+            return Ok(StepResult::continue_step());
+        };
 
         // Phase B: check for _approval_token in inputs.
         let approval_result = if let Some(token) = ctx
@@ -490,7 +709,17 @@ impl Step for BuiltinApprovalGate {
                     format!("Module '{}' not found in registry", ctx.module_id),
                 )
             })?;
-            let annotations = module.annotations();
+            let mut annotations = module.annotations();
+            // Preserve the ApprovalRequest contract ("requires_approval is
+            // guaranteed true", PROTOCOL_SPEC §7) under policy overrides: the
+            // handler sees the effective governance values, not the module's
+            // raw declaration. Reaching this point means the call needs
+            // approval, so requires_approval is true by definition (covers both
+            // rule overrides and gate_destructive). (apcore#76)
+            if let Some(d) = &decision {
+                annotations.requires_approval = true;
+                annotations.destructive = d.destructive;
+            }
             let module_description = module.description();
             let description = if module_description.is_empty() {
                 None
@@ -514,6 +743,7 @@ impl Step for BuiltinApprovalGate {
         // (`_emit_audit`) and apcore-typescript: log the decision and append an
         // `approval_decision` event to the active tracing span when one exists.
         Self::emit_approval_decision(ctx, &approval_result);
+        Self::emit_approval_decision_event(ctx, &approval_result).await;
 
         match approval_result.status.as_str() {
             "approved" => {}

@@ -165,6 +165,18 @@ impl APCore {
         // disabled, leave it `None` (a standalone bus is created lazily on `on()`).
         let event_emitter = sys_modules_context.as_ref().map(|c| Arc::clone(&c.emitter));
 
+        // Thread the shared event bus into the auto-created executor so the
+        // pipeline publishes governance events (apcore#77:
+        // `apcore.approval.decision` / `apcore.policy.override` /
+        // `apcore.acl.denied`) to this instance's `on()` subscribers. A
+        // caller-supplied executor keeps its own wiring (parity with ACL
+        // discovery above).
+        if !executor_supplied {
+            if let Some(ref emitter) = event_emitter {
+                executor.set_event_emitter(Some(Arc::clone(emitter)));
+            }
+        }
+
         Self {
             config,
             executor,
