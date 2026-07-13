@@ -33,14 +33,15 @@ fn next_subscriber_id(type_name: &str) -> String {
 
 /// Process-wide shared `reqwest::Client` for webhook / A2A delivery.
 ///
-/// Constructing a `reqwest::Client` is expensive and, on macOS, performs a
-/// blocking SystemConfiguration proxy lookup (`SCDynamicStoreCopyProxies`) on
-/// every build. Building a fresh client per `on_event` call (i.e. per retry
-/// attempt, per subscriber) serialized those blocking syscalls under load and
-/// could stall delivery for seconds. reqwest's own guidance is to build the
-/// `Client` once and reuse it: it is cheap to share (internally `Arc`-backed)
-/// and owns the connection pool. We therefore cache a single client per
-/// process and apply the per-subscriber timeout per request via
+/// Constructing a `reqwest::Client` is expensive and, on macOS, can perform a
+/// blocking SystemConfiguration proxy lookup (`SCDynamicStoreCopyProxies`).
+/// Building a fresh client per `on_event` call (i.e. per retry attempt, per
+/// subscriber) serialized those blocking syscalls under load and could stall
+/// delivery for seconds. reqwest's own guidance is to build the `Client` once
+/// and reuse it: it is cheap to share (internally `Arc`-backed) and owns the
+/// connection pool. We therefore cache a single client per process, disable
+/// implicit system proxy discovery to keep fire-and-forget delivery bounded,
+/// and apply the per-subscriber timeout per request via
 /// `RequestBuilder::timeout`, preserving each subscriber's `timeout_ms`.
 #[cfg(feature = "events")]
 fn shared_http_client() -> Result<&'static reqwest::Client, ModuleError> {
@@ -50,7 +51,7 @@ fn shared_http_client() -> Result<&'static reqwest::Client, ModuleError> {
     }
     // No global timeout here — the per-request timeout is applied by callers so
     // a shared client honours each subscriber's own `timeout_ms`.
-    let built = reqwest::Client::builder().build().map_err(|e| {
+    let built = reqwest::Client::builder().no_proxy().build().map_err(|e| {
         ModuleError::new(
             ErrorCode::GeneralInternalError,
             format!("HTTP client error: {e}"),
