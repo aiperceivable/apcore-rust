@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Registry::register` concurrent-duplicate TOCTOU race.** Two threads registering the same module ID could both succeed: each passed the read-side conflict check before either published, and the `in_flight` guard did not cover the window where the winner published *and* cleared its `in_flight` slot while the loser was still between its early check and its own publish. The publish path now re-checks `core.modules` under the write lock, so exactly one concurrent registration wins (the rest get `DUPLICATE_MODULE_ID`) — restoring the `register_property_thread_safe_duplicate_single_winner` invariant. Surfaced by the cargo-nextest migration (below), which runs tests under higher concurrency than the old one-binary-per-file layout.
+
 - **`apcore.stream.post_validation_failed` is now actually emitted (#78).** A swallowed post-stream failure (output-schema validation or `middleware_after` failing after chunks were already delivered) previously only produced a `tracing::warn` — the `apcore.stream.post_validation_failed` event that apcore-python and apcore-typescript emit was a comment-only stub. `Executor` now threads its event emitter into the streaming Phase-3 path and publishes the event (payload `error_type` / `message` / `trace_id`, severity `error`) while still swallowing the failure from the chunk stream. Achieves cross-SDK observability parity for post-stream failures.
 
 ### Removed

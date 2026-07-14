@@ -982,6 +982,7 @@ impl Registry {
     /// Always acquire `core` before `in_flight`. Never hold `in_flight.lock()`
     /// while trying to acquire `core.read()` or `core.write()`. Violations
     /// create deadlock cycles.
+    #[allow(clippy::too_many_lines)] // one atomic register path: conflict detection, in_flight reservation, lock-free on_load, and the re-checked publish/rollback must stay together to preserve the lock-ordering and single-winner invariants
     fn register_core(
         &self,
         name: &str,
@@ -1084,21 +1085,38 @@ impl Registry {
         // from in_flight.
         match module_clone.on_load() {
             Ok(()) => {
-                // Atomic publish: insert into visible maps, remove from in_flight.
-                {
+                // Atomic publish, guarded by a final duplicate re-check under the
+                // write lock. The early conflict check and this publish are
+                // separated by on_load() running lock-free; a concurrent same-ID
+                // register that had already published AND cleared its in_flight
+                // slot in that window would otherwise let a second winner through
+                // (TOCTOU — the in_flight guard alone does not cover it because
+                // the loser passed the read-side conflict check before the winner
+                // published). Re-checking core.modules here under the write lock
+                // closes it: exactly one registration wins.
+                let published = {
                     let mut core = self.core.write();
-                    let schema = serde_json::json!({
-                        "input": descriptor.input_schema,
-                        "output": descriptor.output_schema,
-                    });
-                    core.schema_cache.insert(name.to_string(), schema);
-                    core.lowercase_map
-                        .insert(name.to_lowercase(), name.to_string());
-                    core.modules
-                        .insert(name.to_string(), Arc::clone(&module_arc));
-                    core.descriptors.insert(name.to_string(), descriptor);
-                }
+                    if core.modules.contains_key(name) {
+                        false
+                    } else {
+                        let schema = serde_json::json!({
+                            "input": descriptor.input_schema,
+                            "output": descriptor.output_schema,
+                        });
+                        core.schema_cache.insert(name.to_string(), schema);
+                        core.lowercase_map
+                            .insert(name.to_lowercase(), name.to_string());
+                        core.modules
+                            .insert(name.to_string(), Arc::clone(&module_arc));
+                        core.descriptors.insert(name.to_string(), descriptor);
+                        true
+                    }
+                };
                 self.in_flight.lock().remove(name);
+
+                if !published {
+                    return Err(ModuleError::duplicate_module_id(name));
+                }
 
                 for cb in self.snapshot_callbacks("register") {
                     cb(name, module_clone.as_ref());
