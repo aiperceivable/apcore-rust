@@ -2,6 +2,12 @@
 name = "apcore"
 version = "0.26.0"
 edition = "2021"
+# Disable per-file integration-test binary autodiscovery. Cargo would otherwise
+# compile each tests/*.rs into its own binary (122 of them), each re-doing
+# apcore monomorphization + linking 277 deps (~20s each). Instead a single
+# aggregator `tests/it.rs` pulls them all in as modules → one codegen + one
+# link. See tests/it.rs. (apcore#dev-ergonomics)
+autotests = false
 description = "Schema-driven module standard for AI-perceivable interfaces"
 license = "Apache-2.0"
 readme = "README.md"
@@ -21,6 +27,11 @@ categories = [
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+# The single consolidated integration-test binary (autotests disabled above).
+[[test]]
+name = "it"
+path = "tests/it.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
