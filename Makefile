@@ -1,11 +1,9 @@
-.PHONY: setup check check-ci check-chars fmt-check lint lint-full build test test-fast build-examples fmt clean
+.PHONY: setup check check-ci check-chars fmt-check lint lint-full build test build-examples fmt clean
 
 # One-time dev environment setup
 setup:
 	@echo "Installing apdev-rs..."
 	@command -v apdev-rs >/dev/null 2>&1 || cargo install apdev-rs
-	@echo "Installing cargo-nextest (per-test process isolation for the consolidated test binary)..."
-	@command -v cargo-nextest >/dev/null 2>&1 || cargo install cargo-nextest --locked
 	@echo "Installing git pre-commit hook..."
 	@mkdir -p .git/hooks
 	@cp .githooks/pre-commit .git/hooks/pre-commit
@@ -38,20 +36,12 @@ lint-full:
 build:
 	cargo build --all-features
 
-# All integration tests compile into ONE binary (tests/it.rs, autotests=false).
-# nextest runs each test in its own PROCESS, restoring the isolation that the
-# old 122-binaries-per-file layout gave for free (env-var / global-state tests
-# need it). nextest does not run doctests, so those run separately.
+# Most integration tests compile into ONE binary (tests/it.rs, autotests=false)
+# for fast builds; the few files that touch process-global Config/env state stay
+# as separate binaries (see Cargo.toml [[test]] entries) so `cargo test` keeps
+# per-process isolation for them.
 test:
-	@command -v cargo-nextest >/dev/null 2>&1 || { echo "ERROR: cargo-nextest required (run 'make setup' or 'brew install cargo-nextest')"; exit 1; }
-	cargo nextest run --all-features
-	cargo test --doc --all-features
-
-# Plain cargo test — runs the consolidated `it` binary single-process. Some
-# env-var/global-state tests assume per-test isolation and will fail here; use
-# `make test` (nextest) for a green run. Kept for parity debugging.
-test-fast:
-	cargo test --all-features -- --test-threads=1
+	cargo test --all-features
 
 build-examples:
 	cargo build --examples

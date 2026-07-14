@@ -56,12 +56,6 @@ jobs:
         run: cargo install apdev-rs
         continue-on-error: true
 
-      # All integration tests compile into one binary (tests/it.rs, autotests=false).
-      # nextest runs each test in its own process, preserving the isolation the old
-      # per-file binaries gave for free (env-var/cwd tests need it).
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
       - name: Check characters
         run: apdev-rs check-chars src/
         continue-on-error: true
@@ -76,9 +70,7 @@ jobs:
         run: cargo build --all-features
 
       - name: Run tests
-        run: |
-          cargo nextest run --all-features
-          cargo test --doc --all-features
+        run: cargo test --all-features
         env:
           APCORE_SPEC_REPO: ${{ github.workspace }}/.apcore-spec
 

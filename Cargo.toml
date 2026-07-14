@@ -28,10 +28,30 @@ categories = [
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-# The single consolidated integration-test binary (autotests disabled above).
+# The consolidated integration-test binary for all files that don't touch
+# process-global state (autotests disabled above).
 [[test]]
 name = "it"
 path = "tests/it.rs"
+
+# Files that register into the process-global Config namespace registry or
+# mutate env vars are kept as SEPARATE binaries so each runs in its own process
+# — one binary would cross-pollute their global state and break `cargo test`.
+[[test]]
+name = "config_bus"
+path = "tests/config_bus.rs"
+
+[[test]]
+name = "config_bus_spec"
+path = "tests/config_bus_spec.rs"
+
+[[test]]
+name = "config_discovery"
+path = "tests/config_discovery.rs"
+
+[[test]]
+name = "conformance_test"
+path = "tests/conformance_test.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }

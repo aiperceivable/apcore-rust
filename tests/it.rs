@@ -1,10 +1,18 @@
 //! Consolidated integration-test binary (apcore#dev-ergonomics).
 //!
-//! Cargo compiles every top-level tests/*.rs into its OWN binary — 122 of
-//! them here, each re-monomorphizing apcore + re-linking 277 deps (~20s each).
-//! With autotests=false in Cargo.toml, this single aggregator is the only
-//! integration-test binary: one codegen, one link, shared monomorphization.
-//! To add a new test file: drop tests/<name>.rs and add a line below.
+//! Cargo would otherwise compile every top-level tests/*.rs into its OWN
+//! binary (each re-monomorphizing apcore + linking 277 deps, ~20s each).
+//! With autotests=false in Cargo.toml, this single aggregator is the
+//! integration-test binary for all files that do NOT touch process-global
+//! state. One codegen, one link, shared monomorphization.
+//!
+//! EXCLUDED (kept as separate [[test]] binaries in Cargo.toml so each runs
+//! in its own process — they register into the process-global Config
+//! namespace registry / mutate env, which cross-pollutes under one binary):
+//!   config_bus, config_bus_spec, config_discovery, conformance_test
+//!
+//! To add a new test file: drop tests/<name>.rs and add a line below
+//! (unless it touches global Config/env state — then add a [[test]] entry).
 
 #![allow(clippy::pedantic, clippy::all)] // per-module allows live in each file
 
@@ -20,16 +28,8 @@ mod async_tasks_spec;
 mod call_chain_guard_spec;
 #[path = "cancellation_spec.rs"]
 mod cancellation_spec;
-#[path = "config_bus.rs"]
-mod config_bus;
-#[path = "config_bus_spec.rs"]
-mod config_bus_spec;
-#[path = "config_discovery.rs"]
-mod config_discovery;
 #[path = "conformance_high_drift.rs"]
 mod conformance_high_drift;
-#[path = "conformance_test.rs"]
-mod conformance_test;
 #[path = "context_object_spec.rs"]
 mod context_object_spec;
 #[path = "context_serialization_test.rs"]

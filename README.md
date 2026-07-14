@@ -685,11 +685,17 @@ Run all tests:
 cargo test
 ```
 
-Run a specific test file:
+> Most integration tests compile into one binary (`tests/it.rs`, `autotests = false`)
+> for fast builds; the few files that touch process-global `Config`/env state stay
+> as their own binaries (see the `[[test]]` entries in `Cargo.toml`). To add a new
+> test file, add a `mod` line to `tests/it.rs` — or, if it registers Config
+> namespaces / mutates env, a `[[test]]` entry instead.
+
+Run a specific consolidated test file (now a module of the `it` binary):
 
 ```bash
-cargo test --test test_cancel
-cargo test --test test_errors
+cargo test --test it test_cancel
+cargo test --test it test_errors
 ```
 
 Run a specific test by name:
