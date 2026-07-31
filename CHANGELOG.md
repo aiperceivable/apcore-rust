@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+> **Release note:** this section contains a BREAKING change. It must ship as a
+> **minor** (or major) version bump, never a patch.
+
+### Fixed
+
+- **BREAKING: a schema declaring an older draft is now actually validated.** Both validation paths built their `jsonschema` validator in a way that broke on a document carrying `"$schema": "http://json-schema.org/draft-07/schema#"`, in opposite directions. `SchemaValidator` (`schema/validator.rs`) pinned `Draft202012` while leaving the document's own `$schema` in place — and under `jsonschema` 0.28 that combination compiles an **accept-everything** validator, so every draft-07 module schema had been silently unvalidated: `{"count": "abc"}` against `{"count": {"type": "integer"}}` returned `valid = true`, as did `{}` against a schema with required keys. The executor (`executor.rs`) instead used `jsonschema::validator_for`, which auto-detects the draft and therefore validated correctly — but under draft-07 `format` is an **assertion**, so `format: "email"` with `"not-an-email"` failed hard with `SCHEMA_VALIDATION_ERROR`, contradicting the format-annotation semantics of JSON Schema 2020-12 §7.2.1 and diverging from apcore-python and apcore-typescript. The two validators thus reached opposite verdicts on the same input. A new `schema::validator::build_2020_12` pins 2020-12 *and* strips the top-level `$schema` key before compiling (nested `$defs` resources are left alone), and both paths now use it. **Impact:** a module whose schema declares draft-07 was effectively unvalidated by `SchemaValidator` and is now validated, so malformed input that used to pass will now fail with `SCHEMA_VALIDATION_ERROR` — a correction, but a behaviour change for anything that had come to rely on it. In the other direction, a draft-07 schema carrying a `format` no longer fails validation on the executor path. Error codes and the `details.errors` shape are unchanged.
+
+- **The format warning walk reaches into combinators.** `walk_format` (`schema/hardening.rs`) descended only through `properties` and `items`, so a `format` inside an `anyOf` / `oneOf` / `allOf` branch, an `additionalProperties` sub-schema, or a 2020-12 `prefixItems` tuple entry never warned. All five node kinds are now covered, `items` is offset past `prefixItems` when both are present, and duplicate annotations reached through more than one branch are reported once. A union branch is descended into only when the data actually satisfies it, so a sibling branch cannot report a format the value never carried. A sub-tree that declares no `format` skips validator compilation entirely, keeping the walk off the hot path. `$ref` is deliberately **not** dereferenced — resolving it needs the whole document plus cycle detection, and a missed SHOULD-level annotation is harmless; the same applies to `patternProperties`, which does not participate in the `additionalProperties` coverage test. Both limits are recorded in the function's doc comment.
+
+- **`to_strict_schema` hardens an optional nested object.** The recursion test was `obj.get("type") == Some("object")`, which only matches the string form. `make_nullable` rewrites a nullable object's `type` to `["object", "null"]` *before* the recursion runs, so an optional nested object was skipped: it came out with no `additionalProperties: false` and an un-completed `required` list, which OpenAI strict mode rejects. The same schema with the field required was hardened correctly. The test now accepts either form.
+
 ## [0.26.0] - 2026-07-13
 
 ### Added

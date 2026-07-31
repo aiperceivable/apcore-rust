@@ -6,10 +6,10 @@
 
 use std::path::PathBuf;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use apcore::errors::ErrorCode;
-use apcore::schema::{content_hash, format_warnings, SchemaValidator};
+use apcore::schema::{content_hash, format_warnings, FormatWarning, SchemaValidator};
 
 fn find_fixtures_root() -> PathBuf {
     if let Ok(spec_repo) = std::env::var("APCORE_SPEC_REPO") {
@@ -245,4 +245,151 @@ fn conformance_schema_content_hash_reports_digests() {
             "FAIL [{id}]: content_hash must be stable across serialize round-trip"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Traversal coverage — a `format` annotation must be found wherever it is
+// reachable, not only under `properties` / `items`.
+// ---------------------------------------------------------------------------
+
+fn formats_of(warnings: &[FormatWarning]) -> Vec<(String, String)> {
+    warnings
+        .iter()
+        .map(|w| (w.path.clone(), w.format.clone()))
+        .collect()
+}
+
+#[test]
+fn format_warnings_descend_into_anyof_branches() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "contact": {
+                "anyOf": [
+                    { "type": "string", "format": "email" },
+                    { "type": "null" }
+                ]
+            }
+        }
+    });
+    let warnings = format_warnings(&json!({ "contact": "not-an-email" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/contact".to_string(), "email".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_anyof_only_reports_the_branch_the_data_satisfies() {
+    // "alice@example.com" satisfies the email branch; the uri branch describes a
+    // different shape and must not report a format the value never carried.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "contact": {
+                "anyOf": [
+                    { "type": "string", "format": "email" },
+                    { "type": "string", "format": "uri", "minLength": 500 }
+                ]
+            }
+        }
+    });
+    assert!(format_warnings(&json!({ "contact": "alice@example.com" }), &schema).is_empty());
+}
+
+#[test]
+fn format_warnings_descend_into_oneof_branches() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "oneOf": [
+                    { "type": "string", "format": "uuid" },
+                    { "type": "integer" }
+                ]
+            }
+        }
+    });
+    let warnings = format_warnings(&json!({ "id": "not-a-uuid" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/id".to_string(), "uuid".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_descend_into_all_allof_members() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "when": {
+                "allOf": [
+                    { "type": "string" },
+                    { "format": "date-time" }
+                ]
+            }
+        }
+    });
+    let warnings = format_warnings(&json!({ "when": "yesterday" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/when".to_string(), "date-time".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_descend_into_prefix_items() {
+    let schema = json!({
+        "type": "array",
+        "prefixItems": [
+            { "type": "string", "format": "uuid" },
+            { "type": "string", "format": "date" }
+        ]
+    });
+    let warnings = format_warnings(&json!(["not-a-uuid", "not-a-date"]), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![
+            ("/0".to_string(), "uuid".to_string()),
+            ("/1".to_string(), "date".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn format_warnings_descend_into_additional_properties_subschema() {
+    let schema = json!({
+        "type": "object",
+        "properties": { "known": { "type": "string" } },
+        "additionalProperties": { "type": "string", "format": "email" }
+    });
+    let warnings = format_warnings(
+        &json!({ "known": "plain", "extra": "not-an-email" }),
+        &schema,
+    );
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/extra".to_string(), "email".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_deduplicate_annotations_reached_through_several_branches() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "contact": {
+                "anyOf": [
+                    { "type": "string", "format": "email" },
+                    { "type": "string", "format": "email" }
+                ]
+            }
+        }
+    });
+    let warnings = format_warnings(&json!({ "contact": "not-an-email" }), &schema);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "duplicate annotations must collapse: {warnings:?}"
+    );
 }

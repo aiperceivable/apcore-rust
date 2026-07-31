@@ -105,8 +105,12 @@ fn convert_to_strict(node: &mut Value) {
     };
 
     // If this is an object type with properties, enforce strict rules.
-    let is_object_with_props = obj.get("type").and_then(|t| t.as_str()) == Some("object")
-        && obj.contains_key("properties");
+    // `type` may be a string ("object") or an array (["object", "null"]) — the
+    // latter is what `make_nullable` produces for an optional nested object, so
+    // matching only the string form skipped every optional sub-object and left
+    // it without `additionalProperties: false`.
+    let is_object_with_props =
+        declares_object_type(obj.get("type")) && obj.contains_key("properties");
 
     if is_object_with_props {
         obj.insert("additionalProperties".to_string(), Value::Bool(false));
@@ -150,6 +154,16 @@ fn convert_to_strict(node: &mut Value) {
 
     // Recurse into nested structures.
     recurse_into_nested(obj);
+}
+
+/// `true` when a `type` keyword declares "object", in either the string form
+/// (`"object"`) or the union form (`["object", "null"]`).
+fn declares_object_type(type_value: Option<&Value>) -> bool {
+    match type_value {
+        Some(Value::String(s)) => s == "object",
+        Some(Value::Array(items)) => items.iter().any(|v| v.as_str() == Some("object")),
+        _ => false,
+    }
 }
 
 /// Make a property nullable by adding "null" to its type, or wrapping in oneOf.

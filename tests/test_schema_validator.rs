@@ -619,3 +619,90 @@ fn test_schema_validator_required_error_detail_has_constraint() {
     assert!(detail.message.contains("missing required field"));
     assert_eq!(detail.constraint.as_deref(), Some("required"));
 }
+
+// ---------------------------------------------------------------------------
+// Draft parity with `executor::validate_against_schema`
+//
+// `format` belongs to the format-annotation vocabulary in JSON Schema 2020-12
+// (§7.2.1): an unsatisfied format MUST NOT fail validation. Draft-07 treats it
+// as an assertion, so a validator that auto-detects the draft from `$schema`
+// reaches the opposite verdict on the same input. Both entry points must pin
+// Draft 2020-12 (parity with apcore-python / apcore-typescript, where format is
+// SHOULD-level and surfaces as a warning).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_executor_validate_draft07_schema_treats_format_as_annotation() {
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": { "contact": { "type": "string", "format": "email" } },
+        "required": ["contact"]
+    });
+    let value = json!({ "contact": "not-an-email" });
+
+    assert!(
+        apcore::executor::validate_against_schema(&value, &schema, "Input").is_ok(),
+        "an unsatisfied `format` must not fail validation, even under a draft-07 $schema"
+    );
+}
+
+#[test]
+fn test_executor_validate_and_schema_validator_agree_on_format() {
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": { "contact": { "type": "string", "format": "email" } },
+        "required": ["contact"]
+    });
+    let value = json!({ "contact": "not-an-email" });
+
+    let validator_verdict = SchemaValidator::new().validate(&value, &schema).valid;
+    let executor_verdict =
+        apcore::executor::validate_against_schema(&value, &schema, "Input").is_ok();
+
+    assert_eq!(
+        validator_verdict, executor_verdict,
+        "SchemaValidator and executor::validate_against_schema must reach the same verdict"
+    );
+    assert!(validator_verdict);
+}
+
+#[test]
+fn test_executor_validate_still_rejects_real_type_errors_under_draft07() {
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": { "count": { "type": "integer" } },
+        "required": ["count"]
+    });
+    let err =
+        apcore::executor::validate_against_schema(&json!({ "count": "abc" }), &schema, "Input")
+            .unwrap_err();
+
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaValidationError);
+    let errors = err.details.get("errors").expect("details.errors present");
+    let arr = errors.as_array().expect("details.errors is an array");
+    assert!(!arr.is_empty());
+    assert!(arr[0].get("field").is_some());
+    assert!(arr[0].get("message").is_some());
+}
+
+#[test]
+fn test_schema_validator_still_enforces_constraints_under_draft07_schema_keyword() {
+    // Pinning Draft 2020-12 while the document declares an older meta-schema
+    // made `jsonschema` compile an accept-everything validator, silently
+    // disabling validation. The `$schema` keyword must be dropped so the pinned
+    // draft stays authoritative.
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": { "count": { "type": "integer" } },
+        "required": ["count"]
+    });
+
+    assert!(!v.validate(&json!({ "count": "abc" }), &schema).valid);
+    assert!(!v.validate(&json!({}), &schema).valid);
+    assert!(v.validate(&json!({ "count": 3 }), &schema).valid);
+}

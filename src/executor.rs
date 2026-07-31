@@ -252,7 +252,11 @@ pub fn validate_against_schema(
         return Ok(());
     }
 
-    let validator = match jsonschema::validator_for(schema) {
+    // Draft 2020-12 is pinned via the same builder `SchemaValidator` uses, not
+    // auto-detected from `$schema` (`jsonschema::validator_for`). Auto-detection
+    // let a module schema declaring draft-07 turn `format` into an assertion, so
+    // the two validators reached opposite verdicts on the same input.
+    let validator = match crate::schema::validator::build_2020_12(schema) {
         Ok(v) => v,
         Err(e) => {
             return Err(ModuleError::new(

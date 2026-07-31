@@ -89,18 +89,66 @@ pub struct FormatWarning {
 ///
 /// Unmapped formats are ignored. Non-string values are ignored (per Draft 2020-12,
 /// `format` only constrains strings). The traversal mirrors the Python reference
-/// implementation in `apcore.schema.hardening._check_formats_and_warn`.
+/// implementation in `apcore.schema.hardening._check_formats_and_warn` and
+/// apcore-typescript's `SchemaValidator._walkFormats`.
+///
+/// The same annotation can be reached through more than one combinator branch;
+/// duplicates are collapsed so a field is reported once.
 #[must_use]
 pub fn format_warnings(data: &Value, schema: &Value) -> Vec<FormatWarning> {
     let mut warnings = Vec::new();
     walk_format(data, schema, "", &mut warnings);
-    warnings
+    // Order-preserving de-duplication. Warning lists are short (one entry per
+    // offending field), so the linear scan is cheaper than building a set.
+    let mut unique: Vec<FormatWarning> = Vec::with_capacity(warnings.len());
+    for warning in warnings {
+        if !unique.contains(&warning) {
+            unique.push(warning);
+        }
+    }
+    unique
 }
 
+/// Recursive worker for [`format_warnings`].
+///
+/// Traversal covers `properties`, `additionalProperties`, `items`,
+/// `prefixItems`, `anyOf`, `oneOf` and `allOf`.
+///
+/// Known limitations, all deliberate:
+/// - `$ref` is **not** dereferenced. Doing so needs the full document plus
+///   cycle detection (a recursive schema such as a tree node would otherwise
+///   loop forever); resolve the schema with [`crate::schema::RefResolver`]
+///   first if annotations behind a `$ref` matter. Missing a warning is
+///   harmless — format enforcement is SHOULD-level.
+/// - `patternProperties` is not consulted when deciding which keys the
+///   `additionalProperties` subschema covers, so a key matched by a pattern is
+///   checked against `additionalProperties` too. It can only add a warning that
+///   a stricter reading would omit.
 fn walk_format(data: &Value, schema: &Value, path: &str, out: &mut Vec<FormatWarning>) {
     let Some(schema_obj) = schema.as_object() else {
         return;
     };
+
+    // Union: the annotation lives on the branches, not on the union node. Only
+    // branches the data satisfies contribute — a sibling branch describes a
+    // different shape, and warning from it would report a format the value was
+    // never meant to carry (parity with apcore-typescript `_walkFormats`).
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema_obj.get(keyword).and_then(|v| v.as_array()) {
+            for branch in branches {
+                if declares_format(branch) && data_satisfies(branch, data) {
+                    walk_format(data, branch, path, out);
+                }
+            }
+        }
+    }
+
+    // Intersection: every member applies, so every member's annotations count.
+    if let Some(members) = schema_obj.get("allOf").and_then(|v| v.as_array()) {
+        for member in members {
+            walk_format(data, member, path, out);
+        }
+    }
 
     if let (Some(fmt), Some(s)) = (
         schema_obj.get("format").and_then(|v| v.as_str()),
@@ -131,12 +179,69 @@ fn walk_format(data: &Value, schema: &Value, path: &str, out: &mut Vec<FormatWar
         }
     }
 
+    // Keys not named by `properties` fall to the `additionalProperties`
+    // subschema (a boolean value carries no annotations and is skipped).
+    if let (Some(additional), Some(obj)) = (
+        schema_obj
+            .get("additionalProperties")
+            .filter(|v| v.is_object()),
+        data.as_object(),
+    ) {
+        let named = schema_obj.get("properties").and_then(|p| p.as_object());
+        for (name, value) in obj {
+            if named.is_some_and(|props| props.contains_key(name)) {
+                continue;
+            }
+            let child_path = format!("{path}/{name}");
+            walk_format(value, additional, &child_path, out);
+        }
+    }
+
+    // Draft 2020-12 tuple form: `prefixItems` positionally covers the leading
+    // elements, `items` covers whatever follows.
+    let prefix_len = match (
+        schema_obj.get("prefixItems").and_then(|v| v.as_array()),
+        data.as_array(),
+    ) {
+        (Some(prefix_schemas), Some(arr)) => {
+            for (i, (item, item_schema)) in arr.iter().zip(prefix_schemas).enumerate() {
+                let child_path = format!("{path}/{i}");
+                walk_format(item, item_schema, &child_path, out);
+            }
+            prefix_schemas.len()
+        }
+        _ => 0,
+    };
+
     if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), data.as_array()) {
-        for (i, item) in arr.iter().enumerate() {
+        for (i, item) in arr.iter().enumerate().skip(prefix_len) {
             let child_path = format!("{path}/{i}");
             walk_format(item, items_schema, &child_path, out);
         }
     }
+}
+
+/// `true` when `schema` carries a `format` keyword anywhere in its subtree.
+///
+/// Used to skip the cost of compiling a validator for a union branch that could
+/// not produce a warning in the first place.
+fn declares_format(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            map.get("format").is_some_and(Value::is_string) || map.values().any(declares_format)
+        }
+        Value::Array(items) => items.iter().any(declares_format),
+        _ => false,
+    }
+}
+
+/// `true` when `data` validates against the union branch `branch`.
+///
+/// A branch that fails to compile (an unresolvable `$ref`, say) is treated as
+/// not satisfied: the point of the check is to avoid reporting a format the
+/// value was never meant to carry, so an undecidable branch stays silent.
+fn data_satisfies(branch: &Value, data: &Value) -> bool {
+    crate::schema::validator::build_2020_12(branch).is_ok_and(|v| v.is_valid(data))
 }
 
 /// Returns `true` when `value` parses as a member of the declared `format`,

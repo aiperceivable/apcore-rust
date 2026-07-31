@@ -1,7 +1,9 @@
 //! Tests for SchemaExporter — exporting schemas to MCP, OpenAI, Anthropic, and Generic formats.
 #![allow(clippy::similar_names)] // `exporter`/`exported` and `schema`/`schemas` are intentionally distinct
 
-use apcore::schema::{ExportOptions, ExportProfile, SchemaExporter, SchemaLoader};
+use apcore::schema::{
+    to_strict_schema, ExportOptions, ExportProfile, SchemaExporter, SchemaLoader,
+};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -370,6 +372,57 @@ fn test_schema_exporter_openai_strict_transform_makes_optional_nullable() {
         parameters["properties"]["comment"]["type"],
         json!(["string", "null"])
     );
+}
+
+#[test]
+fn test_schema_exporter_openai_strict_transform_hardens_optional_nested_object() {
+    // An optional nested object is made nullable first (`type` becomes
+    // ["object", "null"]), so a string-only `type == "object"` test skips it and
+    // the node keeps neither `additionalProperties: false` nor a complete
+    // `required` list — which OpenAI strict mode rejects.
+    let exporter = SchemaExporter::new();
+    let schema = json!({
+        "name": "tool",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "sub": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "string" },
+                        "y": { "type": "integer" }
+                    },
+                    "required": ["x"]
+                }
+            },
+            "required": ["id"]
+        }
+    });
+    let parsed = exporter
+        .export(&schema, ExportProfile::OpenAi, None)
+        .unwrap();
+
+    let sub = &parsed["function"]["parameters"]["properties"]["sub"];
+    // Optional → nullable, and still hardened as an object node.
+    assert_eq!(sub["type"], json!(["object", "null"]));
+    assert_eq!(sub["additionalProperties"], json!(false));
+    assert_eq!(sub["required"], json!(["x", "y"]));
+    // "y" was optional inside the nested object → nullable.
+    assert_eq!(sub["properties"]["y"]["type"], json!(["integer", "null"]));
+}
+
+#[test]
+fn test_strict_schema_hardens_object_declared_as_type_array() {
+    // Same rule reached directly: a `type` array containing "object" is an
+    // object node, whoever wrote it that way.
+    let hardened = to_strict_schema(&json!({
+        "type": ["object", "null"],
+        "properties": { "x": { "type": "string" } }
+    }));
+
+    assert_eq!(hardened["additionalProperties"], json!(false));
+    assert_eq!(hardened["required"], json!(["x"]));
 }
 
 // ---------------------------------------------------------------------------

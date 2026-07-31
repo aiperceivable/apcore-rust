@@ -223,11 +223,7 @@ impl SchemaValidator {
             return Ok(Arc::clone(v));
         }
 
-        let compiled = jsonschema::options()
-            .with_draft(jsonschema::Draft::Draft202012)
-            .build(schema)
-            .map_err(|e| e.to_string())?;
-        let arc = Arc::new(compiled);
+        let arc = Arc::new(build_2020_12(schema)?);
 
         // Another thread may have populated the entry while we were compiling;
         // both Arcs point to equivalent compiled validators, so overwriting is harmless.
@@ -246,6 +242,47 @@ impl SchemaValidator {
     pub fn cache_len(&self) -> usize {
         self.cache.lock().len()
     }
+}
+
+/// Compile `schema` as JSON Schema **Draft 2020-12**, ignoring any `$schema`
+/// declaration the document carries.
+///
+/// Two reasons the draft is pinned rather than auto-detected
+/// (`jsonschema::validator_for`):
+///
+/// 1. Under draft-07 and earlier, `format` is an *assertion*, so a module
+///    schema declaring `"$schema": "http://json-schema.org/draft-07/schema#"`
+///    would hard-fail on an unsatisfied `format`. Draft 2020-12 §7.2.1 puts
+///    `format` in the format-annotation vocabulary — it MUST NOT fail
+///    validation. apcore enforces the formats it recognises at SHOULD level
+///    instead (see [`format_warnings`]), matching apcore-python and
+///    apcore-typescript.
+/// 2. The whole SDK must reach one verdict for one input; a per-schema draft
+///    would make behaviour depend on an author's `$schema` line.
+///
+/// The `$schema` keyword is **removed** (top level only) before compiling.
+/// `jsonschema` 0.28 derives keyword semantics from the declared meta-schema,
+/// so pinning Draft 2020-12 while the document declares an older draft yields a
+/// validator that accepts *everything* — validation silently disabled. Dropping
+/// the declaration keeps the pinned draft authoritative, so real constraints
+/// (`type`, `required`, …) are still enforced. Nested `$schema` keys (embedded
+/// resources inside `$defs`) are left alone; apcore schemas do not use them.
+pub(crate) fn build_2020_12(schema: &Value) -> Result<Validator, String> {
+    let stripped;
+    let effective = match schema.as_object() {
+        Some(obj) if obj.contains_key("$schema") => {
+            let mut owned = obj.clone();
+            owned.remove("$schema");
+            stripped = Value::Object(owned);
+            &stripped
+        }
+        _ => schema,
+    };
+
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(effective)
+        .map_err(|e| e.to_string())
 }
 
 /// Recursively coerce `value` toward the scalar types declared by `schema`,
