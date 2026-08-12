@@ -5,10 +5,12 @@
 // - `format_warnings` — opt-in semantic format check (date-time, email, uri, …) that emits
 //   non-fatal warnings rather than hard errors (SHOULD-level enforcement).
 
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
-use serde_json::Value;
+use regex::Regex;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -74,7 +76,7 @@ fn write_canonical(value: &Value, out: &mut String) {
 /// Format enforcement is SHOULD-level per PROTOCOL_SPEC §4.15.4 — invalid
 /// `format` values do not fail validation; they surface here so callers can
 /// log or surface them as warnings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FormatWarning {
     /// JSON pointer to the offending field, e.g. `/occurred_at`.
     pub path: String,
@@ -97,22 +99,58 @@ pub struct FormatWarning {
 #[must_use]
 pub fn format_warnings(data: &Value, schema: &Value) -> Vec<FormatWarning> {
     let mut warnings = Vec::new();
-    walk_format(data, schema, "", &mut warnings);
-    // Order-preserving de-duplication. Warning lists are short (one entry per
-    // offending field), so the linear scan is cheaper than building a set.
-    let mut unique: Vec<FormatWarning> = Vec::with_capacity(warnings.len());
-    for warning in warnings {
-        if !unique.contains(&warning) {
-            unique.push(warning);
+    let mut cache = WalkCache::default();
+    walk_format(data, schema, "", &mut warnings, &mut cache);
+    // Order-preserving de-duplication. An array of N offending elements yields
+    // N warnings, so the membership test has to be O(1), not a linear rescan.
+    let mut seen: HashSet<FormatWarning> = HashSet::with_capacity(warnings.len());
+    warnings
+        .into_iter()
+        .filter(|warning| seen.insert(warning.clone()))
+        .collect()
+}
+
+/// Memo table shared by one [`format_warnings`] traversal.
+///
+/// Entries are keyed by the *address* of a schema node. The schema is borrowed
+/// immutably for the whole walk, so every node keeps a stable address and two
+/// lookups with the same address always describe the same subtree. The table is
+/// created per call and dropped with it, so an address can never be reused
+/// while an entry for it is live.
+///
+/// Without it, a union nested `d` levels deep re-derived `declares_format` over
+/// the same subtree once per level — quadratic in the schema size.
+#[derive(Default)]
+struct WalkCache {
+    declares_format: HashMap<usize, bool>,
+}
+
+impl WalkCache {
+    /// `true` when `schema` carries a `format` keyword anywhere in its subtree.
+    ///
+    /// Used to skip a union branch that could not produce a warning anyway.
+    fn declares_format(&mut self, schema: &Value) -> bool {
+        let key = std::ptr::from_ref(schema) as usize;
+        if let Some(hit) = self.declares_format.get(&key) {
+            return *hit;
         }
+        let found = match schema {
+            Value::Object(map) => {
+                map.get("format").is_some_and(Value::is_string)
+                    || map.values().any(|child| self.declares_format(child))
+            }
+            Value::Array(items) => items.iter().any(|item| self.declares_format(item)),
+            _ => false,
+        };
+        self.declares_format.insert(key, found);
+        found
     }
-    unique
 }
 
 /// Recursive worker for [`format_warnings`].
 ///
-/// Traversal covers `properties`, `additionalProperties`, `items`,
-/// `prefixItems`, `anyOf`, `oneOf` and `allOf`.
+/// Traversal covers `properties`, `patternProperties`, `additionalProperties`,
+/// `items`, `prefixItems`, `anyOf`, `oneOf` and `allOf`.
 ///
 /// Known limitations, all deliberate:
 /// - `$ref` is **not** dereferenced. Doing so needs the full document plus
@@ -120,33 +158,30 @@ pub fn format_warnings(data: &Value, schema: &Value) -> Vec<FormatWarning> {
 ///   loop forever); resolve the schema with [`crate::schema::RefResolver`]
 ///   first if annotations behind a `$ref` matter. Missing a warning is
 ///   harmless — format enforcement is SHOULD-level.
-/// - `patternProperties` is not consulted when deciding which keys the
-///   `additionalProperties` subschema covers, so a key matched by a pattern is
-///   checked against `additionalProperties` too. It can only add a warning that
-///   a stricter reading would omit.
-fn walk_format(data: &Value, schema: &Value, path: &str, out: &mut Vec<FormatWarning>) {
+/// - Tuple-form `items` (`"items": [ … ]`, draft-07 and earlier) is not walked;
+///   its Draft 2020-12 spelling `prefixItems` is.
+fn walk_format(
+    data: &Value,
+    schema: &Value,
+    path: &str,
+    out: &mut Vec<FormatWarning>,
+    cache: &mut WalkCache,
+) {
     let Some(schema_obj) = schema.as_object() else {
         return;
     };
 
-    // Union: the annotation lives on the branches, not on the union node. Only
-    // branches the data satisfies contribute — a sibling branch describes a
-    // different shape, and warning from it would report a format the value was
-    // never meant to carry (parity with apcore-typescript `_walkFormats`).
+    // Union: the annotation lives on the branches, not on the union node.
     for keyword in ["anyOf", "oneOf"] {
         if let Some(branches) = schema_obj.get(keyword).and_then(|v| v.as_array()) {
-            for branch in branches {
-                if declares_format(branch) && data_satisfies(branch, data) {
-                    walk_format(data, branch, path, out);
-                }
-            }
+            walk_union(data, branches, path, out, cache);
         }
     }
 
     // Intersection: every member applies, so every member's annotations count.
     if let Some(members) = schema_obj.get("allOf").and_then(|v| v.as_array()) {
         for member in members {
-            walk_format(data, member, path, out);
+            walk_format(data, member, path, out, cache);
         }
     }
 
@@ -167,33 +202,50 @@ fn walk_format(data: &Value, schema: &Value, path: &str, out: &mut Vec<FormatWar
         }
     }
 
-    if let (Some(props), Some(obj)) = (
-        schema_obj.get("properties").and_then(|p| p.as_object()),
-        data.as_object(),
-    ) {
+    let named = schema_obj.get("properties").and_then(|p| p.as_object());
+    let patterns = compile_pattern_properties(schema_obj);
+
+    if let (Some(props), Some(obj)) = (named, data.as_object()) {
         for (name, prop_schema) in props {
             if let Some(value) = obj.get(name) {
                 let child_path = format!("{path}/{name}");
-                walk_format(value, prop_schema, &child_path, out);
+                walk_format(value, prop_schema, &child_path, out, cache);
             }
         }
     }
 
-    // Keys not named by `properties` fall to the `additionalProperties`
-    // subschema (a boolean value carries no annotations and is skipped).
+    // `patternProperties` applies to every key its pattern matches, on top of
+    // whatever `properties` already said about that key (Draft 2020-12 §10.3.2.2).
+    if let Some(obj) = data.as_object() {
+        for (pattern, sub_schema) in &patterns {
+            for (name, value) in obj {
+                if pattern.is_match(name) {
+                    let child_path = format!("{path}/{name}");
+                    walk_format(value, sub_schema, &child_path, out, cache);
+                }
+            }
+        }
+    }
+
+    // `additionalProperties` covers only the keys named by neither `properties`
+    // nor `patternProperties` (Draft 2020-12 §10.3.2.3). Checking a
+    // pattern-matched key against it as well reported formats the key was never
+    // declared to carry. A boolean value carries no annotations and is skipped.
     if let (Some(additional), Some(obj)) = (
         schema_obj
             .get("additionalProperties")
             .filter(|v| v.is_object()),
         data.as_object(),
     ) {
-        let named = schema_obj.get("properties").and_then(|p| p.as_object());
         for (name, value) in obj {
             if named.is_some_and(|props| props.contains_key(name)) {
                 continue;
             }
+            if patterns.iter().any(|(pattern, _)| pattern.is_match(name)) {
+                continue;
+            }
             let child_path = format!("{path}/{name}");
-            walk_format(value, additional, &child_path, out);
+            walk_format(value, additional, &child_path, out, cache);
         }
     }
 
@@ -206,7 +258,7 @@ fn walk_format(data: &Value, schema: &Value, path: &str, out: &mut Vec<FormatWar
         (Some(prefix_schemas), Some(arr)) => {
             for (i, (item, item_schema)) in arr.iter().zip(prefix_schemas).enumerate() {
                 let child_path = format!("{path}/{i}");
-                walk_format(item, item_schema, &child_path, out);
+                walk_format(item, item_schema, &child_path, out, cache);
             }
             prefix_schemas.len()
         }
@@ -216,32 +268,179 @@ fn walk_format(data: &Value, schema: &Value, path: &str, out: &mut Vec<FormatWar
     if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), data.as_array()) {
         for (i, item) in arr.iter().enumerate().skip(prefix_len) {
             let child_path = format!("{path}/{i}");
-            walk_format(item, items_schema, &child_path, out);
+            walk_format(item, items_schema, &child_path, out, cache);
         }
     }
 }
 
-/// `true` when `schema` carries a `format` keyword anywhere in its subtree.
+/// Compile the `patternProperties` regexes declared on one schema node.
 ///
-/// Used to skip the cost of compiling a validator for a union branch that could
-/// not produce a warning in the first place.
-fn declares_format(schema: &Value) -> bool {
-    match schema {
-        Value::Object(map) => {
-            map.get("format").is_some_and(Value::is_string) || map.values().any(declares_format)
+/// JSON Schema mandates ECMA-262 regular expressions; the `regex` crate covers
+/// the subset real schemas use. A pattern it cannot compile is skipped, so the
+/// keys that pattern would have claimed fall through to `additionalProperties`
+/// — the pre-fix behaviour, which can only add a warning, never hide one.
+fn compile_pattern_properties(schema_obj: &Map<String, Value>) -> Vec<(Regex, &Value)> {
+    let Some(patterns) = schema_obj
+        .get("patternProperties")
+        .and_then(|v| v.as_object())
+    else {
+        return Vec::new();
+    };
+    patterns
+        .iter()
+        .filter_map(|(pattern, sub_schema)| {
+            Regex::new(pattern).ok().map(|regex| (regex, sub_schema))
+        })
+        .collect()
+}
+
+/// Collect the warnings an `anyOf` / `oneOf` node contributes.
+///
+/// Only branches that declare a `format` can contribute at all. Of those, a
+/// branch the data provably contradicts is dropped ([`contradicts`]): a sibling
+/// branch describes a different shape, and warning from it would report a format
+/// the value was never meant to carry.
+///
+/// The survivors are then probed individually. If **any** survivor comes back
+/// clean — every `format` it declares checks out — the data unambiguously
+/// belongs to that branch and the union contributes nothing. Otherwise every
+/// survivor's warnings are reported: the value fits no branch, and
+/// over-reporting a SHOULD-level warning beats staying silent about a real one.
+///
+/// The cleanliness probe, not the structural check, is what separates branches
+/// differing *only* by `format`: apcore compiles every schema with format
+/// assertions disabled (see [`crate::schema::validator::build_validator`]), so
+/// no structural check could ever tell `{"format": "uuid"}` from
+/// `{"format": "email"}`.
+fn walk_union(
+    data: &Value,
+    branches: &[Value],
+    path: &str,
+    out: &mut Vec<FormatWarning>,
+    cache: &mut WalkCache,
+) {
+    let survivors: Vec<&Value> = branches
+        .iter()
+        .filter(|branch| cache.declares_format(branch))
+        .filter(|branch| !contradicts(branch, data))
+        .collect();
+
+    let mut probes: Vec<Vec<FormatWarning>> = Vec::with_capacity(survivors.len());
+    for branch in survivors {
+        let mut probe = Vec::new();
+        walk_format(data, branch, path, &mut probe, cache);
+        if probe.is_empty() {
+            return;
         }
-        Value::Array(items) => items.iter().any(declares_format),
-        _ => false,
+        probes.push(probe);
+    }
+    for probe in probes {
+        out.extend(probe);
     }
 }
 
-/// `true` when `data` validates against the union branch `branch`.
+/// `true` only when `data` **definitely** cannot match `schema`.
 ///
-/// A branch that fails to compile (an unresolvable `$ref`, say) is treated as
-/// not satisfied: the point of the check is to avoid reporting a format the
-/// value was never meant to carry, so an undecidable branch stays silent.
-fn data_satisfies(branch: &Value, data: &Value) -> bool {
-    crate::schema::validator::build_2020_12(branch).is_ok_and(|v| v.is_valid(data))
+/// A deliberately partial check. It inspects the keywords whose verdict is both
+/// certain and cheap — `type`, `const`, `enum`, `required`, and those same
+/// keywords beneath `properties`, `allOf`, `anyOf` and `oneOf` — and answers
+/// `false`, "cannot tell", for everything else, `$ref` included.
+///
+/// Three reasons it is hand-rolled rather than delegated to a compiled
+/// `jsonschema::Validator`, which is what this guard used to do:
+/// - A branch holding a `$ref` into the root document cannot be compiled in
+///   isolation at all. Reading that failure as "does not match" silenced every
+///   nullable-reference schema (`anyOf: [{allOf: [{$ref}], format}, {null}]`)
+///   permanently. Here such a branch is simply undecidable, and survives.
+/// - Compiling a branch costs time proportional to its entire subtree, and a
+///   union nested `d` levels deep paid that once per level.
+/// - `format` must not participate anyway, and it is the one keyword a compiled
+///   validator would have contributed over this check.
+///
+/// Erring permissively costs one extra SHOULD-level warning; erring strictly
+/// hides a real one, so every uncertain case resolves to `false`.
+fn contradicts(schema: &Value, data: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+
+    match obj.get("type") {
+        Some(Value::String(name)) if !type_matches(name, data) => return true,
+        Some(Value::Array(names)) => {
+            if !names
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|name| type_matches(name, data))
+            {
+                return true;
+            }
+        }
+        _ => {}
+    }
+
+    if obj.get("const").is_some_and(|expected| expected != data) {
+        return true;
+    }
+
+    if let Some(Value::Array(allowed)) = obj.get("enum") {
+        if !allowed.contains(data) {
+            return true;
+        }
+    }
+
+    if let (Some(Value::Array(names)), Some(map)) = (obj.get("required"), data.as_object()) {
+        if names
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|name| !map.contains_key(name))
+        {
+            return true;
+        }
+    }
+
+    if let (Some(Value::Object(props)), Some(map)) = (obj.get("properties"), data.as_object()) {
+        if props
+            .iter()
+            .any(|(name, sub)| map.get(name).is_some_and(|value| contradicts(sub, value)))
+        {
+            return true;
+        }
+    }
+
+    if let Some(Value::Array(members)) = obj.get("allOf") {
+        if members.iter().any(|member| contradicts(member, data)) {
+            return true;
+        }
+    }
+
+    // A union is contradicted only when every one of its branches is.
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = obj.get(keyword) {
+            if !branches.is_empty() && branches.iter().all(|branch| contradicts(branch, data)) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// `true` when `data` could be an instance of the JSON Schema type `declared`.
+///
+/// `integer` is treated as plain `number`: telling `3.0` from `3` adds nothing
+/// a union realistically discriminates on, and a wrong rejection here silences
+/// a warning.
+fn type_matches(declared: &str, data: &Value) -> bool {
+    match declared {
+        "null" => data.is_null(),
+        "boolean" => data.is_boolean(),
+        "string" => data.is_string(),
+        "integer" | "number" => data.is_number(),
+        "array" => data.is_array(),
+        "object" => data.is_object(),
+        // An unknown `type` value is not something this check can rule on.
+        _ => true,
+    }
 }
 
 /// Returns `true` when `value` parses as a member of the declared `format`,

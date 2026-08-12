@@ -228,7 +228,7 @@ async fn pipeline_hardening_fail_fast_on_step_error() {
                 Arc::clone(&lookup_count),
             )),
             Box::new(RaisingStep::new(
-                "validate_input",
+                "input_validation",
                 false,
                 Arc::clone(&validate_count),
             )),
@@ -240,7 +240,7 @@ async fn pipeline_hardening_fail_fast_on_step_error() {
     let mut ctx = make_ctx();
     let err = PipelineEngine::run(&strategy, &mut ctx)
         .await
-        .expect_err("validate_input must fail-fast");
+        .expect_err("input_validation must fail-fast");
 
     // §1.1: error code must be PIPELINE_STEP_ERROR
     let serialized = serde_json::to_value(err.code).unwrap();
@@ -252,7 +252,7 @@ async fn pipeline_hardening_fail_fast_on_step_error() {
     assert_eq!(err.code, ErrorCode::PipelineStepError);
 
     // step_name is preserved on the wrapper.
-    assert_eq!(err.step_name(), Some("validate_input"));
+    assert_eq!(err.step_name(), Some("input_validation"));
 
     // The original cause is recoverable.
     let underlying = err
@@ -260,7 +260,7 @@ async fn pipeline_hardening_fail_fast_on_step_error() {
         .expect("PipelineStepError must carry the original cause");
     assert_eq!(underlying.code, ErrorCode::GeneralInvalidInput);
 
-    // The expected step set ran, and nothing past validate_input ran.
+    // The expected step set ran, and nothing past input_validation ran.
     assert_eq!(context_count.load(Ordering::SeqCst), 1);
     assert_eq!(lookup_count.load(Ordering::SeqCst), 1);
     assert_eq!(validate_count.load(Ordering::SeqCst), 1);
@@ -297,7 +297,7 @@ async fn pipeline_hardening_continue_on_ignored_error() {
         vec![
             Box::new(TrackingStep::new("step_a", Arc::clone(&pre_count))),
             Box::new(RaisingStep::new(
-                "validate_input",
+                "input_validation",
                 true,
                 Arc::clone(&raised_count),
             )),
@@ -319,8 +319,8 @@ async fn pipeline_hardening_continue_on_ignored_error() {
     let ignored_trace = trace
         .steps
         .iter()
-        .find(|s| s.name == "validate_input")
-        .expect("validate_input must appear in the trace");
+        .find(|s| s.name == "input_validation")
+        .expect("input_validation must appear in the trace");
     assert_eq!(ignored_trace.skip_reason.as_deref(), Some("error_ignored"));
 }
 
@@ -340,30 +340,30 @@ async fn pipeline_hardening_replace_semantic_no_duplicate() {
         "test",
         vec![
             Box::new(TrackingStep::new("a", Arc::clone(&count))),
-            Box::new(TrackingStep::new("validate_input", Arc::clone(&count))),
+            Box::new(TrackingStep::new("input_validation", Arc::clone(&count))),
             Box::new(TrackingStep::new("b", Arc::clone(&count))),
         ],
     )
     .unwrap();
 
-    let original_idx = *strategy.name_to_idx().get("validate_input").unwrap();
+    let original_idx = *strategy.name_to_idx().get("input_validation").unwrap();
 
     let times = case["input"]["times"].as_u64().unwrap();
     for n in 0..times {
-        let replacement = TrackingStep::new("validate_input", Arc::clone(&count));
+        let replacement = TrackingStep::new("input_validation", Arc::clone(&count));
         strategy
-            .configure_step("validate_input", Box::new(replacement))
+            .configure_step("input_validation", Box::new(replacement))
             .unwrap_or_else(|e| panic!("configure_step #{n} must succeed: {e}"));
     }
 
     let occurrences = strategy
         .step_names()
         .iter()
-        .filter(|n| n.as_str() == "validate_input")
+        .filter(|n| n.as_str() == "input_validation")
         .count();
     assert_eq!(occurrences, expected_count);
     assert_eq!(
-        *strategy.name_to_idx().get("validate_input").unwrap(),
+        *strategy.name_to_idx().get("input_validation").unwrap(),
         original_idx,
         "configure_step must preserve the step's position",
     );

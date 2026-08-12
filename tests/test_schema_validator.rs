@@ -436,14 +436,18 @@ fn test_schema_validator_default() {
 }
 
 // ---------------------------------------------------------------------------
-// A-D-005 / A-D-006: type-coercion engine (default-on), cross-language parity
-// with apcore-python (model_validate(strict=not coerce_types)) and
-// apcore-typescript (Value.Decode when coerceTypes). Mirrors pydantic lax mode.
+// A-D-005 / A-D-006: type-coercion engine, now OPT-IN. `SchemaValidator::new()`
+// performs no coercion so it agrees with the module-invocation boundary
+// (`executor::validate_against_schema`, which `builtin_steps.rs` calls) —
+// TYPE_MAPPING §17.3. `with_coerce_types(true)` is the library-level opt-in for
+// a caller validating its own untyped input.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_coerce_string_to_integer_accepted_by_default() {
-    // new() defaults coerce_types=true — "42" against {type:integer} is accepted.
+fn test_string_for_integer_rejected_by_default() {
+    // Regression: `new()` used to default coerce_types=true, so this SDK had two
+    // validation paths that disagreed — `validate_against_schema` rejected
+    // {"a": "42"} while `SchemaValidator::new().validate_detailed` accepted it.
     let v = SchemaValidator::new();
     let schema = json!({
         "type": "object",
@@ -452,8 +456,31 @@ fn test_coerce_string_to_integer_accepted_by_default() {
     });
     let result = v.validate(&json!({ "age": "42" }), &schema);
     assert!(
+        !result.valid,
+        "coerce_types defaults false: \"42\" is a type error for {{type: integer}}"
+    );
+    assert!(!v.coerce_types(), "new() must not coerce");
+
+    // ...and the module-invocation boundary agrees, which is the whole point.
+    assert!(
+        apcore::executor::validate_against_schema(&json!({ "age": "42" }), &schema, "Input")
+            .is_err(),
+        "module boundary must reject the same input"
+    );
+}
+
+#[test]
+fn test_coerce_string_to_integer_accepted_when_enabled() {
+    let v = SchemaValidator::with_coerce_types(true);
+    let schema = json!({
+        "type": "object",
+        "properties": { "age": { "type": "integer" } },
+        "required": ["age"]
+    });
+    let result = v.validate(&json!({ "age": "42" }), &schema);
+    assert!(
         result.valid,
-        "coerce_types defaults true: \"42\" should coerce to 42 (matches Py/TS)"
+        "with_coerce_types(true): \"42\" coerces to 42"
     );
 }
 
@@ -475,7 +502,7 @@ fn test_coerce_string_to_integer_rejected_when_disabled() {
 #[test]
 fn test_coerce_non_numeric_string_to_integer_rejected() {
     // "abc" cannot coerce — always invalid (matches Py/TS + fixture).
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({
         "type": "object",
         "properties": { "count": { "type": "integer" } },
@@ -487,14 +514,14 @@ fn test_coerce_non_numeric_string_to_integer_rejected() {
 
 #[test]
 fn test_coerce_string_to_number_float() {
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({ "type": "object", "properties": { "x": { "type": "number" } } });
     assert!(v.validate(&json!({ "x": "3.14" }), &schema).valid);
 }
 
 #[test]
 fn test_coerce_string_to_bool() {
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({ "type": "object", "properties": { "flag": { "type": "boolean" } } });
     assert!(v.validate(&json!({ "flag": "true" }), &schema).valid);
     assert!(v.validate(&json!({ "flag": "false" }), &schema).valid);
@@ -505,14 +532,14 @@ fn test_coerce_string_to_bool() {
 #[test]
 fn test_coerce_does_not_widen_int_to_string() {
     // pydantic lax mode does NOT coerce int->str; this must stay invalid.
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({ "type": "string" });
     assert!(!v.validate(&json!(42), &schema).valid);
 }
 
 #[test]
 fn test_coerce_int_to_float_widening() {
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({ "type": "object", "properties": { "x": { "type": "number" } } });
     // integer already valid for number; widening is a no-op but must stay valid.
     assert!(v.validate(&json!({ "x": 42 }), &schema).valid);
@@ -520,7 +547,7 @@ fn test_coerce_int_to_float_widening() {
 
 #[test]
 fn test_coerce_recurses_into_nested_objects_and_arrays() {
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({
         "type": "object",
         "properties": {
@@ -547,7 +574,7 @@ fn test_coerce_recurses_into_nested_objects_and_arrays() {
 // A-D-017: validate_input/validate_output must RETURN the coerced value.
 #[test]
 fn test_validate_input_returns_coerced_value() {
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({
         "type": "object",
         "properties": { "age": { "type": "integer" } },
@@ -565,7 +592,7 @@ fn test_validate_input_returns_coerced_value() {
 
 #[test]
 fn test_validate_output_returns_coerced_value() {
-    let v = SchemaValidator::new();
+    let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({
         "type": "object",
         "properties": { "n": { "type": "number" } }
@@ -625,10 +652,11 @@ fn test_schema_validator_required_error_detail_has_constraint() {
 //
 // `format` belongs to the format-annotation vocabulary in JSON Schema 2020-12
 // (§7.2.1): an unsatisfied format MUST NOT fail validation. Draft-07 treats it
-// as an assertion, so a validator that auto-detects the draft from `$schema`
-// reaches the opposite verdict on the same input. Both entry points must pin
-// Draft 2020-12 (parity with apcore-python / apcore-typescript, where format is
-// SHOULD-level and surfaces as a warning).
+// as an assertion, so a validator that let the declared draft decide would
+// reach the opposite verdict on the same input. Both entry points compile with
+// format assertions disabled instead (parity with apcore-python /
+// apcore-typescript, where format is SHOULD-level and surfaces as a warning),
+// leaving every other keyword's draft semantics intact.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -690,10 +718,10 @@ fn test_executor_validate_still_rejects_real_type_errors_under_draft07() {
 
 #[test]
 fn test_schema_validator_still_enforces_constraints_under_draft07_schema_keyword() {
-    // Pinning Draft 2020-12 while the document declares an older meta-schema
-    // made `jsonschema` compile an accept-everything validator, silently
-    // disabling validation. The `$schema` keyword must be dropped so the pinned
-    // draft stays authoritative.
+    // A declared draft must never turn validation off. Compiling a draft-07
+    // document under a pinned Draft 2020-12 made `jsonschema` build an
+    // accept-everything validator; honouring the declaration keeps the real
+    // constraints (`type`, `required`, …) enforced.
     let v = SchemaValidator::with_coerce_types(false);
     let schema = json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -705,4 +733,152 @@ fn test_schema_validator_still_enforces_constraints_under_draft07_schema_keyword
     assert!(!v.validate(&json!({ "count": "abc" }), &schema).valid);
     assert!(!v.validate(&json!({}), &schema).valid);
     assert!(v.validate(&json!({ "count": 3 }), &schema).valid);
+}
+
+// ---------------------------------------------------------------------------
+// Draft handling: the document's own draft is honoured, nested `$schema`
+// declarations are not.
+//
+// Pinning Draft 2020-12 regressed two ways at once: legal draft-07 syntax
+// (tuple-form `items`) stopped compiling at all, and a subtree that redeclared
+// `$schema` was still compiled as its own embedded resource — an
+// accept-everything validator for that subtree.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_draft07_tuple_items_schema_compiles_and_validates_positionally() {
+    // Legal draft-07: `items` as an array is the tuple form. Under a pinned
+    // Draft 2020-12 meta-schema this is not a valid schema at all, so the
+    // compile failed and every input was rejected.
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "array",
+        "items": [{ "type": "string" }, { "type": "integer" }]
+    });
+
+    let ok = v.validate(&json!(["a", 1]), &schema);
+    assert!(
+        ok.valid,
+        "draft-07 tuple form must compile: {:?}",
+        ok.errors
+    );
+    assert!(!v.validate(&json!([1, "a"]), &schema).valid);
+}
+
+#[test]
+fn test_executor_validate_accepts_draft07_tuple_items_schema() {
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "array",
+        "items": [{ "type": "string" }, { "type": "integer" }]
+    });
+
+    assert!(apcore::executor::validate_against_schema(&json!(["a", 1]), &schema, "Input").is_ok());
+    assert!(apcore::executor::validate_against_schema(&json!([1, "a"]), &schema, "Input").is_err());
+}
+
+#[test]
+fn test_nested_schema_declaration_does_not_disable_subtree_validation() {
+    // The `$defs` entry redeclares `$schema`. Stripping only the top-level
+    // declaration left this subtree compiled as a separate draft-07 resource
+    // that accepted everything, so `{"n": "abc"}` slipped through unchecked.
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": { "p": { "$ref": "#/$defs/Inner" } },
+        "$defs": {
+            "Inner": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": { "n": { "type": "integer" } },
+                "required": ["n"]
+            }
+        }
+    });
+
+    assert!(!v.validate(&json!({ "p": { "n": "abc" } }), &schema).valid);
+    assert!(v.validate(&json!({ "p": { "n": 7 } }), &schema).valid);
+}
+
+#[test]
+fn test_nested_schema_declaration_with_id_does_not_disable_subtree_validation() {
+    // Same hole, spelled the way an embedded resource usually is: `$schema`
+    // alongside an `$id`.
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": { "p": { "$ref": "#/$defs/Inner" } },
+        "$defs": {
+            "Inner": {
+                "$id": "https://example.com/inner",
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": { "n": { "type": "integer" } },
+                "required": ["n"]
+            }
+        }
+    });
+
+    assert!(!v.validate(&json!({ "p": { "n": "abc" } }), &schema).valid);
+}
+
+#[test]
+fn test_recursive_self_ref_schema_still_validates() {
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({
+        "type": "object",
+        "properties": { "child": { "$ref": "#" } },
+        "additionalProperties": false
+    });
+
+    assert!(
+        v.validate(&json!({ "child": { "child": {} } }), &schema)
+            .valid
+    );
+    assert!(
+        !v.validate(&json!({ "child": { "extra": 1 } }), &schema)
+            .valid
+    );
+}
+
+#[test]
+fn test_property_literally_named_schema_survives_normalisation() {
+    // Only a *string* `$schema` is a meta-schema declaration. A property named
+    // `$schema` carries a subschema object and must keep constraining its key.
+    let v = SchemaValidator::with_coerce_types(false);
+    let schema = json!({
+        "type": "object",
+        "properties": { "$schema": { "type": "string" } },
+        "required": ["$schema"],
+        "additionalProperties": false
+    });
+
+    assert!(v.validate(&json!({ "$schema": "ok" }), &schema).valid);
+    assert!(!v.validate(&json!({ "$schema": 42 }), &schema).valid);
+}
+
+#[test]
+fn test_executor_validate_invalid_schema_reports_parse_error_with_details() {
+    // The *schema* is broken, not the value. SCHEMA_VALIDATION_ERROR is flagged
+    // caller-fixable, which would point the caller at arguments that were never
+    // at fault, so this path reports SCHEMA_PARSE_ERROR — the same code
+    // `SchemaValidator` uses when a compile fails.
+    let schema = json!({ "type": "object", "properties": { "bad": { "type": 42 } } });
+    let err = apcore::executor::validate_against_schema(&json!({}), &schema, "Input").unwrap_err();
+
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaParseError);
+    assert_eq!(apcore::errors::user_fixable_for_code(err.code), None);
+    let arr = err
+        .details
+        .get("errors")
+        .expect("details.errors present")
+        .as_array()
+        .expect("details.errors is an array");
+    assert_eq!(arr.len(), 1);
+    assert!(arr[0].get("field").is_some());
+    assert!(arr[0].get("message").is_some());
+    assert!(err.ai_guidance.is_some());
 }

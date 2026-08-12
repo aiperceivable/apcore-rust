@@ -112,18 +112,28 @@ impl PeriodicUsageExporter {
         *guard = Some(handle);
     }
 
-    /// Stop the periodic task and invoke `shutdown()` on the exporter. Safe
-    /// to call multiple times — subsequent calls are no-ops.
+    /// Stop the periodic task and invoke `shutdown()` on the exporter.
+    ///
+    /// Idempotent: `shutdown()` fires only on the call that actually takes the
+    /// running task handle. A second `stop()`, or a `stop()` on a driver that
+    /// was never started, is a pure no-op and does NOT call `shutdown()` again.
+    /// This matches `apcore-python`'s `PeriodicUsageExporter.stop`, which
+    /// returns early when `self._task is None` ("only shutdown the exporter if
+    /// it was actually started, mirroring `BatchSpanProcessor` semantics").
     pub async fn stop(&self) {
         let handle = {
             let mut guard = self.handle.lock().await;
             guard.take()
         };
-        if let Some(handle) = handle {
-            handle.abort();
-            // Await termination; ignore the JoinError that aborting produces.
-            let _ = handle.await;
-        }
+        // No handle => never started, or already stopped. Returning here keeps
+        // `shutdown()` exactly-once, which exporters rely on to flush buffers
+        // and release resources without double-free/double-flush.
+        let Some(handle) = handle else {
+            return;
+        };
+        handle.abort();
+        // Await termination; ignore the JoinError that aborting produces.
+        let _ = handle.await;
         if let Err(err) = self.exporter.shutdown().await {
             tracing::warn!(error = %err, "UsageExporter.shutdown failed");
         }
@@ -171,6 +181,33 @@ mod tests {
         driver.stop().await;
         assert!(counter.exports.load(Ordering::SeqCst) >= 2);
         assert_eq!(counter.shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    /// `stop()` twice MUST call `shutdown()` exactly once, and `stop()` on a
+    /// never-started driver MUST NOT call it at all — matching apcore-python.
+    #[tokio::test]
+    async fn periodic_driver_double_stop_calls_shutdown_once() {
+        let collector = Arc::new(UsageCollector::new());
+        let counter = Arc::new(Counter::default());
+        let exporter: Arc<dyn UsageExporter> = counter.clone();
+        let driver = PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(25));
+
+        driver.start().await;
+        driver.stop().await;
+        driver.stop().await;
+        driver.stop().await;
+        assert_eq!(counter.shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn periodic_driver_stop_without_start_does_not_shutdown() {
+        let collector = Arc::new(UsageCollector::new());
+        let counter = Arc::new(Counter::default());
+        let exporter: Arc<dyn UsageExporter> = counter.clone();
+        let driver = PeriodicUsageExporter::new(collector, exporter, Duration::from_millis(25));
+
+        driver.stop().await;
+        assert_eq!(counter.shutdowns.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

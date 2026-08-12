@@ -248,9 +248,9 @@ pub fn build_strategy_from_config(
                 strategy.remove(step_name).map_err(|e| {
                     // Sync alignment W-7: missing-step is a structural
                     // configuration error, distinct from a dependency-graph
-                    // violation. ConfigurationError mirrors PY/TS.
+                    // violation. `PIPELINE_CONFIGURATION_ERROR` mirrors PY/TS.
                     ModuleError::new(
-                        ErrorCode::ConfigurationError,
+                        ErrorCode::PipelineConfigurationError,
                         format!(
                             "pipeline.remove: cannot remove step '{step_name}': {}",
                             e.message
@@ -315,7 +315,7 @@ pub fn build_strategy_from_config(
                         // is a structural configuration error, not a
                         // dependency violation.
                         ModuleError::new(
-                            ErrorCode::ConfigurationError,
+                            ErrorCode::PipelineConfigurationError,
                             format!(
                                 "pipeline.configure: cannot configure step '{step_name_str}': {}",
                                 e.message
@@ -336,12 +336,14 @@ pub fn build_strategy_from_config(
             if let Some(anchor) = after {
                 strategy.insert_after(anchor, step).map_err(|e| {
                     // Re-classify missing-anchor as a structural configuration
-                    // error (sync alignment W-7). The underlying find_step_index
-                    // returns GeneralInvalidInput, which is too broad for
-                    // pipeline-config callers.
-                    if matches!(e.code, ErrorCode::GeneralInvalidInput) {
+                    // error (sync alignment W-7). `find_step_index` reports
+                    // `StepNotFound`, which is correct for direct strategy
+                    // callers but too low-level for pipeline-config callers.
+                    // Other failure modes (duplicate step name, dependency
+                    // violation) propagate unchanged.
+                    if matches!(e.code, ErrorCode::StepNotFound) {
                         ModuleError::new(
-                            ErrorCode::ConfigurationError,
+                            ErrorCode::PipelineConfigurationError,
                             format!(
                                 "pipeline.steps: 'after' anchor '{anchor}' not found: {}",
                                 e.message
@@ -353,9 +355,9 @@ pub fn build_strategy_from_config(
                 })?;
             } else if let Some(anchor) = before {
                 strategy.insert_before(anchor, step).map_err(|e| {
-                    if matches!(e.code, ErrorCode::GeneralInvalidInput) {
+                    if matches!(e.code, ErrorCode::StepNotFound) {
                         ModuleError::new(
-                            ErrorCode::ConfigurationError,
+                            ErrorCode::PipelineConfigurationError,
                             format!(
                                 "pipeline.steps: 'before' anchor '{anchor}' not found: {}",
                                 e.message
@@ -368,13 +370,13 @@ pub fn build_strategy_from_config(
             } else {
                 // Issue #33 §1.2: fail-fast on YAML configuration errors.
                 // Sync alignment W-7: structural configuration errors use
-                // ConfigurationError rather than PipelineConfigInvalid.
+                // PipelineConfigurationError rather than PipelineConfigInvalid.
                 let name = step_def
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 return Err(ModuleError::new(
-                    ErrorCode::ConfigurationError,
+                    ErrorCode::PipelineConfigurationError,
                     format!(
                         "pipeline.steps: step '{name}' has neither 'after' nor 'before' anchor"
                     ),

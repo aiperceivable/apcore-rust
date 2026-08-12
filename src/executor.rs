@@ -118,8 +118,25 @@ fn json_type_name(v: &Value) -> &'static str {
 
 fn deep_merge_value(base: &mut Value, overlay: &Value, depth: usize) {
     if depth >= DEEP_MERGE_MAX_DEPTH {
-        // At the depth limit, replace rather than recurse to avoid stack overflow.
-        *base = overlay.clone();
+        // At the depth limit, stop recursing (stack safety) but still merge
+        // SHALLOWLY: assign each overlay key onto base rather than replacing
+        // the whole node. Replacing dropped every base-only key, so streaming
+        // chunk A `{a:{a:…{x:1}}}` followed by chunk B `{a:{a:…{y:2}}}` at
+        // depth 32 accumulated to `{y:2}` in Rust where apcore-python
+        // (`executor.py` `_deep_merge`) and apcore-typescript
+        // (`executor.ts` `deepMerge`) both produce `{x:1,y:2}`. Machine-generated
+        // deeply nested payloads are exactly where streaming accumulators hit
+        // this cap.
+        match (base, overlay) {
+            (Value::Object(base_map), Value::Object(overlay_map)) => {
+                for (k, v) in overlay_map {
+                    base_map.insert(k.clone(), v.clone());
+                }
+            }
+            (base, overlay) => {
+                *base = overlay.clone();
+            }
+        }
         return;
     }
     match (base, overlay) {
@@ -241,7 +258,17 @@ enum StreamPrep {
 }
 
 /// Validate a JSON value against a JSON Schema.
-/// Returns Ok(()) if valid, or a ModuleError with SchemaValidationError on failure.
+///
+/// This is the module-invocation boundary — `builtin_steps.rs` calls it for both
+/// input and output. It performs **no type coercion**, under any host
+/// configuration: a contract that declares `integer` receives an integer, and
+/// `"42"` is a type error (TYPE_MAPPING §17.3). `SchemaValidator::new()` agrees;
+/// its `coerce_types` default is `false` for exactly that reason.
+///
+/// Returns `Ok(())` when the value is valid. On failure the [`ModuleError`]
+/// carries `SCHEMA_VALIDATION_ERROR` when the *value* is at fault, or
+/// `SCHEMA_PARSE_ERROR` when the *schema* could not be compiled; both spell
+/// their failures out in `details.errors`.
 pub fn validate_against_schema(
     value: &Value,
     schema: &Value,
@@ -252,17 +279,35 @@ pub fn validate_against_schema(
         return Ok(());
     }
 
-    // Draft 2020-12 is pinned via the same builder `SchemaValidator` uses, not
-    // auto-detected from `$schema` (`jsonschema::validator_for`). Auto-detection
-    // let a module schema declaring draft-07 turn `format` into an assertion, so
-    // the two validators reached opposite verdicts on the same input.
-    let validator = match crate::schema::validator::build_2020_12(schema) {
+    // Compiled through the same builder `SchemaValidator` uses, so the executor
+    // and the validator can never reach opposite verdicts on one input: the
+    // document's own draft is honoured and `format` stays an annotation.
+    let validator = match crate::schema::validator::build_validator(schema) {
         Ok(v) => v,
         Err(e) => {
-            return Err(ModuleError::new(
-                ErrorCode::SchemaValidationError,
-                format!("{direction} schema is invalid: {e}"),
-            ));
+            // The *schema* is broken, not the value. SCHEMA_VALIDATION_ERROR is
+            // flagged caller-fixable (`user_fixable_for_code`), which would send
+            // the caller off to edit arguments that were never at fault, so this
+            // branch reports SCHEMA_PARSE_ERROR — the same code
+            // `SchemaValidator::validate_detailed_raw` uses for a failed compile.
+            let message = format!("{direction} schema is invalid: {e}");
+            let mut entry = HashMap::new();
+            entry.insert("field".to_string(), String::new());
+            entry.insert("message".to_string(), message.clone());
+            let mut details = HashMap::new();
+            details.insert(
+                "errors".to_string(),
+                Value::Array(vec![
+                    // INVARIANT: HashMap<String, String> always serializes to a JSON object.
+                    serde_json::to_value(&entry)
+                        .expect("HashMap<String, String> serialization is infallible"),
+                ]),
+            );
+            return Err(ModuleError::new(ErrorCode::SchemaParseError, message)
+                .with_details(details)
+                .with_ai_guidance(format!(
+                    "The {direction} schema itself could not be compiled. Fix the module's schema declaration; the call arguments are not the cause."
+                )));
         }
     };
 
@@ -641,17 +686,33 @@ impl Executor {
     ///
     /// `APCore::with_options` calls this so the pipeline read path and the
     /// `ToggleFeatureModule` write path share one instance-scoped
-    /// [`ToggleState`](crate::sys_modules::ToggleState). When the executor is
-    /// still running the default `"standard"` strategy, the `module_lookup`
-    /// step is rebuilt to read the new store; for any customized strategy the
-    /// stored handle is updated but the existing steps are left untouched
-    /// (callers that customize the pipeline are expected to wire the toggle
-    /// store themselves via [`build_standard_strategy_with_toggle`]).
+    /// [`ToggleState`](crate::sys_modules::ToggleState).
+    ///
+    /// Every built-in preset (`standard`, `internal`, `testing`,
+    /// `performance`, `minimal`) is derived from `build_standard_strategy()`,
+    /// which binds the *process-global* toggle store, so all five need the
+    /// `module_lookup` step rebound — not just `standard`. Rebinding only the
+    /// `standard` preset meant `apcore.disable(module)` on one instance was
+    /// silently ignored by any executor running another preset (issue #71).
+    /// apcore-python honours the per-instance store in all five presets.
+    ///
+    /// A user-supplied custom strategy is left untouched: those callers are
+    /// expected to wire the store themselves via
+    /// [`build_standard_strategy_with_toggle`](crate::builtin_steps::build_standard_strategy_with_toggle).
     pub fn set_toggle_state(&mut self, toggle_state: Arc<crate::sys_modules::ToggleState>) {
-        if self.strategy.name() == "standard" {
-            self.strategy = crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
-                &toggle_state,
-            ));
+        const BUILTIN_PRESETS: &[&str] =
+            &["standard", "internal", "testing", "performance", "minimal"];
+        if BUILTIN_PRESETS.contains(&self.strategy.name()) {
+            let bound = Arc::clone(&toggle_state);
+            // `replace_with` bypasses the `replaceable` flag (module_lookup is
+            // not user-replaceable) and preserves the step's position.
+            // `minimal` and friends all keep `module_lookup`, but ignore the
+            // error if a preset ever drops it.
+            self.strategy
+                .replace_with("module_lookup", move |_old| {
+                    Box::new(crate::builtin_steps::BuiltinModuleLookup::new(bound))
+                })
+                .ok();
         }
         self.toggle_state = toggle_state;
     }
@@ -944,7 +1005,16 @@ impl Executor {
                     check: check_name.to_string(),
                     passed: false,
                     error: Some(serde_json::json!({
-                        "code": format!("{:?}", underlying.code),
+                        // WIRE code, never `Debug` (errors.rs `wire_str`, sync
+                        // finding A-D-14). apcore-python builds this dict from
+                        // `underlying_e.to_dict()`, whose `code` is the wire
+                        // string (executor.py:604-607 — the
+                        // `type(e).__name__` line above it is only the fallback
+                        // for a non-apcore exception), and apcore-typescript
+                        // emits `{ code: e.code }` (executor.ts:880). `Debug`
+                        // here yielded the PascalCase variant name, which is a
+                        // code no registry contains.
+                        "code": underlying.code.wire_str(),
                         "message": underlying.message,
                     })),
                     warnings: vec![],
@@ -1271,6 +1341,14 @@ impl Executor {
         let event = ApCoreEvent::with_module(
             "apcore.stream.post_validation_failed",
             serde_json::json!({
+                // `error_type`, NOT `code` — deliberately a class name rather
+                // than a wire code, matching apcore-python
+                // (`type(exc).__name__`, executor.py:1168) and
+                // apcore-typescript (`cause.constructor?.name`,
+                // executor.ts:818). Rust has no per-code error class, so the
+                // `ErrorCode` variant name is the closest analogue and `Debug`
+                // is correct here — unlike a `code` field, which MUST use
+                // `wire_str()`.
                 "error_type": format!("{:?}", error.code),
                 "message": error.message.clone(),
                 "trace_id": setup.context.trace_id.clone(),

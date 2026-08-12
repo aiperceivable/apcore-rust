@@ -1155,12 +1155,113 @@ impl Registry {
         }
     }
 
-    /// Human-readable module description.
-    pub fn describe(&self, name: &str) -> String {
-        match self.core.read().modules.get(name) {
-            Some(module) => module.description().to_string(),
-            None => "Module not found".to_string(),
+    /// Human-readable, Markdown-formatted module description for AI/LLM use.
+    ///
+    /// Produces the same document as `apcore-python Registry.describe` and
+    /// `apcore-typescript Registry.describe`, so a polyglot consumer reading a
+    /// module description gets identical structure from every SDK:
+    ///
+    /// ```text
+    /// # {module_id}
+    ///
+    /// {description}
+    ///
+    /// **Tags:** a, b
+    ///
+    /// **Parameters:**
+    /// - `param` (type) (required): description
+    ///
+    /// **Documentation:**
+    /// {documentation}
+    /// ```
+    ///
+    /// # Module-supplied override
+    ///
+    /// The peers check for an optional `describe()` member on the module
+    /// object and return it verbatim when present. Rust has no `hasattr`, and
+    /// [`Module::describe`](crate::module::Module::describe) is a *provided*
+    /// trait method whose default returns the structured
+    /// `{description, input_schema, output_schema, annotations}` object of
+    /// PROTOCOL_SPEC §5.6 — so "did the module override it?" cannot be asked
+    /// directly. The detectable analogue is the return *shape*: a module that
+    /// overrides `describe()` to return a JSON **string** is supplying its own
+    /// human-readable document, and that string is returned unchanged. Any
+    /// other shape (including the default object) falls through to the
+    /// generated envelope below.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::ModuleNotFound`](crate::errors::ErrorCode::ModuleNotFound)
+    /// when `name` is not registered — never a `"Module not found"` sentinel
+    /// string, matching the peers' `ModuleNotFoundError`.
+    pub fn describe(&self, name: &str) -> Result<String, ModuleError> {
+        let override_text = {
+            let core = self.core.read();
+            let module = core.modules.get(name).ok_or_else(|| {
+                ModuleError::new(
+                    crate::errors::ErrorCode::ModuleNotFound,
+                    format!("Module '{name}' not found"),
+                )
+            })?;
+            match module.describe() {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            }
+        };
+        if let Some(text) = override_text {
+            return Ok(text);
         }
+
+        // Auto-generate from the descriptor. A registered module with no
+        // descriptor is not reachable through the normal registration paths,
+        // but mirror the peers' graceful fallback rather than erroring.
+        let Some(descriptor) = self.get_definition(name)? else {
+            return Ok(format!("Module: {name}\n\nNo description available."));
+        };
+
+        let mut lines: Vec<String> = vec![format!("# {}", descriptor.module_id)];
+        if !descriptor.description.is_empty() {
+            lines.push(format!("\n{}", descriptor.description));
+        }
+        if !descriptor.tags.is_empty() {
+            lines.push(format!("\n**Tags:** {}", descriptor.tags.join(", ")));
+        }
+        if let Some(props) = descriptor
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .filter(|p| !p.is_empty())
+        {
+            lines.push("\n**Parameters:**".to_string());
+            let required: Vec<&str> = descriptor
+                .input_schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            for (param, schema) in props {
+                let param_type = schema
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("any");
+                let param_desc = schema
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let req_marker = if required.contains(&param.as_str()) {
+                    " (required)"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "- `{param}` ({param_type}){req_marker}: {param_desc}"
+                ));
+            }
+        }
+        if let Some(documentation) = descriptor.documentation.as_ref().filter(|d| !d.is_empty()) {
+            lines.push(format!("\n**Documentation:**\n{documentation}"));
+        }
+        Ok(lines.join("\n"))
     }
 
     /// Draining-aware unregister.
@@ -1566,6 +1667,23 @@ impl Registry {
                 continue;
             }
 
+            // 1b. Reject the reserved `ephemeral.*` namespace.
+            //
+            // PROTOCOL_SPEC:424 names "Standard Registry.register() only" as
+            // the registration mechanism for `ephemeral.*`. A Discoverer
+            // reaching this sink would bypass `warn_if_missing_approval` and
+            // the namespace's audit-provenance contract entirely. apcore-python
+            // (`registry.py` `_register_discovered`) and apcore-typescript
+            // (`registry.ts`) both reject here.
+            if is_ephemeral_module_id(&dm.name) {
+                tracing::warn!(
+                    module_id = %dm.name,
+                    "Discovered module rejected: the reserved ephemeral.* namespace \
+                     may only be populated via Registry::register()"
+                );
+                continue;
+            }
+
             // 2. Run custom validator (outside any lock).
             let validator_snapshot = self.validator.read().as_ref().map(Arc::clone);
             if let Some(validator) = validator_snapshot {
@@ -1746,28 +1864,24 @@ impl Registry {
             .collect()
     }
 
-    /// Export the combined input/output schema for a module.
+    /// Export a module's schema in the cross-SDK envelope
+    /// `{module_id, description, input_schema, output_schema}`.
     ///
-    /// Returns a cloned schema JSON, or `None` if the module is not registered.
-    pub fn export_schema(&self, name: &str) -> Option<serde_json::Value> {
-        self.core.read().schema_cache.get(name).cloned()
-    }
-
-    /// Export the combined input/output schema with optional strict-mode
-    /// transformation applied.
+    /// This is the canonical form, aligned with
+    /// `apcore-python Registry.export_schema(module_id, strict=False)` and
+    /// `apcore-typescript Registry.exportSchema(moduleId, strict=false)` — a
+    /// polyglot consumer reading `result["input_schema"]` gets the same answer
+    /// from every SDK. (Before 0.27 Rust returned the raw internal
+    /// `{input, output}` cache entry, so that read silently yielded `null`.)
     ///
-    /// When `strict=true`, applies [`to_strict_schema`](crate::schema::to_strict_schema)
-    /// to the descriptor's `input_schema` and `output_schema`, producing a
-    /// schema that disallows `additionalProperties`, marks all properties
-    /// required, and rewrites optional fields as nullable. The returned
-    /// JSON has shape `{module_id, description, input_schema, output_schema}`.
+    /// Rust has no default arguments, so `strict` is an explicit parameter
+    /// rather than a second method. When `strict=true`,
+    /// [`to_strict_schema`](crate::schema::to_strict_schema) is applied to both
+    /// schemas, producing a document that disallows `additionalProperties`,
+    /// marks all properties required, and rewrites optional fields as nullable.
     ///
-    /// When `strict=false`, equivalent to [`export_schema`](Self::export_schema)
-    /// but returned in the structured envelope instead of the raw cached
-    /// schema. Returns `None` if the module is not registered.
-    ///
-    /// Aligned with `apcore-python.Registry.export_schema(module_id, strict=True)`.
-    pub fn export_schema_strict(&self, name: &str, strict: bool) -> Option<serde_json::Value> {
+    /// Returns `None` if the module is not registered.
+    pub fn export_schema(&self, name: &str, strict: bool) -> Option<serde_json::Value> {
         // An empty/unregistered name maps to None for this Option-returning API.
         let descriptor = self.get_definition(name).ok().flatten()?;
         let (input_schema, output_schema) = if strict {

@@ -115,8 +115,18 @@ pub enum ErrorCode {
     /// declaring a custom step without a valid `after`/`before` anchor.
     /// Distinct from [`Self::PipelineDependencyError`] so callers can match
     /// the structural-config case independently of dependency-graph failures.
-    /// Cross-language: Python/TS `CONFIGURATION_ERROR`.
-    ConfigurationError,
+    ///
+    /// Serializes to `PIPELINE_CONFIGURATION_ERROR`, the code registered in
+    /// `features/error-system.md` §"Pipeline & Step Configuration Errors" and
+    /// mandated for Rust by decision D-52. It was previously spelled
+    /// `ConfigurationError`, which serialized to `CONFIGURATION_ERROR` — a
+    /// wire string that appears in no canonical registry and in no other SDK.
+    /// Cross-language: the wire code `PIPELINE_CONFIGURATION_ERROR` in all
+    /// three SDKs. The CLASS names differ — Python `ConfigurationError`
+    /// (pipeline.py), TypeScript `ConfigurationError` (pipeline-config.ts) —
+    /// and that is exactly why the conformance fixture asserts the code and
+    /// not the name.
+    PipelineConfigurationError,
     PipelineHandlerNotSupported,
     PipelineStepInsertionAmbiguous,
     /// Issue #33 (core-executor.md §Pipeline Hardening §1.1): a pipeline step's
@@ -163,6 +173,14 @@ pub enum ErrorCode {
     /// without a digit operand, `"v1.0"` prefix, or a non-semver operand).
     /// Cross-language: Python `VERSION_CONSTRAINT_INVALID`, TypeScript `VERSION_CONSTRAINT_INVALID`.
     VersionConstraintInvalid,
+    /// Issue #35 / decision D-51 (`features/observability.md` §"Optional
+    /// `parent_id` Override on `inject()`"): the `parent_id` passed to
+    /// `TraceContext::inject_checked` does not match `^[0-9a-f]{16}$`.
+    /// Serializes to `INVALID_PARENT_ID`, the exact code required by the
+    /// `trace_context.json` fixture. Cross-language: Python raises `ValueError`
+    /// and TypeScript throws an `Error` carrying `code = "INVALID_PARENT_ID"`
+    /// (`src/trace-context.ts`).
+    InvalidParentId,
     /// Issue #32 (PROTOCOL_SPEC §2.1.1, multi-module-discovery.md): two or more
     /// classes in the same file produce the same `class_segment` after
     /// `snake_case` conversion. The registry rejects the entire file — no
@@ -285,7 +303,7 @@ impl ErrorCode {
         ErrorCode::ErrorFormatterDuplicate,
         ErrorCode::PipelineAbort,
         ErrorCode::PipelineConfigInvalid,
-        ErrorCode::ConfigurationError,
+        ErrorCode::PipelineConfigurationError,
         ErrorCode::PipelineHandlerNotSupported,
         ErrorCode::PipelineStepInsertionAmbiguous,
         ErrorCode::PipelineStepError,
@@ -303,6 +321,7 @@ impl ErrorCode {
         ErrorCode::TaskLimitExceeded,
         ErrorCode::ReaperAlreadyRunning,
         ErrorCode::VersionConstraintInvalid,
+        ErrorCode::InvalidParentId,
         ErrorCode::ModuleIdConflict,
         ErrorCode::InvalidSegment,
         ErrorCode::IdTooLong,
@@ -372,6 +391,9 @@ pub fn user_fixable_for_code(code: ErrorCode) -> Option<bool> {
         | ErrorCode::GeneralInvalidInput
         | ErrorCode::ModuleNotFound
         | ErrorCode::VersionConstraintInvalid
+        // A malformed `parent_id` override is supplied by the caller, so the
+        // caller can fix it by passing a valid 16-hex span id.
+        | ErrorCode::InvalidParentId
         | ErrorCode::BindingSchemaInferenceFailed
         | ErrorCode::BindingSchemaModeConflict
         | ErrorCode::BindingStrictSchemaIncompatible

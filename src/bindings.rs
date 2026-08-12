@@ -18,6 +18,7 @@ use crate::decorator::FunctionModule;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::module::ModuleAnnotations;
 use crate::registry::registry::Registry;
+use crate::schema::openai_strict::assert_openai_strict_compatible;
 
 const CURRENT_SPEC_VERSION: &str = "1.0";
 
@@ -172,6 +173,16 @@ pub struct BindingEntry {
     pub display: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Path of the `*.binding.yaml` / `*.json` file this entry was ingested
+    /// from. Populated by the loader, never part of the wire form.
+    ///
+    /// Threaded into `BINDING_STRICT_SCHEMA_INCOMPATIBLE` and
+    /// `BINDING_SCHEMA_INFERENCE_FAILED` diagnostics so the `{file_path}: `
+    /// message prefix and the `file_path` details key required by
+    /// `DECLARATIVE_CONFIG_SPEC.md` §7.2 carry a real value. apcore-python and
+    /// apcore-typescript both pass the binding file path at the same sites.
+    #[serde(skip)]
+    pub source_file: Option<String>,
 }
 
 fn default_version() -> String {
@@ -270,7 +281,11 @@ impl BindingLoader {
         }
 
         let dir = source_path.parent().unwrap_or_else(|| Path::new("."));
-        for entry in file.bindings {
+        for mut entry in file.bindings {
+            // Record the originating file so downstream diagnostics can emit
+            // the `{file_path}: ` prefix mandated by DECLARATIVE_CONFIG_SPEC
+            // §7.2 (parity with apcore-python / apcore-typescript).
+            entry.source_file = Some(source_path.display().to_string());
             let module_id = entry.module_id.clone();
             let schemas = self.resolve_schemas(&entry, dir, source_path)?;
             self.schemas.insert(module_id.clone(), schemas);
@@ -286,6 +301,7 @@ impl BindingLoader {
     /// recorded but produces an empty/permissive schema until apcore-macros
     /// (F11) wires up `schemars`-derived lookup.
     #[allow(clippy::unused_self)]
+    #[allow(clippy::too_many_lines)] // one linear mode-resolution ladder (§3.4); each arm returns, so splitting would fragment the decision order
     fn resolve_schemas(
         &self,
         entry: &BindingEntry,
@@ -396,10 +412,33 @@ impl BindingLoader {
         }
 
         // Implicit default: auto_schema permissive.
-        // Rust auto-inference requires apcore-macros + schemars (F11). Until
-        // wired, we yield a permissive object schema and rely on the user's
-        // handler to validate inputs.
-        let _resolved_mode = auto_mode.unwrap_or("permissive");
+        //
+        // Rust cannot infer a schema from an opaque `target` string the way
+        // apcore-python (type hints) and apcore-typescript (module exports)
+        // can: the only inference source is a `TypedBindingHandler` supplied at
+        // registration time. So this stage yields the permissive placeholder and
+        // the real decision is deferred to `register_into_with_handlers` /
+        // `register_into_with_typed_handlers`, which reject when the normalized
+        // mode is `strict` and no typed schema is available. Without that
+        // deferral `auto_schema: strict` would pass vacuously against the
+        // permissive pair below.
+        let resolved_mode = auto_mode.unwrap_or("permissive");
+        // DECLARATIVE_CONFIG_SPEC §12 marks Rust's `auto_schema: true` /
+        // `permissive` as NOT IMPLEMENTED (F11). Tightening this fallback into
+        // an error would break every working binding, so the gap stays
+        // permissive — but it MUST NOT be silent. One warning per binding;
+        // bindings that supplied `input_schema`/`output_schema`/`schema_ref`
+        // returned above and never reach here.
+        tracing::warn!(
+            module_id = %entry.module_id,
+            binding_file = %source_path.display(),
+            auto_schema_mode = resolved_mode,
+            "automatic schema inference is not implemented in apcore-rust (F11); \
+             falling back to a permissive {{\"type\": \"object\"}} for this binding. \
+             Inputs and outputs are effectively unvalidated. Specify input_schema \
+             and output_schema (or schema_ref) explicitly, or register the target \
+             with a typed handler. See DECLARATIVE_CONFIG_SPEC.md §6.5 / §12"
+        );
         Ok(ResolvedSchemas {
             input: serde_json::json!({"type": "object"}),
             output: serde_json::json!({"type": "object"}),
@@ -478,6 +517,15 @@ impl BindingLoader {
     ///
     /// Returns the number of modules registered, or an error if any binding
     /// is missing a handler.
+    ///
+    /// # Errors
+    ///
+    /// A binding whose normalized `auto_schema` mode is `strict` is rejected
+    /// with [`ErrorCode::BindingSchemaInferenceFailed`]: this API supplies
+    /// untyped handlers, so no schema can be inferred and the strict promise
+    /// could only be satisfied vacuously against the permissive placeholder.
+    /// Use [`Self::register_into_with_typed_handlers`] with
+    /// [`typed_handler`] for `auto_schema: strict` bindings.
     #[allow(clippy::needless_pass_by_value)]
     pub fn register_into_with_handlers(
         &self,
@@ -486,6 +534,14 @@ impl BindingLoader {
     ) -> Result<usize, ModuleError> {
         let mut count = 0usize;
         for (module_id, entry) in &self.bindings {
+            if normalized_auto_mode(entry) == Some("strict") {
+                return Err(strict_inference_failed(
+                    entry,
+                    module_id,
+                    "this registration path supplies untyped handlers, so no schema can be inferred",
+                ));
+            }
+
             let handler = handlers.get(&entry.target).cloned().ok_or_else(|| {
                 ModuleError::new(
                     ErrorCode::BindingModuleNotFound,
@@ -569,6 +625,9 @@ impl BindingLoader {
             // Determine final schemas: YAML-resolved vs handler-provided.
             let yaml_schemas = self.schemas.get(module_id);
             let has_explicit_yaml = entry.input_schema.is_some() || entry.schema_ref.is_some();
+            // `auto_schema: strict` promises an OpenAI/Anthropic strict-compatible
+            // schema (DECLARATIVE_CONFIG_SPEC.md §6.2 / §6.6).
+            let strict = !has_explicit_yaml && normalized_auto_mode(entry) == Some("strict");
 
             let (input_schema, output_schema) = if has_explicit_yaml {
                 // YAML-specified schemas take precedence.
@@ -580,6 +639,18 @@ impl BindingLoader {
             } else if let (Some(is), Some(os)) = (&typed.input_schema, &typed.output_schema) {
                 // Handler provides auto-derived schemas (schemars).
                 (is.clone(), os.clone())
+            } else if strict {
+                // No schema to check means the strict promise cannot be kept.
+                // Falling back to the permissive `{"type":"object"}` pair here
+                // would make `assert_openai_strict_compatible` succeed
+                // vacuously — the exact defect apcore-python
+                // (`BindingSchemaInferenceFailedError`, bindings.py) and
+                // apcore-typescript (bindings.ts) raise on.
+                return Err(strict_inference_failed(
+                    entry,
+                    module_id,
+                    "the supplied TypedBindingHandler carries no input_schema/output_schema",
+                ));
             } else {
                 // Fallback: permissive.
                 (
@@ -587,6 +658,22 @@ impl BindingLoader {
                     serde_json::json!({"type": "object"}),
                 )
             };
+
+            if strict {
+                let file_path = entry.source_file.as_deref();
+                assert_openai_strict_compatible(
+                    &input_schema,
+                    module_id,
+                    Some("input"),
+                    file_path,
+                )?;
+                assert_openai_strict_compatible(
+                    &output_schema,
+                    module_id,
+                    Some("output"),
+                    file_path,
+                )?;
+            }
 
             let annotations = annotations_from_value(entry.annotations.as_ref());
             let display_meta = display_into_metadata(entry.display.as_ref());
@@ -626,6 +713,56 @@ impl Default for BindingLoader {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Normalized `auto_schema` mode for an entry: `Some("permissive")`,
+/// `Some("strict")`, or `None` (absent, explicitly `false`, or invalid — the
+/// latter two are already rejected by `resolve_schemas` at ingest).
+fn normalized_auto_mode(entry: &BindingEntry) -> Option<&'static str> {
+    match entry.auto_schema.as_ref()?.normalize() {
+        Ok(Some("strict")) => Some("strict"),
+        Ok(Some(_)) => Some("permissive"),
+        _ => None,
+    }
+}
+
+/// Build the `BINDING_SCHEMA_INFERENCE_FAILED` error raised when a binding
+/// declares `auto_schema: strict` but no typed schema is available to check.
+///
+/// Mirrors apcore-python `BindingSchemaInferenceFailedError` and
+/// apcore-typescript `BindingSchemaInferenceFailedError`: message carries the
+/// `{file_path}: ` prefix from DECLARATIVE_CONFIG_SPEC.md §7.2 and the details
+/// map carries `module_id`, `target` and `file_path`.
+fn strict_inference_failed(entry: &BindingEntry, module_id: &str, reason: &str) -> ModuleError {
+    let loc = entry
+        .source_file
+        .as_deref()
+        .map_or_else(String::new, |p| format!("{p}: "));
+    let mut details = HashMap::new();
+    details.insert(
+        "module_id".to_string(),
+        serde_json::Value::String(module_id.to_string()),
+    );
+    details.insert(
+        "target".to_string(),
+        serde_json::Value::String(entry.target.clone()),
+    );
+    if let Some(path) = entry.source_file.as_deref() {
+        details.insert(
+            "file_path".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+    }
+    ModuleError::new(
+        ErrorCode::BindingSchemaInferenceFailed,
+        format!(
+            "{loc}binding '{module_id}' (target '{}') declares auto_schema: strict but no schema could be inferred: {reason}. \
+             Register it via BindingLoader::register_into_with_typed_handlers with a `typed_handler`, or declare input_schema/output_schema explicitly. \
+             See DECLARATIVE_CONFIG_SPEC.md §6.6",
+            entry.target,
+        ),
+    )
+    .with_details(details)
 }
 
 /// Detect which schema-mode fields a binding entry sets.

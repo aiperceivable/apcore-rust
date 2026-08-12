@@ -4,6 +4,7 @@
 pub mod exporter;
 pub mod hardening;
 pub mod loader;
+pub mod openai_strict;
 pub mod ref_resolver;
 pub mod strict;
 pub mod validator;
@@ -11,6 +12,7 @@ pub mod validator;
 pub use exporter::{ExportOptions, ExportProfile, SchemaExporter};
 pub use hardening::{content_hash, format_warnings, FormatWarning};
 pub use loader::{SchemaLoader, SchemaStrategy};
+pub use openai_strict::{assert_openai_strict_compatible, detect_openai_strict_incompatibilities};
 pub use ref_resolver::RefResolver;
 pub use strict::to_strict_schema;
 pub use validator::{DetailedValidationResult, SchemaValidator};

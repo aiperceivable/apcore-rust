@@ -683,6 +683,41 @@ async fn validate_error_no_raise_on_failure() {
         .expect("validate does not error on validation failure");
     assert!(!result.valid);
     assert!(result.checks.iter().any(|c| !c.passed));
+    // The categorized check built from the unwrapped pipeline error MUST name
+    // the WIRE code. Asserting only that SOME check failed leaves the code
+    // unpinned, and the code is what a polyglot caller matches on:
+    // apcore-python builds this dict from the error's `to_dict()` (wire code,
+    // executor.py:604-607) and apcore-typescript emits `{ code: e.code }`
+    // (executor.ts:880). Rust formatted the `ErrorCode` with `Debug` here,
+    // yielding the PascalCase variant name — a code in no registry.
+    let lookup_codes: Vec<String> = result
+        .checks
+        .iter()
+        .filter(|c| c.check == "module_lookup")
+        .map(|c| {
+            assert!(!c.passed, "a missing module cannot pass module_lookup");
+            c.error.as_ref().expect("failing check carries an error")["code"]
+                .as_str()
+                .expect("check error code is a string")
+                .to_string()
+        })
+        .collect();
+    // Two entries, in this order: the trace-derived check keeps its own
+    // `STEP_<NAME>_FAILED` code (apcore-python executor.py:96,
+    // apcore-typescript executor.ts:1045), and the categorized check built
+    // from the unwrapped pipeline error carries the WIRE code.
+    //
+    // DIVERGENCE: apcore-python emits only the SECOND entry — its
+    // `except PipelineStepError` branch leaves `trace` unset "to avoid
+    // _trace_to_checks adding a second, redundant failure entry for the same
+    // step" (executor.py:595-598). Rust extends from the trace first and then
+    // pushes the categorized check, so a polyglot caller counting failed
+    // checks sees two here and one in Python.
+    assert_eq!(
+        lookup_codes,
+        vec!["STEP_MODULE_LOOKUP_FAILED", "MODULE_NOT_FOUND"],
+        "preflight check errors carry the wire code, not the Debug variant name"
+    );
 }
 
 // clause: apcore_client.validate.returns.preflight_result

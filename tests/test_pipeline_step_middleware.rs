@@ -223,6 +223,26 @@ async fn step_middleware_on_step_error_can_recover_with_value() {
     // Recovery from failing step then "after" runs cleanly.
     assert_eq!(output, Some(serde_json::json!("after")));
     assert_eq!(mw.error_count.load(Ordering::SeqCst), 1);
+    // CORRECTED: `after_step` fires after a RECOVERED step body too, so both
+    // steps close their onion — twice, not once. apcore-rust used to jump from
+    // the recovery branch straight to the next step, which leaked whatever the
+    // middleware had acquired in `before_step`
+    // (`features/middleware-system.md` → "Pipeline Step Middleware" →
+    // Normative Rules; fixture `after_step_fires_after_a_recovered_step`).
+    assert_eq!(mw.before_count.load(Ordering::SeqCst), 2);
+    assert_eq!(mw.after_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *mw.log.lock(),
+        vec![
+            "before:bad".to_string(),
+            "error:bad".to_string(),
+            "after:bad".to_string(),
+            "before:after".to_string(),
+            "after:after".to_string(),
+        ],
+        "the recovered step's after_step runs AFTER the handler that recovered \
+         it, before the pipeline advances"
+    );
 }
 
 #[tokio::test]
@@ -242,4 +262,106 @@ async fn step_middleware_multiple_run_in_registration_order() {
 
     assert_eq!(*log1.lock(), vec!["before:only", "after:only"]);
     assert_eq!(*log2.lock(), vec!["before:only", "after:only"]);
+}
+
+/// Middleware for the `before_step` unwind pass: `before_step` fails on one
+/// named step, and `on_step_error` can itself return `Err`.
+///
+/// The canonical fixture (`before_step_failure_recovery_is_discarded`) covers
+/// the unwind pass short-circuiting on `Ok(Some(_))`, but nothing there makes a
+/// hook return `Err`. The rule is that this cleanup pass has NO early exit at
+/// all — first-recovery-wins does not apply, because no recovery is being
+/// sought — so a hook that blows up must not strand the cleanup of the
+/// middlewares registered behind it either.
+struct UnwindMiddleware {
+    label: String,
+    log: Arc<Mutex<Vec<String>>>,
+    before_fails_on: Option<String>,
+    on_error_fails: bool,
+}
+
+#[async_trait]
+impl StepMiddleware for UnwindMiddleware {
+    async fn before_step(
+        &self,
+        step_name: &str,
+        _state: &PipelineState<'_>,
+    ) -> Result<(), ModuleError> {
+        self.log.lock().push(format!("before:{}", self.label));
+        if self.before_fails_on.as_deref() == Some(step_name) {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleExecuteError,
+                format!("{} before_step exploded", self.label),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn on_step_error(
+        &self,
+        _step_name: &str,
+        _state: &PipelineState<'_>,
+        _error: &ModuleError,
+    ) -> Result<Option<Value>, ModuleError> {
+        self.log.lock().push(format!("error:{}", self.label));
+        if self.on_error_fails {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleExecuteError,
+                format!("{} on_step_error exploded", self.label),
+            ));
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn before_step_unwind_notifies_every_entered_middleware_even_if_a_hook_fails() {
+    let log: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut strategy = ExecutionStrategy::new(
+        "test",
+        vec![
+            OkStep::boxed("acl_check", serde_json::json!(1)),
+            OkStep::boxed("execute", serde_json::json!(2)),
+        ],
+    )
+    .unwrap();
+    // mw_c's before_step fails on acl_check; the unwind then runs c, b, a.
+    // mw_b's on_step_error raises — mw_a MUST still be told, or its cleanup is
+    // stranded by a peer it knows nothing about.
+    for (label, before_fails_on, on_error_fails) in [
+        ("mw_a", None, false),
+        ("mw_b", None, true),
+        ("mw_c", Some("acl_check".to_string()), false),
+    ] {
+        strategy.add_step_middleware(Arc::new(UnwindMiddleware {
+            label: label.to_string(),
+            log: Arc::clone(&log),
+            before_fails_on,
+            on_error_fails,
+        }));
+    }
+
+    let mut pctx = ctx();
+    let err = PipelineEngine::run(&strategy, &mut pctx)
+        .await
+        .expect_err("a before_step failure terminates the step");
+
+    assert_eq!(
+        err.code,
+        ErrorCode::MiddlewareChainError,
+        "the chain error MUST surface, and a failing cleanup hook MUST NOT replace it"
+    );
+    assert_eq!(
+        *log.lock(),
+        vec![
+            "before:mw_a".to_string(),
+            "before:mw_b".to_string(),
+            "before:mw_c".to_string(),
+            "error:mw_c".to_string(),
+            "error:mw_b".to_string(),
+            "error:mw_a".to_string(),
+        ],
+        "the unwind pass has NO early exit: neither a recovery value nor a \
+         raising hook may cut it short"
+    );
 }

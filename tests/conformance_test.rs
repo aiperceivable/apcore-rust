@@ -610,20 +610,22 @@ fn conformance_context_identity_types() {
 #[test]
 fn conformance_schema_validation() {
     let fixture = load_fixture("schema_validation");
-    let validator = SchemaValidator::new();
+    // `SchemaValidator::new()` no longer coerces (TYPE_MAPPING §17.3 — the
+    // module-invocation boundary never does, and the two paths must agree), so
+    // this driver names the mode it wants instead of leaning on a default. A
+    // case carrying `expected_valid_strict` / `expected_valid_coerce` documents
+    // BOTH modes and is asserted against both.
+    let validator = SchemaValidator::with_coerce_types(false);
+    let coercing_validator = SchemaValidator::with_coerce_types(true);
 
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
         let schema = &tc["schema"];
         let input = &tc["input"];
 
-        // Determine expected validity
+        // Determine expected validity for the no-coercion validator.
         let expected_valid = if let Some(v) = tc.get("expected_valid") {
             v.as_bool().unwrap()
-        } else if tc.get("expected_valid_coerce").is_some() {
-            // SchemaValidator::new() coerces types by default (A-D-005/006),
-            // matching apcore-python's default (coerce_types=True).
-            tc["expected_valid_coerce"].as_bool().unwrap()
         } else if tc.get("expected_valid_strict").is_some() {
             tc["expected_valid_strict"].as_bool().unwrap()
         } else {
@@ -642,9 +644,19 @@ fn conformance_schema_validation() {
             id, result.valid, expected_valid, result.errors
         );
 
+        // The opt-in coercing mode is a separate library-level contract.
+        if let Some(expected_coerce) = tc.get("expected_valid_coerce").and_then(Value::as_bool) {
+            let coerced_result = coercing_validator.validate(input, schema);
+            assert_eq!(
+                coerced_result.valid, expected_coerce,
+                "FAIL [{}] (coerce_types=true): valid={}, expected={}, errors={:?}",
+                id, coerced_result.valid, expected_coerce, coerced_result.errors
+            );
+        }
+
         // When the fixture pins a coerced value, validate_input must return it.
         if let Some(expected_coerced) = tc.get("expected_coerced_value") {
-            let coerced = validator
+            let coerced = coercing_validator
                 .validate_input(input, schema)
                 .unwrap_or_else(|e| panic!("FAIL [{id}]: coercion errored: {e:?}"));
             if let Some(obj) = coerced.as_object() {
@@ -1809,12 +1821,15 @@ fn conformance_core_schema_structure() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    for key in &["version", "project", "extensions", "schema", "acl"] {
-        assert!(
-            required.contains(key),
-            "apcore-config: missing {key:?} in required; got {required:?}"
-        );
-    }
+    // PROTOCOL_SPEC §9.1: a key is required only when it has no canonical
+    // default. Exactly two qualify — `version` and `project`. `extensions`,
+    // `schema` and `acl` all carry defaults in `defaults.schema.json`, so
+    // requiring them would reject a resolvable configuration.
+    assert_eq!(
+        required,
+        vec!["version", "project"],
+        "apcore-config: required must be exactly [version, project]; got {required:?}"
+    );
 
     // binding
     let s = load_schema("binding");

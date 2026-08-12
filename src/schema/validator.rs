@@ -21,11 +21,11 @@ use crate::schema::hardening::{content_hash, format_warnings, FormatWarning};
 #[derive(Debug)]
 pub struct SchemaValidator {
     cache: Arc<Mutex<HashMap<String, Arc<Validator>>>>,
-    /// When `true` (the default), a coercion pre-pass mirrors pydantic lax mode
-    /// (and apcore-python `model_validate(strict=False)` / apcore-typescript
-    /// `Value.Decode`): string→number/bool, int↔float widening, applied
-    /// recursively per the schema's declared scalar types before validation.
-    /// When `false`, validation is the raw jsonschema check (no coercion).
+    /// When `true`, a coercion pre-pass runs before validation: string→number/bool
+    /// and int↔float widening, applied recursively per the schema's declared
+    /// scalar types. When `false` (**the default**), validation is the raw
+    /// jsonschema check with no coercion — the same thing the module-invocation
+    /// boundary does (`executor::validate_against_schema`).
     coerce_types: bool,
 }
 
@@ -55,18 +55,27 @@ pub struct DetailedValidationResult {
 impl SchemaValidator {
     /// Create a new validator with an empty internal compile cache.
     ///
-    /// Type coercion is **enabled by default** (`coerce_types = true`), matching
-    /// apcore-python (`SchemaValidator(coerce_types=True)`) and apcore-typescript
-    /// (`new SchemaValidator(true)`). Use [`Self::with_coerce_types`] to opt out.
+    /// Type coercion is **disabled by default** (`coerce_types = false`), so this
+    /// validator agrees with the module-invocation boundary
+    /// ([`crate::executor::validate_against_schema`], which `builtin_steps.rs`
+    /// calls): a contract that declares `integer` receives an integer, and
+    /// `"42"` is a type error. Two validation paths in one SDK disagreeing about
+    /// that was the divergence this default closes (TYPE_MAPPING §17.3).
+    ///
+    /// Use [`Self::with_coerce_types`] when a *caller* — not a module contract —
+    /// genuinely wants pydantic-lax-style conversion of its own untyped input.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_coerce_types(true)
+        Self::with_coerce_types(false)
     }
 
     /// Create a new validator with explicit coercion behavior.
     ///
     /// `coerce_types = true` enables the pydantic-lax-style coercion pre-pass;
-    /// `false` performs the raw jsonschema check with no coercion.
+    /// `false` (the [`Self::new`] default) performs the raw jsonschema check with
+    /// no coercion. This is a library-level knob for callers doing their own
+    /// validation — it has no effect on the module-invocation boundary, which
+    /// never coerces regardless of how any host is configured.
     #[must_use]
     pub fn with_coerce_types(coerce_types: bool) -> Self {
         Self {
@@ -223,7 +232,7 @@ impl SchemaValidator {
             return Ok(Arc::clone(v));
         }
 
-        let arc = Arc::new(build_2020_12(schema)?);
+        let arc = Arc::new(build_validator(schema)?);
 
         // Another thread may have populated the entry while we were compiling;
         // both Arcs point to equivalent compiled validators, so overwriting is harmless.
@@ -244,45 +253,66 @@ impl SchemaValidator {
     }
 }
 
-/// Compile `schema` as JSON Schema **Draft 2020-12**, ignoring any `$schema`
-/// declaration the document carries.
+/// Compile `schema` into a [`Validator`], letting the document's own top-level
+/// `$schema` declaration select the draft while `format` stays an annotation.
 ///
-/// Two reasons the draft is pinned rather than auto-detected
-/// (`jsonschema::validator_for`):
+/// Two normalisations happen before the build:
 ///
-/// 1. Under draft-07 and earlier, `format` is an *assertion*, so a module
-///    schema declaring `"$schema": "http://json-schema.org/draft-07/schema#"`
-///    would hard-fail on an unsatisfied `format`. Draft 2020-12 §7.2.1 puts
-///    `format` in the format-annotation vocabulary — it MUST NOT fail
-///    validation. apcore enforces the formats it recognises at SHOULD level
-///    instead (see [`format_warnings`]), matching apcore-python and
+/// 1. **Nested `$schema` declarations are dropped**; the top-level one is kept.
+///    `jsonschema` 0.28 treats a subtree that redeclares `$schema` as an
+///    embedded resource compiled under *its own* meta-schema. Mixing a draft-07
+///    subtree into a 2020-12 root that way produced a subtree validator which
+///    accepted everything — the `$defs` entry was silently unchecked. Removing
+///    the inner declarations keeps one draft authoritative for the whole
+///    document. Only *string* values are stripped, so a schema that describes a
+///    property literally named `$schema` (whose value is a subschema object)
+///    survives untouched.
+/// 2. **`format` assertion is disabled for every draft.** Draft-07 and earlier
+///    make `format` an assertion, so a module schema declaring draft-07 would
+///    hard-fail on an unsatisfied `format` while a 2020-12 sibling would not.
+///    Draft 2020-12 §7.2.1 puts `format` in the format-annotation vocabulary —
+///    it MUST NOT fail validation. apcore enforces the formats it recognises at
+///    SHOULD level instead (see [`format_warnings`]), matching apcore-python and
 ///    apcore-typescript.
-/// 2. The whole SDK must reach one verdict for one input; a per-schema draft
-///    would make behaviour depend on an author's `$schema` line.
 ///
-/// The `$schema` keyword is **removed** (top level only) before compiling.
-/// `jsonschema` 0.28 derives keyword semantics from the declared meta-schema,
-/// so pinning Draft 2020-12 while the document declares an older draft yields a
-/// validator that accepts *everything* — validation silently disabled. Dropping
-/// the declaration keeps the pinned draft authoritative, so real constraints
-/// (`type`, `required`, …) are still enforced. Nested `$schema` keys (embedded
-/// resources inside `$defs`) are left alone; apcore schemas do not use them.
-pub(crate) fn build_2020_12(schema: &Value) -> Result<Validator, String> {
-    let stripped;
-    let effective = match schema.as_object() {
-        Some(obj) if obj.contains_key("$schema") => {
-            let mut owned = obj.clone();
-            owned.remove("$schema");
-            stripped = Value::Object(owned);
-            &stripped
-        }
-        _ => schema,
-    };
-
+/// The draft is deliberately **not** pinned. Pinning 2020-12 rejected legal
+/// draft-07 contracts outright (tuple-form `items`, `"exclusiveMinimum": true`,
+/// …) at compile time; auto-detection keeps each draft's structural keywords
+/// meaningful while normalisation 2 removes the only cross-draft divergence
+/// apcore cares about.
+pub(crate) fn build_validator(schema: &Value) -> Result<Validator, String> {
+    let normalised = strip_nested_schema(schema, true);
     jsonschema::options()
-        .with_draft(jsonschema::Draft::Draft202012)
-        .build(effective)
+        .should_validate_formats(false)
+        .build(&normalised)
         .map_err(|e| e.to_string())
+}
+
+/// Deep-copy `value`, removing every nested `"$schema": "<uri>"` entry.
+///
+/// `top` marks the root object, whose declaration is preserved so the document's
+/// own draft is still detected. Non-string `$schema` values are kept: they can
+/// only be a property *named* `$schema`, never a meta-schema declaration.
+fn strip_nested_schema(value: &Value, top: bool) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                if key == "$schema" && !top && child.is_string() {
+                    continue;
+                }
+                out.insert(key.clone(), strip_nested_schema(child, false));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| strip_nested_schema(item, false))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Recursively coerce `value` toward the scalar types declared by `schema`,

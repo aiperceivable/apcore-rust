@@ -4,7 +4,7 @@
 
 # apcore
 
-![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)
+![Rust](https://img.shields.io/badge/rust-1.86+-orange.svg)
 ![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12294/badge)](https://www.bestpractices.dev/projects/12294)
 
@@ -33,9 +33,9 @@ A schema-enforced module standard for the AI-Perceivable era.
 ## Cross-Language Feature Parity
 
 The Rust SDK tracks the apcore protocol spec and ships full feature parity
-with the Python and TypeScript SDKs. The table below highlights the v0.23
-hardening items (#60–#65) plus the long-standing background-task and
-extension surfaces.
+with the Python and TypeScript SDKs. The table below covers the v0.23
+hardening items (#60–#65), the v0.24–v0.26 governance surfaces, and the
+long-standing background-task and extension surfaces.
 
 | Feature | Python | TypeScript | Rust |
 |---------|:------:|:----------:|:----:|
@@ -114,16 +114,16 @@ tests at `tests/test_async_task.rs` and `tests/test_extensions.rs`.
 | `BindingLoader` | Load modules from YAML binding files |
 
 > See [Cross-Language Feature Parity](#cross-language-feature-parity) for the
-> full v0.23 parity matrix across Python, TypeScript, and Rust.
+> full parity matrix across Python, TypeScript, and Rust.
 
 ## Documentation
 
 For full documentation, including Quick Start guides for Python and Rust, visit:
-**[https://aiperceivable.github.io/apcore/getting-started.html](https://aiperceivable.github.io/apcore/getting-started.html)**
+**[https://aiperceivable.github.io/apcore/getting-started/](https://aiperceivable.github.io/apcore/getting-started/)**
 
 ## Requirements
 
-- Rust >= 1.75
+- Rust >= 1.86 (enforced by `rust-version` in `Cargo.toml`)
 - Tokio async runtime
 
 ## Installation
@@ -299,6 +299,57 @@ let acl = ACL::new(vec![
 ], "deny", None);
 ```
 
+### Execution policy (external governance overrides)
+
+`ExecutionPolicy` lets a platform operator override a module's governance
+annotations (`requires_approval`, `destructive`) at execution time, without
+touching the module's source or its registration. It attaches to the
+`Executor` and is consulted by the approval gate (pipeline step 5). Rules use
+the same wildcard matching and specificity scoring as ACL rules; on a
+specificity tie the more restrictive rule wins.
+
+```rust
+use std::sync::Arc;
+
+use apcore::approval::AutoApproveHandler;
+use apcore::config::Config;
+use apcore::executor::Executor;
+use apcore::registry::registry::Registry;
+use apcore::{ExecutionPolicy, PolicyRule};
+
+fn configure(registry: Arc<Registry>) -> Result<Executor, apcore::errors::ModuleError> {
+    let mut executor = Executor::new(registry, Config::from_defaults());
+
+    let policy = ExecutionPolicy::new(vec![
+        // Force approval for every module under `executor.payments.*`,
+        // whatever the module itself declares.
+        PolicyRule::new("executor.payments.*")?
+            .with_requires_approval(true)
+            .with_reason("PCI scope — platform requires human sign-off"),
+        // Exempt a known-safe read path from the broader rule above; the more
+        // specific pattern wins.
+        PolicyRule::new("executor.payments.read_balance")?
+            .with_requires_approval(false)
+            .with_reason("read-only balance lookup"),
+    ])
+    // Also gate anything annotated `destructive: true`, even without a rule.
+    .with_gate_destructive(true)
+    // Fail CLOSED when approval is required but no ApprovalHandler is
+    // configured, instead of warning and proceeding.
+    .with_strict(true);
+
+    executor.set_policy(Some(policy));
+    executor.set_approval_handler(Box::new(AutoApproveHandler));
+    Ok(executor)
+}
+```
+
+A matched rule overrides the module's own annotations — external governance is
+the platform's word against the module author's. Policy decisions are carried
+into `ApprovalRequest` and emitted as `apcore.policy.override` /
+`apcore.approval.decision` events. See `examples/execution_policy.rs` for a
+runnable end-to-end version.
+
 ### Rust-specific quirks: two `RetryConfig` types
 
 The Rust SDK ships two distinct `RetryConfig` structs that cannot share a
@@ -312,9 +363,11 @@ use apcore::RetryConfig as MiddlewareRetryConfig;
 // equivalent to: use apcore::middleware::RetryConfig;
 
 // AsyncTaskManager-level retry (used by background task scheduling).
-// Must be imported via the full path — intentionally NOT re-exported at
-// the crate root (see src/lib.rs).
-use apcore::async_task::RetryConfig as TaskRetryConfig;
+// Re-exported at the crate root under the non-colliding name
+// `AsyncRetryConfig`, mirroring apcore-python and apcore-typescript which
+// both rename-export the same type. The nested path also still works.
+use apcore::AsyncRetryConfig as TaskRetryConfig;
+// equivalent to: use apcore::async_task::RetryConfig;
 ```
 
 ### YAML bindings
@@ -430,6 +483,8 @@ cargo run --example greet
 cargo run --example get_user
 cargo run --example send_email
 cargo run --example cancel_token
+cargo run --example execution_policy   # external governance overrides (#76)
+cargo run --example format_date        # YAML binding loader
 ```
 
 ---

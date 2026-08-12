@@ -98,15 +98,125 @@ fn env_map_claimed() -> &'static RwLock<HashMap<String, String>> {
 /// perspective, satisfying §9.9.5 requirement (3).
 pub const RESERVED_NAMESPACES: &[&str] = &["apcore", "_config"];
 
+/// The canonical `observability` namespace name (`PROTOCOL_SPEC` §9.15.2).
+///
+/// Named rather than spelled inline because issue #33 turned it into a
+/// *coupling*: it is simultaneously a typed [`Config`] field and a
+/// `user_namespaces` key, and the four sites that reconcile the two
+/// ([`Config::deserialize`], [`Config::get`], [`Config::namespace`],
+/// `Serialize`) must agree on the spelling or the subkeys go missing again.
+const OBSERVABILITY_NS: &str = "observability";
+
+/// The canonical `executor` namespace name (`PROTOCOL_SPEC` §9.1).
+///
+/// Same coupling as [`OBSERVABILITY_NS`], reached from the other direction.
+/// `executor` is a typed [`Config`] field, so `Config::deserialize` never
+/// leaves a `user_namespaces` entry for it — but `set("executor.<key>", …)`
+/// and `mount("executor", …)` both create one, because neither routes through
+/// the typed struct for a key `ExecutorConfig` does not model. From that point
+/// the namespace has two stores again, and the four sites that read it
+/// ([`Config::get`], [`Config::namespace`], [`Config::bind`], `Serialize`)
+/// must agree on the spelling or they disagree on the value.
+const EXECUTOR_NS: &str = "executor";
+
+/// A canonical default value. Const-constructible so [`CONFIG_DEFAULTS`] can
+/// stay a plain `const` table rather than a lazily-built map.
+#[derive(Debug, Clone, Copy)]
+enum DefaultValue {
+    Str(&'static str),
+    Bool(bool),
+    Int(i64),
+}
+
+impl DefaultValue {
+    fn to_json(self) -> serde_json::Value {
+        match self {
+            Self::Str(s) => serde_json::Value::String(s.to_string()),
+            Self::Bool(b) => serde_json::Value::Bool(b),
+            Self::Int(i) => serde_json::Value::Number(i.into()),
+        }
+    }
+}
+
 /// Canonical default values for config keys that resolve to a default when
 /// omitted, rather than being hard-required.
 ///
-/// Currently this is just `acl.root` (D-64, Recommendation A): the key defaults
-/// to `"./acl"` so a config that omits it remains VALID and ACL discovery
-/// (`ACL::discover`) anchors at the conventional directory. This mirrors the
-/// deep-merged `_DEFAULTS["acl"]["root"]` in apcore-python and the equivalent
-/// default in apcore-typescript, unifying the cross-SDK contract.
-const CONFIG_DEFAULTS: &[(&str, &str)] = &[("acl.root", "./acl")];
+/// This is a verbatim transcription of `apcore/schemas/defaults.schema.json`
+/// (the cross-SDK single source of truth), plus the two keys apcore-python
+/// carries in `_DEFAULTS` that the schema does not model (`version` and
+/// `project.name`). It mirrors apcore-python's `_DEFAULTS` (config.py) and
+/// apcore-typescript's `DEFAULTS` (config-defaults.ts).
+///
+/// Consulted by [`Config::get`] **after** the typed-field and
+/// `user_namespaces` lookups, so a value present in the loaded YAML always
+/// wins. Before this table existed, a legacy YAML omitting these keys made
+/// `Config::get` return `None` where both peers returned the canonical
+/// default.
+///
+/// `executor.*` and `observability.*` are absent by design: they are typed
+/// struct fields whose `Default` impls already carry the same values, and
+/// `get_typed_field` resolves them first.
+///
+/// NOTE on `sys_modules.enabled`: `defaults.schema.json` and apcore-python
+/// `_DEFAULTS` both declare `false`. The `sys_modules` *namespace*
+/// registration (PROTOCOL_SPEC §9.15.3) declares `enabled: true` — that is the
+/// namespace-bus default surfaced by [`Config::namespace`], a different
+/// lookup. Both peers have the same split; keep it.
+/// Every configuration key `validate_key_constraint` carries a constraint for.
+///
+/// `#[doc(hidden)]`: this exists so `config_key_governance.json` can assert the
+/// constraint table stays inside the key set the canonical schemas declare. It
+/// is not part of the public API. The in-crate test
+/// `constrained_config_keys_matches_the_match_arms` keeps it honest — a key
+/// added to the match without being added here fails there.
+#[doc(hidden)]
+pub const CONSTRAINED_CONFIG_KEYS: &[&str] = &[
+    "acl.default_effect",
+    "observability.tracing.sampling_rate",
+    "sys_modules.events.thresholds.error_rate",
+    "sys_modules.events.thresholds.latency_p99_ms",
+    "extensions.max_depth",
+    "executor.default_timeout",
+    "executor.global_timeout",
+    "executor.max_call_depth",
+    "executor.max_module_repeat",
+    "sys_modules.error_history.max_entries_per_module",
+    "sys_modules.error_history.max_total_entries",
+];
+
+/// Every configuration key the canonical default table declares.
+///
+/// `#[doc(hidden)]`: exposed only so `config_key_governance.json` can compare
+/// this SDK's default table against `schemas/defaults.schema.json`. Use
+/// [`Config::default_for`] to resolve a value.
+#[doc(hidden)]
+#[must_use]
+pub fn config_default_keys() -> Vec<&'static str> {
+    CONFIG_DEFAULTS.iter().map(|(k, _)| *k).collect()
+}
+
+const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
+    // Not modelled in defaults.schema.json; sourced from apcore-python
+    // `_DEFAULTS["version"]` — the frozen baseline spec version that
+    // legacy-mode configs are parsed against, NOT the SDK version.
+    ("version", DefaultValue::Str("0.16.0")),
+    // Not modelled in defaults.schema.json; sourced from apcore-python
+    // `_DEFAULTS["project"]`.
+    ("extensions.root", DefaultValue::Str("./extensions")),
+    ("extensions.auto_discover", DefaultValue::Bool(true)),
+    ("extensions.max_depth", DefaultValue::Int(8)),
+    ("extensions.follow_symlinks", DefaultValue::Bool(false)),
+    ("schema.root", DefaultValue::Str("./schemas")),
+    ("schema.strategy", DefaultValue::Str("yaml_first")),
+    ("schema.max_ref_depth", DefaultValue::Int(32)),
+    // D-64 (Recommendation A): `acl.root` defaults rather than being required,
+    // so a config that omits it stays VALID and `ACL::discover` anchors at the
+    // conventional directory.
+    ("acl.root", DefaultValue::Str("./acl")),
+    ("acl.default_effect", DefaultValue::Str("deny")),
+    ("sys_modules.enabled", DefaultValue::Bool(false)),
+    ("stream.max_merge_depth", DefaultValue::Int(32)),
+];
 
 /// Executor namespace configuration (`PROTOCOL_SPEC` §9.1).
 ///
@@ -157,11 +267,35 @@ pub struct ObservabilityConfig {
 ///
 /// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
 /// fields without breaking downstream struct-literal construction.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
 pub struct TracingConfig {
     pub enabled: bool,
+    /// Trace sampling rate in `[0.0, 1.0]`. Default `1.0`.
+    ///
+    /// Modelled as a real field (rather than being swallowed by the untyped
+    /// `user_namespaces` bag) so the `observability.tracing.sampling_rate`
+    /// constraint in [`Config::validate_key_constraint`] is reachable. While
+    /// `observability` was a typed struct with only `enabled`, an
+    /// out-of-range `sampling_rate: 5.0` was silently dropped at
+    /// deserialization — accepted by Rust where apcore-python and
+    /// apcore-typescript both reject it with `CONFIG_INVALID` — and a
+    /// legitimate `0.1` never survived a `data()` round-trip.
+    pub sampling_rate: f64,
+    /// Trace exporter: `"stdout" | "otlp" | "in_memory"`. Default `"stdout"`
+    /// (PROTOCOL_SPEC §9.15.2).
+    pub exporter: String,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sampling_rate: 1.0,
+            exporter: "stdout".to_string(),
+        }
+    }
 }
 
 /// Metrics sub-config of `ObservabilityConfig` (`PROTOCOL_SPEC` §9.1).
@@ -215,27 +349,156 @@ pub struct MetricsConfig {
 /// This is a documented Rust-specific divergence rather than a behavioral
 /// bug; cross-language conformance fixtures rely on `from_yaml_file` /
 /// `from_defaults` and therefore see consistent behavior.
-#[derive(Debug, Clone, Default, Serialize)]
+/// ## `observability` is stored twice, on purpose (issue #33)
+///
+/// The four leaves modelled by [`ObservabilityConfig`]
+/// (`tracing.enabled`, `tracing.sampling_rate`, `tracing.exporter`,
+/// `metrics.enabled`) live in the typed struct. **The whole raw
+/// `observability` object from the file also lives in `user_namespaces`**, so
+/// the subkeys the typed struct does not model — `redaction.*`, `logging.*`,
+/// `error_history.*`, `platform_notify.*`, `tracing.strategy`,
+/// `tracing.otlp_endpoint`, `metrics.exporter`, all of them declared
+/// configurable by the §9.15.2 namespace registration — survive the load
+/// instead of being discarded by [`Config::deserialize`].
+///
+/// One rule resolves the overlap everywhere: **the typed struct wins for its
+/// four leaves, the `user_namespaces` tree owns everything else.** It is
+/// applied in exactly one place, [`Config::observability_view`], which
+/// [`Config::get`], [`Config::namespace`], [`Config::bind`] and
+/// `Serialize`/[`Config::data`] all read through — so `set()`, an env
+/// override, and the file can never disagree about which value is live.
+///
+/// ## `executor` has the same two stores, reached differently (issue #34)
+///
+/// [`ExecutorConfig`] models *every* key `$defs/ExecutorConfig` in
+/// `schemas/apcore-config.schema.json` declares, and that schema is
+/// `additionalProperties: false`, so — unlike `observability` — **no
+/// spec-declared `executor` subkey is lost at load**. `Config::deserialize`
+/// keeps no raw copy and needs none.
+///
+/// A second store still appears at runtime: `set("executor.<unmodelled>", …)`
+/// falls past `set_typed_field` into `user_namespaces`, and
+/// `mount("executor", …)` writes there directly. Once it exists, every reader
+/// that consulted only one of the two stores was wrong — `Serialize` wrote the
+/// typed struct and then let the flattened bag overwrite it, so a single
+/// `set("executor.vendor_knob", …)` erased all four typed leaves from the §9.1
+/// wire form. [`Config::executor_view`] applies the same rule as
+/// `observability_view` (raw tree as base, typed struct overlaid last) and the
+/// same four readers go through it.
+///
+/// The one deliberate asymmetry: `observability_view` is guarded on the raw
+/// entry in [`Config::get`] so an undeclared block still reports `None`;
+/// `executor_view` is not. `ExecutorConfig` has no optional leaf — every field
+/// always carries a value — so `get("executor.max_call_depth")` already
+/// answers `Some(32)` for a document that declares nothing. A container fetch
+/// answering `None` while its own leaf answers `Some` is the contradiction
+/// this issue is about, one level up.
+#[derive(Debug, Clone, Default)]
 pub struct Config {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modules_path: Option<PathBuf>,
-    #[serde(default)]
     pub executor: ExecutorConfig,
-    #[serde(default)]
     pub observability: ObservabilityConfig,
     /// User-defined and vendor namespaces. Captures any top-level key not
-    /// matching a canonical namespace above. Per spec §9.1, custom namespace
-    /// names should follow `[a-z][a-z0-9-]*`.
-    #[serde(flatten)]
+    /// matching a canonical namespace above, plus the raw `observability`
+    /// object (see the struct-level note). An `executor` entry can appear here
+    /// too, but only via `set`/`mount` — never from the file, whose
+    /// `executor:` block the typed field consumes whole. Per spec §9.1, custom
+    /// namespace names should follow `[a-z][a-z0-9-]*`.
     pub user_namespaces: HashMap<String, serde_json::Value>,
-    #[serde(skip)]
     pub yaml_path: Option<PathBuf>,
-    #[serde(skip)]
     pub mode: ConfigMode,
     /// Atomic-style generation counter to detect concurrent modifications.
     /// Incremented on every mutation (set, mount, reload). Aligned with D-20.
-    #[serde(skip)]
     pub generation: u64,
+    /// Namespaces attached via [`Config::mount`], in mount order, retained so
+    /// [`Config::reload`] can replay them onto the freshly-read file.
+    ///
+    /// PROTOCOL_SPEC §9.11 requires mounts to survive a reload. Without this
+    /// record `mount("my-plugin", …)` followed by `reload()` dropped the
+    /// mounted subtree entirely (`my-plugin.timeout` → `None`), where
+    /// apcore-python and apcore-typescript still resolved it.
+    ///
+    /// Public only because `Config` is constructed with struct-update syntax
+    /// (`..Config::default()`) across the workspace; treat it as internal and
+    /// mutate it through [`Config::mount`].
+    pub mounts: Vec<(String, serde_json::Value)>,
+}
+
+/// Hand-written to keep the `observability` wire object consistent with
+/// [`Config::get`] (issue #33).
+///
+/// `#[derive(Serialize)]` emitted the typed `observability` field and then the
+/// `#[serde(flatten)] user_namespaces` bag into the same map. Once
+/// `user_namespaces` carries an `observability` entry the second write wins,
+/// so the typed leaves vanished from [`Config::data`] entirely: a config with
+/// `tracing.sampling_rate: 0.1` and `logging.enabled: false` serialized as
+/// `observability: {logging: {enabled: false}}` — the sampling rate, and the
+/// canonical defaults for every other typed leaf, silently gone from the §9.1
+/// wire form. Emitting [`Config::observability_view`] once, and skipping the
+/// bag's own `observability` entry, makes `data()` report exactly what `get()`
+/// resolves.
+///
+/// Issue #34: `executor` had the identical clobber, one `set()` away. Nothing
+/// puts an `executor` entry in the bag at load time, so the two writes never
+/// collided for a file-loaded config — but `set("executor.vendor_knob", "x")`
+/// creates one, and from then on `data()["executor"]` was
+/// `{"vendor_knob": "x"}`: `max_call_depth`, `max_module_repeat`,
+/// `default_timeout` and `global_timeout` all gone from the §9.1 wire form,
+/// including values the operator's file had set. Emitting
+/// [`Config::executor_view`] and skipping the bag's `executor` entry fixes it
+/// the same way.
+impl Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut len = 2 + self.user_namespaces.len();
+        if self.modules_path.is_some() {
+            len += 1;
+        }
+        if self.user_namespaces.contains_key(OBSERVABILITY_NS) {
+            len -= 1;
+        }
+        if self.user_namespaces.contains_key(EXECUTOR_NS) {
+            len -= 1;
+        }
+
+        let mut map = serializer.serialize_map(Some(len))?;
+        if let Some(path) = self.modules_path.as_ref() {
+            map.serialize_entry("modules_path", path)?;
+        }
+        map.serialize_entry(EXECUTOR_NS, &self.executor_view())?;
+        map.serialize_entry(OBSERVABILITY_NS, &self.observability_view())?;
+        for (key, value) in &self.user_namespaces {
+            if key == OBSERVABILITY_NS || key == EXECUTOR_NS {
+                continue;
+            }
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+/// Split `key` at a canonical namespace prefix, returning the remainder.
+///
+/// `Some("")` for the bare namespace name (a container fetch), `Some("rest")`
+/// for `<ns>.rest`, `None` when `ns` is merely a string prefix of a different
+/// top-level key (`observability_extra` must not route here).
+fn strip_namespace<'a>(key: &'a str, ns: &str) -> Option<&'a str> {
+    key.strip_prefix(ns)
+        .filter(|rest| rest.is_empty() || rest.starts_with('.'))
+        .map(|rest| rest.trim_start_matches('.'))
+}
+
+/// Walk a dot-path remainder through an already-reconciled namespace view.
+///
+/// An empty remainder yields the whole view, which is what makes a container
+/// fetch (`get("executor")`) return the namespace object rather than `None`.
+fn walk_view(view: serde_json::Value, rest: &str) -> Option<serde_json::Value> {
+    let mut current = view;
+    for part in rest.split('.').filter(|part| !part.is_empty()) {
+        current = current.get(part)?.clone();
+    }
+    Some(current)
 }
 
 /// Legacy v0.17.x root-level field names that are no longer accepted in v0.18.0.
@@ -299,17 +562,50 @@ impl<'de> Deserialize<'de> for Config {
             }
         }
 
+        // Issue #33: `observability` is a TYPED field on `ConfigHelper`, so
+        // serde hands the whole object to `ObservabilityConfig` — which models
+        // only `tracing.{enabled,sampling_rate,exporter}` and `metrics.enabled`
+        // — and drops every other subkey on the floor. `redaction.*`,
+        // `logging.*`, `error_history.*`, `platform_notify.*`,
+        // `tracing.strategy`, `tracing.otlp_endpoint` and `metrics.exporter`
+        // are all declared configurable by the §9.15.2 namespace registration
+        // and were all discarded here, before any accessor could see them:
+        // an operator's `logging.enabled: false` did not merely fail to apply,
+        // `namespace("observability")` confidently reported the registered
+        // default `true` back at them.
+        //
+        // Keeping the raw object in `user_namespaces` as well is what makes
+        // those subkeys resolvable. It does NOT change the four typed leaves:
+        // `get_direct` consults `get_typed_field` first, and every other
+        // observability reader goes through `observability_view`, which
+        // overlays the typed struct last. Read from `core_data` rather than
+        // `raw` so namespace-mode files that nest the block under `apcore:`
+        // are covered too.
+        let raw_observability = core_data
+            .get(OBSERVABILITY_NS)
+            .and_then(serde_json::Value::as_object)
+            .cloned();
+
         let helper: ConfigHelper = serde_json::from_value(serde_json::Value::Object(core_data))
             .map_err(D::Error::custom)?;
+
+        let mut user_namespaces = helper.user_namespaces;
+        if let Some(observability) = raw_observability {
+            user_namespaces.insert(
+                OBSERVABILITY_NS.to_string(),
+                serde_json::Value::Object(observability),
+            );
+        }
 
         Ok(Config {
             modules_path: helper.modules_path,
             executor: helper.executor,
             observability: helper.observability,
-            user_namespaces: helper.user_namespaces,
+            user_namespaces,
             yaml_path: None,
             mode,
             generation: 0,
+            mounts: Vec::new(),
         })
     }
 }
@@ -425,9 +721,7 @@ impl Config {
                 value.as_str() == Some("allow") || value.as_str() == Some("deny"),
                 "must be 'allow' or 'deny'",
             ),
-            "observability.tracing.sampling_rate"
-            | "sys_modules.events.thresholds.error_rate"
-            | "middleware.circuit_breaker.open_threshold" => (
+            "observability.tracing.sampling_rate" | "sys_modules.events.thresholds.error_rate" => (
                 as_number(value).is_some_and(|n| (0.0..=1.0).contains(&n)),
                 "must be a number in [0.0, 1.0]",
             ),
@@ -439,18 +733,14 @@ impl Config {
                 as_int(value).is_some_and(|n| (1..=16).contains(&n)),
                 "must be an integer in [1, 16]",
             ),
-            "executor.default_timeout"
-            | "executor.global_timeout"
-            | "middleware.circuit_breaker.recovery_window_ms" => (
+            "executor.default_timeout" | "executor.global_timeout" => (
                 is_integer(value) && as_int(value).is_some_and(|n| n >= 0),
                 "must be a non-negative integer (milliseconds)",
             ),
             "executor.max_call_depth"
             | "executor.max_module_repeat"
             | "sys_modules.error_history.max_entries_per_module"
-            | "sys_modules.error_history.max_total_entries"
-            | "middleware.circuit_breaker.window_size"
-            | "middleware.circuit_breaker.min_samples" => (
+            | "sys_modules.error_history.max_total_entries" => (
                 is_integer(value) && as_int(value).is_some_and(|n| n >= 1),
                 "must be a positive integer",
             ),
@@ -484,21 +774,28 @@ impl Config {
         // not a standalone config, so a minimal namespace-mode YAML is accepted
         // (apcore-python `_validate_namespace_mode` runs constraints only).
         if self.mode != ConfigMode::Namespace {
-            // D-64 (Recommendation A): `acl.root` is no longer hard-required.
-            // It now carries a default of `"./acl"` (see `CONFIG_DEFAULTS` /
-            // `get()`), unifying Rust with apcore-python and apcore-typescript
-            // which default the key rather than rejecting its omission. A config
-            // omitting `acl.root` is VALID; ACL discovery (`ACL::discover`)
-            // simply finds no file at the default path and attaches nothing.
-            const REQUIRED_FIELDS: &[&str] = &[
-                "version",
-                "project.name",
-                "extensions.root",
-                "schema.root",
-                "acl.default_effect",
-            ];
+            // PROTOCOL_SPEC §9.1: a key is required **only when it has no
+            // canonical default**. Exactly two qualify. Everything else in the
+            // section — `extensions.*`, `schema.*`, `acl.*`, `executor.*`,
+            // `sys_modules.*`, `observability.*`, `stream.*` — carries a
+            // default in `schemas/defaults.schema.json`, so requiring it would
+            // reject a document the framework resolves perfectly well.
+            // `schemas/apcore-config.schema.json` declares exactly these two in
+            // its `required` array.
+            const REQUIRED_FIELDS: &[&str] = &["version", "project.name"];
+            // Deliberately uses `get_declared` rather than `get`: per §9.3
+            // step 1, requiredness is evaluated against the DECLARED document,
+            // before defaults are merged. `get()` falls back to
+            // `CONFIG_DEFAULTS`; routing through it would make the check
+            // vacuous (decision A-D-03, now spec-backed but narrower).
+            //
+            // Cross-language note: apcore-python and apcore-typescript
+            // deep-merge their default table into the parsed document before
+            // this loop runs, so their equivalent check is a no-op. Because
+            // neither declares a default for `version` or `project.name`, all
+            // three SDKs still accept and reject the same documents.
             for field in REQUIRED_FIELDS {
-                if self.get(field).is_none() {
+                if self.get_declared(field).is_none() {
                     errors.push(format!("missing required field '{field}'"));
                 }
             }
@@ -511,17 +808,14 @@ impl Config {
         // required-field concern (handled above) or simply unset.
         self.collect_constraint_errors(&mut errors);
 
-        // --- 3. Cross-field semantic check ---------------------------------
-        // default_timeout == 0 means no timeout, which is allowed.
-        if self.executor.global_timeout > 0
-            && self.executor.default_timeout > 0
-            && self.executor.global_timeout < self.executor.default_timeout
-        {
-            errors.push(format!(
-                "executor.global_timeout ({}) must be >= executor.default_timeout ({})",
-                self.executor.global_timeout, self.executor.default_timeout
-            ));
-        }
+        // NOTE: there is deliberately NO `global_timeout >= default_timeout`
+        // cross-field check. `builtin_steps.rs` clamps the per-module timeout
+        // to the remaining global deadline
+        // (`if timeout_ms == 0 || remaining_ms < timeout_ms { timeout_ms = remaining_ms }`),
+        // so `global_timeout: 10000` with `default_timeout: 30000` is a valid
+        // configuration meaning "no single module over 30s, whole chain under
+        // 10s". Neither apcore-python, apcore-typescript, nor the PROTOCOL_SPEC
+        // §9.3 constraint table rejects it.
 
         // Namespace-mode validation (A12-NS, §9.14). Mirrors apcore-python
         // `_validate_namespace_mode` (config.py:1106) and the TS equivalent
@@ -611,12 +905,10 @@ impl Config {
             }
         }
 
-        // Numbers in [0.0, 1.0]. Includes circuit_breaker.open_threshold, which
-        // is an error RATE (default 0.5), NOT an integer count.
+        // Numbers in [0.0, 1.0].
         for key in [
             "observability.tracing.sampling_rate",
             "sys_modules.events.thresholds.error_rate",
-            "middleware.circuit_breaker.open_threshold",
         ] {
             if let Some(v) = self.get(key) {
                 if as_number(&v).is_none_or(|n| !(0.0..=1.0).contains(&n)) {
@@ -635,11 +927,7 @@ impl Config {
         }
 
         // Non-negative integers (>= 0, milliseconds).
-        for key in [
-            "executor.default_timeout",
-            "executor.global_timeout",
-            "middleware.circuit_breaker.recovery_window_ms",
-        ] {
+        for key in ["executor.default_timeout", "executor.global_timeout"] {
             if let Some(v) = self.get(key) {
                 if as_int(&v).is_none_or(|n| n < 0) {
                     errors.push(format!("{key} must be a non-negative integer (got {v})"));
@@ -653,8 +941,6 @@ impl Config {
             "executor.max_module_repeat",
             "sys_modules.error_history.max_entries_per_module",
             "sys_modules.error_history.max_total_entries",
-            "middleware.circuit_breaker.window_size",
-            "middleware.circuit_breaker.min_samples",
         ] {
             if let Some(v) = self.get(key) {
                 if as_int(&v).is_none_or(|n| n < 1) {
@@ -745,23 +1031,108 @@ impl Config {
             }
         }
 
-        // D-64: fall back to a canonical default for keys that resolve to a
-        // default when omitted (currently `acl.root` -> `"./acl"`). This keeps
-        // a config that omits the key VALID and gives `ACL::discover` a path to
-        // anchor at, matching apcore-python/-typescript which default the key.
+        // Fall back to the canonical default table. apcore-python deep-merges
+        // `_DEFAULTS` into its data tree at load and apcore-typescript merges
+        // `DEFAULTS`, so both return the canonical value for a key a legacy
+        // YAML omits. Consulting the table here gives Rust the same answer
+        // without mutating the loaded tree (so `data()` still round-trips the
+        // file as written).
         Self::default_for(key)
+    }
+
+    /// Like [`Self::get`] but WITHOUT the [`CONFIG_DEFAULTS`] fallback: returns
+    /// `Some` only when the key was actually declared by the loaded config
+    /// (file, env override, `set()`, or a typed struct field).
+    ///
+    /// Used by [`Self::validate`]'s required-field check, which must
+    /// distinguish "declared" from "defaulted".
+    #[must_use]
+    pub fn get_declared(&self, key: &str) -> Option<serde_json::Value> {
+        if let Some(val) = self.get_direct(key) {
+            return Some(val);
+        }
+        if self.mode == ConfigMode::Namespace
+            && key != "apcore"
+            && !key.starts_with("apcore.")
+            && self.user_namespaces.contains_key("apcore")
+        {
+            return self.get_direct(&format!("apcore.{key}"));
+        }
+        None
     }
 
     /// Resolve the canonical default value for a config key, if one exists.
     ///
-    /// Mirrors apcore-python's `Config.get_default`. Returns `None` for keys
-    /// without a defined default.
+    /// Mirrors apcore-python's `Config.get_default` and apcore-typescript's
+    /// `getDefault`. Returns `None` for keys without a defined default.
     #[must_use]
     pub fn default_for(key: &str) -> Option<serde_json::Value> {
         CONFIG_DEFAULTS
             .iter()
             .find(|(k, _)| *k == key)
-            .map(|(_, v)| serde_json::Value::String((*v).to_string()))
+            .map(|(_, v)| v.to_json())
+    }
+
+    /// The single reconciled view of the `observability` namespace: the raw
+    /// object as loaded (file, `set()`, `mount()`, env override), with the
+    /// typed [`ObservabilityConfig`] leaves overlaid last.
+    ///
+    /// Overlay order encodes the precedence rule stated on [`Config`]: the
+    /// typed struct is authoritative for the four leaves it models, the raw
+    /// tree owns every other subkey. Because `set("observability.tracing.
+    /// enabled", …)` routes into the typed struct (`set_typed_field` matches
+    /// first) while the file also left a copy in the raw tree, overlaying the
+    /// typed struct last is what stops a stale file value from resurfacing in
+    /// `data()` / `namespace()` after a runtime `set`.
+    ///
+    /// Overlaying unconditionally is safe when nothing was configured: the
+    /// typed defaults (`enabled: false`, `sampling_rate: 1.0`,
+    /// `exporter: "stdout"`, `metrics.enabled: false`) are the same values the
+    /// §9.15.2 registration declares.
+    fn observability_view(&self) -> serde_json::Value {
+        self.typed_namespace_view(OBSERVABILITY_NS, &self.observability)
+    }
+
+    /// The single reconciled view of the `executor` namespace: the raw object
+    /// if one exists, with the typed [`ExecutorConfig`] overlaid last.
+    ///
+    /// Same precedence rule and same overlay order as
+    /// [`Self::observability_view`], for the same reason — but the two stores
+    /// arise differently. `Config::deserialize` hands the file's whole
+    /// `executor:` block to the typed struct and keeps no raw copy, so for a
+    /// freshly-loaded config the base layer is empty and this is exactly
+    /// `to_value(&self.executor)`. The base layer only ever holds something a
+    /// caller put there at runtime: `set("executor.<key>", …)` for a key
+    /// `set_typed_field` does not match, or `mount("executor", …)`.
+    ///
+    /// That is why the loaded value is never lost by overlaying the typed
+    /// struct last: the typed struct *is* where the file's `executor:` block
+    /// ended up. A `mount` that tries to override `max_call_depth` loses to it,
+    /// which is the documented rule ("the typed struct wins for the leaves it
+    /// models") and matches how a mounted `observability.tracing.enabled`
+    /// behaves.
+    fn executor_view(&self) -> serde_json::Value {
+        self.typed_namespace_view(EXECUTOR_NS, &self.executor)
+    }
+
+    /// Reconcile a namespace that is simultaneously a typed [`Config`] field
+    /// and a possible `user_namespaces` entry: raw tree as the base, typed
+    /// struct deep-merged over it.
+    ///
+    /// Extracted so [`Self::observability_view`] and [`Self::executor_view`]
+    /// cannot drift apart — the precedence rule they encode is the same rule,
+    /// and issues #33 and #34 were both "two stores, readers disagreed".
+    fn typed_namespace_view<T: Serialize>(&self, name: &str, typed: &T) -> serde_json::Value {
+        let mut view = self
+            .user_namespaces
+            .get(name)
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Ok(typed) = serde_json::to_value(typed) {
+            deep_merge_value(&mut view, &typed);
+        }
+        view
     }
 
     /// Direct lookup with no implicit-apcore fallback (the pre-A-D-009 path).
@@ -769,6 +1140,46 @@ impl Config {
         // Check canonical typed fields first.
         if let Some(val) = self.get_typed_field(key) {
             return Some(val);
+        }
+
+        // Issue #33: everything else under `observability` resolves against
+        // the reconciled view, not the raw bag. Leaf keys would resolve the
+        // same either way, but CONTAINER fetches (`observability`,
+        // `observability.tracing`, `observability.metrics`) must not hand back
+        // a subtree whose typed leaves are stale — `get("observability.
+        // tracing")["enabled"]` disagreeing with
+        // `get("observability.tracing.enabled")` is the same wrong-value
+        // failure this issue is about, one level down.
+        if let Some(rest) = strip_namespace(key, OBSERVABILITY_NS) {
+            // Guard on the raw entry, not on the view: without it a config
+            // that never declared an `observability:` block would start
+            // answering `Some` for the namespace key itself, and
+            // `get_declared` — which decides required-field validation on
+            // "did the document declare this" — would lose the distinction.
+            if !self.user_namespaces.contains_key(OBSERVABILITY_NS) {
+                return None;
+            }
+            return walk_view(self.observability_view(), rest);
+        }
+
+        // Issue #34: the same routing for `executor`, whose CONTAINER fetch
+        // resolved to `None` for every file-loaded config — `executor` is a
+        // typed field, so `user_namespaces` held no entry to traverse and the
+        // dot-split fallback below found nothing. A config whose file said
+        // `max_call_depth: 7` answered `Some(7)` for
+        // `get("executor.max_call_depth")` and `None` for `get("executor")`.
+        // apcore-python and apcore-typescript both return the object.
+        //
+        // Deliberately NOT guarded on the raw entry the way `observability` is:
+        // that guard exists to preserve a "declared vs. defaulted" distinction,
+        // and `executor` has none to preserve. Every `ExecutorConfig` leaf is
+        // non-optional, so `get("executor.max_call_depth")` answers `Some(32)`
+        // for a document that declares no `executor:` block at all; the
+        // container has to answer `Some` there too or it contradicts its own
+        // leaf. An unmodelled key still resolves to `None` unless something put
+        // it in the raw tree — `walk_view` fails on the missing member.
+        if let Some(rest) = strip_namespace(key, EXECUTOR_NS) {
+            return walk_view(self.executor_view(), rest);
         }
 
         // Longest-prefix match against the registered namespaces, then fall
@@ -899,9 +1310,29 @@ impl Config {
 
         // Preserve the yaml_path through reload
         let yaml_path = self.yaml_path.take();
+        // PROTOCOL_SPEC §9.11: mounted namespaces survive reload. Carry the
+        // recorded mount payloads across and replay them in mount order on top
+        // of the freshly-read file, so file content still wins for keys the
+        // file declares and mounted-only keys remain resolvable. Matches
+        // apcore-python and apcore-typescript, which re-apply their mount
+        // registry after re-reading.
+        let mounts = std::mem::take(&mut self.mounts);
         reloaded.generation = self.generation + 1;
         *self = reloaded;
         self.yaml_path = yaml_path;
+        for (namespace, data) in &mounts {
+            self.apply_mount(namespace, data);
+        }
+        self.mounts = mounts;
+        // PROTOCOL_SPEC §9.11 step 5: re-validate. `Self::load` above already
+        // validated the freshly-read file, but that ran BEFORE the mount replay
+        // — so without this the post-mount tree is never checked and a mount
+        // carrying an out-of-range value survives a reload silently.
+        //
+        // Rust's loaders validate unconditionally (there is no `validate=false`
+        // opt-out to carry forward, unlike apcore-python and apcore-typescript),
+        // so the second clause of §9.11 step 5 applies: always re-validate.
+        self.validate()?;
         Ok(())
     }
 
@@ -1037,7 +1468,32 @@ impl Config {
         }
 
         // Overlay: loaded YAML + env values for this namespace.
-        if let Some(loaded @ serde_json::Value::Object(_)) = self.user_namespaces.get(name) {
+        //
+        // Issue #33: `observability` overlays the reconciled view instead of
+        // the raw bag. Before the fix this method was the sharpest edge of the
+        // defect — the raw bag held nothing at all for a file-loaded config, so
+        // `namespace("observability")` returned the REGISTERED DEFAULT for a
+        // key the operator had explicitly set: a file saying
+        // `logging.enabled: false` read back `true`. That is worse than a
+        // missing value, because nothing distinguishes it from a real choice.
+        // Going through the view also keeps the four typed leaves in step with
+        // `get()`, which the raw bag alone would not (a `set()` on
+        // `tracing.enabled` lands in the typed struct, not the bag).
+        // Issue #34: `executor` overlays its reconciled view for the same
+        // reason. It is a typed field with no `user_namespaces` entry, so this
+        // method returned an EMPTY map for every file-loaded config — while
+        // `get("executor.max_call_depth")` on the same config returned the
+        // file's value. A caller reading the namespace as a unit (which is what
+        // `namespace()` is for, and what `bind` is built on) saw nothing at all
+        // where apcore-python and apcore-typescript both return the object.
+        // Unlike `observability` there is no registered §9.15 default layer
+        // underneath, so the failure was a missing value rather than a
+        // confidently wrong one — but `{}` still contradicts `get()`.
+        if name == OBSERVABILITY_NS {
+            deep_merge_value(&mut merged, &self.observability_view());
+        } else if name == EXECUTOR_NS {
+            deep_merge_value(&mut merged, &self.executor_view());
+        } else if let Some(loaded @ serde_json::Value::Object(_)) = self.user_namespaces.get(name) {
             deep_merge_value(&mut merged, loaded);
         }
 
@@ -1073,16 +1529,26 @@ impl Config {
                 "mount source must be a JSON object",
             ));
         }
+        self.apply_mount(namespace, &data);
+        // §9.11: mounts survive reload. Record the *resolved* data (not the
+        // `MountSource`) so a replay after `reload()` does not re-read a file
+        // that may have changed or disappeared.
+        self.mounts.push((namespace.to_string(), data));
+        Ok(())
+    }
+
+    /// Deep-merge an already-resolved mount payload into `user_namespaces`.
+    ///
+    /// Sync CB-002: deep-merge so peer keys in nested objects are preserved
+    /// rather than overwritten. Mirrors apcore-python's `_deep_merge_dicts`
+    /// (config.py) and apcore-typescript's `deepMerge`. Without this,
+    /// `mount({db:{host:'a'}})` over `{db:{port:5432}}` would discard `port`.
+    fn apply_mount(&mut self, namespace: &str, data: &serde_json::Value) {
         let entry = self
             .user_namespaces
             .entry(namespace.to_string())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if let (Some(target), Some(source_map)) = (entry.as_object_mut(), data.as_object()) {
-            // Sync CB-002: deep-merge so peer keys in nested objects are
-            // preserved rather than overwritten. Mirrors apcore-python's
-            // `_deep_merge_dicts` (config.py) and apcore-typescript's
-            // `deepMerge`. Without this, `mount({db:{host:'a'}})` over
-            // `{db:{port:5432}}` would discard `port`.
             for (k, v) in source_map {
                 match target.get_mut(k) {
                     Some(existing) => {
@@ -1094,26 +1560,31 @@ impl Config {
                 }
             }
         }
-        Ok(())
     }
 
     pub fn bind<T: DeserializeOwned>(&self, namespace: &str) -> Result<T, ModuleError> {
         // Special-case canonical namespaces so `bind::<ExecutorConfig>("executor")`
         // returns the typed struct directly.
         match namespace {
-            "executor" => {
-                return serde_json::from_value(
-                    serde_json::to_value(&self.executor)
-                        .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))?,
-                )
-                .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
+            // Issue #34: bind the reconciled VIEW rather than the typed struct
+            // alone, so `bind` agrees with `get("executor")` and
+            // `namespace("executor")`. `bind::<ExecutorConfig>` is unchanged
+            // (the struct ignores extra members); a caller binding their own
+            // type over a `mount("executor", …)` payload previously could not
+            // see it.
+            EXECUTOR_NS => {
+                return serde_json::from_value(self.executor_view())
+                    .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
             }
-            "observability" => {
-                return serde_json::from_value(
-                    serde_json::to_value(&self.observability)
-                        .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))?,
-                )
-                .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
+            // Issue #33: bind the reconciled VIEW, not the typed struct alone.
+            // `bind::<ObservabilityConfig>` is unaffected (the struct ignores
+            // the extra members), but a caller binding their own type — the
+            // whole point of `bind` — previously received a payload from which
+            // `redaction`, `logging`, `error_history` and `platform_notify` had
+            // been stripped, and could not tell that from "unconfigured".
+            OBSERVABILITY_NS => {
+                return serde_json::from_value(self.observability_view())
+                    .map_err(|e| ModuleError::config_bind_error(namespace, &e.to_string()))
             }
             _ => {}
         }
@@ -1284,6 +1755,13 @@ impl Config {
             "observability.tracing.enabled" => {
                 Some(serde_json::Value::Bool(self.observability.tracing.enabled))
             }
+            "observability.tracing.sampling_rate" => {
+                serde_json::Number::from_f64(self.observability.tracing.sampling_rate)
+                    .map(serde_json::Value::Number)
+            }
+            "observability.tracing.exporter" => Some(serde_json::Value::String(
+                self.observability.tracing.exporter.clone(),
+            )),
             "observability.metrics.enabled" => {
                 Some(serde_json::Value::Bool(self.observability.metrics.enabled))
             }
@@ -1333,6 +1811,18 @@ impl Config {
             "observability.tracing.enabled" => {
                 if let Some(b) = value.as_bool() {
                     self.observability.tracing.enabled = b;
+                    return true;
+                }
+            }
+            "observability.tracing.sampling_rate" => {
+                if let Some(n) = value.as_f64() {
+                    self.observability.tracing.sampling_rate = n;
+                    return true;
+                }
+            }
+            "observability.tracing.exporter" => {
+                if let Some(s) = value.as_str() {
+                    self.observability.tracing.exporter = s.to_string();
                     return true;
                 }
             }
@@ -1477,28 +1967,46 @@ fn init_builtin_namespaces() {
             NamespaceRegistration {
                 name: "observability".to_string(),
                 env_prefix: Some("APCORE_OBSERVABILITY".to_string()),
+                // Verbatim transcription of PROTOCOL_SPEC §9.15.2. Matches
+                // apcore-python (config.py `register_namespace("observability", …)`)
+                // and apcore-typescript (config.ts `registerNamespace`) key for
+                // key. Rust previously diverged on four points, each of which
+                // changed observable runtime behavior:
+                //   - `metrics.exporter` was "in_memory" (spec/peers: "stdout")
+                //   - `tracing.otlp_endpoint` was a live "http://localhost:4318"
+                //     (spec/peers: null) — a Rust service with tracing enabled
+                //     would attempt OTLP export to localhost where its peers
+                //     would not
+                //   - `logging.enabled`, `logging.redact_sensitive` and
+                //     `platform_notify.enabled` were absent, so consumers read
+                //     None instead of the spec-mandated true/true/false
+                //   - `logging.redact_keys` is not a spec key; the redaction
+                //     key list lives in the observability redaction config,
+                //     not here (see `crate::observability` defaults)
                 defaults: Some(serde_json::json!({
                     "tracing": {
                         "enabled": false,
-                        "sampling_rate": 1.0,
                         "strategy": "full",
+                        "sampling_rate": 1.0,
                         "exporter": "stdout",
-                        "otlp_endpoint": "http://localhost:4318"
+                        "otlp_endpoint": null
                     },
                     "metrics": {
                         "enabled": false,
-                        "exporter": "in_memory"
+                        "exporter": "stdout"
                     },
                     "logging": {
+                        "enabled": true,
                         "level": "info",
                         "format": "json",
-                        "redact_keys": ["password", "secret", "token", "api_key"]
+                        "redact_sensitive": true
                     },
                     "error_history": {
                         "max_entries_per_module": 50,
                         "max_total_entries": 1000
                     },
                     "platform_notify": {
+                        "enabled": false,
                         "error_rate_threshold": 0.1,
                         "latency_p99_threshold_ms": 5000.0
                     }
@@ -1718,12 +2226,22 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    /// `global_timeout` below `default_timeout` is a VALID configuration:
+    /// `builtin_steps.rs` clamps the per-module timeout to the remaining global
+    /// deadline, so it reads as "no single module over 30s, whole chain under
+    /// 10s". Neither peer nor the PROTOCOL_SPEC §9.3 constraint table rejects
+    /// it, so neither does Rust.
     #[test]
-    fn validate_rejects_global_timeout_less_than_default_timeout() {
-        let mut cfg = Config::default();
-        cfg.executor.global_timeout = 1_000; // less than default_timeout (30_000)
-        cfg.executor.default_timeout = 5_000;
-        assert!(cfg.validate().is_err());
+    fn validate_allows_global_timeout_less_than_default_timeout() {
+        let mut json = valid_legacy_config_json();
+        json["executor"]["global_timeout"] = serde_json::json!(10_000);
+        json["executor"]["default_timeout"] = serde_json::json!(30_000);
+        let cfg = config_from_json(&json);
+        assert!(
+            cfg.validate().is_ok(),
+            "the runtime clamp makes this configuration meaningful: {:?}",
+            cfg.validate()
+        );
     }
 
     #[test]
@@ -1731,7 +2249,7 @@ mod tests {
         // Build a complete, valid legacy config, then set global_timeout = 0
         // (0 = no global deadline). This must still pass. Uses a populated
         // config because required-field enforcement (A-D-03) now rejects bare
-        // defaults that lack version/project/extensions/schema/acl.
+        // defaults that lack version/project.
         let mut json = valid_legacy_config_json();
         json["executor"]["global_timeout"] = serde_json::json!(0);
         let cfg = config_from_json(&json);
@@ -1929,19 +2447,41 @@ mod tests {
         );
     }
 
+    /// PROTOCOL_SPEC §9.1: every key that carries a canonical default in
+    /// `defaults.schema.json` is optional. Rust used to hard-require
+    /// `extensions.root`, `schema.root` and `acl.default_effect`, rejecting
+    /// documents that apcore-python and apcore-typescript accept.
+    #[test]
+    fn validate_accepts_legacy_config_missing_defaulted_keys() {
+        let mut json = valid_legacy_config_json();
+        json.as_object_mut().unwrap().remove("extensions");
+        json.as_object_mut().unwrap().remove("schema");
+        json.as_object_mut().unwrap().remove("acl");
+        let cfg = config_from_json(&json);
+        assert!(
+            cfg.validate().is_ok(),
+            "keys with canonical defaults must not be required: {:?}",
+            cfg.validate()
+        );
+        assert_eq!(
+            cfg.get("extensions.root"),
+            Some(serde_json::json!("./extensions"))
+        );
+        assert_eq!(cfg.get("schema.root"), Some(serde_json::json!("./schemas")));
+        assert_eq!(
+            cfg.get("acl.default_effect"),
+            Some(serde_json::json!("deny"))
+        );
+    }
+
     #[test]
     fn validate_rejects_each_missing_required_field() {
-        // version, project.name, extensions.root, schema.root,
-        // acl.default_effect — absence of any one is CONFIG_INVALID.
-        // `acl.root` is intentionally absent here: D-64 made it default-valued,
-        // not hard-required (see `validate_accepts_legacy_config_missing_acl_root_with_default`).
-        let removals: &[(&str, &str)] = &[
-            ("version", ""),
-            ("project", "name"),
-            ("extensions", "root"),
-            ("schema", "root"),
-            ("acl", "default_effect"),
-        ];
+        // PROTOCOL_SPEC §9.1: a key is required only when it has no canonical
+        // default. Exactly two qualify — `version` and `project.name`.
+        // `extensions.root`, `schema.root`, `acl.root` and `acl.default_effect`
+        // all carry defaults in `defaults.schema.json`, so their absence is
+        // VALID (see `validate_accepts_legacy_config_missing_defaulted_keys`).
+        let removals: &[(&str, &str)] = &[("version", ""), ("project", "name")];
         for (top, nested) in removals {
             let mut json = valid_legacy_config_json();
             if nested.is_empty() {
@@ -1993,55 +2533,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_circuit_breaker_open_threshold_above_one() {
-        // A count-like value (5) is out of [0,1] and MUST be rejected — this is
-        // the bug the review caught (was previously accepted as integer >= 1).
-        let mut json = valid_legacy_config_json();
-        json["middleware"]["circuit_breaker"]["open_threshold"] = serde_json::json!(5);
-        let cfg = config_from_json(&json);
-        let result = cfg.validate();
-        assert!(
-            result.is_err(),
-            "open_threshold = 5 must be rejected ([0,1])"
-        );
-        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
-    }
-
-    #[test]
-    fn validate_rejects_circuit_breaker_open_threshold_fractional_above_one() {
-        let mut json = valid_legacy_config_json();
-        json["middleware"]["circuit_breaker"]["open_threshold"] = serde_json::json!(1.5);
-        let cfg = config_from_json(&json);
-        let result = cfg.validate();
-        assert!(
-            result.is_err(),
-            "open_threshold = 1.5 must be rejected ([0,1])"
-        );
-        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
-    }
-
-    #[test]
-    fn validate_rejects_circuit_breaker_window_size_zero() {
-        // window_size is the integer threshold (>= 1).
-        let mut json = valid_legacy_config_json();
-        json["middleware"]["circuit_breaker"]["window_size"] = serde_json::json!(0);
-        let cfg = config_from_json(&json);
-        let result = cfg.validate();
-        assert!(result.is_err(), "window_size = 0 must be rejected (>= 1)");
-        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
-    }
-
-    #[test]
-    fn validate_rejects_circuit_breaker_min_samples_zero() {
-        let mut json = valid_legacy_config_json();
-        json["middleware"]["circuit_breaker"]["min_samples"] = serde_json::json!(0);
-        let cfg = config_from_json(&json);
-        let result = cfg.validate();
-        assert!(result.is_err(), "min_samples = 0 must be rejected (>= 1)");
-        assert_eq!(result.unwrap_err().code, ErrorCode::ConfigInvalid);
-    }
-
-    #[test]
     fn validate_rejects_error_history_max_entries_per_module_zero() {
         let mut json = valid_legacy_config_json();
         json["sys_modules"]["error_history"] = serde_json::json!({ "max_entries_per_module": 0 });
@@ -2076,25 +2567,43 @@ mod tests {
     }
 
     #[test]
-    fn validate_key_constraint_open_threshold_is_rate() {
-        // The update_config path must agree with validate().
-        let ok = Config::validate_key_constraint(
-            "middleware.circuit_breaker.open_threshold",
-            &serde_json::json!(0.5),
-        );
+    fn constrained_config_keys_matches_the_match_arms() {
+        // CONSTRAINED_CONFIG_KEYS is hand-maintained beside a `match` that
+        // cannot be enumerated. This keeps the two honest: every listed key must
+        // actually carry a constraint.
+        for key in super::CONSTRAINED_CONFIG_KEYS {
+            assert!(
+                Config::validate_key_constraint(key, &serde_json::json!(null)).is_some(),
+                "{key} is listed in CONSTRAINED_CONFIG_KEYS but carries no constraint"
+            );
+        }
+        // And a key that carries none must not be listed.
         assert_eq!(
-            ok,
-            Some(Ok(())),
-            "0.5 must be accepted via update_config path"
+            Config::validate_key_constraint("project.name", &serde_json::json!(null)),
+            None
         );
-        let bad = Config::validate_key_constraint(
+        assert!(!super::CONSTRAINED_CONFIG_KEYS.contains(&"project.name"));
+    }
+
+    #[test]
+    fn middleware_circuit_breaker_is_not_a_config_key() {
+        // `apcore-config.schema.json` declares MiddlewareConfig as `{ disabled }`
+        // with additionalProperties:false, so `middleware.circuit_breaker.*` was
+        // rejected by the canonical config schema while all three SDKs validated
+        // it — and no SDK ever read it. The breaker is configured through its
+        // constructor options and the declarative middleware-chain config.
+        for key in [
             "middleware.circuit_breaker.open_threshold",
-            &serde_json::json!(5),
-        );
-        assert!(
-            matches!(bad, Some(Err(_))),
-            "5 must be rejected via update_config path"
-        );
+            "middleware.circuit_breaker.recovery_window_ms",
+            "middleware.circuit_breaker.window_size",
+            "middleware.circuit_breaker.min_samples",
+        ] {
+            assert_eq!(
+                Config::validate_key_constraint(key, &serde_json::json!(-1)),
+                None,
+                "{key} must carry no constraint — it is not a config key"
+            );
+        }
     }
 
     #[test]
@@ -2130,14 +2639,6 @@ mod tests {
         // not an unbounded >= 1 check.
         let mut json = valid_legacy_config_json();
         json["extensions"]["max_depth"] = serde_json::json!(17);
-        let cfg = config_from_json(&json);
-        assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
-    }
-
-    #[test]
-    fn validate_rejects_circuit_breaker_negative_recovery_window() {
-        let mut json = valid_legacy_config_json();
-        json["middleware"]["circuit_breaker"]["recovery_window_ms"] = serde_json::json!(-1);
         let cfg = config_from_json(&json);
         assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::ConfigInvalid);
     }

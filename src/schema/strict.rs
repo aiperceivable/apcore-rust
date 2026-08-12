@@ -104,13 +104,13 @@ fn convert_to_strict(node: &mut Value) {
         return;
     };
 
-    // If this is an object type with properties, enforce strict rules.
-    // `type` may be a string ("object") or an array (["object", "null"]) — the
-    // latter is what `make_nullable` produces for an optional nested object, so
-    // matching only the string form skipped every optional sub-object and left
-    // it without `additionalProperties: false`.
-    let is_object_with_props =
-        declares_object_type(obj.get("type")) && obj.contains_key("properties");
+    // If this is an object schema with properties, enforce strict rules.
+    // `type` may be a string ("object"), an array (["object", "null"] — what
+    // `make_nullable` produces for an optional nested object), or absent
+    // entirely: `properties` alone already implies an object schema, and
+    // requiring a `type` keyword let `{"properties": {…}}` through unhardened.
+    let is_object_with_props = obj.contains_key("properties")
+        && (obj.get("type").is_none() || declares_object_type(obj.get("type")));
 
     if is_object_with_props {
         obj.insert("additionalProperties".to_string(), Value::Bool(false));
@@ -189,18 +189,21 @@ fn make_nullable(prop: &mut Value) {
             _ => {}
         }
     } else {
-        // Pure $ref or composition — wrap in oneOf with null.
+        // Pure $ref or composition — wrap in anyOf with null. `anyOf`, not
+        // `oneOf`: OpenAI structured outputs accepts only `anyOf` as the
+        // nullable-union spelling, and strict mode exists to feed that adapter.
         let original = Value::Object(prop_obj.clone());
         let mut new_map = Map::new();
         new_map.insert(
-            "oneOf".to_string(),
+            "anyOf".to_string(),
             Value::Array(vec![original, serde_json::json!({"type": "null"})]),
         );
         *prop = Value::Object(new_map);
     }
 }
 
-/// Recurse into properties, items, allOf/anyOf/oneOf, and definitions/$defs.
+/// Recurse into properties, items, prefixItems, allOf/anyOf/oneOf, and
+/// definitions/$defs.
 fn recurse_into_nested(obj: &mut Map<String, Value>) {
     // properties
     if let Some(properties) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
@@ -213,6 +216,14 @@ fn recurse_into_nested(obj: &mut Map<String, Value>) {
     if let Some(items) = obj.get_mut("items") {
         if items.is_object() {
             convert_to_strict(items);
+        }
+    }
+
+    // prefixItems — the Draft 2020-12 tuple form. Without this, an object
+    // sitting at a tuple position was never hardened.
+    if let Some(prefix_items) = obj.get_mut("prefixItems").and_then(|v| v.as_array_mut()) {
+        for item in prefix_items.iter_mut() {
+            convert_to_strict(item);
         }
     }
 
@@ -403,12 +414,77 @@ mod tests {
 
         let result = to_strict_schema(&schema);
 
-        // optional_ref had no "type", so it should be wrapped in oneOf with null.
+        // optional_ref had no "type", so it is wrapped in a nullable union.
+        // `anyOf`, not `oneOf`: OpenAI structured outputs — the consumer strict
+        // mode exists for — accepts only `anyOf`.
         let optional = &result["properties"]["optional_ref"];
-        assert!(optional.get("oneOf").is_some());
-        let one_of = optional["oneOf"].as_array().unwrap();
-        assert_eq!(one_of.len(), 2);
-        assert_eq!(one_of[1], json!({"type": "null"}));
+        assert!(optional.get("oneOf").is_none());
+        let any_of = optional["anyOf"].as_array().unwrap();
+        assert_eq!(any_of.len(), 2);
+        assert_eq!(any_of[0], json!({"$ref": "#/$defs/Other"}));
+        assert_eq!(any_of[1], json!({"type": "null"}));
+    }
+
+    #[test]
+    fn test_object_with_properties_but_no_type_keyword_is_hardened() {
+        // `properties` alone already makes this an object schema. Requiring a
+        // `type` keyword let it through with neither `additionalProperties:
+        // false` nor a `required` list — exactly what strict mode must add.
+        let schema = json!({
+            "properties": {
+                "x": {"type": "string"}
+            }
+        });
+
+        let result = to_strict_schema(&schema);
+
+        assert_eq!(result["additionalProperties"], json!(false));
+        assert_eq!(result["required"], json!(["x"]));
+        assert_eq!(result["properties"]["x"]["type"], json!(["string", "null"]));
+    }
+
+    #[test]
+    fn test_nested_object_without_type_keyword_is_hardened() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "inner": {
+                    "properties": {"y": {"type": "integer"}}
+                }
+            },
+            "required": ["inner"]
+        });
+
+        let result = to_strict_schema(&schema);
+
+        let inner = &result["properties"]["inner"];
+        assert_eq!(inner["additionalProperties"], json!(false));
+        assert_eq!(inner["required"], json!(["y"]));
+    }
+
+    #[test]
+    fn test_prefix_items_entries_are_hardened() {
+        // Draft 2020-12 tuple form. Without recursion into `prefixItems`, an
+        // object sitting at a tuple position was returned unhardened.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "pair": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}},
+                        {"type": "string"}
+                    ]
+                }
+            },
+            "required": ["pair"]
+        });
+
+        let result = to_strict_schema(&schema);
+
+        let first = &result["properties"]["pair"]["prefixItems"][0];
+        assert_eq!(first["additionalProperties"], json!(false));
+        assert_eq!(first["required"], json!(["a"]));
     }
 
     #[test]

@@ -128,7 +128,7 @@ fn test_registry_list_returns_vec_of_str() {
 #[test]
 fn test_export_schema_returns_none_for_unregistered_module() {
     let registry = Registry::new();
-    assert!(registry.export_schema("not.registered").is_none());
+    assert!(registry.export_schema("not.registered", false).is_none());
 }
 
 #[test]
@@ -139,14 +139,23 @@ fn test_export_schema_returns_schema_after_registration() {
         .register_internal("math.add", Box::new(StubModule), descriptor)
         .expect("registration should succeed");
 
-    let schema = registry.export_schema("math.add");
+    let schema = registry.export_schema("math.add", false);
     assert!(
         schema.is_some(),
-        "schema should be cached after registration"
+        "schema should be exported after registration"
     );
     let s = schema.unwrap();
-    assert!(s.get("input").is_some(), "schema should have 'input' key");
-    assert!(s.get("output").is_some(), "schema should have 'output' key");
+    // Cross-SDK envelope keys (0.27): `input_schema` / `output_schema`, not
+    // the old raw-cache `input` / `output`.
+    assert_eq!(s.get("module_id"), Some(&serde_json::json!("math.add")));
+    assert!(
+        s.get("input_schema").is_some(),
+        "envelope should have 'input_schema' key"
+    );
+    assert!(
+        s.get("output_schema").is_some(),
+        "envelope should have 'output_schema' key"
+    );
 }
 
 // ---------------------------------------------------------------------------

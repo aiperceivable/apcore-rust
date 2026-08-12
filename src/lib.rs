@@ -159,8 +159,9 @@ pub use registry::{
     ModuleFactory, MultiClassEntry, MAX_MODULE_ID_LEN,
 };
 pub use schema::{
-    to_strict_schema, ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader,
-    SchemaStrategy, SchemaValidator,
+    assert_openai_strict_compatible, detect_openai_strict_incompatibilities, to_strict_schema,
+    ExportProfile, RefResolver, SchemaDefinition, SchemaExporter, SchemaLoader, SchemaStrategy,
+    SchemaValidator,
 };
 pub use sys_modules::control::UpdateConfigModule;
 pub use sys_modules::overrides::{

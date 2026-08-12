@@ -281,20 +281,128 @@ fn format_warnings_descend_into_anyof_branches() {
 
 #[test]
 fn format_warnings_anyof_only_reports_the_branch_the_data_satisfies() {
-    // "alice@example.com" satisfies the email branch; the uri branch describes a
-    // different shape and must not report a format the value never carried.
+    // Branches that differ ONLY by `format`. apcore compiles every schema with
+    // format assertions disabled, so a compiled validator finds both branches
+    // equally satisfied and cannot discriminate — the valid email would be
+    // reported as a malformed uuid. The branch that comes back clean is what
+    // identifies the shape the value was meant for.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "anyOf": [
+                    { "type": "string", "format": "uuid" },
+                    { "type": "string", "format": "email" }
+                ]
+            }
+        }
+    });
+    let warnings = format_warnings(&json!({ "id": "alice@example.com" }), &schema);
+    assert!(
+        warnings.is_empty(),
+        "a valid email must not be reported as a bad uuid: {warnings:?}"
+    );
+
+    // …and the mirror case: a valid uuid must not be reported as a bad email.
+    let warnings = format_warnings(
+        &json!({ "id": "5f0e5b1a-9f5c-4c1e-8a0e-1c2d3e4f5a6b" }),
+        &schema,
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn format_warnings_anyof_reports_every_branch_when_no_branch_fits() {
+    // Guard against over-suppression: when nothing fits, staying silent would
+    // hide a real mismatch, so every surviving branch reports.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "anyOf": [
+                    { "type": "string", "format": "uuid" },
+                    { "type": "string", "format": "email" }
+                ]
+            }
+        }
+    });
+    let warnings = format_warnings(&json!({ "id": "neither-of-them" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![
+            ("/id".to_string(), "uuid".to_string()),
+            ("/id".to_string(), "email".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn format_warnings_nullable_ref_branch_is_not_silenced() {
+    // The canonical "nullable reference" shape. The branch cannot be compiled in
+    // isolation (`#/$defs/Email` is unreachable from the branch alone), and
+    // treating an undecidable branch as unsatisfied silenced this whole family
+    // of schemas — including the branch's own `format`.
     let schema = json!({
         "type": "object",
         "properties": {
             "contact": {
                 "anyOf": [
-                    { "type": "string", "format": "email" },
-                    { "type": "string", "format": "uri", "minLength": 500 }
+                    { "allOf": [{ "$ref": "#/$defs/Email" }], "format": "email" },
+                    { "type": "null" }
                 ]
             }
-        }
+        },
+        "$defs": { "Email": { "type": "string" } }
     });
+
+    let warnings = format_warnings(&json!({ "contact": "not-an-email" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/contact".to_string(), "email".to_string())]
+    );
     assert!(format_warnings(&json!({ "contact": "alice@example.com" }), &schema).is_empty());
+}
+
+#[test]
+fn format_warnings_undecidable_branch_survives_alongside_a_rejected_one() {
+    // Two format-declaring branches: one cannot be compiled, the other compiles
+    // and is structurally rejected. "Cannot decide" must not collapse into
+    // "does not match", or the only branch that could warn disappears.
+    let schema = json!({
+        "anyOf": [
+            { "allOf": [{ "$ref": "#/$defs/Str" }], "format": "email" },
+            { "type": "integer", "format": "int64" }
+        ],
+        "$defs": { "Str": { "type": "string" } }
+    });
+    let warnings = format_warnings(&json!("not-an-email"), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/".to_string(), "email".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_anyof_drops_the_structurally_contradicted_branch() {
+    // A discriminated union: only the `user` branch can describe this value, so
+    // the `session` branch's uuid annotation must not be reported.
+    let schema = json!({
+        "anyOf": [
+            {
+                "type": "object",
+                "properties": { "kind": { "const": "user" }, "v": { "format": "email" } }
+            },
+            {
+                "type": "object",
+                "properties": { "kind": { "const": "session" }, "v": { "format": "uuid" } }
+            }
+        ]
+    });
+    let warnings = format_warnings(&json!({ "kind": "user", "v": "not-an-email" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/v".to_string(), "email".to_string())]
+    );
 }
 
 #[test]
@@ -374,6 +482,98 @@ fn format_warnings_descend_into_additional_properties_subschema() {
 }
 
 #[test]
+fn format_warnings_descend_into_pattern_properties_subschema() {
+    let schema = json!({
+        "type": "object",
+        "patternProperties": { "^ts_": { "type": "string", "format": "date-time" } }
+    });
+    let warnings = format_warnings(&json!({ "ts_created": "yesterday" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/ts_created".to_string(), "date-time".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_pattern_matched_key_is_not_checked_against_additional_properties() {
+    // Draft 2020-12 §10.3.2.3: `additionalProperties` applies only to keys that
+    // neither `properties` nor `patternProperties` matched. Checking `ts_created`
+    // against the `email` subschema too was a spec violation, not a lax reading.
+    let schema = json!({
+        "type": "object",
+        "patternProperties": { "^ts_": { "type": "string", "format": "date-time" } },
+        "additionalProperties": { "type": "string", "format": "email" }
+    });
+    let warnings = format_warnings(&json!({ "ts_created": "2020-01-01T00:00:00Z" }), &schema);
+    assert!(
+        warnings.is_empty(),
+        "a pattern-matched key must not be judged by additionalProperties: {warnings:?}"
+    );
+}
+
+#[test]
+fn format_warnings_additional_properties_still_covers_unmatched_keys() {
+    let schema = json!({
+        "type": "object",
+        "patternProperties": { "^ts_": { "type": "string", "format": "date-time" } },
+        "additionalProperties": { "type": "string", "format": "email" }
+    });
+    let warnings = format_warnings(&json!({ "owner": "not-an-email" }), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/owner".to_string(), "email".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_prefix_items_boundary_hands_the_tail_to_items() {
+    let schema = json!({
+        "type": "array",
+        "prefixItems": [{ "type": "string", "format": "uuid" }],
+        "items": { "type": "string", "format": "email" }
+    });
+    let warnings = format_warnings(&json!(["not-a-uuid", "nope", "also-nope"]), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![
+            ("/0".to_string(), "uuid".to_string()),
+            ("/1".to_string(), "email".to_string()),
+            ("/2".to_string(), "email".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn format_warnings_items_false_contributes_nothing_past_the_prefix() {
+    let schema = json!({
+        "type": "array",
+        "prefixItems": [{ "type": "string", "format": "uuid" }],
+        "items": false
+    });
+    let warnings = format_warnings(&json!(["not-a-uuid", "extra"]), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/0".to_string(), "uuid".to_string())]
+    );
+}
+
+#[test]
+fn format_warnings_prefix_items_longer_than_the_data_is_not_an_error() {
+    let schema = json!({
+        "type": "array",
+        "prefixItems": [
+            { "type": "string", "format": "uuid" },
+            { "type": "string", "format": "date" }
+        ]
+    });
+    let warnings = format_warnings(&json!(["not-a-uuid"]), &schema);
+    assert_eq!(
+        formats_of(&warnings),
+        vec![("/0".to_string(), "uuid".to_string())]
+    );
+}
+
+#[test]
 fn format_warnings_deduplicate_annotations_reached_through_several_branches() {
     let schema = json!({
         "type": "object",
@@ -391,5 +591,58 @@ fn format_warnings_deduplicate_annotations_reached_through_several_branches() {
         warnings.len(),
         1,
         "duplicate annotations must collapse: {warnings:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cost guards. Both bounds are an order of magnitude above the measured runtime
+// of the linear implementation on a debug build (19 ms and 3 ms respectively),
+// so they flag a return to quadratic behaviour without tripping on a slow
+// machine.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn format_warnings_scale_linearly_across_a_large_array() {
+    // De-duplication used `Vec::contains` — an O(n) rescan per warning. One
+    // warning per element makes the pass quadratic.
+    let schema = json!({
+        "type": "array",
+        "items": { "type": "string", "format": "email" }
+    });
+    let data = Value::Array(
+        (0..16_000)
+            .map(|i| Value::String(format!("bad-{i}")))
+            .collect(),
+    );
+
+    let started = std::time::Instant::now();
+    let warnings = format_warnings(&data, &schema);
+    let elapsed = started.elapsed();
+
+    assert_eq!(warnings.len(), 16_000);
+    assert!(
+        elapsed < std::time::Duration::from_millis(400),
+        "de-duplication looks quadratic again: 16k warnings took {elapsed:?}"
+    );
+}
+
+#[test]
+fn format_warnings_scale_across_deeply_nested_unions() {
+    // Every union level used to compile a `jsonschema::Validator` for its whole
+    // inner subtree, and re-derive `declares_format` over it, so the cost grew
+    // super-linearly with nesting depth.
+    let mut schema = json!({ "type": "string", "format": "email" });
+    for _ in 0..120 {
+        schema = json!({ "anyOf": [schema, { "type": "string", "format": "uuid" }] });
+    }
+
+    let started = std::time::Instant::now();
+    let warnings = format_warnings(&json!("not-an-email"), &schema);
+    let elapsed = started.elapsed();
+
+    assert!(!warnings.is_empty());
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "nested unions look super-linear again: depth 120 took {elapsed:?}"
     );
 }

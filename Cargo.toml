@@ -1,7 +1,13 @@
 [package]
 name = "apcore"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
+# Minimum supported Rust version. Verified with `cargo +1.86 check --all-features`.
+# The binding language constraint is `std::task::Waker::noop()` (used by the
+# synchronous ACL condition-evaluation path), stabilized in Rust 1.85; 1.86 is
+# the floor this repo actually verifies against. The README badge and the
+# Requirements section must be kept in step with this value.
+rust-version = "1.86"
 # Disable per-file integration-test binary autodiscovery. Cargo would otherwise
 # compile each tests/*.rs into its own binary (122 of them), each re-doing
 # apcore monomorphization + linking 277 deps (~20s each). Instead a single
@@ -37,6 +43,13 @@ path = "tests/it.rs"
 # Files that register into the process-global Config namespace registry or
 # mutate env vars are kept as SEPARATE binaries so each runs in its own process
 # — one binary would cross-pollute their global state and break `cargo test`.
+# Cargo autodiscovers `examples/*.rs` and `examples/*/main.rs` only, so an
+# example living at `examples/<dir>/<name>.rs` is never compiled and can rot.
+# Declaring it explicitly puts it back under `cargo build --examples`.
+[[example]]
+name = "format_date"
+path = "examples/bindings/format_date.rs"
+
 [[test]]
 name = "config_bus"
 path = "tests/config_bus.rs"

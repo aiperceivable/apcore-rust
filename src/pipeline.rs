@@ -35,19 +35,37 @@ pub type RunUntilPredicate = Box<dyn Fn(&PipelineState) -> bool + Send + Sync>;
 /// step-level middleware (Issue #33 §2.2).
 ///
 /// Hook semantics:
-/// - [`Self::before_step`] runs before every step. Returning `Err` aborts the
-///   pipeline immediately with the returned error wrapped in `PipelineStepError`.
-/// - [`Self::after_step`] runs after a step succeeds. Errors propagate the same
-///   way as `before_step`.
-/// - [`Self::on_step_error`] runs when a step's `execute()` returns `Err` and
-///   the step is **not** marked `ignore_errors`. Returning `Ok(Some(value))`
-///   recovers — `ctx.output` is replaced with `value`, the failure is treated
-///   as a successful continue, and `after_step` is NOT invoked for the recovered
-///   step. Returning `Ok(None)` lets the original error propagate.
+/// - [`Self::before_step`] runs before every step. It is an **observation**
+///   hook: a [`Step`] is `execute(ctx)`, so there is no inputs parameter for a
+///   middleware to replace and the hook has no meaningful return value.
+///   Returning `Err` **terminates the step and is not recoverable**: the step
+///   body never runs, the error surfaces wrapped in
+///   [`ErrorCode::MiddlewareChainError`] (matching the module-level middleware
+///   contract), the middlewares that had already entered `before_step` receive
+///   `on_step_error` for observation and cleanup only — any value they return
+///   is **discarded** — `after_step` is NOT invoked because no body ran, and
+///   the step's `ignore_errors` does NOT apply.
+/// - [`Self::after_step`] runs after a step body completes, whether it
+///   succeeded naturally or was **recovered** by `on_step_error`. A recovered
+///   step produced an output and the pipeline continued, so the onion MUST
+///   close: a middleware that acquired something in `before_step` gets its
+///   `after_step` on both paths, or the recovery path leaks. Errors propagate
+///   wrapped in `PipelineStepError`.
+/// - [`Self::on_step_error`] runs when a step's `execute()` returns `Err`, and
+///   is consulted *before* the step's `ignore_errors` setting is applied.
+///   Returning `Ok(Some(value))` recovers — `ctx.output` is replaced with
+///   `value`, the failure is treated as a successful continue, and
+///   `after_step` still fires for the recovered step. Returning `Ok(None)`
+///   lets the original error propagate, subject to `ignore_errors`.
 ///
-/// Multiple middlewares run in registration order during the before phase and
-/// reverse order during the after phase, mirroring the global middleware
-/// chain semantics.
+/// Invocation order (`features/middleware-system.md` "Pipeline Step Middleware"
+/// → "Normative Rules", fixture `pipeline_step_middleware.json`):
+/// - `before_step` runs in **registration** order.
+/// - `after_step` runs in **reverse** registration order (onion model,
+///   identical to the module-level middleware chain).
+/// - `on_step_error` runs in **reverse** registration order over only the
+///   middlewares whose `before_step` had already executed, and the first
+///   `Ok(Some(_))` short-circuits the remaining handlers (first-recovery-wins).
 #[async_trait]
 pub trait StepMiddleware: Send + Sync {
     /// Called before each step's `execute()` method.
@@ -367,11 +385,23 @@ impl PipelineTrace {
 ///
 /// Mirrors `apcore.pipeline.PipelineState` in Python.
 pub struct PipelineState<'a> {
-    /// Name of the step that just completed.
+    /// The step this view is about: the one that just completed for a
+    /// [`RunUntilPredicate`], the one being observed for a [`StepMiddleware`]
+    /// hook.
     pub step_name: &'a str,
-    /// Output snapshots, keyed by step name. The value is a shallow copy of
-    /// `ctx.output` taken right after the step ran (or `None` if the step did
-    /// not set an output). Snapshots are append-only across the run.
+    /// Output snapshots, keyed by step name — **exactly the steps that
+    /// completed BEFORE [`Self::step_name`]**. The value is a copy of
+    /// `ctx.output` taken after the step ran (or `None` if the step set no
+    /// output). Snapshots are append-only across the run.
+    ///
+    /// `step_name` itself is **never** a key in any of the three
+    /// [`StepMiddleware`] hooks (`features/middleware-system.md` → "Pipeline
+    /// Step Middleware" → "What `state.outputs` contains"): in `before_step` it
+    /// has not run; in `on_step_error` it ran and failed, so there is no
+    /// output; in `after_step` it succeeded and its output is the `result`
+    /// parameter. Implementations MUST NOT insert it before invoking
+    /// `after_step` — the insert being ordered AFTER the hook is what enforces
+    /// this, on the naturally successful path and the recovery path alike.
     pub outputs: &'a HashMap<String, Option<serde_json::Value>>,
     /// The live pipeline context. Held by reference — predicates must not
     /// mutate state through it.
@@ -470,14 +500,15 @@ impl ExecutionStrategy {
         let mut seen = std::collections::HashSet::new();
         for step in &steps {
             if !seen.insert(step.name().to_string()) {
-                return Err(ModuleError::new(
-                    ErrorCode::GeneralInvalidInput,
-                    format!(
-                        "Duplicate step name '{}' in strategy '{}'",
-                        step.name(),
-                        name,
-                    ),
-                ));
+                // Mirrors apcore-python `pipeline.py:218` and
+                // apcore-typescript `pipeline.ts:235`, which both raise
+                // `StepNameDuplicateError` from the constructor's duplicate
+                // detection.
+                return Err(ModuleError::step_name_duplicate(format!(
+                    "Duplicate step name '{}' in strategy '{}'",
+                    step.name(),
+                    name,
+                )));
             }
         }
         let mut strategy = Self {
@@ -597,11 +628,16 @@ impl ExecutionStrategy {
     }
 
     /// Remove a step by name. Fails if the step is not removable.
+    ///
+    /// Errors: [`ErrorCode::StepNotFound`] when the step does not exist,
+    /// [`ErrorCode::StepNotRemovable`] when it exists but is pinned. Mirrors
+    /// apcore-python `StepNotFoundError`/`StepNotRemovableError` and
+    /// apcore-typescript `StepNotFoundError`/`StepNotRemovableError`.
     pub fn remove(&mut self, step_name: &str) -> Result<(), ModuleError> {
         let idx = self.find_step_index(step_name)?;
         if !self.steps[idx].removable() {
             return Err(ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
+                ErrorCode::StepNotRemovable,
                 format!("Step '{step_name}' is not removable"),
             ));
         }
@@ -611,17 +647,50 @@ impl ExecutionStrategy {
     }
 
     /// Replace a step's implementation. Fails if the step is not replaceable.
+    ///
+    /// Errors: [`ErrorCode::StepNotFound`] when the step does not exist,
+    /// [`ErrorCode::StepNotReplaceable`] when it exists but is pinned.
+    ///
+    /// Note the deliberate cross-SDK split on the missing-step code: `replace`
+    /// reports `STEP_NOT_FOUND` while [`configure_step`](Self::configure_step)
+    /// reports `PIPELINE_STEP_NOT_FOUND`. All three SDKs share that split.
     pub fn replace(&mut self, step_name: &str, new_step: Box<dyn Step>) -> Result<(), ModuleError> {
         let idx = self.find_step_index(step_name)?;
         if !self.steps[idx].replaceable() {
             return Err(ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
+                ErrorCode::StepNotReplaceable,
                 format!("Step '{step_name}' is not replaceable"),
             ));
         }
+        self.validate_replacement_name(step_name, new_step.name())?;
         // Step name may differ from original; rebuild the index either way.
         self.steps[idx] = new_step;
         self.rebuild_index();
+        Ok(())
+    }
+
+    /// Reject a replacement whose name collides with a *different* existing
+    /// step.
+    ///
+    /// Without this, the strategy can end up holding two identically-named
+    /// steps while `rebuild_index` keeps only the last: a `skip_to` then
+    /// resolves past the first occurrence and `remove` targets the wrong
+    /// position. apcore-typescript guards the same case in
+    /// `ExecutionStrategy.configureStep` (`pipeline.ts:355`) and raises
+    /// `StepNameDuplicateError` — it is the same duplicate-name condition as
+    /// [`validate_no_duplicate`](Self::validate_no_duplicate), so it carries
+    /// the same [`ErrorCode::StepNameDuplicate`].
+    fn validate_replacement_name(
+        &self,
+        step_name: &str,
+        new_name: &str,
+    ) -> Result<(), ModuleError> {
+        if new_name != step_name && self.name_to_idx.contains_key(new_name) {
+            return Err(ModuleError::step_name_duplicate(format!(
+                "Step name '{new_name}' already exists at a different position in strategy '{}'",
+                self.name
+            )));
+        }
         Ok(())
     }
 
@@ -643,13 +712,16 @@ impl ExecutionStrategy {
             )
         })?;
         // Respect the replaceable flag, matching `replace()` and the
-        // apcore-python / apcore-typescript `configure_step` guards.
+        // apcore-python / apcore-typescript `configure_step` guards, which
+        // raise `StepNotReplaceableError` here (only the missing-step code
+        // differs between `configure_step` and `replace`).
         if !self.steps[idx].replaceable() {
             return Err(ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
+                ErrorCode::StepNotReplaceable,
                 format!("Step '{step_name}' is not replaceable"),
             ));
         }
+        self.validate_replacement_name(step_name, new_step.name())?;
         self.steps[idx] = new_step;
         self.rebuild_index();
         Ok(())
@@ -691,25 +763,33 @@ impl ExecutionStrategy {
 
     // -- helpers --
 
+    /// Locate a step by name.
+    ///
+    /// Raises [`ErrorCode::StepNotFound`] when absent — the code shared by
+    /// `insert_after`/`insert_before` (missing anchor), `remove` and `replace`
+    /// in apcore-python and apcore-typescript. `configure_step` deliberately
+    /// does NOT route through here: it reports `PIPELINE_STEP_NOT_FOUND`.
     fn find_step_index(&self, step_name: &str) -> Result<usize, ModuleError> {
         // O(1) via name_to_idx (§1.5).
         self.name_to_idx.get(step_name).copied().ok_or_else(|| {
             ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
+                ErrorCode::StepNotFound,
                 format!("Step '{}' not found in strategy '{}'", step_name, self.name),
             )
         })
     }
 
+    /// Reject inserting a step whose name is already taken.
+    ///
+    /// Raises [`ErrorCode::StepNameDuplicate`] — the code apcore-python
+    /// (`pipeline.py:259,271`) and apcore-typescript (`pipeline.ts:286,300`)
+    /// raise from `insert_after` / `insert_before`.
     fn validate_no_duplicate(&self, name: &str) -> Result<(), ModuleError> {
         if self.name_to_idx.contains_key(name) {
-            return Err(ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
-                format!(
-                    "Step name '{}' already exists in strategy '{}'",
-                    name, self.name,
-                ),
-            ));
+            return Err(ModuleError::step_name_duplicate(format!(
+                "Step name '{}' already exists in strategy '{}'",
+                name, self.name,
+            )));
         }
         Ok(())
     }
@@ -758,6 +838,37 @@ impl RunOptions {
             until: Some(Box::new(predicate)),
         }
     }
+}
+
+/// Run every `after_step` hook in REVERSE registration order (onion model — the
+/// middleware registered first opens the outermost layer and closes last).
+///
+/// Shared by the two paths that MUST close the onion: a step body that
+/// succeeded naturally, and a step body that failed and was **recovered** by
+/// `on_step_error`. `features/middleware-system.md` ("Pipeline Step
+/// Middleware" → Normative Rules) requires the recovered case too — the step
+/// produced an output and the pipeline continued, so a middleware that
+/// acquired something in `before_step` would otherwise never release it.
+///
+/// The `before_step` unwind path deliberately does NOT call this: no step body
+/// ran there, so there is nothing to close over, and the two paths MUST NOT be
+/// unified (same section, "A `before_step` failure terminates the step").
+async fn run_after_step_hooks(
+    middlewares: &[Arc<dyn StepMiddleware>],
+    step_name: &str,
+    step_outputs: &HashMap<String, Option<serde_json::Value>>,
+    ctx: &PipelineContext,
+    result: &serde_json::Value,
+) -> Result<(), ModuleError> {
+    for mw in middlewares.iter().rev() {
+        let state = PipelineState {
+            step_name,
+            outputs: step_outputs,
+            context: ctx,
+        };
+        mw.after_step(step_name, &state, result).await?;
+    }
+    Ok(())
 }
 
 impl PipelineEngine {
@@ -867,33 +978,92 @@ impl PipelineEngine {
                 continue;
             }
 
-            // (3a) StepMiddleware: before_step hooks run in registration order.
-            //      A failure here aborts the pipeline like any step error.
+            // (3a) StepMiddleware: before_step hooks run in REGISTRATION order
+            //      (middleware-system.md "Normative Rules"). The hook only
+            //      observes — a Step is `execute(ctx)`, so there is no inputs
+            //      parameter it could rewrite and its return value is unused.
             let step_name_for_hooks = step.name().to_string();
             let middlewares = strategy.step_middlewares();
             let mut before_err: Option<ModuleError> = None;
+            // Count of middlewares whose `before_step` actually ran, including
+            // the one that failed. Middlewares past this point never entered
+            // the step and MUST NOT be told it failed.
+            let mut before_executed = 0usize;
             for mw in middlewares {
                 let state = PipelineState {
                     step_name: &step_name_for_hooks,
                     outputs: &step_outputs,
                     context: ctx,
                 };
+                before_executed += 1;
                 if let Err(e) = mw.before_step(&step_name_for_hooks, &state).await {
                     before_err = Some(e);
                     break;
                 }
             }
             if let Some(err) = before_err {
+                // Spec: "Step middleware errors raised from `before_step`
+                // itself (not from the step body) MUST be wrapped in
+                // `MiddlewareChainError`, identical to the module-level
+                // contract." The original error stays recoverable through
+                // `ModuleError::unwrap_middleware_chain_error()`, mirroring
+                // `MiddlewareManager::execute_before`.
+                let mut details = std::collections::HashMap::new();
+                if let Ok(inner_json) = serde_json::to_value(&err) {
+                    details.insert("inner_error".to_string(), inner_json);
+                }
+                details.insert(
+                    "step_name".to_string(),
+                    serde_json::json!(step_name_for_hooks),
+                );
+                let chain_err =
+                    ModuleError::new(ErrorCode::MiddlewareChainError, err.message.clone())
+                        .with_details(details)
+                        .with_cause(format!(
+                    "StepMiddleware before_step failed for step '{step_name_for_hooks}': {err}"
+                ));
+
+                // The step body never ran, so unwind by notifying exactly the
+                // middlewares that did run, in REVERSE order. A recovery value
+                // returned here is ignored: there is no step output to replace
+                // because the step never executed, and the fixture requires the
+                // MiddlewareChainError to surface.
+                //
+                // First-recovery-wins MUST NOT apply to this pass: short-
+                // circuiting exists to stop shopping for a recovery once one is
+                // found, and no recovery is being sought here. The loop
+                // therefore has NO early exit — neither `Ok(Some(_))` (dropped
+                // by the `if let Err` pattern) nor `Err(_)` (logged) may cut it
+                // short, or the cleanup of every middleware registered behind
+                // that one is stranded.
+                for mw in middlewares[..before_executed].iter().rev() {
+                    let state = PipelineState {
+                        step_name: &step_name_for_hooks,
+                        outputs: &step_outputs,
+                        context: ctx,
+                    };
+                    if let Err(hook_err) = mw
+                        .on_step_error(&step_name_for_hooks, &state, &chain_err)
+                        .await
+                    {
+                        tracing::warn!(
+                            step = %step_name_for_hooks,
+                            error = %hook_err,
+                            "StepMiddleware on_step_error failed while unwinding before_step"
+                        );
+                    }
+                }
+
                 ctx.trace.steps.push(StepTrace {
                     name: step_name_for_hooks.clone(),
                     duration_ms: 0.0,
-                    result: StepResult::abort(&err.to_string()),
+                    result: StepResult::abort(&chain_err.to_string()),
                     skipped: false,
                     decision_point: false,
                     skip_reason: None,
                 });
                 ctx.trace.total_duration_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
-                return Err(ModuleError::pipeline_step_error(&step_name_for_hooks, &err));
+                return Err(chain_err);
             }
 
             // (3) Execute with per-step timeout
@@ -924,12 +1094,13 @@ impl PipelineEngine {
             let result = match exec_result {
                 Ok(r) => r,
                 Err(err) => {
-                    // (3b) StepMiddleware: on_step_error hooks may recover by
-                    // returning Some(value). The first middleware to return a
+                    // (3b) StepMiddleware: on_step_error hooks run in REVERSE
+                    // registration order (onion unwinding) and may recover by
+                    // returning Some(value). The FIRST middleware to return a
                     // recovery value wins; remaining middlewares are skipped.
                     let mut recovery: Option<serde_json::Value> = None;
                     let mut hook_err: Option<ModuleError> = None;
-                    for mw in middlewares {
+                    for mw in middlewares.iter().rev() {
                         let state = PipelineState {
                             step_name: &step_name_for_hooks,
                             outputs: &step_outputs,
@@ -962,6 +1133,43 @@ impl PipelineEngine {
                     }
                     if let Some(value) = recovery {
                         ctx.output = Some(value);
+                        // The onion MUST close after a RECOVERED step body as
+                        // well as after a naturally successful one: the step
+                        // produced an output and the pipeline continues, so a
+                        // middleware that acquired something in `before_step`
+                        // gets its `after_step` here or the recovery path
+                        // leaks (`features/middleware-system.md` → "Pipeline
+                        // Step Middleware" → Normative Rules; fixture case
+                        // `after_step_fires_after_a_recovered_step`). Every
+                        // registered middleware ran `before_step` — a step body
+                        // only executes once the whole chain succeeded — so the
+                        // full chain unwinds, in reverse registration order.
+                        let after_result_value =
+                            ctx.output.clone().unwrap_or(serde_json::Value::Null);
+                        if let Err(after_err) = run_after_step_hooks(
+                            middlewares,
+                            &step_name_for_hooks,
+                            &step_outputs,
+                            ctx,
+                            &after_result_value,
+                        )
+                        .await
+                        {
+                            ctx.trace.steps.push(StepTrace {
+                                name: step_name_for_hooks.clone(),
+                                duration_ms,
+                                result: StepResult::abort(&after_err.to_string()),
+                                skipped: false,
+                                decision_point: false,
+                                skip_reason: None,
+                            });
+                            ctx.trace.total_duration_ms =
+                                pipeline_start.elapsed().as_secs_f64() * 1000.0;
+                            return Err(ModuleError::pipeline_step_error(
+                                &step_name_for_hooks,
+                                &after_err,
+                            ));
+                        }
                         ctx.trace.steps.push(StepTrace {
                             name: step_name_for_hooks.clone(),
                             duration_ms,
@@ -974,6 +1182,10 @@ impl PipelineEngine {
                             decision_point: false,
                             skip_reason: Some("error_recovered".to_string()),
                         });
+                        // Below `run_after_step_hooks` for the same reason as
+                        // (6): the recovered step is still the CURRENT step
+                        // while its `after_step` runs, so it MUST NOT yet be a
+                        // key in `state.outputs`.
                         step_outputs.insert(step_name_for_hooks.clone(), ctx.output.clone());
                         idx += 1;
                         continue;
@@ -1019,24 +1231,21 @@ impl PipelineEngine {
                 }
             };
 
-            // (3c) StepMiddleware: after_step hooks run after a successful step.
+            // (3c) StepMiddleware: after_step hooks run after the step body,
+            //      in REVERSE registration order (onion model — a middleware
+            //      registered first opens the outermost layer and closes last).
             //      Snapshot of ctx.output is passed; null when step did not set output.
+            //      The recovered-step path at (3b) closes the onion the same way.
             let after_result_value = ctx.output.clone().unwrap_or(serde_json::Value::Null);
-            let mut after_err: Option<ModuleError> = None;
-            for mw in middlewares {
-                let state = PipelineState {
-                    step_name: &step_name_for_hooks,
-                    outputs: &step_outputs,
-                    context: ctx,
-                };
-                if let Err(e) = mw
-                    .after_step(&step_name_for_hooks, &state, &after_result_value)
-                    .await
-                {
-                    after_err = Some(e);
-                    break;
-                }
-            }
+            let after_err = run_after_step_hooks(
+                middlewares,
+                &step_name_for_hooks,
+                &step_outputs,
+                ctx,
+                &after_result_value,
+            )
+            .await
+            .err();
             if let Some(err) = after_err {
                 ctx.trace.steps.push(StepTrace {
                     name: step_name_for_hooks.clone(),
@@ -1068,6 +1277,13 @@ impl PipelineEngine {
             // cannot alter the historical record. (Python's `dict(ctx.output)`
             // does only a one-level copy; the Rust snapshot is deeper but the
             // intent — a frozen copy — is the same.)
+            //
+            // ORDERING IS NORMATIVE: this MUST stay below (3c). `state.outputs`
+            // holds exactly the steps that completed BEFORE the current one, so
+            // moving the insert above the `after_step` hooks would start
+            // showing them the current step — the drift apcore-python was
+            // corrected for. Fixture case
+            // `state_outputs_excludes_the_current_step_in_every_hook`.
             let step_name_owned = step.name().to_string();
             step_outputs.insert(step_name_owned.clone(), ctx.output.clone());
 

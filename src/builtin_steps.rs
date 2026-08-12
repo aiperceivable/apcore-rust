@@ -221,6 +221,23 @@ impl Step for BuiltinContextCreation {
                 }
             }
         }
+
+        // Derive the child context for THIS call. `Context::child` appends
+        // `module_id` to `call_chain` and promotes the previous tail to
+        // `caller_id`.
+        //
+        // This MUST live in `context_creation`, which is non-removable, not in
+        // `call_chain_guard`, which `build_testing_strategy` and
+        // `build_minimal_strategy` remove. With the derivation in the guard,
+        // those two presets never grew `call_chain`, so depth limits,
+        // circular-call detection and frequency throttling all reset and a
+        // nested call reported the wrong `caller_id`. apcore-python
+        // (`builtin_steps.py` context_creation) and apcore-typescript
+        // (`builtin-steps.ts` contextCreation) both derive it here;
+        // docs/spec/design-execution-pipeline.md §4.0 lists `context_creation`
+        // among the mandatory non-removable steps for exactly this reason.
+        ctx.context = ctx.context.child(&ctx.module_id);
+
         Ok(StepResult::continue_step())
     }
 }
@@ -247,14 +264,13 @@ impl Step for BuiltinCallChainGuard {
         if let Some(token) = ctx.context.cancel_token.as_ref() {
             token.check_for(&ctx.module_id)?;
         }
-        // Create the child context FIRST so call_chain already includes
-        // module_id at the end, then guard. This matches the cross-language
-        // canonical contract (apcore-python `Context.child()` populates the
-        // chain before `guard_call_chain`, and apcore-typescript does the
-        // same): the guard counts the full chain — including the trailing
-        // self-entry — for frequency, and strips it for circular detection
-        // (sync findings A-D-039 / A-D-040).
-        ctx.context = ctx.context.child(&ctx.module_id);
+        // The child context was already derived by the non-removable
+        // `context_creation` step, so `call_chain` here already ends with
+        // `module_id`. The guard counts the full chain — including the
+        // trailing self-entry — for frequency, and strips it for circular
+        // detection (sync findings A-D-039 / A-D-040). Deriving it here
+        // instead would tie chain growth to a removable step; see the note in
+        // `BuiltinContextCreation::execute`.
         crate::utils::guard_call_chain_with_repeat(
             &ctx.context,
             &ctx.module_id,

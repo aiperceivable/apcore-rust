@@ -688,18 +688,18 @@ impl APCore {
 
     /// Describe a module by ID.
     ///
-    /// Returns the module's description on success. Per the spec contract,
+    /// Delegates to [`Registry::describe`](crate::registry::registry::Registry::describe),
+    /// which builds the cross-SDK Markdown envelope. Per the spec contract,
     /// `describe` MUST raise `ModuleNotFoundError` for a missing module rather
     /// than returning a sentinel string — matching apcore-python /
-    /// apcore-typescript (which raise `ModuleNotFoundError`).
+    /// apcore-typescript, whose `APCore.describe` is the same thin delegation.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::ModuleNotFound`](crate::errors::ErrorCode::ModuleNotFound)
+    /// when `module_id` is not registered.
     pub fn describe(&self, module_id: &str) -> Result<String, ModuleError> {
-        match self.registry.get(module_id) {
-            Ok(Some(module)) => Ok(module.description().to_string()),
-            Ok(None) | Err(_) => Err(ModuleError::new(
-                crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{module_id}' not found"),
-            )),
-        }
+        self.registry.describe(module_id)
     }
 
     /// Add a before callback middleware. Returns `&Self` for chaining.

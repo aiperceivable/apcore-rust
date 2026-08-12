@@ -502,8 +502,8 @@ fn configure_step_error_pipeline_step_not_found() {
 // clause: core_executor.configure_step.error.StepNotReplaceableError
 // Cross-language contract: configure_step() must reject replacing a step that
 // is marked non-replaceable, matching apcore-python and apcore-typescript
-// (both raise StepNotReplaceableError). Rust returns GENERAL_INVALID_INPUT
-// with a "not replaceable" message and leaves the fixed step untouched.
+// (both raise StepNotReplaceableError). Rust now emits STEP_NOT_REPLACEABLE
+// too and leaves the fixed step untouched.
 #[test]
 fn configure_step_error_step_not_replaceable() {
     let mut strat =
@@ -511,7 +511,8 @@ fn configure_step_error_step_not_replaceable() {
     let err = strat
         .configure_step("fixed", NoopStep::new("fixed"))
         .expect_err("configure_step must reject a non-replaceable step");
-    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+    assert_eq!(err.code, ErrorCode::StepNotReplaceable);
+    assert_eq!(code_str(&err), "STEP_NOT_REPLACEABLE");
     // The original fixed step is preserved (rejection, not silent replacement).
     assert_eq!(strat.step_names(), vec!["fixed".to_string()]);
 }

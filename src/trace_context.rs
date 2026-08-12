@@ -368,12 +368,15 @@ impl TraceContext {
     ///
     /// Identical to [`inject_with_options`] except a `Some(parent_id)` that
     /// does not match `^[0-9a-f]{16}$` is rejected with
-    /// [`ErrorCode::GeneralInvalidInput`] instead of being silently replaced
+    /// [`ErrorCode::InvalidParentId`] instead of being silently replaced
     /// with a fresh random parent_id.
     ///
     /// Cross-language: matches `TraceContext.inject(parent_id=...)` in
     /// `apcore-python` (raises `ValueError`) and `TraceContext.inject` in
-    /// `apcore-typescript` (throws `Error`).
+    /// `apcore-typescript` (throws an `Error` with `code = "INVALID_PARENT_ID"`).
+    /// The wire code `INVALID_PARENT_ID` is required by decision D-51 and the
+    /// `trace_context.json` fixture; this previously returned
+    /// `GENERAL_INVALID_INPUT`, which no other SDK emits here.
     ///
     /// [`inject_with_options`]: TraceContext::inject_with_options
     pub fn inject_checked<T: serde::Serialize>(
@@ -385,7 +388,7 @@ impl TraceContext {
         if let Some(p) = parent_id {
             if !PARENT_ID_RE.is_match(p) {
                 return Err(ModuleError::new(
-                    ErrorCode::GeneralInvalidInput,
+                    ErrorCode::InvalidParentId,
                     format!("parent_id must be 16 lowercase hex chars, got {p:?}"),
                 ));
             }

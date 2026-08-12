@@ -218,6 +218,12 @@ pub async fn evaluate_conditions_async<S: ::std::hash::BuildHasher>(
                 h.clone()
             } else {
                 tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                // A typo'd condition key must leave a forensic record, not just
+                // an identical DENY. apcore-typescript sets `handlerError` on
+                // this branch too; Rust previously left it null so the audit
+                // entry could not distinguish "rule did not match" from
+                // "rule referenced a condition nobody registered".
+                report_handler_error(format!("{key}: unknown ACL condition"));
                 return false;
             };
             to_evaluate.push((key.clone(), handler, value.clone()));
@@ -343,14 +349,50 @@ impl ACLConditionHandler for MaxCallDepthHandler {
 // Compound handlers
 // ---------------------------------------------------------------------------
 
+/// Which registry a compound operator resolves its sub-conditions from.
+///
+/// PROTOCOL_SPEC §6.1: sub-conditions MUST be evaluated in the same mode as the
+/// enclosing call. A single instance cannot know how it was invoked (the trait
+/// has one `async fn evaluate`), so two instances are registered per operator:
+/// the `Sync` one into [`CONDITION_HANDLERS`] (reached by `ACL::check`) and the
+/// `Async` one into [`ASYNC_CONDITION_HANDLERS`] (reached by
+/// `ACL::async_check` / [`evaluate_conditions_async`], which consults the async
+/// registry first).
+///
+/// Before this split, both operators were registered only in the sync registry
+/// yet delegated to [`evaluate_conditions_async`], so a *sync* `ACL::check` on
+/// `{$or: [{k: v}]}` resolved `k` from the ASYNC registry — where apcore-python
+/// and apcore-typescript resolve it from the sync registry only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompoundMode {
+    Sync,
+    Async,
+}
+
+/// Evaluate a sub-condition set in the mode of the enclosing call.
+async fn evaluate_sub_conditions(
+    mode: CompoundMode,
+    map: &HashMap<String, Value>,
+    ctx: &Context<Value>,
+) -> bool {
+    match mode {
+        CompoundMode::Sync => crate::acl::ACL::evaluate_conditions(map, ctx),
+        CompoundMode::Async => evaluate_conditions_async(map, ctx).await,
+    }
+}
+
+fn sub_condition_map(obj: &serde_json::Map<String, Value>) -> HashMap<String, Value> {
+    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 /// $or: list of condition dicts. Returns true if ANY sub-set passes.
-/// Delegates to `evaluate_conditions_async` so async handlers in sub-conditions
-/// are fully awaited (fixes the prior sync-path footgun).
-pub(crate) struct OrHandler;
+pub(crate) struct OrHandler {
+    mode: CompoundMode,
+}
 
 impl OrHandler {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(mode: CompoundMode) -> Self {
+        Self { mode }
     }
 }
 
@@ -362,9 +404,7 @@ impl ACLConditionHandler for OrHandler {
         };
         for sub in arr {
             if let Some(obj) = sub.as_object() {
-                let map: HashMap<String, Value> =
-                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                if evaluate_conditions_async(&map, ctx).await {
+                if evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx).await {
                     return true;
                 }
             }
@@ -374,12 +414,13 @@ impl ACLConditionHandler for OrHandler {
 }
 
 /// $not: single condition dict. Returns true if the sub-set FAILS.
-/// Delegates to `evaluate_conditions_async` for the same reason as `OrHandler`.
-pub(crate) struct NotHandler;
+pub(crate) struct NotHandler {
+    mode: CompoundMode,
+}
 
 impl NotHandler {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(mode: CompoundMode) -> Self {
+        Self { mode }
     }
 }
 
@@ -387,11 +428,7 @@ impl NotHandler {
 impl ACLConditionHandler for NotHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
         match value.as_object() {
-            Some(obj) => {
-                let map: HashMap<String, Value> =
-                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                !evaluate_conditions_async(&map, ctx).await
-            }
+            Some(obj) => !evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx).await,
             None => false,
         }
     }
@@ -402,8 +439,11 @@ pub fn register_builtin_handlers() {
     register_condition("identity_types", Arc::new(IdentityTypesHandler));
     register_condition("roles", Arc::new(RolesHandler));
     register_condition("max_call_depth", Arc::new(MaxCallDepthHandler));
-    register_condition("$or", Arc::new(OrHandler::new()));
-    register_condition("$not", Arc::new(NotHandler::new()));
+    // Mode-matched pairs — see `CompoundMode`.
+    register_condition("$or", Arc::new(OrHandler::new(CompoundMode::Sync)));
+    register_condition("$not", Arc::new(NotHandler::new(CompoundMode::Sync)));
+    register_async_condition("$or", Arc::new(OrHandler::new(CompoundMode::Async)));
+    register_async_condition("$not", Arc::new(NotHandler::new(CompoundMode::Async)));
 }
 
 #[cfg(test)]
@@ -589,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn or_handler_true_if_any_sub_passes() {
         setup_compound_test_handlers();
-        let handler = OrHandler::new();
+        let handler = OrHandler::new(CompoundMode::Async);
         let ctx = anon_ctx();
         let value = serde_json::json!([
             {"pass": false},
@@ -601,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn or_handler_false_if_none_pass() {
         setup_compound_test_handlers();
-        let handler = OrHandler::new();
+        let handler = OrHandler::new(CompoundMode::Async);
         let ctx = anon_ctx();
         let value = serde_json::json!([
             {"pass": false},
@@ -612,7 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn or_handler_rejects_non_array_value() {
-        let handler = OrHandler::new();
+        let handler = OrHandler::new(CompoundMode::Async);
         let ctx = anon_ctx();
         let value = serde_json::json!({"pass": true}); // not an array
         assert!(!handler.evaluate(&value, &ctx).await);
@@ -625,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn not_handler_inverts_passing_condition() {
         setup_compound_test_handlers();
-        let handler = NotHandler::new();
+        let handler = NotHandler::new(CompoundMode::Async);
         let ctx = anon_ctx();
         let value = serde_json::json!({"pass": true});
         assert!(!handler.evaluate(&value, &ctx).await);
@@ -634,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn not_handler_inverts_failing_condition() {
         setup_compound_test_handlers();
-        let handler = NotHandler::new();
+        let handler = NotHandler::new(CompoundMode::Async);
         let ctx = anon_ctx();
         let value = serde_json::json!({"pass": false});
         assert!(handler.evaluate(&value, &ctx).await);
@@ -642,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn not_handler_rejects_non_object_value() {
-        let handler = NotHandler::new();
+        let handler = NotHandler::new(CompoundMode::Async);
         let ctx = anon_ctx();
         let value = serde_json::json!([{"pass": true}]); // not an object
         assert!(!handler.evaluate(&value, &ctx).await);

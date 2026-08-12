@@ -818,12 +818,20 @@ fn register_sys_modules_side_effect_disabled_returns_empty() {
 #[test]
 fn register_sys_modules_defaults_disabled_when_key_absent() {
     let registry = make_registry();
-    // Config::default() does not set sys_modules.enabled in its data tree, so
-    // `config.get("sys_modules.enabled")` returns None and the fallback applies.
+    // Config::default() does not declare sys_modules.enabled in its data tree.
+    // Since the CONFIG_DEFAULTS table landed (sync C4), `get()` resolves it to
+    // the canonical default `false` from `apcore/schemas/defaults.schema.json`
+    // instead of returning None — same outcome, now sourced from the shared
+    // cross-SDK default rather than a local fallback.
     let config = Config::default();
     assert!(
-        config.get("sys_modules.enabled").is_none(),
-        "precondition: key must be absent for this test"
+        config.get_declared("sys_modules.enabled").is_none(),
+        "precondition: key must not be declared for this test"
+    );
+    assert_eq!(
+        config.get("sys_modules.enabled"),
+        Some(json!(false)),
+        "canonical default for an undeclared sys_modules.enabled is false"
     );
     let executor = Executor::new(Arc::clone(&registry), Config::default());
     let ctx =

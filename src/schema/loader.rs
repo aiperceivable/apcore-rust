@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::errors::{ErrorCode, ModuleError};
+use crate::schema::ref_resolver::{RefResolver, DEFAULT_MAX_REF_DEPTH};
 use crate::schema::SchemaDefinition;
 
 /// Strategy for loading schemas when both YAML and native definitions exist.
@@ -29,6 +30,9 @@ pub struct SchemaLoader {
     pub strategy: SchemaStrategy,
     /// Optional base directory used by the spec-compatible `load()` method.
     schemas_dir: Option<PathBuf>,
+    /// `schema.max_ref_depth` — the `$ref` recursion cap handed to the
+    /// [`RefResolver`] built by [`Self::resolve`].
+    max_ref_depth: usize,
 }
 
 impl SchemaLoader {
@@ -39,6 +43,7 @@ impl SchemaLoader {
             schemas: HashMap::new(),
             strategy: SchemaStrategy::YamlFirst,
             schemas_dir: None,
+            max_ref_depth: DEFAULT_MAX_REF_DEPTH,
         }
     }
 
@@ -46,26 +51,76 @@ impl SchemaLoader {
     #[must_use]
     pub fn with_strategy(strategy: SchemaStrategy) -> Self {
         Self {
-            schemas: HashMap::new(),
             strategy,
-            schemas_dir: None,
+            ..Self::new()
         }
     }
 
     /// Spec-compatible constructor: create a loader from a `Config` and optional schemas directory.
     ///
     /// `schemas_dir` overrides the directory used by [`Self::load`] to resolve schema files.
-    /// When `schemas_dir` is `None` the loader falls back to `config.modules_path` and
-    /// finally to the current working directory.
+    /// When `schemas_dir` is `None` the loader falls back to `config.schema.root`, then
+    /// `config.modules_path`, and finally to the current working directory.
     pub fn with_config(config: &Config, schemas_dir: Option<&Path>) -> Self {
         let resolved_dir = schemas_dir
             .map(std::path::Path::to_path_buf)
+            .or_else(|| {
+                config
+                    .get("schema.root")
+                    .and_then(|v| v.as_str().map(PathBuf::from))
+            })
             .or_else(|| config.modules_path.clone());
+        let max_ref_depth = config
+            .get("schema.max_ref_depth")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(DEFAULT_MAX_REF_DEPTH);
         Self {
             schemas: HashMap::new(),
             strategy: SchemaStrategy::YamlFirst,
             schemas_dir: resolved_dir,
+            max_ref_depth,
         }
+    }
+
+    /// The `$ref` recursion cap this loader hands to [`RefResolver`].
+    #[must_use]
+    pub fn max_ref_depth(&self) -> usize {
+        self.max_ref_depth
+    }
+
+    /// Resolve every `$ref` in `schema`, anchored at this loader's schemas
+    /// directory and (optionally) the file `schema` was read from.
+    ///
+    /// Until this existed, nothing on the Rust load path ever invoked
+    /// [`RefResolver`]: `schema.max_ref_depth` was silently inert and
+    /// `SCHEMA_CIRCULAR_REF` / `SCHEMA_MAX_DEPTH_EXCEEDED` could not be raised
+    /// at load time. apcore-python (`loader.py`) and apcore-typescript
+    /// (`loader.ts`) both wire the resolver into their loaders.
+    ///
+    /// # Errors
+    ///
+    /// `SCHEMA_CIRCULAR_REF` for a `$ref` → `$ref` chain,
+    /// `SCHEMA_MAX_DEPTH_EXCEEDED` when the chain exceeds `max_ref_depth`, and
+    /// `SCHEMA_NOT_FOUND` for an unresolvable reference.
+    pub fn resolve(
+        &self,
+        schema: &serde_json::Value,
+        current_file: Option<&Path>,
+    ) -> Result<serde_json::Value, ModuleError> {
+        let mut resolver = RefResolver::with_max_depth(self.max_ref_depth);
+        if let Some(dir) = self.schemas_dir.as_deref() {
+            resolver = resolver.with_schemas_dir(dir);
+        }
+        if let Some(file) = current_file {
+            resolver = resolver.with_current_file(file);
+        }
+        // In-memory schemas registered on this loader are referenceable by
+        // their exact key, matching the peers' registry-first lookup.
+        for (name, value) in &self.schemas {
+            resolver.register(name, value.clone());
+        }
+        resolver.resolve(schema)
     }
 
     /// Spec-compatible load: resolve a schema for `module_id` and return a [`SchemaDefinition`].
@@ -109,6 +164,10 @@ impl SchemaLoader {
                 self.load_from_file(module_id, path)?;
                 // INVARIANT: load_from_file inserts into self.schemas on Ok; the key is present.
                 let value = self.get(module_id).expect("just loaded").clone();
+                // Resolve `$ref`s against this file's directory before shaping
+                // the definition, so circular / too-deep / unresolvable
+                // references fail at load time as they do in Python and TS.
+                let value = self.resolve(&value, Some(path))?;
                 return Self::value_to_schema_def(module_id, value);
             }
             last_err = Some(ModuleError::new(

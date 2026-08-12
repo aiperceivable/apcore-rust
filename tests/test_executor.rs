@@ -273,8 +273,11 @@ async fn test_apcore_describe_module() {
     let client = APCore::new();
     client.register("math.add", Box::new(AddModule)).unwrap();
 
+    // describe() returns the cross-SDK Markdown envelope (0.27), not the bare
+    // one-line description.
     let desc = client.describe("math.add").expect("module is registered");
-    assert_eq!(desc, "Add two numbers");
+    assert!(desc.starts_with("# math.add"), "got: {desc}");
+    assert!(desc.contains("Add two numbers"), "got: {desc}");
 }
 
 #[tokio::test]

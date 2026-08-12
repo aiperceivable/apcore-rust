@@ -202,6 +202,13 @@ impl ACL {
                     h.clone()
                 } else {
                     tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
+                    // Leave a forensic record so the audit entry distinguishes
+                    // "rule did not match" from "rule referenced a condition
+                    // nobody registered". apcore-typescript sets `handlerError`
+                    // here as well.
+                    crate::acl_handlers::report_handler_error(format!(
+                        "{key}: unknown ACL condition"
+                    ));
                     return false;
                 };
                 to_evaluate.push((key, handler, value));
@@ -231,6 +238,13 @@ impl ACL {
                         "Async condition '{}' not immediately ready in sync context — treated as unsatisfied",
                         key,
                     );
+                    // Same forensic contract as the unknown-key and panic
+                    // branches: a handler that could not be resolved
+                    // synchronously is an operator-visible problem, not a
+                    // plain non-match.
+                    crate::acl_handlers::report_handler_error(format!(
+                        "{key}: handler is not ready synchronously (use ACL::async_check)"
+                    ));
                     return false;
                 }
                 Err(payload) => {
@@ -427,11 +441,26 @@ impl ACL {
             )
         })?;
 
-        let default_effect = raw
-            .get("default_effect")
-            .and_then(|v| v.as_str())
-            .unwrap_or("deny")
-            .to_string();
+        // Distinguish "key absent" (→ canonical default `deny`) from "key
+        // present but not a string". The previous
+        // `.and_then(as_str).unwrap_or("deny")` silently coerced a non-string
+        // such as `default_effect: true` into a valid value, so `try_new`'s
+        // validation never fired and an operator typo went unreported.
+        // apcore-python and apcore-typescript both raise `ACLRuleError` here.
+        // The outcome was fail-closed either way, so this is a diagnostics fix,
+        // not a bypass.
+        let default_effect = match raw.get("default_effect") {
+            None | Some(serde_json::Value::Null) => "deny".to_string(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(ModuleError::new(
+                    ErrorCode::ACLRuleError,
+                    format!(
+                        "ACL file '{path}': default_effect must be the string 'allow' or 'deny' (got {other})"
+                    ),
+                ))
+            }
+        };
 
         // Propagate try_new validation errors as Result rather than panicking
         // — YAML errors must not crash the host process (sync finding A-D-302).

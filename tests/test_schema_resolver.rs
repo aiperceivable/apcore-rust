@@ -1,4 +1,5 @@
-//! Tests for RefResolver — JSON $ref resolution and circular reference detection.
+//! Tests for RefResolver — JSON $ref resolution, self-reference preservation
+//! and circular reference detection (PROTOCOL_SPEC §4.15).
 
 use apcore::schema::RefResolver;
 use serde_json::json;
@@ -38,8 +39,12 @@ fn test_schema_resolver_resolve_definitions_path() {
 }
 
 #[test]
-fn test_schema_resolver_resolve_root_ref() {
-    // #  (empty pointer) should return the root
+fn test_schema_resolver_resolve_root_ref_is_preserved_lazily() {
+    // `$ref: "#"` names the document being resolved: a self-reference, not a
+    // cycle. PROTOCOL_SPEC §4.15.2 requires it to survive resolution as a lazy
+    // reference so the validator can bind it recursively — inlining it would
+    // never terminate, and rejecting it would make every recursive data
+    // structure unusable.
     let resolver = RefResolver::new();
     let schema = json!({
         "type": "object",
@@ -47,11 +52,10 @@ fn test_schema_resolver_resolve_root_ref() {
             "self_ref": { "$ref": "#" }
         }
     });
-    // This should trigger circular detection because #-># is circular
-    // Actually: resolve_inner inserts "#" into seen, then resolves root which
-    // contains the same $ref "#" again -> circular.
-    let result = resolver.resolve(&schema);
-    assert!(result.is_err());
+    let result = resolver
+        .resolve(&schema)
+        .expect("self-reference must resolve");
+    assert_eq!(result["properties"]["self_ref"], json!({ "$ref": "#" }));
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +140,17 @@ fn test_schema_resolver_has_circular_refs_false() {
     assert!(!resolver.has_circular_refs(&schema));
 }
 
+// PROTOCOL_SPEC §4.15: a `$ref` re-entered by *structural descent* (through
+// `properties` / `items` / a combinator) is a self-reference, not a cycle —
+// `resolve` preserves it lazily and returns Ok (see
+// `test_schema_resolver_resolve_self_referencing_def_is_preserved_lazily`
+// directly below, which asserts exactly that on this same schema). This test
+// previously asserted `true`, contradicting its neighbour: `has_circular_refs`
+// ran its own traversal with no `from_ref_chain` discriminator, so it answered
+// `true` for every recursive schema `resolve` accepted. The predicate now
+// delegates to `resolve`, so both agree.
 #[test]
-fn test_schema_resolver_has_circular_refs_true_self_ref() {
+fn test_schema_resolver_has_circular_refs_false_for_structural_self_ref() {
     let resolver = RefResolver::new();
     let schema = json!({
         "$defs": {
@@ -152,11 +165,15 @@ fn test_schema_resolver_has_circular_refs_true_self_ref() {
             "root": { "$ref": "#/$defs/node" }
         }
     });
-    assert!(resolver.has_circular_refs(&schema));
+    assert!(resolver.resolve(&schema).is_ok());
+    assert!(!resolver.has_circular_refs(&schema));
 }
 
 #[test]
-fn test_schema_resolver_resolve_circular_ref_returns_error() {
+fn test_schema_resolver_resolve_self_referencing_def_is_preserved_lazily() {
+    // `#/$defs/node` re-entered through `properties` is a recursive data
+    // structure, not a cycle: the first occurrence is inlined and the one inside
+    // it stays a `$ref` for the validator to bind (PROTOCOL_SPEC §4.15.2).
     let resolver = RefResolver::new();
     let schema = json!({
         "$defs": {
@@ -169,6 +186,29 @@ fn test_schema_resolver_resolve_circular_ref_returns_error() {
         },
         "properties": {
             "root": { "$ref": "#/$defs/node" }
+        }
+    });
+    let result = resolver
+        .resolve(&schema)
+        .expect("self-reference must resolve");
+    assert_eq!(result["properties"]["root"]["type"], "object");
+    assert_eq!(
+        result["properties"]["root"]["properties"]["child"],
+        json!({ "$ref": "#/$defs/node" })
+    );
+}
+
+#[test]
+fn test_schema_resolver_resolve_ref_only_cycle_returns_error() {
+    // A `$ref` → `$ref` chain reaches no schema body, so there is nothing to
+    // defer to and resolution cannot terminate. That is the *circular* case
+    // PROTOCOL_SPEC §4.15.2 still requires SCHEMA_CIRCULAR_REF for.
+    let resolver = RefResolver::new();
+    let schema = json!({
+        "$ref": "#/$defs/a",
+        "$defs": {
+            "a": { "$ref": "#/$defs/b" },
+            "b": { "$ref": "#/$defs/a" }
         }
     });
     let result = resolver.resolve(&schema);
@@ -285,10 +325,14 @@ fn test_schema_resolver_has_circular_refs_false_for_scalars() {
     assert!(!resolver.has_circular_refs(&json!(null)));
 }
 
+// Same §4.15 rule reached through an array: descending into `items` is a
+// structural descent, so the re-entered `$ref` is a self-reference, not a
+// cycle. A genuine `$ref` → `$ref` chain inside an array still answers `true`
+// (second half of this test).
 #[test]
 fn test_schema_resolver_has_circular_refs_in_array() {
     let resolver = RefResolver::new();
-    let schema = json!({
+    let self_ref = json!({
         "$defs": {
             "node": {
                 "type": "object",
@@ -301,7 +345,17 @@ fn test_schema_resolver_has_circular_refs_in_array() {
             { "$ref": "#/$defs/node" }
         ]
     });
-    assert!(resolver.has_circular_refs(&schema));
+    assert!(resolver.resolve(&self_ref).is_ok());
+    assert!(!resolver.has_circular_refs(&self_ref));
+
+    let ref_only_cycle = json!({
+        "$ref": "#/$defs/a",
+        "$defs": {
+            "a": { "$ref": "#/$defs/b" },
+            "b": { "$ref": "#/$defs/a" }
+        }
+    });
+    assert!(resolver.has_circular_refs(&ref_only_cycle));
 }
 
 // ---------------------------------------------------------------------------
@@ -353,4 +407,34 @@ fn test_schema_resolver_rejects_chain_exceeding_max_depth() {
 fn test_schema_resolver_with_max_depth_constructor_round_trip() {
     let resolver = RefResolver::with_max_depth(8);
     assert_eq!(resolver.max_depth(), 8);
+}
+
+#[test]
+fn test_schema_resolver_output_still_validates_recursively() {
+    // The lazy `$ref` the resolver leaves behind has to remain *bindable*: the
+    // resolved document must validate a deep tree and still reject a type error
+    // at depth. A resolver that dropped or widened the reference would make the
+    // recursive positions of the contract assert nothing.
+    let resolver = RefResolver::new();
+    let schema = json!({
+        "$id": "TreeNode",
+        "type": "object",
+        "required": ["value"],
+        "properties": {
+            "value": { "type": "string" },
+            "children": { "type": "array", "items": { "$ref": "#" } }
+        }
+    });
+    let resolved = resolver
+        .resolve(&schema)
+        .expect("self-reference must resolve");
+
+    let deep = json!({
+        "value": "root",
+        "children": [{ "value": "child", "children": [{ "value": "grandchild" }] }]
+    });
+    assert!(apcore::executor::validate_against_schema(&deep, &resolved, "Input").is_ok());
+
+    let bad = json!({ "value": "root", "children": [{ "value": 42 }] });
+    assert!(apcore::executor::validate_against_schema(&bad, &resolved, "Input").is_err());
 }

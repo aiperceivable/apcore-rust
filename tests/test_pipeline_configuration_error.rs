@@ -1,14 +1,14 @@
 //! Sync alignment (W-7): pipeline-configuration errors that are NOT about
 //! `requires`/`provides` mismatch should surface as
-//! `ErrorCode::ConfigurationError` (or the existing `PipelineConfigInvalid`
+//! `ErrorCode::PipelineConfigurationError` (or the existing `PipelineConfigInvalid`
 //! when missing-anchor/missing-step) — distinct from
 //! `PipelineDependencyError` which is reserved for graph-dependency failures.
 //!
 //! Behaviour expected:
-//!   - removing a non-existent step -> ConfigurationError
-//!   - configuring a non-existent step -> ConfigurationError
-//!   - inserting after/before an unknown anchor -> ConfigurationError
-//!   - missing both anchor (after/before) on a custom step -> ConfigurationError
+//!   - removing a non-existent step -> PipelineConfigurationError
+//!   - configuring a non-existent step -> PipelineConfigurationError
+//!   - inserting after/before an unknown anchor -> PipelineConfigurationError
+//!   - missing both anchor (after/before) on a custom step -> PipelineConfigurationError
 //!
 //! NONE of these should yield `PipelineDependencyError`.
 
@@ -62,7 +62,7 @@ fn missing_step_in_remove_yields_configuration_error_not_dependency() {
         ErrorCode::PipelineDependencyError,
         "missing-step removal must not be classified as a dependency error"
     );
-    assert_eq!(err.code, ErrorCode::ConfigurationError);
+    assert_eq!(err.code, ErrorCode::PipelineConfigurationError);
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn missing_step_in_configure_yields_configuration_error_not_dependency() {
     });
     let err = build_strategy_from_config(&cfg).expect_err("must fail");
     assert_ne!(err.code, ErrorCode::PipelineDependencyError);
-    assert_eq!(err.code, ErrorCode::ConfigurationError);
+    assert_eq!(err.code, ErrorCode::PipelineConfigurationError);
 }
 
 #[test]
@@ -98,9 +98,9 @@ fn missing_anchor_yields_configuration_error_not_dependency() {
     assert!(
         matches!(
             err.code,
-            ErrorCode::ConfigurationError | ErrorCode::PipelineStepNotFound
+            ErrorCode::PipelineConfigurationError | ErrorCode::PipelineStepNotFound
         ),
-        "expected ConfigurationError or PipelineStepNotFound, got {:?}",
+        "expected PipelineConfigurationError or PipelineStepNotFound, got {:?}",
         err.code
     );
 }

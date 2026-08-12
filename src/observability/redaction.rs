@@ -1,6 +1,8 @@
 // APCore Protocol — Configurable redaction rules
 // Spec reference: observability.md §1.5 Configurable Redaction Rules
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use glob::Pattern;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
@@ -18,12 +20,21 @@ pub const DEFAULT_REPLACEMENT: &str = "***REDACTED***";
 pub const NEVER_REDACT_FIELDS: &[&str] =
     &["trace_id", "caller_id", "target_id", "module_id", "span_id"];
 
-/// Default sensitive-key glob patterns applied when the user has not supplied
-/// `observability.redaction.sensitive_keys` in their Config. Issue #43 §5.
+/// Default sensitive-key glob patterns applied when the operator has not
+/// supplied `obs.redaction.sensitive_keys` in their Config (D-54, Issue #43 §5).
 ///
-/// User-supplied entries are merged into this list rather than replacing it,
-/// matching apcore-python's `_DEFAULT_SENSITIVE_KEYS` semantics. Includes
-/// snake_case, camelCase, and lowercase parity (`api_key` / `apiKey` /
+/// An operator-supplied list **replaces** this one; it does not merge
+/// (`features/observability.md`, "Canonical default `sensitive_keys`": "the
+/// override **replaces** the default; it does not merge"). Both peers were read
+/// to confirm the claim rather than assumed: apcore-python passes
+/// `_DEFAULT_OBS_REDACTION_SENSITIVE_KEYS` to `config.get` as the FALLBACK
+/// argument only (`observability/context_logger.py`,
+/// `RedactionConfig.from_config`), and apcore-typescript spreads
+/// `DEFAULT_REDACTION_FIELD_PATTERNS` only when the configured value is not an
+/// array (`observability/context-logger.ts`, `RedactionConfig.fromConfig`).
+/// Neither merges the operator's entries into the defaults.
+///
+/// Includes snake_case, camelCase, and lowercase parity (`api_key` / `apiKey` /
 /// `apikey`) so common framework conventions are covered out of the box.
 pub const DEFAULT_SENSITIVE_KEYS: &[&str] = &[
     "_secret_*",
@@ -43,6 +54,72 @@ pub const DEFAULT_SENSITIVE_KEYS: &[&str] = &[
     "session",
     "bearer",
 ];
+
+/// Canonical `RedactionConfig` config keys (D-53). `features/observability.md`
+/// ("Canonical Config keys (cross-SDK)") requires all three SDKs to read these
+/// and calls any divergence a conformance bug: apcore-python reads exactly
+/// these, apcore-typescript reads them first.
+const CANONICAL_SENSITIVE_KEYS: &str = "obs.redaction.sensitive_keys";
+const CANONICAL_REGEX_PATTERNS: &str = "obs.redaction.regex_patterns";
+const CANONICAL_REPLACEMENT: &str = "obs.redaction.replacement";
+
+/// The keys this SDK read before the canonical namespace was honoured. Still
+/// accepted so existing apcore-rust deployments keep working, but reading one
+/// emits a one-shot deprecation warning. (apcore-typescript keeps its OWN
+/// pre-D-53 spellings — `observability.redaction.field_patterns` /
+/// `.value_patterns` — which this SDK never read and therefore does not adopt.)
+const LEGACY_SENSITIVE_KEYS: &str = "observability.redaction.sensitive_keys";
+const LEGACY_REGEX_PATTERNS: &str = "observability.redaction.regex_patterns";
+const LEGACY_REPLACEMENT: &str = "observability.redaction.replacement";
+
+/// One-shot bookkeeping for the legacy-key deprecation warning.
+static LEGACY_REDACTION_KEY_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+
+/// Warn once per process that deprecated `observability.redaction.*` keys were
+/// read, naming the keys actually used and their canonical replacements.
+/// Mirrors apcore-typescript's `_emitRedactionLegacyDeprecation`, which is
+/// likewise one-shot per process.
+fn emit_legacy_redaction_key_deprecation(legacy_keys: &[&str]) {
+    if LEGACY_REDACTION_KEY_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        "[apcore] Config keys {} are deprecated; use {CANONICAL_SENSITIVE_KEYS} / \
+         {CANONICAL_REGEX_PATTERNS} / {CANONICAL_REPLACEMENT} instead. Legacy keys \
+         will be removed in a future release.",
+        legacy_keys.join(", ")
+    );
+}
+
+/// Read one redaction setting: canonical key first, deprecated key second.
+///
+/// Absent and explicitly `null` both count as "not configured", so a `null`
+/// written against the canonical key falls through to the legacy key and then
+/// to the built-in default instead of being mistaken for a configured value.
+/// Matches apcore-typescript (`undefined || null` -> fall through) and
+/// apcore-python (which coerces a `None` back to the default list).
+///
+/// Every legacy key actually consulted is appended to `legacy_used` so the
+/// caller can emit one warning naming all of them, rather than one per key.
+fn read_redaction_key(
+    config: &Config,
+    canonical: &str,
+    legacy: &'static str,
+    legacy_used: &mut Vec<&'static str>,
+) -> Option<Value> {
+    if let Some(value) = config.get(canonical) {
+        if !value.is_null() {
+            return Some(value);
+        }
+    }
+    match config.get(legacy) {
+        Some(value) if !value.is_null() => {
+            legacy_used.push(legacy);
+            Some(value)
+        }
+        _ => None,
+    }
+}
 
 /// Runtime-configurable redaction rules layered on top of schema-level
 /// (`x-sensitive`) annotations.
@@ -102,9 +179,12 @@ impl RedactionConfig {
     }
 
     /// Construct a redaction config with the canonical default sensitive_keys
-    /// list. Equivalent to [`Self::with_default_sensitive_keys`]; provided so
-    /// callers can write `RedactionConfig::default()` and get spec-canonical
-    /// behavior matching `apcore-python.RedactionConfig.default()`.
+    /// list. Equivalent to [`Self::with_default_sensitive_keys`], and the
+    /// counterpart of apcore-python's `RedactionConfig.default()` classmethod.
+    ///
+    /// Note the one-letter trap: the DERIVED [`Default`] impl
+    /// (`RedactionConfig::default()`, no `s`) yields zero rules and an empty
+    /// replacement string, not this policy.
     #[must_use]
     pub fn defaults() -> Self {
         Self::with_default_sensitive_keys()
@@ -137,71 +217,104 @@ impl RedactionConfig {
         RedactionConfigBuilder::default()
     }
 
-    /// Build a redaction config from `observability.redaction.*` keys in a
-    /// loaded [`Config`]. Issue #43 §5 — replaces the legacy hardcoded
-    /// `_secret_` prefix with a fully Config-driven policy.
+    /// Build a redaction config from the canonical `obs.redaction.*` keys of a
+    /// loaded [`Config`] (D-53), falling back to the deprecated
+    /// `observability.redaction.*` keys this SDK read before that alignment.
     ///
-    /// Reads:
-    ///   - `observability.redaction.sensitive_keys: Vec<String>` — glob
-    ///     patterns applied to field NAMES. User entries are unioned with
-    ///     [`DEFAULT_SENSITIVE_KEYS`] (the canonical superset: `_secret_*`,
-    ///     `password`, `passwd`, `secret`, `token`, `api_key`, `apikey`,
-    ///     `apiKey`, `access_key`, `private_key`, `authorization`, `auth`,
-    ///     `credential`, `cookie`, `session`, `bearer`).
-    ///   - `observability.redaction.regex_patterns: Vec<String>` — regular
-    ///     expressions applied to string VALUES. Compiled with
-    ///     [`RegexBuilder::case_insensitive(true)`].
-    ///   - `observability.redaction.replacement: String` — replacement string
-    ///     (defaults to [`DEFAULT_REPLACEMENT`]).
+    /// Reads, in order of precedence:
+    ///   1. `obs.redaction.sensitive_keys: Vec<String>` — glob/substring
+    ///      patterns applied to field NAMES.
+    ///      `obs.redaction.regex_patterns: Vec<String>` — regular expressions
+    ///      applied to string VALUES, compiled case-insensitively.
+    ///      `obs.redaction.replacement: String` — the substitution string
+    ///      (defaults to [`DEFAULT_REPLACEMENT`]).
+    ///   2. The same three settings under `observability.redaction.*`, which
+    ///      are **deprecated**. Reading any of them emits a one-shot `warn`
+    ///      naming the canonical replacements, as apcore-typescript does.
+    ///
+    /// `sensitive_keys` semantics (**D-54**): an operator-supplied list
+    /// **replaces** [`DEFAULT_SENSITIVE_KEYS`] (`_secret_*`, `password`,
+    /// `passwd`, `secret`, `token`, `api_key`, `apikey`, `apiKey`,
+    /// `access_key`, `private_key`, `authorization`, `auth`, `credential`,
+    /// `cookie`, `session`, `bearer`); it does not merge with them, so an
+    /// operator can narrow the list and not only widen it. "Not supplied"
+    /// means the key is absent or explicitly `null`. An explicitly EMPTY list
+    /// is an override like any other — it disables key-based redaction
+    /// entirely, including the `_secret_*` prefix, which is entry `[0]` of the
+    /// default list and not a separate hardcoded rule. It MUST NOT be re-read
+    /// as "unset" (matches apcore-python and apcore-typescript). The
+    /// value-regex rule is independent and still applies.
     ///
     /// Malformed patterns are logged at `warn` and skipped — a typo in one
     /// rule MUST NOT disable redaction for every other rule.
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
         let mut cfg = Self::new();
+        let mut legacy_used: Vec<&'static str> = Vec::new();
 
-        // Default sensitive keys are always applied.
-        for default in DEFAULT_SENSITIVE_KEYS {
-            cfg.add_sensitive_key(default);
+        let sensitive_keys = read_redaction_key(
+            config,
+            CANONICAL_SENSITIVE_KEYS,
+            LEGACY_SENSITIVE_KEYS,
+            &mut legacy_used,
+        );
+        let regex_patterns = read_redaction_key(
+            config,
+            CANONICAL_REGEX_PATTERNS,
+            LEGACY_REGEX_PATTERNS,
+            &mut legacy_used,
+        );
+        let replacement = read_redaction_key(
+            config,
+            CANONICAL_REPLACEMENT,
+            LEGACY_REPLACEMENT,
+            &mut legacy_used,
+        );
+
+        if !legacy_used.is_empty() {
+            emit_legacy_redaction_key_deprecation(&legacy_used);
         }
 
-        // User-supplied sensitive_keys (additive — see D-54: operators that
-        // need replace-semantics should construct via the builder directly).
-        if let Some(value) = config.get("observability.redaction.sensitive_keys") {
-            if let Some(arr) = value.as_array() {
-                for entry in arr {
+        // D-54: the operator's list REPLACES the default rather than being
+        // unioned with it. Only an unconfigured key (absent or null) — or a
+        // value that is not a list at all — falls back to the canonical
+        // defaults; a configured empty list means "redact nothing by name".
+        match sensitive_keys.as_ref().and_then(Value::as_array) {
+            Some(entries) => {
+                for entry in entries {
                     if let Some(s) = entry.as_str() {
                         cfg.add_sensitive_key(s);
                     }
                 }
             }
+            None => {
+                for default in DEFAULT_SENSITIVE_KEYS {
+                    cfg.add_sensitive_key(default);
+                }
+            }
         }
 
         let mut value_patterns: Vec<Regex> = Vec::new();
-        if let Some(value) = config.get("observability.redaction.regex_patterns") {
-            if let Some(arr) = value.as_array() {
-                for entry in arr {
-                    if let Some(s) = entry.as_str() {
-                        match RegexBuilder::new(s).case_insensitive(true).build() {
-                            Ok(r) => value_patterns.push(r),
-                            Err(e) => tracing::warn!(
-                                pattern = %s,
-                                error = %e,
-                                "Skipping invalid regex_patterns entry"
-                            ),
-                        }
+        if let Some(entries) = regex_patterns.as_ref().and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(s) = entry.as_str() {
+                    match RegexBuilder::new(s).case_insensitive(true).build() {
+                        Ok(r) => value_patterns.push(r),
+                        Err(e) => tracing::warn!(
+                            pattern = %s,
+                            error = %e,
+                            "Skipping invalid regex_patterns entry"
+                        ),
                     }
                 }
             }
         }
 
-        let replacement = config
-            .get("observability.redaction.replacement")
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_else(|| DEFAULT_REPLACEMENT.to_string());
-
         cfg.value_patterns = value_patterns;
-        cfg.replacement = replacement;
+        cfg.replacement = replacement
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map_or_else(|| DEFAULT_REPLACEMENT.to_string(), str::to_owned);
         cfg
     }
 
@@ -212,9 +325,22 @@ impl RedactionConfig {
     }
 
     fn redact_inner(&self, value: &mut Value, field_name: Option<&str>) {
+        // Correlation identifiers are exempt from BOTH redaction rules, not
+        // just the field-name one: observability.md ("Implementations MUST NOT
+        // redact `trace_id`, `caller_id`, `module_id`, or `span_id`; these
+        // correlation fields MUST appear unmodified in every log entry") states
+        // the exemption unconditionally. apcore-typescript checks
+        // `PROTECTED_LOG_FIELDS` at the top of `_shouldRedact` and
+        // apcore-python does the same at the top of `_apply_redaction_config`,
+        // i.e. before either the name rule or the value regex is evaluated.
+        // Guarding only the name rule made a `trace_id` whose VALUE happened to
+        // match a secret regex get redacted in Rust but not in Python/TS,
+        // breaking trace correlation exactly where it matters most.
+        let protected = field_name.is_some_and(|name| NEVER_REDACT_FIELDS.contains(&name));
+
         // Field-name rule applies based on the field this value is bound to.
         if let Some(name) = field_name {
-            if !NEVER_REDACT_FIELDS.contains(&name) && self.field_matches(name) {
+            if !protected && self.field_matches(name) {
                 *value = Value::String(self.replacement.clone());
                 return;
             }
@@ -229,7 +355,11 @@ impl RedactionConfig {
                     self.redact_inner(item, None);
                 }
             }
-            Value::String(s) if self.value_matches(s) => {
+            // Value rule. Containers below a protected key are still descended
+            // into (matching TS, which recurses through `redact` after
+            // `_shouldRedact` returns false) — only the protected field's own
+            // scalar value is immune.
+            Value::String(s) if !protected && self.value_matches(s) => {
                 s.clone_from(&self.replacement);
             }
             _ => {}
@@ -237,18 +367,11 @@ impl RedactionConfig {
     }
 
     fn redact_object(&self, map: &mut Map<String, Value>) {
-        let keys: Vec<String> = map.keys().cloned().collect();
-        for key in keys {
-            let preserved = NEVER_REDACT_FIELDS.contains(&key.as_str());
-            if !preserved && self.field_matches(&key) {
-                if let Some(slot) = map.get_mut(&key) {
-                    *slot = Value::String(self.replacement.clone());
-                }
-                continue;
-            }
-            if let Some(child) = map.get_mut(&key) {
-                self.redact_inner(child, Some(&key));
-            }
+        // `iter_mut` hands out the key and its own value slot as independent
+        // borrows, so the per-entry decision lives entirely in `redact_inner`
+        // and the protected-field guard is encoded in exactly one place.
+        for (key, slot) in map.iter_mut() {
+            self.redact_inner(slot, Some(key.as_str()));
         }
     }
 
@@ -405,8 +528,49 @@ impl RedactionConfigBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::config::Config;
     use serde_json::json;
+
+    /// Serializes the tests that reach into the process-global one-shot flag.
+    /// They reset it, so running two of them concurrently would let one consume
+    /// the other's warning.
+    static LEGACY_WARNING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with a thread-local subscriber and return everything it logged.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 
     #[test]
     fn field_glob_redacts_matching_field() {
@@ -460,5 +624,72 @@ mod tests {
             .value_patterns(["[invalid"])
             .try_build();
         assert!(result.is_err());
+    }
+
+    /// Issue #32. Reading a deprecated `observability.redaction.*` key MUST
+    /// still work and MUST warn, naming both the key read and its canonical
+    /// replacement — the operator otherwise has no signal that they are on a
+    /// key scheduled for removal. One-shot per process, as apcore-typescript's
+    /// `_emitRedactionLegacyDeprecation` is.
+    ///
+    /// Lives here rather than in `tests/` because only this module can reset
+    /// the one-shot flag; an integration test could observe the warning at most
+    /// once per binary, whichever test happened to run first.
+    #[test]
+    fn legacy_redaction_keys_emit_a_one_shot_deprecation_warning() {
+        let _guard = LEGACY_WARNING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        LEGACY_REDACTION_KEY_WARNING_EMITTED.store(false, Ordering::Relaxed);
+
+        let mut config = Config::from_defaults();
+        config.set(LEGACY_SENSITIVE_KEYS, json!(["legacy_key"]));
+
+        let logs = capture_logs(|| {
+            let cfg = RedactionConfig::from_config(&config);
+            assert!(
+                cfg.field_matches("legacy_key"),
+                "the deprecated key must still be applied, not merely warned about"
+            );
+        });
+        assert!(
+            logs.contains(LEGACY_SENSITIVE_KEYS),
+            "the warning must name the deprecated key that was read: {logs}"
+        );
+        assert!(
+            logs.contains(CANONICAL_SENSITIVE_KEYS),
+            "the warning must name the canonical replacement: {logs}"
+        );
+
+        let again = capture_logs(|| {
+            let _ = RedactionConfig::from_config(&config);
+        });
+        assert!(
+            !again.contains("deprecated"),
+            "the deprecation warning is one-shot per process: {again}"
+        );
+    }
+
+    /// The canonical keys are not deprecated, so using them must stay silent —
+    /// a warning fired on the documented path would train operators to ignore
+    /// it.
+    #[test]
+    fn canonical_redaction_keys_emit_no_deprecation_warning() {
+        let _guard = LEGACY_WARNING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        LEGACY_REDACTION_KEY_WARNING_EMITTED.store(false, Ordering::Relaxed);
+
+        let mut config = Config::from_defaults();
+        config.set(CANONICAL_SENSITIVE_KEYS, json!(["canonical_key"]));
+
+        let logs = capture_logs(|| {
+            let cfg = RedactionConfig::from_config(&config);
+            assert!(cfg.field_matches("canonical_key"));
+        });
+        assert!(
+            !logs.contains("deprecated"),
+            "the canonical key path must not warn: {logs}"
+        );
     }
 }

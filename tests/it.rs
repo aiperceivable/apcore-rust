@@ -86,6 +86,8 @@ mod test_acl_handler_error_conformance;
 mod test_acl_panic_boundary;
 #[path = "test_acl_root_discovery.rs"]
 mod test_acl_root_discovery;
+#[path = "test_acl_root_discovery_conformance.rs"]
+mod test_acl_root_discovery_conformance;
 #[path = "test_acl_sync_handler_error.rs"]
 mod test_acl_sync_handler_error;
 #[path = "test_approval.rs"]
@@ -116,8 +118,14 @@ mod test_chunk_shape;
 mod test_client;
 #[path = "test_compute_delay_ms.rs"]
 mod test_compute_delay_ms;
+#[path = "test_config_key_governance_conformance.rs"]
+mod test_config_key_governance_conformance;
 #[path = "test_config_key_restricted.rs"]
 mod test_config_key_restricted;
+#[path = "test_config_load_executor_namespace.rs"]
+mod test_config_load_executor_namespace;
+#[path = "test_config_load_observability_subkeys.rs"]
+mod test_config_load_observability_subkeys;
 #[path = "test_config_reload_from_disk.rs"]
 mod test_config_reload_from_disk;
 #[path = "test_context.rs"]
@@ -150,6 +158,8 @@ mod test_event_delivery_semantics;
 mod test_event_management_hardening_conformance;
 #[path = "test_event_naming_canonical.rs"]
 mod test_event_naming_canonical;
+#[path = "test_event_naming_conformance.rs"]
+mod test_event_naming_conformance;
 #[path = "test_events.rs"]
 mod test_events;
 #[path = "test_executor.rs"]
@@ -180,22 +190,36 @@ mod test_multi_module_discovery_conformance;
 mod test_observability;
 #[path = "test_observability_hardening_conformance.rs"]
 mod test_observability_hardening_conformance;
+#[path = "test_openai_strict.rs"]
+mod test_openai_strict;
+#[path = "test_openai_strict_compat_conformance.rs"]
+mod test_openai_strict_compat_conformance;
+#[path = "test_overrides_store_conformance.rs"]
+mod test_overrides_store_conformance;
 #[path = "test_overrides_store_trait.rs"]
 mod test_overrides_store_trait;
 #[path = "test_pipeline_configuration_error.rs"]
 mod test_pipeline_configuration_error;
 #[path = "test_pipeline_failfast.rs"]
 mod test_pipeline_failfast;
+#[path = "test_pipeline_failfast_config_conformance.rs"]
+mod test_pipeline_failfast_config_conformance;
 #[path = "test_pipeline_hardening_conformance.rs"]
 mod test_pipeline_hardening_conformance;
 #[path = "test_pipeline_step_middleware.rs"]
 mod test_pipeline_step_middleware;
+#[path = "test_pipeline_step_middleware_conformance.rs"]
+mod test_pipeline_step_middleware_conformance;
 #[path = "test_pipeline_tasks.rs"]
 mod test_pipeline_tasks;
 #[path = "test_pipeline_types.rs"]
 mod test_pipeline_types;
 #[path = "test_redaction_config.rs"]
 mod test_redaction_config;
+#[path = "test_redaction_config_conformance.rs"]
+mod test_redaction_config_conformance;
+#[path = "test_redaction_config_keys.rs"]
+mod test_redaction_config_keys;
 #[path = "test_redaction_default_keys.rs"]
 mod test_redaction_default_keys;
 #[path = "test_register_module_annotations.rs"]
@@ -208,24 +232,36 @@ mod test_registry_load_ordering;
 mod test_registry_ordering_conformance;
 #[path = "test_reload_path_filter.rs"]
 mod test_reload_path_filter;
+#[path = "test_reload_path_filter_conformance.rs"]
+mod test_reload_path_filter_conformance;
 #[path = "test_retry_config_default.rs"]
 mod test_retry_config_default;
 #[path = "test_retry_signal.rs"]
 mod test_retry_signal;
+#[path = "test_schema_export_envelope_conformance.rs"]
+mod test_schema_export_envelope_conformance;
 #[path = "test_schema_exporter.rs"]
 mod test_schema_exporter;
 #[path = "test_schema_hardening_conformance.rs"]
 mod test_schema_hardening_conformance;
+#[path = "test_schema_keyword_parity_conformance.rs"]
+mod test_schema_keyword_parity_conformance;
 #[path = "test_schema_loader.rs"]
 mod test_schema_loader;
 #[path = "test_schema_resolver.rs"]
 mod test_schema_resolver;
+#[path = "test_schema_strict_conversion_conformance.rs"]
+mod test_schema_strict_conversion_conformance;
 #[path = "test_schema_validator.rs"]
 mod test_schema_validator;
 #[path = "test_serde_wire_format.rs"]
 mod test_serde_wire_format;
+#[path = "test_spec_decision_followup.rs"]
+mod test_spec_decision_followup;
 #[path = "test_storage_backend.rs"]
 mod test_storage_backend;
+#[path = "test_storage_backend_conformance.rs"]
+mod test_storage_backend_conformance;
 #[path = "test_stream_chunk_reject.rs"]
 mod test_stream_chunk_reject;
 #[path = "test_stream_phase1_on_error.rs"]
@@ -234,10 +270,16 @@ mod test_stream_phase1_on_error;
 mod test_streaming_interface;
 #[path = "test_suspend_resume.rs"]
 mod test_suspend_resume;
+#[path = "test_sync_parity_critical.rs"]
+mod test_sync_parity_critical;
+#[path = "test_sync_parity_warning.rs"]
+mod test_sync_parity_warning;
 #[path = "test_system_modules_hardening_conformance.rs"]
 mod test_system_modules_hardening_conformance;
 #[path = "test_trace_context.rs"]
 mod test_trace_context;
+#[path = "test_trace_context_conformance.rs"]
+mod test_trace_context_conformance;
 #[path = "test_true_streaming.rs"]
 mod test_true_streaming;
 #[path = "test_unified_registry.rs"]
@@ -246,6 +288,8 @@ mod test_unified_registry;
 mod test_usage_collector_trend_period;
 #[path = "test_usage_exporter.rs"]
 mod test_usage_exporter;
+#[path = "test_usage_exporter_conformance.rs"]
+mod test_usage_exporter_conformance;
 #[path = "test_usage_hourly_padding.rs"]
 mod test_usage_hourly_padding;
 #[path = "test_v0_21_preview_and_ephemeral.rs"]
