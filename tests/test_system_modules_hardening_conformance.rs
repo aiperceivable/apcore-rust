@@ -24,7 +24,7 @@ use apcore::events::emitter::EventEmitter;
 use apcore::executor::Executor;
 use apcore::module::Module;
 use apcore::observability::usage::UsageCollector;
-use apcore::registry::registry::Registry;
+use apcore::registry::registry::{Registry, RegistryEvents};
 use apcore::sys_modules::audit::{AuditAction, AuditStore, InMemoryAuditStore};
 use apcore::sys_modules::control::{ReloadModule, ToggleFeatureModule, UpdateConfigModule};
 use apcore::sys_modules::overrides::load_overrides;
@@ -529,6 +529,175 @@ async fn case_reload_with_path_filter() {
         dep_order,
         vec!["executor.pdf.render", "executor.email.send"],
         "reload_order must be topological (dependency first), not alphabetical"
+    );
+}
+
+/// Case `reload_order_is_topological_not_alphabetical`.
+///
+/// The discriminating half of `reload_order: "topological"`.
+/// `case_reload_with_path_filter` above cannot tell topological from
+/// alphabetical using the fixture's own module set — its three modules declare
+/// no dependencies on each other, so every permutation is a valid topological
+/// order. Here `executor.alpha` depends on `executor.zulu`, so a plain sort and
+/// Kahn's sort cannot both pass. Ids, edge and expected order all come out of
+/// the fixture; nothing is hand-transcribed.
+///
+/// Two rules from the fixture's `driver_contract` shape the assertions:
+///
+/// * `ordering_needs_a_disagreeing_graph` — the observation is the sequence of
+///   registry unregistrations the reload actually performed, taken from the
+///   `unregister` registry event. `reloaded_modules` in the response is
+///   appended to inside that same loop, so asserting it would only check that
+///   the report matches itself.
+/// * `dependencies_must_survive_registration` — the edge is declared through
+///   `Registry::register` (the path an application uses) and read back through
+///   `Registry::get_definition`, the post-registration accessor
+///   `ReloadModule::topo_sort_modules` itself consults. apcore-python and
+///   apcore-typescript both lost `dependencies` in the metadata merge while
+///   discovery-time sorting kept working, so a driver that hands the graph
+///   straight to the sort would pass against that bug.
+#[tokio::test]
+async fn case_reload_order_is_topological_not_alphabetical() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "reload_order_is_topological_not_alphabetical");
+    let expected = &case["expected"];
+
+    let registered: Vec<String> = case["setup"]["registered_modules"]
+        .as_array()
+        .expect("setup.registered_modules is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let declared: HashMap<String, Vec<String>> =
+        serde_json::from_value(case["setup"]["declared_dependencies"].clone())
+            .expect("setup.declared_dependencies is a map of module id -> dependency ids");
+
+    let registry = Arc::new(Registry::new());
+    for module_id in &registered {
+        let deps = declared.get(module_id).cloned().unwrap_or_default();
+        register_app_module_with_deps(&registry, module_id, &deps);
+    }
+
+    // `dependencies_must_survive_registration` — the accessor, not the input.
+    for (module_id, deps) in &declared {
+        let descriptor = registry
+            .get_definition(module_id)
+            .expect("get_definition must not error")
+            .unwrap_or_else(|| panic!("{module_id} is registered"));
+        let stored: Vec<String> = descriptor
+            .dependencies
+            .iter()
+            .map(|d| d.module_id.clone())
+            .collect();
+        assert_eq!(
+            &stored, deps,
+            "{module_id} declared dependencies {deps:?} through Registry::register, but \
+             get_definition() reports {stored:?}"
+        );
+    }
+
+    // `ordering_needs_a_disagreeing_graph` — record the order the work happens
+    // in. The `unregister` event fires once per module from inside the reload
+    // loop, so the recorded sequence is the reload sequence.
+    let unregister_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorder = Arc::clone(&unregister_order);
+    registry.on(
+        RegistryEvents::UNREGISTER,
+        Box::new(move |name: &str, _module: &dyn Module| {
+            recorder.lock().unwrap().push(name.to_string());
+        }),
+    );
+
+    let module = ReloadModule::new(Arc::clone(&registry), Arc::new(EventEmitter::new()));
+    let out = module
+        .execute(case["action"]["input"].clone(), &make_ctx(None))
+        .await
+        .expect("bulk reload should succeed");
+
+    assert_eq!(
+        out["success"].as_bool(),
+        expected["call_success"].as_bool(),
+        "call_success mismatch"
+    );
+
+    let observed: Vec<String> = expected["reload_order_observed"]
+        .as_array()
+        .expect("expected.reload_order_observed is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let actual = unregister_order.lock().unwrap().clone();
+    assert_eq!(
+        actual, observed,
+        "modules were reloaded in {actual:?}; the declared dependency graph requires {observed:?}"
+    );
+
+    // `alphabetical_order_would_be` / `orders_differ` — pin the fixture's claim
+    // against a real sort, so editing the ids into agreement fails here instead
+    // of quietly disarming the assertion above.
+    let alphabetical: Vec<String> = expected["alphabetical_order_would_be"]
+        .as_array()
+        .expect("expected.alphabetical_order_would_be is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let mut plain_sort = registered.clone();
+    plain_sort.sort();
+    assert_eq!(
+        plain_sort, alphabetical,
+        "alphabetical_order_would_be must be the plain sort of the registered modules"
+    );
+    assert_eq!(
+        observed != alphabetical,
+        expected["orders_differ"]
+            .as_bool()
+            .expect("expected.orders_differ is a bool"),
+        "orders_differ must describe whether the two candidate orders disagree"
+    );
+    if expected["orders_differ"].as_bool() == Some(true) {
+        assert_ne!(
+            actual, alphabetical,
+            "reload order collapsed to the alphabetical order — the dependency graph was ignored"
+        );
+    }
+}
+
+/// Canonical case id -> the test in this file that asserts it.
+///
+/// The assertions here are hand-written per case rather than generated by
+/// iterating the fixture (each case needs its own registry / config /
+/// filesystem wiring), so a case added on the spec side would otherwise leave
+/// no trace: `fixture_case` only sees the ids it is asked for.
+const COVERED_CASE_IDS: &[&str] = &[
+    "overrides_persisted_on_update",
+    "overrides_loaded_on_startup",
+    "audit_entry_records_actor",
+    "audit_entry_records_change",
+    "prometheus_usage_exports_calls_total",
+    "reload_with_path_filter",
+    "reload_module_id_and_filter_conflict",
+    "startup_fail_on_error_true_raises",
+    "startup_fail_on_error_false_continues",
+    "rust_register_returns_result",
+    "reload_order_is_topological_not_alphabetical",
+];
+
+#[test]
+fn fixture_case_inventory_is_complete() {
+    let fixture = load_fixture();
+    let mut canonical: Vec<String> = fixture["test_cases"]
+        .as_array()
+        .expect("test_cases must be an array")
+        .iter()
+        .map(|c| c["id"].as_str().expect("case id is a string").to_string())
+        .collect();
+    canonical.sort();
+    let mut covered: Vec<String> = COVERED_CASE_IDS.iter().map(|s| (*s).to_string()).collect();
+    covered.sort();
+    assert_eq!(
+        canonical, covered,
+        "system_modules_hardening.json and this file disagree on the case inventory: \
+         a canonical case gained upstream needs a driver here"
     );
 }
 
@@ -1040,6 +1209,44 @@ fn register_dummy_module_with_dep(registry: &Arc<Registry>, module_id: &str, dep
     registry
         .register_internal(module_id, module, descriptor)
         .expect("dummy registration");
+}
+
+/// Register through `Registry::register` — the path an application uses —
+/// declaring `dependencies` on the descriptor.
+///
+/// `register_dummy_module*` above use `register_internal`, the sys-module entry
+/// point. The topological-order case registers the way an application does so
+/// that anything the registration path drops is visible to `get_definition`.
+fn register_app_module_with_deps(registry: &Arc<Registry>, module_id: &str, depends_on: &[String]) {
+    use apcore::registry::registry::{DependencyInfo, ModuleDescriptor};
+    let module: Box<dyn Module> = Box::new(DummyModule);
+    let descriptor = ModuleDescriptor {
+        module_id: module_id.to_string(),
+        name: None,
+        description: "test module".to_string(),
+        documentation: None,
+        input_schema: json!({"type": "object"}),
+        output_schema: json!({"type": "object"}),
+        version: "1.0.0".to_string(),
+        tags: vec![],
+        annotations: None,
+        examples: vec![],
+        metadata: HashMap::new(),
+        display: None,
+        sunset_date: None,
+        dependencies: depends_on
+            .iter()
+            .map(|dep| DependencyInfo {
+                module_id: dep.clone(),
+                version_constraint: String::new(),
+                optional: false,
+            })
+            .collect(),
+        enabled: true,
+    };
+    registry
+        .register(module_id, module, descriptor)
+        .expect("application-path registration");
 }
 
 fn register_dummy_module(registry: &Arc<Registry>, module_id: &str) {
