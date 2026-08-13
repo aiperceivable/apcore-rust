@@ -238,6 +238,8 @@ mod test_registry;
 mod test_registry_load_ordering;
 #[path = "test_registry_ordering_conformance.rs"]
 mod test_registry_ordering_conformance;
+#[path = "test_reload_order_registration_paths.rs"]
+mod test_reload_order_registration_paths;
 #[path = "test_reload_path_filter.rs"]
 mod test_reload_path_filter;
 #[path = "test_reload_path_filter_conformance.rs"]

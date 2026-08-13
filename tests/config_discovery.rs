@@ -1,5 +1,31 @@
 use std::io::Write;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use tempfile::TempDir;
+
+/// Serialises the tests in this file against each other.
+///
+/// Every test here mutates process-global state — `APCORE_CONFIG_FILE`,
+/// `APCORE_BINDINGS_DIR`, the current working directory — and Cargo runs the
+/// tests within one binary on parallel threads that share it. This file is
+/// already a separate `[[test]]` binary (see `Cargo.toml`) so it cannot
+/// cross-pollute `tests/it.rs`, but that isolation stops at the process
+/// boundary and said nothing about its own tests.
+///
+/// The observable failure was `test_declared_env_override_still_reaches_the_
+/// declared_document` setting `APCORE_BINDINGS_DIR` while the two
+/// `…_is_not_a_config_override_*` tests were loading a config, which then saw a
+/// `bindings.dir` key their file never declared and failed on the exact-set
+/// assertion. Every test takes this guard for its whole body, so the variables
+/// are set and removed with no other test in flight.
+///
+/// Poisoning is ignored: a panicking test leaves the lock poisoned, and the
+/// remaining tests should report their own results rather than a cascade of
+/// unrelated `PoisonError`s.
+static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+fn env_guard() -> MutexGuard<'static, ()> {
+    ENV_GUARD.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn write_valid_yaml(dir: &TempDir, filename: &str) -> std::path::PathBuf {
     let path = dir.path().join(filename);
@@ -28,6 +54,7 @@ fn write_valid_yaml(dir: &TempDir, filename: &str) -> std::path::PathBuf {
 
 #[test]
 fn test_discover_uses_apcore_config_file_env_var() {
+    let _guard = env_guard();
     let dir = TempDir::new().unwrap();
     let config_path = write_valid_yaml(&dir, "custom.yaml");
 
@@ -41,6 +68,7 @@ fn test_discover_uses_apcore_config_file_env_var() {
 
 #[test]
 fn test_discover_falls_back_to_defaults_when_no_file_found() {
+    let _guard = env_guard();
     // Make sure env var is not set
     std::env::remove_var("APCORE_CONFIG_FILE");
 
@@ -114,6 +142,7 @@ fn write_minimal_yaml(dir: &TempDir, filename: &str, body: &str) -> std::path::P
 /// the file really does declare.
 #[test]
 fn test_config_file_env_var_is_not_a_config_override_legacy_mode() {
+    let _guard = env_guard();
     let dir = TempDir::new().unwrap();
     let path = write_minimal_yaml(
         &dir,
@@ -130,6 +159,7 @@ fn test_config_file_env_var_is_not_a_config_override_legacy_mode() {
 
 #[test]
 fn test_config_file_env_var_is_not_a_config_override_namespace_mode() {
+    let _guard = env_guard();
     let dir = TempDir::new().unwrap();
     let path = write_minimal_yaml(
         &dir,
@@ -159,6 +189,7 @@ fn test_config_file_env_var_is_not_a_config_override_namespace_mode() {
 /// `APCORE_BINDINGS_DIR` is §9.2 working as designed.
 #[test]
 fn test_declared_env_override_still_reaches_the_declared_document() {
+    let _guard = env_guard();
     let dir = TempDir::new().unwrap();
     let path = write_minimal_yaml(
         &dir,

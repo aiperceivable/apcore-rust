@@ -39,7 +39,7 @@ use crate::module::Module;
 use crate::registry::dependencies::resolve_dependencies;
 use crate::registry::metadata::{load_id_map, load_metadata, parse_dependencies};
 use crate::registry::registry::{
-    is_ephemeral_module_id, DiscoveredModule, Discoverer, ModuleDescriptor,
+    is_ephemeral_module_id, DependencyInfo, DiscoveredModule, Discoverer, ModuleDescriptor,
     EPHEMERAL_NAMESPACE_PREFIX, MAX_MODULE_ID_LENGTH, RESERVED_WORDS,
 };
 use crate::registry::scanner::scan_extensions;
@@ -279,10 +279,16 @@ impl Discoverer for DefaultDiscoverer {
                 continue;
             };
 
-            // Stage 5: build the descriptor from module + metadata (YAML wins).
-            let descriptor = build_descriptor(&file, module.as_ref(), meta);
-
-            // Parse declared dependencies for stage 6.
+            // Parse declared dependencies ONCE, before the descriptor is built.
+            // They have two consumers, and until this fix only the second one
+            // saw them: stage 6's load-order topo sort below, and the descriptor
+            // itself — which is what `Registry::register_discovered` stores and
+            // `Registry::get_definition` hands back. `build_descriptor` used to
+            // hard-code an empty list, so every filesystem-discovered module
+            // reported no dependencies after registration even though discovery
+            // had just sorted by them. `ReloadModule::topo_sort_modules` reads
+            // that accessor, so a `path_filter` reload silently degenerated to
+            // alphabetical order.
             let deps = if let Some(m) = meta {
                 m.get("dependencies")
                     .and_then(|v| v.as_array())
@@ -291,6 +297,9 @@ impl Discoverer for DefaultDiscoverer {
             } else {
                 Vec::new()
             };
+
+            // Stage 5: build the descriptor from module + metadata (YAML wins).
+            let descriptor = build_descriptor(&file, module.as_ref(), meta, &deps);
 
             pending.push(Pending {
                 file,
@@ -350,10 +359,16 @@ impl Discoverer for DefaultDiscoverer {
 }
 
 /// Build a `ModuleDescriptor` from the live module + optional YAML metadata.
+///
+/// `deps` is the caller's already-parsed view of the metadata's `dependencies`
+/// array (see the call site) — passed in rather than re-parsed here so the
+/// descriptor and the stage-6 load order are built from one parse, and cannot
+/// drift apart.
 fn build_descriptor(
     file: &DiscoveredFile,
     module: &dyn Module,
     meta: Option<&HashMap<String, serde_json::Value>>,
+    deps: &[DepInfo],
 ) -> ModuleDescriptor {
     let yaml = meta.cloned().unwrap_or_default();
 
@@ -398,7 +413,7 @@ fn build_descriptor(
         metadata: yaml,
         display: None,
         sunset_date: None,
-        dependencies: vec![],
+        dependencies: deps.iter().cloned().map(DependencyInfo::from).collect(),
         enabled: true,
     }
 }

@@ -17,6 +17,8 @@ use crate::module::{
     Module, ModuleAnnotations, ModuleExample, ValidationErrorDetail, ValidationResult,
 };
 use crate::registry::conflicts::{detect_id_conflicts, ConflictSeverity, ConflictType};
+use crate::registry::metadata::parse_dependencies;
+use crate::registry::types::DepInfo;
 
 /// Join the `message` field of each validation error detail into a single
 /// comma-separated string for human-readable error reporting.
@@ -95,6 +97,53 @@ pub struct DependencyInfo {
     pub version_constraint: String,
     #[serde(default)]
     pub optional: bool,
+}
+
+impl From<DepInfo> for DependencyInfo {
+    /// Lift a parsed metadata dependency into the descriptor's shape.
+    ///
+    /// The two types differ only in how "no version constraint" is spelled:
+    /// [`DepInfo::version`] is `Option<String>` (the YAML/metadata form, where
+    /// the key may simply be absent) while [`DependencyInfo::version_constraint`]
+    /// is a plain `String`. The empty string is the descriptor's "unconstrained"
+    /// value — `ReloadModule::topo_sort_modules` maps it straight back to
+    /// `None`, so the round trip is lossless.
+    fn from(dep: DepInfo) -> Self {
+        Self {
+            module_id: dep.module_id,
+            version_constraint: dep.version.unwrap_or_default(),
+            optional: dep.optional,
+        }
+    }
+}
+
+/// Read `metadata["dependencies"]` — the cross-language metadata shape, a list
+/// of `{module_id, version?, optional?}` objects — into descriptor dependencies.
+///
+/// This is the canonical four-argument `register`'s only source of declared
+/// dependencies: the [`Module`] trait exposes no `dependencies()` method, so
+/// unlike `description()` / `tags()` / `annotations()` there is nothing to fall
+/// back to in code. apcore-python (`merge_module_metadata`, code fallback via
+/// `getattr(module, "dependencies", [])`) and apcore-typescript
+/// (`mergeModuleMetadata`) accept exactly this shape through their own
+/// `register(module_id, module, version?, metadata?)`.
+///
+/// A `dependencies` value that is not an array means "none declared" rather
+/// than an error: nothing validates this key (no schema describes it), so a
+/// scalar can arrive here from hand-written YAML or a hand-built metadata map.
+fn dependencies_from_metadata(
+    metadata: &HashMap<String, serde_json::Value>,
+) -> Vec<DependencyInfo> {
+    metadata
+        .get("dependencies")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            parse_dependencies(arr)
+                .into_iter()
+                .map(DependencyInfo::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A module found via discovery.
@@ -243,7 +292,12 @@ pub const DEFAULT_MODULE_VERSION: &str = "1.0.0";
 /// consumers do not hardcode the underlying string literals. Aligned with
 /// `apcore-python.REGISTRY_EVENTS` and `apcore-typescript.REGISTRY_EVENTS`.
 ///
-/// Usage: `registry.on(REGISTRY_EVENTS.REGISTER, callback);`
+/// Usage: `registry.on(RegistryEvents::REGISTER, callback);` — or
+/// `registry.on(registry_events::REGISTER, callback);` for the free-standing
+/// constants below. The dotted `REGISTRY_EVENTS.REGISTER` spelling this
+/// comment used to show is Python/TypeScript syntax and does not compile in
+/// Rust: `REGISTER` is an associated const on [`RegistryEvents`], reachable
+/// only through the type, never through a value of it.
 pub mod registry_events {
     /// Fired after a module is successfully registered.
     pub const REGISTER: &str = "register";
@@ -254,9 +308,10 @@ pub mod registry_events {
 
 /// Container for the standard registry event names.
 ///
-/// Provides the same `REGISTRY_EVENTS.REGISTER` / `REGISTRY_EVENTS.UNREGISTER`
-/// access pattern used by `apcore-python` (dict) and `apcore-typescript`
-/// (frozen object), so that idiomatic usage is consistent across SDKs.
+/// Carries the same names `apcore-python` (dict) and `apcore-typescript`
+/// (frozen object) group under `REGISTRY_EVENTS`, spelled the way Rust
+/// reaches associated constants: `RegistryEvents::REGISTER` /
+/// `RegistryEvents::UNREGISTER`, through the type rather than through a value.
 pub struct RegistryEvents;
 
 impl RegistryEvents {
@@ -264,8 +319,10 @@ impl RegistryEvents {
     pub const UNREGISTER: &'static str = registry_events::UNREGISTER;
 }
 
-/// Singleton instance providing `REGISTRY_EVENTS.REGISTER` / `REGISTRY_EVENTS.UNREGISTER`
-/// access pattern matching the Python and TypeScript SDKs.
+/// Singleton value of [`RegistryEvents`], kept so the name `REGISTRY_EVENTS`
+/// resolves for readers coming from the Python and TypeScript SDKs. The event
+/// names themselves are read off the type — `RegistryEvents::REGISTER` — not
+/// off this value; `REGISTRY_EVENTS.REGISTER` is not valid Rust.
 pub const REGISTRY_EVENTS: RegistryEvents = RegistryEvents;
 
 /// Canonical regex source for the module ID pattern (`PROTOCOL_SPEC` §2.7).
@@ -640,6 +697,12 @@ impl Registry {
             metadata: HashMap::new(),
             display: None,
             sunset_date: None,
+            // No source to populate from: the two-argument form takes no
+            // metadata, and the `Module` trait has no `dependencies()` method
+            // to derive from the way `tags()` and `annotations()` above are.
+            // Declare dependencies through `register_versioned`'s `metadata`
+            // (`{"dependencies": [{"module_id": …}]}`) or the three-argument
+            // `register` with an explicit descriptor.
             dependencies: vec![],
             enabled: true,
         };
@@ -659,6 +722,14 @@ impl Registry {
     /// descriptor and surfaces through `get_definition().version`);
     /// pass non-`None` metadata to seed the descriptor's metadata map.
     ///
+    /// A `dependencies` key inside `metadata` — the cross-language shape
+    /// `[{"module_id": "…", "version": "…", "optional": false}]` that
+    /// apcore-python and apcore-typescript accept here — is parsed into
+    /// `descriptor.dependencies` and readable through
+    /// [`get_definition`](Self::get_definition). That is the accessor
+    /// `ReloadModule::topo_sort_modules` consults, so declaring an edge this
+    /// way orders a `path_filter` reload.
+    ///
     /// All other descriptor fields are auto-derived from the module —
     /// schemas from `input_schema()` / `output_schema()`, description
     /// from `description()`, tags from the new `tags()` trait method
@@ -672,6 +743,15 @@ impl Registry {
         version: Option<&str>,
         metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<(), ModuleError> {
+        let metadata = metadata.unwrap_or_default();
+        // `metadata["dependencies"]` was discarded here: the descriptor hard-coded
+        // an empty list, so the same call that builds a working dependency graph
+        // in apcore-python and apcore-typescript built an empty one in Rust and
+        // `get_definition().dependencies` came back empty. Only the three-argument
+        // descriptor form could declare an edge, and `ReloadModule::topo_sort_modules`
+        // reads that accessor — so a `path_filter` reload of modules registered this
+        // way sorted an empty graph and degenerated to alphabetical order.
+        let dependencies = dependencies_from_metadata(&metadata);
         let descriptor = ModuleDescriptor {
             module_id: name.to_string(),
             name: None,
@@ -687,10 +767,10 @@ impl Registry {
             // declarations are not silently dropped.
             annotations: Some(module.annotations()),
             examples: vec![],
-            metadata: metadata.unwrap_or_default(),
+            metadata,
             display: None,
             sunset_date: None,
-            dependencies: vec![],
+            dependencies,
             enabled: true,
         };
         self.register(name, module, descriptor)
