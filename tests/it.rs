@@ -128,6 +128,8 @@ mod test_config_key_restricted;
 mod test_config_load_coverage_guard;
 #[path = "test_config_load_executor_namespace.rs"]
 mod test_config_load_executor_namespace;
+#[path = "test_config_load_framework_sections.rs"]
+mod test_config_load_framework_sections;
 #[path = "test_config_load_observability_subkeys.rs"]
 mod test_config_load_observability_subkeys;
 #[path = "test_config_load_sections.rs"]

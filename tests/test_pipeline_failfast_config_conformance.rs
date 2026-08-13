@@ -25,7 +25,9 @@
 
 use apcore::errors::{ErrorCode, ModuleError};
 use apcore::pipeline::{ExecutionStrategy, PipelineContext, Step, StepResult};
-use apcore::pipeline_config::build_strategy_from_config;
+use apcore::pipeline_config::{
+    build_strategy_from_config, register_step_type, unregister_step_type,
+};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
@@ -149,6 +151,46 @@ fn expected_code(wire: &str) -> ErrorCode {
     }
 }
 
+/// Register the step type the `pipeline.steps` case names, so the case reaches
+/// the INSERTION path.
+///
+/// `driver_contract.steps_entries_are_closed_too`: without a registered type
+/// the entry fails on "step type not registered" instead, which is a different
+/// error and would pass an assertion on `error_code` while testing nothing. The
+/// rejection under test happens before the factory lookup, so this registration
+/// is what proves the rejection is about the unknown KEY.
+fn with_fixture_step_types<T>(tc: &Value, body: impl FnOnce() -> T) -> T {
+    let types: Vec<String> = tc["input"]
+        .get("yaml")
+        .and_then(|y| y["pipeline"].get("steps"))
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("type").and_then(|t| t.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    for name in &types {
+        let owned = name.clone();
+        let _ = register_step_type(
+            name,
+            Box::new(move |_cfg: &Value| -> Result<Box<dyn Step>, ModuleError> {
+                Ok(Box::new(FixtureStep {
+                    name: owned.clone(),
+                    requires: Vec::new(),
+                    provides: Vec::new(),
+                }))
+            }),
+        );
+    }
+    let out = body();
+    for name in &types {
+        let _ = unregister_step_type(name);
+    }
+    out
+}
+
 fn message_fragments(want: &Value) -> Vec<String> {
     match want {
         Value::String(s) => vec![s.clone()],
@@ -173,7 +215,8 @@ fn run_case(tc: &Value) {
 
     let outcome: Result<ExecutionStrategy, ModuleError> =
         if let Some(yaml) = tc["input"].get("yaml") {
-            build_strategy_from_config(&canonical_pipeline_config(&yaml["pipeline"]))
+            let cfg = canonical_pipeline_config(&yaml["pipeline"]);
+            with_fixture_step_types(tc, || build_strategy_from_config(&cfg))
         } else if let Some(strategy) = tc["input"].get("strategy") {
             strategy_from(strategy)
         } else {
@@ -252,17 +295,85 @@ fn run_case(tc: &Value) {
                 let strategy = outcome
                     .as_ref()
                     .unwrap_or_else(|e| panic!("[{id}] construction failed: {}", e.message));
-                let names: Vec<&str> = strategy.steps().iter().map(|s| s.name()).collect();
-                let want_names: Vec<&str> = tc["input"]["strategy"]["steps"]
-                    .as_array()
-                    .expect("strategy.steps")
+                // A `strategy:` case declares the exact step list; a `yaml:`
+                // case configures the STANDARD strategy, which has its own.
+                if let Some(steps) = tc["input"]
+                    .get("strategy")
+                    .and_then(|s| s.get("steps"))
+                    .and_then(|v| v.as_array())
+                {
+                    let names: Vec<&str> = strategy.steps().iter().map(|s| s.name()).collect();
+                    let want_names: Vec<&str> = steps
+                        .iter()
+                        .map(|s| s["name"].as_str().expect("step.name"))
+                        .collect();
+                    assert_eq!(
+                        names, want_names,
+                        "[{id}] a callable strategy must retain every declared step in order"
+                    );
+                } else {
+                    assert!(
+                        !strategy.steps().is_empty(),
+                        "[{id}] a callable strategy must retain the standard steps"
+                    );
+                }
+            }
+            // `driver_contract.read_the_field_back_off_the_step`: assert each
+            // value on the BUILT step. `raises: false` alone also passes
+            // against an implementation that accepts the keys and applies
+            // none of them — which is what this SDK did with a warning.
+            "configured_step_fields" => {
+                let want = want
+                    .as_object()
+                    .expect("configured_step_fields is an object");
+                let strategy = outcome
+                    .as_ref()
+                    .unwrap_or_else(|e| panic!("[{id}] construction failed: {}", e.message));
+                let step_name = want["step_name"].as_str().expect("step_name is a string");
+                let step = strategy
+                    .steps()
                     .iter()
-                    .map(|s| s["name"].as_str().expect("step.name"))
-                    .collect();
-                assert_eq!(
-                    names, want_names,
-                    "[{id}] a callable strategy must retain every declared step in order"
-                );
+                    .find(|s| s.name() == step_name)
+                    .unwrap_or_else(|| panic!("[{id}] configured step `{step_name}` is gone"));
+                for (field, value) in want {
+                    match field.as_str() {
+                        "step_name" => {}
+                        "match_modules" => {
+                            let got: Vec<&str> = step
+                                .match_modules()
+                                .unwrap_or(&[])
+                                .iter()
+                                .map(String::as_str)
+                                .collect();
+                            let expect: Vec<&str> = value
+                                .as_array()
+                                .expect("match_modules is an array")
+                                .iter()
+                                .map(|v| v.as_str().expect("glob is a string"))
+                                .collect();
+                            assert_eq!(got, expect, "[{id}] match_modules on `{step_name}`");
+                        }
+                        "ignore_errors" => assert_eq!(
+                            step.ignore_errors(),
+                            value.as_bool().expect("ignore_errors is a bool"),
+                            "[{id}] ignore_errors on `{step_name}`"
+                        ),
+                        "pure" => assert_eq!(
+                            step.pure(),
+                            value.as_bool().expect("pure is a bool"),
+                            "[{id}] pure on `{step_name}`"
+                        ),
+                        "timeout_ms" => assert_eq!(
+                            step.timeout_ms(),
+                            value.as_u64().expect("timeout_ms is an integer"),
+                            "[{id}] timeout_ms on `{step_name}`"
+                        ),
+                        other => panic!(
+                            "[{id}] configured_step_fields grew `{other}` that this \
+                             driver does not read back — teach it, do not skip it"
+                        ),
+                    }
+                }
             }
             other => panic!(
                 "[{id}] pipeline_failfast_config.json grew expectation `{other}` that \

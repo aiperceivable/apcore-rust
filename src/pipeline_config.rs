@@ -127,12 +127,105 @@ impl Step for ConfiguredStep {
 
 /// Resolve a single step definition dict into a `Box<dyn Step>`.
 ///
+/// The four fields `pipeline.configure` may override, per
+/// `schemas/apcore-config.schema.json` `$defs/ConfigurableStepFields` and
+/// `DECLARATIVE_CONFIG_SPEC.md` §4.2 — the §4.3 step-entry fields that still
+/// mean something applied to a step that already exists.
+///
+/// `requires` / `provides` are deliberately absent: a step's capability
+/// contract is declared by its implementation. Configuration able to rewrite it
+/// disables the `PipelineDependencyError` rule that
+/// `features/middleware-system.md` § Configuration safety states as a MUST —
+/// measured on apcore-python and apcore-typescript, the spec's own former
+/// example moved `input_validation` from `requires=["module"]` to
+/// `requires=["context"]`, deleting the dependency `module_lookup` satisfies.
+/// This SDK never applied them, so it was never affected; it dropped them with
+/// a warning instead, which is the defect fixed below.
+const CONFIGURABLE_STEP_FIELDS: &[&str] = &["match_modules", "ignore_errors", "pure", "timeout_ms"];
+
+/// The ten keys a `pipeline.steps` entry may carry, per `$defs/PipelineStep`
+/// (`additionalProperties: false`) and §4.3.
+///
+/// That definition has been closed since it was written and nothing enforced
+/// it. Measured on this SDK before the fix: an entry
+/// `{"name": "x", "type": "probe_noop", "after": "execute", "tiemout_ms": 5000}`
+/// built successfully with `timeout_ms == 0` — the operator's five-second
+/// timeout silently absent. Same failure mode as the `configure:` warning, one
+/// key over.
+const STEP_ENTRY_FIELDS: &[&str] = &[
+    "name",
+    "type",
+    "handler",
+    "config",
+    "match_modules",
+    "ignore_errors",
+    "pure",
+    "timeout_ms",
+    "after",
+    "before",
+];
+
+/// Reject any key of `entry` outside `allowed`, naming the offender and the
+/// legal set. Runs before anything is constructed, so a typo is a start-up
+/// error rather than a field that quietly never took effect.
+fn reject_unknown_keys(
+    entry: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), ModuleError> {
+    // EVERY offending key, not the first. Two reasons, and the second is why
+    // this is not merely nicer:
+    //
+    //   * One restart shows the whole problem instead of one restart per typo.
+    //     apcore-python set this precedent for the `_config.strict` framework-key
+    //     check.
+    //   * Reporting only the first makes the message depend on map iteration
+    //     order, which differs by language — `serde_json::Map` is a BTreeMap here
+    //     (sorted) while Python dicts and JS objects preserve insertion order. A
+    //     conformance assertion naming one key would then pass on two SDKs and
+    //     fail on this one for a reason that is not a behaviour difference.
+    let unknown: Vec<&str> = entry
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !allowed.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let plural = if unknown.len() == 1 {
+        "field"
+    } else {
+        "fields"
+    };
+    Err(ModuleError::new(
+        ErrorCode::PipelineConfigurationError,
+        format!(
+            "{context}: {} {plural} not valid here: {}. Accepted: {}.",
+            unknown.len(),
+            unknown
+                .iter()
+                .map(|k| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            allowed.join(", ")
+        ),
+    ))
+}
+
 /// Per `DECLARATIVE_CONFIG_SPEC.md` §4.3:
 ///   - `type:` → registry lookup (only supported mode in Rust)
 ///   - `handler:` → parse-time error (Rust cannot dynamically load modules)
 ///   - Metadata: `match_modules`, `ignore_errors`, `pure`, `timeout_ms` applied via wrapper.
 fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
     let step_name = step_def.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(entry) = step_def.as_object() {
+        let label = if step_name.is_empty() {
+            "pipeline.steps entry".to_string()
+        } else {
+            format!("pipeline.steps entry '{step_name}'")
+        };
+        reject_unknown_keys(entry, STEP_ENTRY_FIELDS, &label)?;
+    }
     let type_name = step_def.get("type").and_then(|v| v.as_str());
     let handler_path = step_def.get("handler").and_then(|v| v.as_str());
     let config = step_def
@@ -281,18 +374,16 @@ pub fn build_strategy_from_config(
                 let pure_val = fields.get("pure").and_then(serde_json::Value::as_bool);
                 let timeout_ms = fields.get("timeout_ms").and_then(serde_json::Value::as_u64);
 
-                // Warn on unknown keys (never silently drop).
-                for key in fields.keys() {
-                    if !["match_modules", "ignore_errors", "pure", "timeout_ms"]
-                        .contains(&key.as_str())
-                    {
-                        tracing::warn!(
-                            step = step_name_str,
-                            field = key.as_str(),
-                            "Unknown configurable field — ignored"
-                        );
-                    }
-                }
+                // #89: an unknown key is a parse-time error, not a warning.
+                // Warn-and-continue meant an operator's typo produced an
+                // unconfigured pipeline while the process reported success —
+                // and apcore-python and apcore-typescript both raised, so the
+                // same apcore.yaml behaved differently on each SDK.
+                reject_unknown_keys(
+                    fields,
+                    CONFIGURABLE_STEP_FIELDS,
+                    &format!("pipeline.configure: cannot configure step '{step_name_str}'"),
+                )?;
 
                 // Wrap the existing step with a ConfiguredStep overlay.
                 // Issue #33 §1.2: configuring a nonexistent step is a hard

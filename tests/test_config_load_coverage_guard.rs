@@ -6,7 +6,8 @@
 //!
 //! The individual load-path suites
 //! (`test_config_load_executor_namespace.rs`, `test_config_load_observability_subkeys.rs`,
-//! `test_config_load_sections.rs`) pin the sections that exist **today**. They
+//! `test_config_load_framework_sections.rs`, `test_config_load_sections.rs`)
+//! pin the sections that exist **today**. They
 //! cannot notice a section added tomorrow. Both defects this issue is about
 //! were found by reasoning about the mechanism, not by a failing test, and both
 //! had been shipping — precisely because nothing failed when the untested
@@ -15,8 +16,18 @@
 //! So this test asks the inverse question: **for every config section
 //! `src/config.rs` declares, is there a `Config::load` test that both writes it
 //! into a real file and asserts on the value that comes back?** A new typed
-//! field, a new default-table section, a new built-in namespace or a new
-//! required field all fail here until such a test exists.
+//! field, a new framework section in `apcore-config.schema.json`, a new
+//! default-table section, a new built-in namespace or a new required field all
+//! fail here until such a test exists.
+//!
+//! The section list has to be assembled from **every** place `src/config.rs`
+//! names one, not the convenient ones. This guard originally read five of the
+//! six and skipped `FRAMEWORK_SECTION_KEYS` — the longest list, and the only
+//! one that is a projection of the canonical schema. Seven sections
+//! (`bindings`, `id_map`, `logging`, `middleware`, `obs`, `pipeline`,
+//! `validation`) appear *only* there, so they had no `Config::load` coverage
+//! and the guard reported none missing. A guard over a partial list is the
+//! defect it was built to catch, wearing the costume of a test.
 //!
 //! ## How it works, and what it cannot do
 //!
@@ -55,6 +66,10 @@ const LOAD_SUITES: &[(&str, &str)] = &[
     (
         "test_config_load_observability_subkeys.rs",
         include_str!("test_config_load_observability_subkeys.rs"),
+    ),
+    (
+        "test_config_load_framework_sections.rs",
+        include_str!("test_config_load_framework_sections.rs"),
     ),
     (
         "test_config_load_sections.rs",
@@ -127,6 +142,65 @@ fn string_literals(body: &str) -> Vec<String> {
             i += 1;
         }
     }
+    out
+}
+
+/// Every string literal in `body` that is immediately followed by `, &[` —
+/// i.e. the KEY half of a `("section", &["key", …])` tuple.
+///
+/// Written as "literal followed by a slice" rather than "literal after an open
+/// paren" because the table is rustfmt-wrapped: a long entry puts the `(` on
+/// its own line, so the paren is not adjacent to the name. The trailing marker
+/// is unambiguous — a section name is the only literal followed by a slice,
+/// since the inner key literals are followed by `, "` or by `]`.
+fn slice_keyed_literals(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '"' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut lit = String::new();
+        while j < chars.len() && chars[j] != '"' {
+            if chars[j] == '\\' {
+                j += 1;
+            }
+            if j < chars.len() {
+                lit.push(chars[j]);
+            }
+            j += 1;
+        }
+        // `j` is the closing quote. Look at what follows, ignoring whitespace.
+        let tail: String = chars[(j + 1).min(chars.len())..]
+            .iter()
+            .filter(|c| !c.is_whitespace())
+            .take(3)
+            .collect();
+        if tail.starts_with(",&[") {
+            out.push(lit);
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Every framework section `schemas/apcore-config.schema.json` declares, as
+/// projected into `FRAMEWORK_SECTION_KEYS`.
+///
+/// This is the longest of the section lists in `src/config.rs` and the one the
+/// guard originally did not read — which is precisely why `bindings`, `id_map`,
+/// `logging`, `middleware`, `obs`, `pipeline` and `validation` sat with no
+/// `Config::load` coverage while the guard stayed green (apcore-rust#34).
+/// Every name here is a top-level key an operator can write in `apcore.yaml`
+/// and the canonical schema will accept, so every one needs load-path coverage.
+fn framework_schema_sections() -> Vec<String> {
+    let body = const_body(CONFIG_RS, "pub const FRAMEWORK_SECTION_KEYS:");
+    let mut out = slice_keyed_literals(&body);
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -233,22 +307,51 @@ fn reserved_namespace_names() -> Vec<String> {
 // Corpus probes
 // ---------------------------------------------------------------------------
 
-/// Does some load suite DECLARE `section` in a config fixture?
+/// Does some load suite DECLARE `section` at the TOP LEVEL of a config fixture?
 ///
-/// Fixtures are written both as raw strings (a real newline before the key) and
-/// as ordinary strings (a literal `\` `n` escape), and JSON fixtures spell the
-/// key `"section":`, so all three spellings count.
+/// A config section is a top-level key, so only a top-level occurrence counts.
+/// The check is deliberately position-aware rather than a substring search,
+/// because several section names are also *subkey* names elsewhere in the
+/// canonical tree — `logging` is both the root `logging:` section and the
+/// `observability.logging.*` family. A naive `contains("\n  logging:")` reads
+/// the nested family in `test_config_load_observability_subkeys.rs` as coverage
+/// for the root section and reports a section covered that no test loads. A
+/// guard that passes for the wrong reason is worse than no guard, and that
+/// false pass is the same class of mistake as the defects being guarded
+/// against, so the scan tracks indentation instead.
+///
+/// Two positions count as top level:
+///   * column 0 — the legacy-mode shape, and the namespace-mode shape used by
+///     these suites (sections sit beside the `apcore:` block, not inside it);
+///   * two-space indent when the nearest preceding column-0 line is `apcore:`
+///     — the §9.6 shape where the whole framework tree nests under `apcore:`.
+///
+/// Both raw-string fixtures (a real newline before the key) and ordinary
+/// strings (a literal `\` `n` escape) are covered by normalising the escape
+/// before the scan.
 fn declared_in_a_fixture(section: &str) -> Option<&'static str> {
-    let markers = [
-        format!("\n{section}:"),
-        format!("\\n{section}:"),
-        format!("\n  {section}:"),
-        format!("\\n  {section}:"),
-        format!("\"{section}\":"),
-    ];
+    fn declares(src: &str, section: &str) -> bool {
+        let normalised = src.replace("\\n", "\n");
+        let mut under_apcore = false;
+        for line in normalised.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            if indent == 0 {
+                // A column-0 line closes any `apcore:` block that was open.
+                under_apcore = trimmed.starts_with("apcore:");
+                if trimmed.starts_with(&format!("{section}:")) {
+                    return true;
+                }
+            } else if indent == 2 && under_apcore && trimmed.starts_with(&format!("{section}:")) {
+                return true;
+            }
+        }
+        false
+    }
+
     LOAD_SUITES
         .iter()
-        .find(|(_, src)| markers.iter().any(|m| src.contains(m.as_str())))
+        .find(|(_, src)| declares(src, section))
         .map(|(name, _)| *name)
 }
 
@@ -293,6 +396,24 @@ fn the_section_extractors_are_not_vacuous() {
     assert!(
         typed.contains(&"executor".to_string()) && typed.contains(&"observability".to_string()),
         "the two typed fields that broke must still be recovered, got {typed:?}"
+    );
+
+    let framework = framework_schema_sections();
+    assert!(
+        framework.len() >= 10,
+        "FRAMEWORK_SECTION_KEYS should yield every section of \
+         apcore-config.schema.json, got {framework:?}"
+    );
+    for expected in ["acl", "bindings", "id_map", "logging", "obs", "validation"] {
+        assert!(
+            framework.contains(&expected.to_string()),
+            "`{expected}` must be recovered from FRAMEWORK_SECTION_KEYS, got {framework:?}"
+        );
+    }
+    assert!(
+        !framework.contains(&"strict".to_string()) && !framework.contains(&"redaction".to_string()),
+        "`strict` and `redaction` are declared KEYS, not sections — the \
+         key/section split in slice_keyed_literals broke: {framework:?}"
     );
 
     let defaults = default_table_sections();
@@ -340,6 +461,12 @@ fn every_config_section_has_load_path_coverage() {
         sections.push((
             name,
             "typed field on ConfigHelper (outside the flatten bag)",
+        ));
+    }
+    for name in framework_schema_sections() {
+        sections.push((
+            name,
+            "framework section declared by apcore-config.schema.json",
         ));
     }
     for name in default_table_sections() {
