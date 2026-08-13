@@ -9,7 +9,6 @@ use apcore::events::subscribers::EventSubscriber;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,32 +17,7 @@ use std::time::Duration;
 // Fixture loading
 // ---------------------------------------------------------------------------
 
-fn find_fixtures_root() -> PathBuf {
-    if let Ok(spec_repo) = std::env::var("APCORE_SPEC_REPO") {
-        let p = PathBuf::from(&spec_repo)
-            .join("conformance")
-            .join("fixtures");
-        if p.is_dir() {
-            return p;
-        }
-        panic!("APCORE_SPEC_REPO={spec_repo} does not contain conformance/fixtures/");
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest_dir
-        .parent()
-        .unwrap()
-        .join("apcore")
-        .join("conformance")
-        .join("fixtures");
-    if sibling.is_dir() {
-        return sibling;
-    }
-    panic!(
-        "Cannot find apcore conformance fixtures.\n\
-         Set APCORE_SPEC_REPO or clone apcore as a sibling of {}",
-        manifest_dir.parent().unwrap().display()
-    );
-}
+use crate::conformance_env::find_fixtures_root;
 
 fn load_fixture() -> Value {
     let path = find_fixtures_root().join("event_delivery_semantics.json");

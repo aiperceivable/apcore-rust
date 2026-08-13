@@ -72,7 +72,7 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
         env:
-          APCORE_SPEC_REPO: ${{ github.workspace }}/.apcore-spec
+          CONFORMANCE_SPEC_REPO: ${{ github.workspace }}/.apcore-spec
 
       - name: Build examples
         run: cargo build --examples

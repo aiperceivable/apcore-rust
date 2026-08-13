@@ -515,29 +515,7 @@ fn allow_unknown_does_not_soften_the_strict_framework_key_check() {
 
 /// Locate `apcore/schemas/` the same way the conformance drivers locate
 /// `apcore/conformance/fixtures/`.
-fn find_schemas_root() -> std::path::PathBuf {
-    if let Ok(spec_repo) = std::env::var("APCORE_SPEC_REPO") {
-        let p = std::path::PathBuf::from(&spec_repo).join("schemas");
-        if p.is_dir() {
-            return p;
-        }
-        panic!("APCORE_SPEC_REPO={spec_repo} does not contain schemas/");
-    }
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest_dir
-        .parent()
-        .unwrap()
-        .join("apcore")
-        .join("schemas");
-    if sibling.is_dir() {
-        return sibling;
-    }
-    panic!(
-        "Cannot find apcore schemas. Set APCORE_SPEC_REPO or clone apcore as a \
-         sibling at {}",
-        manifest_dir.parent().unwrap().join("apcore").display()
-    );
-}
+use crate::conformance_env::find_schemas_root;
 
 fn read_schema(name: &str) -> Value {
     let path = find_schemas_root().join(name);

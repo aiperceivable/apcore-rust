@@ -40,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Conformance driver follows the fixture.** `middleware_hardening.json` dropped its `tracing_span_created` case (it pinned §1.3) and `context_namespace_violation` now uses `_apcore.mw.tracing.spans` as its example framework-owned key instead of `_apcore.mw.tracing.span_id`. The corresponding driver case in `tests/test_middleware_hardening_conformance.rs` was deleted, and `tracing_noop_without_otel` now drives `observability::TracingMiddleware`: the fixture's `otel_available: false` reads in Rust as "no telemetry pipeline is wired", since the middleware links against no OpenTelemetry SDK at all.
 
+### Fixed
+
+- **BEHAVIOUR CHANGE: the documented nested `retry:` block on a subscriber is now read from config, on all five built-in types (apcore#85).** `features/event-system.md` documents a per-subscriber retry policy and shows it under a heading reading *"showing the policy on multiple subscriber types"* — an `a2a` entry with `max_attempts: 5` and a `file` entry with `max_attempts: 2`. **No SDK parsed it.** An operator who copied that example got the default policy, silently, with nothing to indicate the block had been ignored: `schemas/sys-modules.schema.json` does not describe subscriber entries beyond requiring a `type`, so nothing rejected the key either.
+
+  The capability was already built at every other layer, which is why this survived. `EventRetryConfig` (`events::retry`) declares exactly the four keys the document shows, and `EventEmitter::deliver_with_dlq` calls `subscriber.retry()` with no type check and no allowlist, so whatever a subscriber declares is honoured. The single missing layer was config → object: none of the five `build_*_subscriber` factories constructed a policy.
+
+  `events::subscribers::parse_retry_config` now parses the block and every built-in builder applies the result. Partial blocks merge over the spec defaults (`max_attempts=3`, `initial_backoff_ms=100`, `max_backoff_ms=30000`, `backoff_multiplier=2.0`), as the documented `file` example requires — it declares only two of the four keys. A `retry:` that is not an object is ignored rather than fatal.
+
+  **`FileSubscriber`, `StdoutSubscriber` and `FilterSubscriber` gained the `retry` field they were missing**, each with a `with_retry` builder and a `retry()` trait override, matching what `WebhookSubscriber` and `A2ASubscriber` already had. Without the field they fell through to the trait default and no policy could reach them from any direction — not from config, and not from a caller constructing them directly. All three are real retry surfaces: `FileSubscriber::on_event` returns `Err` on open/write failure, `StdoutSubscriber` writes to stdout (EPIPE, closed stream), and `FilterSubscriber` forwards to its delegate, so a retry there re-runs delegate delivery.
+
+  **`WebhookSubscriber::retry_count` was inert and is now wired.** `build_webhook_subscriber` wrote the flat legacy shorthand into `sub.retry_count`, but `retry()` returns `self.retry` and never consulted that field — so in this SDK the one spelling that *was* parsed had no effect on delivery either. The field's own doc comment claimed the precedence resolution "happens in `build_webhook_subscriber`", which it did not. Both spellings now reach `retry`: `retry_count` keeps its `max_attempts = retry_count + 1` translation as a deprecated webhook-only alias — that spelling is what deployments use today — and **the nested block wins when both are present.** `retry_count` is now applied only when the key is actually present in the config, rather than defaulting to `3` and overwriting whatever else was set.
+
+  Also corrected: the `EventSubscriber::retry` doc comment claimed the default was "single-attempt (no retry)" while the body returns `EventRetryConfig::default()` — 3 attempts with backoff. The text now matches the code and points at `EventRetryConfig::no_retry` for callers who genuinely want one attempt.
+
+  **This changes delivery behaviour for anyone who had already written the documented block**: a subscriber that was silently retrying 3 times now retries as configured. Pinned by `tests/test_subscriber_retry_config.rs`, one case per subscriber type plus two end-to-end cases — one asserting the DLQ payload's `attempt_count` for a real failing `file` subscriber, one counting actual `on_event` invocations. Every asserted value differs from the default, so a case cannot pass against a factory that ignores the block.
+
 ---
 
 ## [0.27.0] - 2026-08-12

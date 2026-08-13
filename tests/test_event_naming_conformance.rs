@@ -11,7 +11,6 @@
 //! claim is checked wherever the SDK actually puts the value.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use apcore::config::Config;
@@ -29,32 +28,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-fn find_fixtures_root() -> PathBuf {
-    if let Ok(spec_repo) = std::env::var("APCORE_SPEC_REPO") {
-        let p = PathBuf::from(&spec_repo)
-            .join("conformance")
-            .join("fixtures");
-        if p.is_dir() {
-            return p;
-        }
-        panic!("APCORE_SPEC_REPO={spec_repo} does not contain conformance/fixtures/");
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest_dir
-        .parent()
-        .unwrap()
-        .join("apcore")
-        .join("conformance")
-        .join("fixtures");
-    if sibling.is_dir() {
-        return sibling;
-    }
-    panic!(
-        "Cannot find apcore conformance fixtures. Set APCORE_SPEC_REPO or clone \
-         apcore as a sibling at {}",
-        manifest_dir.parent().unwrap().join("apcore").display()
-    );
-}
+use crate::conformance_env::find_fixtures_root;
 
 fn fixture() -> Value {
     let path = find_fixtures_root().join("event_naming.json");

@@ -146,8 +146,13 @@ pub trait EventSubscriber: Send + Sync + std::fmt::Debug {
 
     /// Retry configuration for delivery of events to this subscriber.
     ///
-    /// Defaults to single-attempt (no retry). Override to opt into exponential
-    /// backoff with DLQ emission on exhaustion.
+    /// Defaults to the spec policy ([`EventRetryConfig::default`] — 3 attempts,
+    /// 100 ms initial backoff, 2.0x, 30 s cap) with DLQ emission on exhaustion.
+    /// Override to declare a different policy; use
+    /// [`EventRetryConfig::no_retry`] for single-attempt delivery.
+    ///
+    /// [`EventRetryConfig::default`]: crate::events::retry::EventRetryConfig::default
+    /// [`EventRetryConfig::no_retry`]: crate::events::retry::EventRetryConfig::no_retry
     fn retry(&self) -> crate::events::retry::EventRetryConfig {
         crate::events::retry::EventRetryConfig::default()
     }
@@ -487,6 +492,10 @@ pub struct FileSubscriber {
     pub append: bool,
     pub format: OutputFormat,
     pub rotate_bytes: Option<u64>,
+    /// Retry policy applied by [`EventEmitter`](super::EventEmitter). `on_event`
+    /// returns `Err` on open/write failure, so this policy governs real
+    /// re-delivery of transient I/O errors (apcore#85).
+    pub retry: crate::events::retry::EventRetryConfig,
 }
 
 impl FileSubscriber {
@@ -498,6 +507,7 @@ impl FileSubscriber {
             append: true,
             format: OutputFormat::Json,
             rotate_bytes: None,
+            retry: crate::events::retry::EventRetryConfig::default(),
         }
     }
 
@@ -522,6 +532,13 @@ impl FileSubscriber {
     #[must_use]
     pub fn with_rotate_bytes(mut self, rotate_bytes: Option<u64>) -> Self {
         self.rotate_bytes = rotate_bytes;
+        self
+    }
+
+    /// Override the retry policy applied by [`EventEmitter`](super::EventEmitter).
+    #[must_use]
+    pub fn with_retry(mut self, retry: crate::events::retry::EventRetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -563,6 +580,10 @@ impl EventSubscriber for FileSubscriber {
     #[allow(clippy::unnecessary_literal_bound)]
     fn event_pattern(&self) -> &str {
         "*"
+    }
+
+    fn retry(&self) -> crate::events::retry::EventRetryConfig {
+        self.retry
     }
 
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
@@ -622,6 +643,10 @@ pub struct StdoutSubscriber {
     pub id: String,
     pub format: OutputFormat,
     pub level_filter: Option<String>,
+    /// Retry policy applied by [`EventEmitter`](super::EventEmitter). Writing
+    /// to stdout can fail (EPIPE, closed stream), so this policy governs real
+    /// re-delivery (apcore#85).
+    pub retry: crate::events::retry::EventRetryConfig,
 }
 
 impl Default for StdoutSubscriber {
@@ -637,7 +662,15 @@ impl StdoutSubscriber {
             id: next_subscriber_id("stdout"),
             format: OutputFormat::Text,
             level_filter: None,
+            retry: crate::events::retry::EventRetryConfig::default(),
         }
+    }
+
+    /// Override the retry policy applied by [`EventEmitter`](super::EventEmitter).
+    #[must_use]
+    pub fn with_retry(mut self, retry: crate::events::retry::EventRetryConfig) -> Self {
+        self.retry = retry;
+        self
     }
 
     #[must_use]
@@ -682,6 +715,10 @@ impl EventSubscriber for StdoutSubscriber {
         "*"
     }
 
+    fn retry(&self) -> crate::events::retry::EventRetryConfig {
+        self.retry
+    }
+
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
         if !self.allow(event) {
             return Ok(());
@@ -720,6 +757,10 @@ pub struct FilterSubscriber {
     pub delegate: Box<dyn EventSubscriber>,
     pub include_events: Option<Vec<String>>,
     pub exclude_events: Option<Vec<String>>,
+    /// Retry policy applied by [`EventEmitter`](super::EventEmitter). The
+    /// filter forwards to its delegate, so a retry here re-runs delegate
+    /// delivery (apcore#85).
+    pub retry: crate::events::retry::EventRetryConfig,
 }
 
 impl std::fmt::Debug for FilterSubscriber {
@@ -740,12 +781,20 @@ impl FilterSubscriber {
             delegate,
             include_events: None,
             exclude_events: None,
+            retry: crate::events::retry::EventRetryConfig::default(),
         }
     }
 
     #[must_use]
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// Override the retry policy applied by [`EventEmitter`](super::EventEmitter).
+    #[must_use]
+    pub fn with_retry(mut self, retry: crate::events::retry::EventRetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -792,6 +841,10 @@ impl EventSubscriber for FilterSubscriber {
 
     fn event_pattern(&self) -> &str {
         self.delegate.event_pattern()
+    }
+
+    fn retry(&self) -> crate::events::retry::EventRetryConfig {
+        self.retry
     }
 
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
@@ -843,6 +896,44 @@ fn match_glob_pattern(pattern: &str, value: &str) -> bool {
 type SubscriberFactory =
     Box<dyn Fn(&serde_json::Value) -> Result<Box<dyn EventSubscriber>, ModuleError> + Send + Sync>;
 
+/// Parse a subscriber's nested `retry:` block into an [`EventRetryConfig`].
+///
+/// Implements the per-subscriber retry policy documented in
+/// `docs/features/event-system.md` §"Per-Subscriber Retry Policy" (apcore#85).
+/// The block is optional and may be partial — omitted keys fall back to the
+/// spec defaults (`max_attempts=3`, `initial_backoff_ms=100`,
+/// `max_backoff_ms=30000`, `backoff_multiplier=2.0`).
+///
+/// Returns `None` when no `retry:` block is present, so the subscriber keeps
+/// its own default policy.
+///
+/// [`EventRetryConfig`]: crate::events::retry::EventRetryConfig
+fn parse_retry_config(
+    config: &serde_json::Value,
+) -> Option<crate::events::retry::EventRetryConfig> {
+    let nested = config.get("retry")?.as_object()?;
+    let default = crate::events::retry::EventRetryConfig::default();
+    Some(crate::events::retry::EventRetryConfig {
+        max_attempts: nested
+            .get("max_attempts")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default.max_attempts),
+        initial_backoff_ms: nested
+            .get("initial_backoff_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(default.initial_backoff_ms),
+        max_backoff_ms: nested
+            .get("max_backoff_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(default.max_backoff_ms),
+        backoff_multiplier: nested
+            .get("backoff_multiplier")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(default.backoff_multiplier),
+    })
+}
+
 // ModuleError is a protocol-level domain type whose rich field set is spec-required;
 // boxing individual fields would break ergonomics across the entire codebase.
 #[allow(clippy::result_large_err)]
@@ -854,12 +945,13 @@ fn build_webhook_subscriber(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ModuleError::new(ErrorCode::ConfigInvalid, "webhook: 'url' is required"))?
         .to_string();
+    // Deprecated flat shorthand: `retry_count` counted retries *after* the
+    // first attempt, so it maps to `max_attempts = retry_count + 1`. Only
+    // applied when present; the nested `retry:` block wins (apcore#85).
     let retry_count = config
         .get("retry_count")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(3)
-        .try_into()
-        .unwrap_or(3u32);
+        .and_then(|v| u32::try_from(v).ok());
     let timeout_ms = config
         .get("timeout_ms")
         .and_then(serde_json::Value::as_u64)
@@ -875,8 +967,17 @@ fn build_webhook_subscriber(
     let id = next_subscriber_id("webhook");
     let mut sub = WebhookSubscriber::new(id, url, "*");
     sub.headers = headers;
-    sub.retry_count = retry_count;
     sub.timeout_ms = timeout_ms;
+    if let Some(retry) = parse_retry_config(config) {
+        sub.retry_count = retry.max_attempts.saturating_sub(1);
+        sub.retry = retry;
+    } else if let Some(count) = retry_count {
+        sub.retry_count = count;
+        sub.retry = crate::events::retry::EventRetryConfig {
+            max_attempts: count.saturating_add(1),
+            ..crate::events::retry::EventRetryConfig::default()
+        };
+    }
     Ok(Box::new(sub) as Box<dyn EventSubscriber>)
 }
 
@@ -912,6 +1013,9 @@ fn build_a2a_subscriber(
     let mut sub = A2ASubscriber::new(id, platform_url, "*");
     sub.auth = auth;
     sub.timeout_ms = timeout_ms;
+    if let Some(retry) = parse_retry_config(config) {
+        sub.retry = retry;
+    }
     Ok(Box::new(sub) as Box<dyn EventSubscriber>)
 }
 
@@ -933,10 +1037,13 @@ fn build_file_subscriber(
     let rotate_bytes = config
         .get("rotate_bytes")
         .and_then(serde_json::Value::as_u64);
-    let sub = FileSubscriber::new(path)
+    let mut sub = FileSubscriber::new(path)
         .with_format(format)
         .with_append(append)
         .with_rotate_bytes(rotate_bytes);
+    if let Some(retry) = parse_retry_config(config) {
+        sub = sub.with_retry(retry);
+    }
     Ok(Box::new(sub) as Box<dyn EventSubscriber>)
 }
 
@@ -952,9 +1059,12 @@ fn build_stdout_subscriber(
         .get("level_filter")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    let sub = StdoutSubscriber::new()
+    let mut sub = StdoutSubscriber::new()
         .with_format(format)
         .with_level_filter(level_filter);
+    if let Some(retry) = parse_retry_config(config) {
+        sub = sub.with_retry(retry);
+    }
     Ok(Box::new(sub) as Box<dyn EventSubscriber>)
 }
 
@@ -1012,6 +1122,9 @@ fn build_filter_subscriber(
     }
     if let Some(p) = exclude {
         sub = sub.with_exclude(p);
+    }
+    if let Some(retry) = parse_retry_config(config) {
+        sub = sub.with_retry(retry);
     }
     Ok(Box::new(sub) as Box<dyn EventSubscriber>)
 }

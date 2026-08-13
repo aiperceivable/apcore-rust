@@ -28,6 +28,8 @@ mod async_tasks_spec;
 mod call_chain_guard_spec;
 #[path = "cancellation_spec.rs"]
 mod cancellation_spec;
+#[path = "conformance_env.rs"]
+mod conformance_env;
 #[path = "conformance_high_drift.rs"]
 mod conformance_high_drift;
 #[path = "context_object_spec.rs"]
@@ -274,6 +276,8 @@ mod test_stream_chunk_reject;
 mod test_stream_phase1_on_error;
 #[path = "test_streaming_interface.rs"]
 mod test_streaming_interface;
+#[path = "test_subscriber_retry_config.rs"]
+mod test_subscriber_retry_config;
 #[path = "test_suspend_resume.rs"]
 mod test_suspend_resume;
 #[path = "test_sync_parity_critical.rs"]

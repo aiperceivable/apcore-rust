@@ -15,7 +15,6 @@
 #![allow(clippy::pedantic)] // fixture-driven test file: casts/layout follow the fixture schema
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use apcore::errors::{ErrorCode, ModuleError};
 use serde_json::Value;
@@ -25,32 +24,7 @@ use serde_json::Value;
 // conformance drivers in this crate).
 // ---------------------------------------------------------------------------
 
-fn find_fixtures_root() -> PathBuf {
-    if let Ok(spec_repo) = std::env::var("APCORE_SPEC_REPO") {
-        let p = PathBuf::from(&spec_repo)
-            .join("conformance")
-            .join("fixtures");
-        if p.is_dir() {
-            return p;
-        }
-        panic!("APCORE_SPEC_REPO={spec_repo} does not contain conformance/fixtures/");
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest_dir
-        .parent()
-        .unwrap()
-        .join("apcore")
-        .join("conformance")
-        .join("fixtures");
-    if sibling.is_dir() {
-        return sibling;
-    }
-    panic!(
-        "Cannot find apcore conformance fixtures.\n\
-         Set APCORE_SPEC_REPO or clone apcore as a sibling of {}",
-        manifest_dir.parent().unwrap().display()
-    );
-}
+use crate::conformance_env::find_fixtures_root;
 
 fn load_fixture() -> Value {
     let path = find_fixtures_root().join("error_serialization.json");

@@ -20,7 +20,6 @@
 
 #![allow(clippy::missing_panics_doc)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,36 +41,7 @@ use apcore::observability::tracing_middleware::{SamplingStrategy, TracingMiddlew
 // Fixture loading (mirrors other conformance tests)
 // ---------------------------------------------------------------------------
 
-fn find_fixtures_root() -> PathBuf {
-    if let Ok(spec_repo) = std::env::var("APCORE_SPEC_REPO") {
-        let p = PathBuf::from(&spec_repo)
-            .join("conformance")
-            .join("fixtures");
-        if p.is_dir() {
-            return p;
-        }
-        panic!("APCORE_SPEC_REPO={spec_repo} does not contain conformance/fixtures/");
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest_dir
-        .parent()
-        .unwrap()
-        .join("apcore")
-        .join("conformance")
-        .join("fixtures");
-    if sibling.is_dir() {
-        return sibling;
-    }
-
-    panic!(
-        "Cannot find apcore conformance fixtures.\n\
-         Fix one of:\n\
-         1. Set APCORE_SPEC_REPO to the apcore spec repo path\n\
-         2. Clone apcore as a sibling: git clone <apcore-url> {}\n",
-        manifest_dir.parent().unwrap().join("apcore").display()
-    );
-}
+use crate::conformance_env::find_fixtures_root;
 
 fn load_fixture() -> Value {
     let path = find_fixtures_root().join("middleware_hardening.json");

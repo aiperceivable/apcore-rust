@@ -2,49 +2,18 @@
 //! (PROTOCOL_SPEC §4.16 / ALGORITHMS A23).
 //!
 //! Consumes the canonical `schema_strict_conversion.json` fixture shipped by
-//! the `apcore` spec repo (sibling directory or `APCORE_SPEC_REPO`).
+//! the `apcore` spec repo (sibling directory or `CONFORMANCE_SPEC_REPO`).
 //!
 //! DRIVER CONTRACT: this file MUST drive [`apcore::to_strict_schema`] — the A23
 //! entry point — not the exporter and not the binding wrapper. A23 is the
 //! shared deterministic surface; the three SDKs must emit the same strict
 //! schema for the same input.
 
-use std::path::PathBuf;
-
 use serde_json::Value;
 
 use apcore::to_strict_schema;
 
-fn find_fixtures_root() -> PathBuf {
-    if let Ok(spec_repo) = std::env::var("APCORE_SPEC_REPO") {
-        let p = PathBuf::from(&spec_repo)
-            .join("conformance")
-            .join("fixtures");
-        if p.is_dir() {
-            return p;
-        }
-        panic!("APCORE_SPEC_REPO={spec_repo} does not contain conformance/fixtures/");
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest_dir
-        .parent()
-        .unwrap()
-        .join("apcore")
-        .join("conformance")
-        .join("fixtures");
-    if sibling.is_dir() {
-        return sibling;
-    }
-
-    panic!(
-        "Cannot find apcore conformance fixtures.\n\
-         Fix one of:\n\
-         1. Set APCORE_SPEC_REPO to the apcore spec repo path\n\
-         2. Clone apcore as a sibling: git clone <apcore-url> {}\n",
-        sibling.display()
-    );
-}
+use crate::conformance_env::find_fixtures_root;
 
 fn load_fixture(name: &str) -> Value {
     let path = find_fixtures_root().join(format!("{name}.json"));
