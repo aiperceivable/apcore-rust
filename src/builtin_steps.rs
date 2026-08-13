@@ -788,6 +788,22 @@ impl Step for BuiltinApprovalGate {
                 ));
             }
             "pending" => {
+                // The `approval_id` MUST travel on the error: it is the token a
+                // caller needs to resume via `_approval_token` once the external
+                // approval lands (protocol-spec.md §7.4 "Resume semantics", and
+                // conformance fixture approval_gate.json `gate_fires_pending`).
+                // Without it a pending result is a dead end. Mirrors
+                // apcore-python `ApprovalPendingError.__init__`, which sets
+                // `self.details["approval_id"]`.
+                let mut details: std::collections::HashMap<String, serde_json::Value> =
+                    std::collections::HashMap::new();
+                details.insert(
+                    "approval_id".to_string(),
+                    match &approval_result.approval_id {
+                        Some(approval_id) => serde_json::Value::String(approval_id.clone()),
+                        None => serde_json::Value::Null,
+                    },
+                );
                 return Err(ModuleError::new(
                     ErrorCode::ApprovalPending,
                     format!(
@@ -795,9 +811,11 @@ impl Step for BuiltinApprovalGate {
                         ctx.module_id,
                         approval_result
                             .reason
+                            .clone()
                             .unwrap_or_else(|| "no reason given".to_string())
                     ),
-                ));
+                )
+                .with_details(details));
             }
             _ => {
                 tracing::warn!(

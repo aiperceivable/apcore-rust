@@ -49,6 +49,15 @@ fn fixture() -> serde_json::Value {
     serde_json::from_str(&raw).expect("fixture parses")
 }
 
+fn fixture_case<'a>(fx: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    fx["test_cases"]
+        .as_array()
+        .expect("test_cases is an array")
+        .iter()
+        .find(|c| c["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("fixture case '{id}' not present"))
+}
+
 fn allowed_keys(fx: &serde_json::Value) -> HashSet<String> {
     fx["allowed_keys"]
         .as_array()
@@ -65,13 +74,19 @@ fn allowed_keys(fx: &serde_json::Value) -> HashSet<String> {
 fn config_defaults_declare_no_undeclared_key() {
     let fx = fixture();
     let allowed = allowed_keys(&fx);
-    let violations: Vec<&str> = apcore::config::config_default_keys()
+    let mut violations: Vec<&str> = apcore::config::config_default_keys()
         .into_iter()
         .filter(|k| !allowed.contains(*k))
         .collect();
-    assert!(
-        violations.is_empty(),
-        "CONFIG_DEFAULTS declares keys no canonical schema allows: {violations:?}\n\
+    violations.sort_unstable();
+    // `violations` — compared against the list the fixture declares, not merely
+    // asserted empty: if the fixture ever accepts a known exception, the driver
+    // must accept exactly that one and no other.
+    let case = fixture_case(&fx, "sdk_default_table_declares_no_undeclared_key");
+    assert_eq!(
+        serde_json::to_value(&violations).unwrap(),
+        case["expected"]["violations"],
+        "CONFIG_DEFAULTS declares keys the fixture does not list under `violations`.\n\
          Either add them to a schema in apcore/schemas/ (and regenerate the \
          fixture) or remove them from CONFIG_DEFAULTS."
     );
@@ -83,14 +98,18 @@ fn config_defaults_declare_no_undeclared_key() {
 fn config_constraints_declare_no_undeclared_key() {
     let fx = fixture();
     let allowed = allowed_keys(&fx);
-    let violations: Vec<&str> = apcore::config::CONSTRAINED_CONFIG_KEYS
+    let mut violations: Vec<&str> = apcore::config::CONSTRAINED_CONFIG_KEYS
         .iter()
         .copied()
         .filter(|k| !allowed.contains(*k))
         .collect();
-    assert!(
-        violations.is_empty(),
-        "validate_key_constraint covers keys no canonical schema allows: {violations:?}"
+    violations.sort_unstable();
+    // `violations`
+    let case = fixture_case(&fx, "sdk_constraint_table_declares_no_undeclared_key");
+    assert_eq!(
+        serde_json::to_value(&violations).unwrap(),
+        case["expected"]["violations"],
+        "validate_key_constraint covers keys the fixture does not list under `violations`"
     );
 }
 
@@ -139,8 +158,12 @@ fn config_default_values_match_canonical_defaults() {
             mismatched.push(format!("{key}: sdk={got:?} canonical={want}"));
         }
     }
-    assert!(
-        mismatched.is_empty(),
+    // `mismatched`
+    mismatched.sort();
+    let case = fixture_case(&fx, "sdk_default_values_match_canonical_defaults");
+    assert_eq!(
+        serde_json::to_value(&mismatched).unwrap(),
+        case["expected"]["mismatched"],
         "CONFIG_DEFAULTS disagrees with defaults.schema.json:\n  {}",
         mismatched.join("\n  ")
     );

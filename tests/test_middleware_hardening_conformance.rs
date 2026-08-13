@@ -312,18 +312,35 @@ async fn conformance_circuit_breaker_short_circuits_open() {
     ctx.caller_id = Some(caller_id.to_string());
 
     let result = mw.before(module_id, Value::Null, &ctx).await;
+    let result_was_err = result.is_err();
     assert!(
-        result.is_err(),
+        result_was_err,
         "before() must short-circuit while OPEN within the recovery window"
     );
     let err = result.unwrap_err();
-    assert_eq!(err.code, ErrorCode::CircuitBreakerOpen);
 
+    // CORRECTED: this previously read `expected["error"]` and compared it to the
+    // literal "CircuitBreakerOpenError" — fixture text against a string in the
+    // test, with the SDK never consulted. It stayed green no matter what
+    // `before()` returned. The contract is the WIRE CODE, which is the only
+    // thing all three SDKs can carry (apcore-rust has no error CLASS hierarchy,
+    // only `ErrorCode` variants), so assert the code the SDK actually produced
+    // against the code the fixture declares.
+    let actual_code = serde_json::to_value(err.code).expect("ErrorCode serializes");
     assert_eq!(
-        case["expected"]["error"].as_str(),
-        Some("CircuitBreakerOpenError"),
+        actual_code, case["expected"]["error_code"],
+        "wire code produced by CircuitBreakerMiddleware::before must match the fixture"
     );
-    assert_eq!(case["expected"]["module_reached"].as_bool(), Some(false));
+
+    // `module_reached: false` — the short-circuit means `before()` returned Err,
+    // so the pipeline never reached the module. Drive the check off the fixture
+    // value rather than asserting the fixture equals a literal.
+    let module_reached = !result_was_err;
+    assert_eq!(
+        module_reached,
+        case["expected"]["module_reached"].as_bool().unwrap(),
+        "module_reached mismatch"
+    );
 }
 
 // ---------------------------------------------------------------------------

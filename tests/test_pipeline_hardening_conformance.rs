@@ -432,12 +432,20 @@ async fn pipeline_hardening_run_until_stops_early() {
     assert!(trace.success);
     assert_eq!(context_count.load(Ordering::SeqCst), 1);
     assert_eq!(lookup_count.load(Ordering::SeqCst), 1);
+
+    // `steps_after_skipped` — every step positioned AFTER the one the predicate
+    // matched on must not have run. Counted from the steps' own side-effects,
+    // so a pipeline that kept going past the predicate turns this red.
+    let steps_after_skipped =
+        execute_count.load(Ordering::SeqCst) == 0 && return_count.load(Ordering::SeqCst) == 0;
     assert_eq!(
+        steps_after_skipped,
+        case["expected"]["steps_after_skipped"].as_bool().unwrap(),
+        "steps_after_skipped mismatch — execute ran {} time(s), return_result ran {} time(s) \
+         after run_until returned true on {stop_after}",
         execute_count.load(Ordering::SeqCst),
-        0,
-        "execute must NOT run after run_until returned true on module_lookup",
+        return_count.load(Ordering::SeqCst),
     );
-    assert_eq!(return_count.load(Ordering::SeqCst), 0);
 
     // The last entry in the trace is the step the predicate matched on.
     let last_executed = trace

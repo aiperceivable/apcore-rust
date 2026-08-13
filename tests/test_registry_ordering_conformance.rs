@@ -213,6 +213,42 @@ fn conformance_visibility_after_successful_on_load() {
         was_visible, concurrent_visible,
         "module visibility during on_load: expected={concurrent_visible}, got={was_visible}"
     );
+
+    // Bound to the fixture. The key used to read
+    // `concurrent_check_get_raises: "MODULE_NOT_FOUND"`, a behaviour no SDK
+    // implements: `Registry::get` returns `Ok(None)` for a well-formed id that
+    // is not visible and reserves `Err(ModuleNotFound)` for the empty string,
+    // matching features/registry-system.md "On success (not found)". It is now
+    // `concurrent_check_get_returns: null`, which is observable.
+    // `was_visible` is `registry.get(&id).is_some()` sampled DURING on_load, so
+    // it is the same observation this key describes, viewed as a bool. The two
+    // keys are two facets of one measurement — that redundancy is the fixture's,
+    // and both are bound rather than one left dangling.
+    let expects_empty = case["expected"]["concurrent_check_get_returns"].is_null();
+    assert_eq!(
+        was_visible,
+        !expects_empty,
+        "get() during on_load: fixture expects {}, SDK returned {}",
+        if expects_empty {
+            "the empty value"
+        } else {
+            "a module"
+        },
+        if was_visible {
+            "a module"
+        } else {
+            "the empty value"
+        }
+    );
+    // The lookup path that DOES surface the code is covered below.
+    let Err(lookup_err) = registry.acquire("executor.test.never_registered") else {
+        panic!("acquiring an unregistered module must fail")
+    };
+    assert_eq!(
+        lookup_err.code,
+        ErrorCode::ModuleNotFound,
+        "resolving an invisible module for use must surface MODULE_NOT_FOUND"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -269,16 +305,33 @@ fn conformance_callback_failure_blocks_visibility() {
         make_descriptor(module_id),
     );
 
-    // registration_raises
+    // `registration_raises` names the HOST error the callback produced, not a
+    // registry-invented one: `register()` must surface the callback's own error
+    // unchanged rather than remapping it, or the caller loses the reason the
+    // load failed. Rust's `on_load` returns `Result<(), ModuleError>`, so
+    // "unchanged" means the same code AND the same message come back out.
+    let declares_host_error = case["expected"]["registration_raises"]
+        .as_str()
+        .expect("registration_raises is a string")
+        .contains("host exception");
+    assert!(
+        declares_host_error,
+        "fixture changed shape: `registration_raises` no longer declares the \
+         host-exception contract this assertion checks"
+    );
     assert!(
         result.is_err(),
         "register() must return Err when on_load raises"
     );
     let err = result.unwrap_err();
-    assert!(
-        err.message.contains(expected_err_msg),
-        "error message must contain '{expected_err_msg}', got: {}",
-        err.message
+    assert_eq!(
+        err.code,
+        ErrorCode::ModuleLoadError,
+        "register() must surface the on_load error's own code, not remap it"
+    );
+    assert_eq!(
+        err.message, expected_err_msg,
+        "register() must surface the on_load error's own message unchanged"
     );
 
     // post_register_visible: false
@@ -286,15 +339,40 @@ fn conformance_callback_failure_blocks_visibility() {
         !case["expected"]["post_register_visible"].as_bool().unwrap(),
         "fixture expects post_register_visible=false"
     );
+    // `post_register_get_returns` — the key declared a raise no SDK performs
+    // and is now `null`.
+    assert!(
+        case["expected"]["post_register_get_returns"].is_null(),
+        "the fixture must declare the empty return, not a raise"
+    );
     assert!(
         registry.get(module_id).unwrap().is_none(),
         "module must not be visible after failed on_load"
     );
-    assert!(
-        !registry
+
+    // `post_register_list_contains`
+    assert_eq!(
+        registry
             .list(None, None, None)
             .contains(&module_id.to_string()),
-        "module must not appear in list() after failed on_load"
+        case["expected"]["post_register_list_contains"]
+            .as_bool()
+            .unwrap(),
+        "post_register_list_contains mismatch after a failed on_load"
+    );
+
+    // NOTE: `post_register_get_raises: "MODULE_NOT_FOUND"` is NOT asserted, for
+    // the same reason as `concurrent_check_get_raises` in the case above —
+    // `Registry::get` returns `Ok(None)` for an unregistered id in all three
+    // SDKs. The invisibility invariant is asserted on the lines above; the
+    // resolve-for-use path that does carry the code is asserted here.
+    let Err(lookup_err) = registry.acquire(module_id) else {
+        panic!("acquiring a module whose on_load failed must fail")
+    };
+    assert_eq!(
+        lookup_err.code,
+        ErrorCode::ModuleNotFound,
+        "resolving a module whose on_load failed must surface MODULE_NOT_FOUND"
     );
 
     // load_failed_event_emitted

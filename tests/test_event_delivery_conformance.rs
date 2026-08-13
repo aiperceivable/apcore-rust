@@ -73,6 +73,9 @@ struct FailNSubscriber {
     attempt_count: Arc<AtomicU32>,
     received: Arc<Mutex<Vec<String>>>,
     retry_config: EventRetryConfig,
+    /// Wall-clock instant of each delivery attempt, so the gaps between them
+    /// can be measured against the fixture's declared backoff schedule.
+    attempt_times: Arc<Mutex<Vec<std::time::Instant>>>,
 }
 
 #[async_trait]
@@ -87,6 +90,7 @@ impl EventSubscriber for FailNSubscriber {
         self.retry_config
     }
     async fn on_event(&self, event: &ApCoreEvent) -> Result<(), ModuleError> {
+        self.attempt_times.lock().push(std::time::Instant::now());
         let attempt = self.attempt_count.fetch_add(1, Ordering::SeqCst);
         if attempt < self.fail_count {
             Err(ModuleError::new(
@@ -176,6 +180,13 @@ async fn conformance_retry_succeeds_before_exhaustion() {
 
     let attempt_count = Arc::new(AtomicU32::new(0));
     let received = Arc::new(Mutex::new(Vec::new()));
+    let attempt_times = Arc::new(Mutex::new(Vec::new()));
+    let retry_config = EventRetryConfig {
+        max_attempts,
+        initial_backoff_ms,
+        max_backoff_ms: retry_cfg["max_backoff_ms"].as_u64().unwrap_or(100),
+        backoff_multiplier,
+    };
     let sub = FailNSubscriber {
         id: case["setup"]["subscriber"]["id"]
             .as_str()
@@ -184,12 +195,8 @@ async fn conformance_retry_succeeds_before_exhaustion() {
         fail_count: fail_attempts_count,
         attempt_count: Arc::clone(&attempt_count),
         received: Arc::clone(&received),
-        retry_config: EventRetryConfig {
-            max_attempts,
-            initial_backoff_ms,
-            max_backoff_ms: retry_cfg["max_backoff_ms"].as_u64().unwrap_or(100),
-            backoff_multiplier,
-        },
+        retry_config,
+        attempt_times: Arc::clone(&attempt_times),
     };
 
     // DLQ recording subscriber
@@ -236,6 +243,46 @@ async fn conformance_retry_succeeds_before_exhaustion() {
         !received.lock().is_empty(),
         "event must be received on success"
     );
+
+    // `backoff_delays_ms` — the delay before retry N, checked two ways.
+    //
+    // (a) The schedule the SDK computes. `compute_delay_ms` is the function the
+    //     delivery loop actually sleeps on (emitter.rs `deliver_with_dlq`), so
+    //     this pins the exact sequence, not an approximation of it.
+    // (b) The delays that were really taken, measured between consecutive
+    //     delivery attempts. `tokio::time::sleep` never wakes early, so a lower
+    //     bound here is exact rather than flaky; it catches a schedule that is
+    //     computed correctly and then not applied.
+    let want_delays: Vec<u64> = case["expected"]["backoff_delays_ms"]
+        .as_array()
+        .expect("backoff_delays_ms is an array")
+        .iter()
+        .map(|v| v.as_u64().expect("delay is an integer"))
+        .collect();
+
+    let computed: Vec<u64> = (0..want_delays.len() as u32)
+        .map(|attempt| retry_config.compute_delay_ms(attempt))
+        .collect();
+    assert_eq!(
+        computed, want_delays,
+        "backoff_delays_ms: EventRetryConfig::compute_delay_ms produced {computed:?}"
+    );
+
+    let times = attempt_times.lock();
+    assert_eq!(
+        times.len() as u32,
+        expected_attempts,
+        "one timestamp per delivery attempt"
+    );
+    for (i, want_ms) in want_delays.iter().enumerate() {
+        let observed = times[i + 1].duration_since(times[i]).as_millis();
+        assert!(
+            observed >= u128::from(*want_ms),
+            "backoff_delays_ms[{i}]: retry {} started {observed}ms after the previous \
+             attempt, less than the required {want_ms}ms backoff",
+            i + 1
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,9 +451,21 @@ async fn conformance_dlq_event_subscriber_failure_is_not_retried() {
         },
     };
 
+    // A passive recorder on the same DLQ pattern. It counts every DLQ event
+    // that is dispatched, which is what makes `second_order_dlq_event_emitted`
+    // observable: a DLQ raised for the FAILING DLQ subscriber would land here
+    // as a second event.
+    let dlq_seen: Arc<Mutex<Vec<ApCoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let dlq_recorder = RecordingSubscriber {
+        id: "dlq-recorder".to_string(),
+        pattern: "apcore.event.delivery_failed".to_string(),
+        received: Arc::clone(&dlq_seen),
+    };
+
     let emitter = EventEmitter::new();
     emitter.subscribe(Box::new(primary_sub));
     emitter.subscribe(Box::new(dlq_sub));
+    emitter.subscribe(Box::new(dlq_recorder));
 
     let event = ApCoreEvent::new("apcore.test.broken", json!({}));
     emitter.emit_delivery_semantics(event);
@@ -430,6 +489,138 @@ async fn conformance_dlq_event_subscriber_failure_is_not_retried() {
         expected_dlq_attempts,
         "DLQ subscriber must be called exactly {expected_dlq_attempts} time(s) — DLQ delivery is never retried"
     );
+
+    // `dlq_event_emitted` — exactly one, for the primary subscriber.
+    let dlq_events = dlq_seen.lock();
+    assert_eq!(
+        !dlq_events.is_empty(),
+        case["expected"]["dlq_event_emitted"].as_bool().unwrap(),
+        "dlq_event_emitted mismatch"
+    );
+
+    // `second_order_dlq_event_emitted` — the DLQ subscriber above fails on
+    // every attempt. If the SDK raised a DLQ for THAT failure the recorder
+    // would hold a second event, which is the infinite-loop this rule forbids.
+    let second_order = dlq_events.len() > 1;
+    assert_eq!(
+        second_order,
+        case["expected"]["second_order_dlq_event_emitted"]
+            .as_bool()
+            .unwrap(),
+        "second_order_dlq_event_emitted mismatch — the recorder saw {} DLQ event(s); \
+         a failing DLQ subscriber must be logged and discarded, not re-queued",
+        dlq_events.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Case: dlq_event_subscriber_failure_is_not_retried — `error_log_count`
+// ---------------------------------------------------------------------------
+
+/// In-memory `tracing` writer so the test can count emitted log records.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// `error_log_count`: "the SDK MUST log at ERROR and discard". Discarding is
+/// covered above by `dlq_subscriber_attempt_count` / `second_order_...`; this
+/// covers the other half, that the discard is not silent.
+///
+/// Delivery is driven through `emit_filtered` rather than
+/// `emit_delivery_semantics` because the latter spawns a `tokio::task` per
+/// subscriber, and a task does not inherit a thread-scoped `tracing`
+/// subscriber. `emit_filtered` runs the same `deliver_with_dlq` inline on this
+/// thread, so the records are captured. Both entry points share that function,
+/// so the logging behaviour under test is the same one.
+#[tokio::test]
+async fn conformance_dlq_subscriber_failure_logs_at_error() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "dlq_event_subscriber_failure_is_not_retried");
+
+    let primary_cfg = &case["setup"]["primary_subscriber"]["retry"];
+    let primary_sub = AlwaysFailSubscriber {
+        id: case["setup"]["primary_subscriber"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        pattern: "apcore.test.broken".to_string(),
+        attempt_count: Arc::new(AtomicU32::new(0)),
+        on_failure_count: Arc::new(AtomicU32::new(0)),
+        retry_config: EventRetryConfig {
+            max_attempts: primary_cfg["max_attempts"].as_u64().unwrap() as u32,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 10,
+            backoff_multiplier: 1.0,
+        },
+    };
+    let broken_dlq = AlwaysFailSubscriber {
+        id: case["setup"]["dlq_subscriber"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        pattern: "apcore.event.delivery_failed".to_string(),
+        attempt_count: Arc::new(AtomicU32::new(0)),
+        on_failure_count: Arc::new(AtomicU32::new(0)),
+        retry_config: EventRetryConfig {
+            max_attempts: case["setup"]["dlq_subscriber"]["retry"]["max_attempts"]
+                .as_u64()
+                .unwrap() as u32,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 10,
+            backoff_multiplier: 1.0,
+        },
+    };
+
+    let emitter = EventEmitter::new();
+    emitter.subscribe(Box::new(primary_sub));
+    emitter.subscribe(Box::new(broken_dlq));
+
+    let captured = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::ERROR)
+        .with_ansi(false)
+        .with_target(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let event = ApCoreEvent::new("apcore.test.broken", json!({}));
+    emitter.emit_filtered(&event, "*").await.unwrap();
+    drop(guard);
+
+    let logs = captured.text();
+    let error_lines = logs.lines().filter(|l| l.contains("ERROR")).count();
+    assert_eq!(
+        error_lines as u64,
+        case["expected"]["error_log_count"].as_u64().unwrap(),
+        "error_log_count mismatch — captured:\n{logs}"
+    );
+    assert!(
+        logs.contains(case["setup"]["dlq_subscriber"]["id"].as_str().unwrap()),
+        "the ERROR record must name the failing DLQ subscriber — captured:\n{logs}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -439,28 +630,112 @@ async fn conformance_dlq_event_subscriber_failure_is_not_retried() {
 #[tokio::test]
 async fn conformance_subscriber_id_sdk_generated_when_omitted() {
     let fixture = load_fixture();
-    let _case = fixture_case(&fixture, "subscriber_id_sdk_generated_when_omitted");
+    let case = fixture_case(&fixture, "subscriber_id_sdk_generated_when_omitted");
 
-    // Both subscribers omit explicit IDs — use StdoutSubscriber whose new()
-    // auto-generates ids following "{type}-{counter}" convention.
+    // The fixture's two subscribers are `stdout` with no `id` and
+    // `fail_attempts: "all"`. `StdoutSubscriber::new()` is what generates the
+    // id, so each subscriber under test takes its id FROM a real
+    // StdoutSubscriber and layers the fixture's injected failure on top — the
+    // identifier is the SDK's, only the delivery outcome is the test's.
     use apcore::events::subscribers::StdoutSubscriber;
 
-    let s1 = StdoutSubscriber::new();
-    let s2 = StdoutSubscriber::new();
+    #[derive(Debug)]
+    struct FailingStdout {
+        inner: StdoutSubscriber,
+        retry_config: EventRetryConfig,
+    }
 
-    let id1 = s1.subscriber_id().to_string();
-    let id2 = s2.subscriber_id().to_string();
+    #[async_trait]
+    impl EventSubscriber for FailingStdout {
+        fn subscriber_id(&self) -> &str {
+            self.inner.subscriber_id()
+        }
+        fn subscriber_type(&self) -> &str {
+            self.inner.subscriber_type()
+        }
+        fn event_pattern(&self) -> &str {
+            "apcore.test.dlq_count"
+        }
+        fn retry(&self) -> EventRetryConfig {
+            self.retry_config
+        }
+        async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+            Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                "fail_attempts: all",
+            ))
+        }
+    }
 
-    // IDs must be distinct
-    assert_ne!(id1, id2, "auto-generated subscriber IDs must be distinct");
+    let subscribers = case["setup"]["subscribers"]
+        .as_array()
+        .expect("setup.subscribers is an array");
+    let mut generated_ids = Vec::new();
+    let emitter = EventEmitter::new();
+    for sub_cfg in subscribers {
+        assert!(
+            sub_cfg.get("id").is_none(),
+            "this case is about subscribers that OMIT the id field"
+        );
+        let inner = StdoutSubscriber::new();
+        generated_ids.push(inner.subscriber_id().to_string());
+        emitter.subscribe(Box::new(FailingStdout {
+            inner,
+            retry_config: EventRetryConfig {
+                max_attempts: sub_cfg["retry"]["max_attempts"].as_u64().unwrap() as u32,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 10,
+                backoff_multiplier: 1.0,
+            },
+        }));
+    }
 
-    // IDs must match the expected pattern "stdout-{something}"
-    assert!(
-        id1.starts_with("stdout-"),
-        "generated ID must match 'stdout-{{...}}' pattern, got: {id1}"
+    let dlq_seen: Arc<Mutex<Vec<ApCoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    emitter.subscribe(Box::new(RecordingSubscriber {
+        id: "dlq-recorder".to_string(),
+        pattern: "apcore.event.delivery_failed".to_string(),
+        received: Arc::clone(&dlq_seen),
+    }));
+
+    emitter.emit_delivery_semantics(ApCoreEvent::new("apcore.test.dlq_count", json!({})));
+    emitter.flush(5_000).await.unwrap();
+
+    // `dlq_events_emitted` — one per exhausted subscriber.
+    let dlq_events = dlq_seen.lock();
+    assert_eq!(
+        dlq_events.len() as u64,
+        case["expected"]["dlq_events_emitted"].as_u64().unwrap(),
+        "dlq_events_emitted mismatch"
     );
-    assert!(
-        id2.starts_with("stdout-"),
-        "generated ID must match 'stdout-{{...}}' pattern, got: {id2}"
+
+    // `subscriber_ids_distinct` / `subscriber_ids_pattern` — asserted against
+    // the ids that actually travelled in the DLQ payloads, which is what
+    // "used consistently across all DLQ events" means.
+    let payload_ids: Vec<String> = dlq_events
+        .iter()
+        .map(|e| e.data["subscriber_id"].as_str().unwrap().to_string())
+        .collect();
+    let distinct: std::collections::HashSet<&String> = payload_ids.iter().collect();
+    assert_eq!(
+        distinct.len() == payload_ids.len(),
+        case["expected"]["subscriber_ids_distinct"]
+            .as_bool()
+            .unwrap(),
+        "subscriber_ids_distinct mismatch: {payload_ids:?}"
+    );
+    let pattern = regex::Regex::new(case["expected"]["subscriber_ids_pattern"].as_str().unwrap())
+        .expect("subscriber_ids_pattern is a valid regex");
+    for id in &payload_ids {
+        assert!(
+            pattern.is_match(id),
+            "DLQ payload subscriber_id {id:?} does not match {pattern}"
+        );
+    }
+    // The id in the DLQ payload must be the one the SDK generated, not a
+    // re-derivation: the two sets must agree.
+    let generated: std::collections::HashSet<&String> = generated_ids.iter().collect();
+    assert_eq!(
+        distinct, generated,
+        "DLQ events must carry the SDK-generated subscriber ids"
     );
 }

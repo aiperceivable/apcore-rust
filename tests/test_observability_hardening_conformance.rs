@@ -132,7 +132,11 @@ async fn case_batch_processor_buffers_spans() {
     let schedule_delay_ms = case["input"]["schedule_delay_ms"].as_u64().unwrap();
     let spans_submitted = case["input"]["spans_submitted"].as_u64().unwrap() as usize;
 
-    let processor = BatchSpanProcessor::builder(Arc::new(DiscardExporter))
+    // A counting exporter, not a discarding one: `spans_exported_immediately`
+    // is a statement about what reached the EXPORTER, and a DiscardExporter
+    // cannot answer it.
+    let exporter = Arc::new(InMemoryExporter::new());
+    let processor = BatchSpanProcessor::builder(exporter.clone())
         .schedule_delay_ms(schedule_delay_ms)
         .build();
 
@@ -143,6 +147,23 @@ async fn case_batch_processor_buffers_spans() {
 
     let expected_queue = case["expected"]["queue_size"].as_u64().unwrap() as usize;
     let expected_dropped = case["expected"]["spans_dropped"].as_u64().unwrap();
+
+    // `spans_exported_immediately` — read at `elapsed_ms_after_submit`, i.e.
+    // before the schedule delay could have fired. Buffering is the whole point
+    // of the batch processor; a SimpleSpanProcessor here would export 3.
+    assert_eq!(
+        case["input"]["elapsed_ms_after_submit"].as_u64().unwrap(),
+        0,
+        "this driver reads the exporter immediately after submit"
+    );
+    assert_eq!(
+        exporter.get_spans().len() as u64,
+        case["expected"]["spans_exported_immediately"]
+            .as_u64()
+            .unwrap(),
+        "spans_exported_immediately mismatch — spans reached the exporter before \
+         the {schedule_delay_ms}ms schedule delay elapsed"
+    );
 
     assert_eq!(processor.queue_size(), expected_queue);
     assert_eq!(processor.spans_dropped(), expected_dropped);

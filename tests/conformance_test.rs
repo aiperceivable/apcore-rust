@@ -1241,107 +1241,180 @@ fn conformance_annotations_extra_round_trip() {
 
 // ---------------------------------------------------------------------------
 // 15. Approval Gate (A05)
+//
+// CORRECTED: this driver used to compute the gate decision itself
+// (`gate_would_fire = handler_configured && module_requires_approval`) and then
+// assert things like `expected["error_code"] == "APPROVAL_DENIED"` — fixture
+// text against a literal in the test, with the Executor never invoked. Both the
+// gate rule and the status→error mapping were untested. It now runs the real
+// Step 5 through `Executor::call`.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn conformance_approval_gate() {
-    use apcore::approval::{AlwaysDenyHandler, ApprovalResult, AutoApproveHandler};
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one arm per fixture case; splitting hides the mapping
+async fn conformance_approval_gate() {
+    use apcore::approval::{ApprovalHandler, ApprovalRequest, ApprovalResult};
+    use apcore::executor::Executor;
+    use apcore::module::{Module, ModuleAnnotations};
+    use apcore::registry::{ModuleDescriptor, Registry};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Returns the fixture's declared `approval_result` and counts invocations,
+    /// which is what makes `gate_invoked` an observation rather than a guess.
+    #[derive(Debug)]
+    struct ScriptedHandler {
+        result: ApprovalResult,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ApprovalHandler for ScriptedHandler {
+        async fn request_approval(
+            &self,
+            _request: &ApprovalRequest,
+        ) -> Result<ApprovalResult, apcore::errors::ModuleError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+        async fn check_approval(
+            &self,
+            _approval_id: &str,
+        ) -> Result<ApprovalResult, apcore::errors::ModuleError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+    }
+
+    struct SensitiveModule;
+    #[async_trait]
+    impl Module for SensitiveModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn output_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn description(&self) -> &'static str {
+            "Module gated by the approval step"
+        }
+        async fn execute(
+            &self,
+            inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            Ok(inputs)
+        }
+    }
 
     let fixture = load_fixture("approval_gate");
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
-        let handler_configured = tc["approval_handler_configured"].as_bool().unwrap();
-        let module_requires_approval = tc["module_requires_approval"].as_bool().unwrap();
-        let approval_result_data = &tc["approval_result"];
         let expected = &tc["expected"];
-        let expected_gate_invoked = expected["gate_invoked"].as_bool().unwrap();
-        let expected_outcome = expected["outcome"].as_str().unwrap();
+        let module_id = "executor.test.sensitive";
 
-        // Build an approval result from the fixture data if provided.
-        let approval_result: Option<ApprovalResult> = if approval_result_data.is_null() {
-            None
-        } else {
-            {
-                let mut ar = ApprovalResult::default();
-                ar.status = approval_result_data["status"].as_str().unwrap().to_string();
-                ar.approved_by = approval_result_data["approved_by"]
-                    .as_str()
-                    .map(String::from);
-                ar.reason = approval_result_data["reason"].as_str().map(String::from);
-                ar.approval_id = approval_result_data["approval_id"]
-                    .as_str()
-                    .map(String::from);
-                Some(ar)
-            }
+        let registry = Arc::new(Registry::new());
+        let descriptor = ModuleDescriptor {
+            module_id: module_id.to_string(),
+            name: None,
+            description: "Module gated by the approval step".to_string(),
+            documentation: None,
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            annotations: Some(ModuleAnnotations {
+                requires_approval: tc["module_requires_approval"].as_bool().unwrap(),
+                ..Default::default()
+            }),
+            examples: vec![],
+            metadata: HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
         };
+        registry
+            .register(module_id, Box::new(SensitiveModule), descriptor)
+            .unwrap();
 
-        // Simulate gate logic: gate fires only when handler is configured AND
-        // module declares requires_approval=true.
-        let gate_would_fire = handler_configured && module_requires_approval;
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+        if tc["approval_handler_configured"].as_bool().unwrap() {
+            let raw = &tc["approval_result"];
+            let mut result = ApprovalResult::default();
+            if !raw.is_null() {
+                result.status = raw["status"].as_str().unwrap().to_string();
+                result.approved_by = raw["approved_by"].as_str().map(String::from);
+                result.reason = raw["reason"].as_str().map(String::from);
+                result.approval_id = raw["approval_id"].as_str().map(String::from);
+            }
+            executor.set_approval_handler(Box::new(ScriptedHandler {
+                result,
+                invocations: Arc::clone(&invocations),
+            }));
+        }
 
+        let outcome: Result<Value, apcore::errors::ModuleError> =
+            executor.call(module_id, json!({"v": 1}), None, None).await;
+
+        // `gate_invoked` — counted from the handler itself.
         assert_eq!(
-            gate_would_fire, expected_gate_invoked,
-            "FAIL [{id}]: gate_invoked expected={expected_gate_invoked} got={gate_would_fire}"
+            invocations.load(Ordering::SeqCst) > 0,
+            expected["gate_invoked"].as_bool().unwrap(),
+            "FAIL [{id}]: gate_invoked — handler ran {} time(s)",
+            invocations.load(Ordering::SeqCst)
         );
 
-        if !gate_would_fire {
-            assert_eq!(
-                expected_outcome, "proceed",
-                "FAIL [{id}]: non-firing gate must produce outcome=proceed"
-            );
-            continue;
-        }
+        // `outcome`
+        let actual_outcome = if outcome.is_ok() { "proceed" } else { "error" };
+        assert_eq!(
+            actual_outcome,
+            expected["outcome"].as_str().unwrap(),
+            "FAIL [{id}]: outcome — executor returned {outcome:?}"
+        );
 
-        // Gate fires — check outcome based on approval_result status.
-        let result_status = approval_result
-            .as_ref()
-            .map_or("approved", |r| r.status.as_str());
-
-        match result_status {
-            "approved" => {
+        match outcome {
+            Ok(value) => {
                 assert_eq!(
-                    expected_outcome, "proceed",
-                    "FAIL [{id}]: approved should proceed"
+                    value,
+                    json!({"v": 1}),
+                    "FAIL [{id}]: a proceeding call must reach the module"
                 );
             }
-            "rejected" => {
+            Err(err) => {
+                // `error_code` — the wire code the Executor actually raised.
                 assert_eq!(
-                    expected_outcome, "error",
-                    "FAIL [{id}]: rejected should error"
+                    serde_json::to_value(err.code).unwrap(),
+                    expected["error_code"],
+                    "FAIL [{id}]: error_code; message was {}",
+                    err.message
                 );
-                let expected_code = expected["error_code"].as_str().unwrap();
-                assert_eq!(
-                    expected_code, "APPROVAL_DENIED",
-                    "FAIL [{id}]: rejected error code"
-                );
-            }
-            "pending" => {
-                assert_eq!(
-                    expected_outcome, "error",
-                    "FAIL [{id}]: pending should error"
-                );
-                let expected_code = expected["error_code"].as_str().unwrap();
-                assert_eq!(
-                    expected_code, "APPROVAL_PENDING",
-                    "FAIL [{id}]: pending error code"
-                );
-                if let Some(approval_id) = expected.get("approval_id").and_then(|v| v.as_str()) {
-                    let actual_approval_id = approval_result
-                        .as_ref()
-                        .and_then(|r| r.approval_id.as_deref())
-                        .unwrap_or("");
+
+                // `approval_id` — round-tripped from the handler's result into
+                // the raised error so a caller can resume with `_approval_token`.
+                if let Some(want) = expected.get("approval_id") {
                     assert_eq!(
-                        actual_approval_id, approval_id,
-                        "FAIL [{id}]: approval_id mismatch"
+                        err.details.get("approval_id"),
+                        Some(want),
+                        "FAIL [{id}]: approval_id must be carried on the error; \
+                         details were {:?}",
+                        err.details
                     );
                 }
-            }
-            other => panic!("FAIL [{id}]: unknown approval status {other:?}"),
-        }
 
-        // Validate AutoApproveHandler and AlwaysDenyHandler implement the trait.
-        let _ = AutoApproveHandler;
-        let _ = AlwaysDenyHandler;
+                // NOTE: `http_status` (403 / 202) is NOT asserted. No apcore SDK
+                // exposes an error-code→HTTP-status mapping — apcore-rust has no
+                // such accessor on `ErrorCode` or `ModuleError`, and neither
+                // apcore-python nor apcore-typescript defines one either. The
+                // mapping in protocol-spec.md §7.5 is a contract for the HTTP
+                // transport adapters (fastapi-apcore, express-apcore,
+                // axum-apcore), not for the core SDKs. Reported as a fixture /
+                // spec-layering issue rather than faked here.
+            }
+        }
     }
 }
 
@@ -1494,218 +1567,110 @@ fn conformance_binding_yaml_canonical() {
 
 // ---------------------------------------------------------------------------
 // 18. Dependency Version Constraints (spec §5.3, §5.15.2)
+//
+// CORRECTED: this driver used to re-implement constraint checking and
+// topological ordering inside the test (a private `check_version_constraint`
+// plus a hand-rolled edge walk) and then assert that its OWN result matched the
+// fixture. The SDK was never called, so every case was green regardless of what
+// `apcore::registry::resolve_dependencies` did. It now drives the real resolver.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn conformance_dependency_version_constraints() {
+    use apcore::registry::{resolve_dependencies, DepInfo};
+
     let fixture = load_fixture("dependency_version_constraints");
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
         let expected = &tc["expected"];
         let expected_outcome = expected["outcome"].as_str().unwrap();
 
-        let modules = tc["modules"].as_array().unwrap();
-
-        // Build a simple in-memory dependency map: module_id -> Vec<(dep_id, version)>
-        let mut dep_map: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
-        let mut version_map: HashMap<String, String> = HashMap::new();
-        for m in modules {
+        let mut modules: Vec<(String, Vec<DepInfo>)> = Vec::new();
+        let mut versions: HashMap<String, String> = HashMap::new();
+        for m in tc["modules"].as_array().unwrap() {
             let module_id = m["module_id"].as_str().unwrap().to_string();
-            let version = m["version"].as_str().unwrap().to_string();
-            version_map.insert(module_id.clone(), version);
-            let deps: Vec<(String, Option<String>)> = m["dependencies"]
+            versions.insert(
+                module_id.clone(),
+                m["version"].as_str().unwrap().to_string(),
+            );
+            let deps: Vec<DepInfo> = m["dependencies"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|d| {
-                    let dep_id = d["module_id"].as_str().unwrap().to_string();
-                    let dep_ver = d.get("version").and_then(|v| v.as_str()).map(String::from);
-                    (dep_id, dep_ver)
+                .map(|d| DepInfo {
+                    module_id: d["module_id"].as_str().unwrap().to_string(),
+                    version: d.get("version").and_then(|v| v.as_str()).map(String::from),
+                    optional: d
+                        .get("optional")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 })
                 .collect();
-            dep_map.insert(module_id, deps);
+            modules.push((module_id, deps));
         }
 
-        // Check each module's dependencies against available versions.
-        let mut found_error = false;
-        let mut error_detail: Option<(String, String, String, String)> = None;
-
-        'outer: for (module_id, deps) in &dep_map {
-            for (dep_id, req_ver) in deps {
-                // optional dependency: if present check if it's marked optional
-                let is_optional = modules.iter().any(|m| {
-                    m["module_id"].as_str() == Some(module_id.as_str())
-                        && m["dependencies"].as_array().is_some_and(|arr| {
-                            arr.iter().any(|d| {
-                                d["module_id"].as_str() == Some(dep_id.as_str())
-                                    && d.get("optional")
-                                        .and_then(serde_json::Value::as_bool)
-                                        .unwrap_or(false)
-                            })
-                        })
-                });
-
-                if let Some(req) = req_ver {
-                    if let Some(actual_ver) = version_map.get(dep_id) {
-                        // Use negotiate_version to check constraint satisfaction.
-                        // negotiate_version expects (declared, sdk) — we use (actual, req)
-                        // to check if the actual version satisfies the required constraint.
-                        // Since negotiate_version checks semver compatibility between a
-                        // declared version and an SDK version, we simulate constraint
-                        // checking here with a simplified semver comparison.
-                        let satisfied = check_version_constraint(req, actual_ver);
-                        if !satisfied {
-                            if is_optional {
-                                // Optional mismatch: skip edge but not an error.
-                                continue;
-                            }
-                            found_error = true;
-                            error_detail = Some((
-                                module_id.clone(),
-                                dep_id.clone(),
-                                req.clone(),
-                                actual_ver.clone(),
-                            ));
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
+        let result = resolve_dependencies(&modules, None, Some(&versions));
 
         match expected_outcome {
             "ok" => {
-                assert!(
-                    !found_error,
-                    "FAIL [{id}]: expected ok but found version mismatch: {error_detail:?}"
-                );
+                let order = match result {
+                    Ok(order) => order,
+                    Err(e) => panic!("FAIL [{id}]: expected ok, resolver returned {e:?}"),
+                };
+
+                if let Some(want) = expected.get("load_order").and_then(|v| v.as_array()) {
+                    let want: Vec<&str> = want.iter().map(|v| v.as_str().unwrap()).collect();
+                    assert_eq!(order, want, "FAIL [{id}]: load_order");
+                }
+
+                // `skipped_edges` — an edge that WAS applied forces the
+                // dependency ahead of its dependent in the load order. Observing
+                // the dependent first is therefore direct evidence the edge was
+                // dropped, which is what skipping an unsatisfiable OPTIONAL
+                // constraint means. (Turning the same constraint into a hard
+                // dependency, or into an error, both turn this red.)
+                if let Some(skipped) = expected.get("skipped_edges").and_then(|v| v.as_array()) {
+                    for edge in skipped {
+                        let pair = edge.as_array().expect("skipped edge is a [from, to] pair");
+                        let from = pair[0].as_str().unwrap();
+                        let to = pair[1].as_str().unwrap();
+                        let pos = |m: &str| {
+                            order.iter().position(|x| x == m).unwrap_or_else(|| {
+                                panic!("FAIL [{id}]: {m} missing from {order:?}")
+                            })
+                        };
+                        assert!(
+                            pos(from) < pos(to),
+                            "FAIL [{id}]: skipped_edges declares {from} -> {to} dropped, but the \
+                             load order {order:?} still places {to} before {from} — the edge was \
+                             enforced"
+                        );
+                    }
+                }
             }
             "error" => {
-                assert!(
-                    found_error,
-                    "FAIL [{id}]: expected DEPENDENCY_VERSION_MISMATCH error but got ok"
+                let err = match result {
+                    Err(e) => e,
+                    Ok(order) => panic!(
+                        "FAIL [{id}]: expected {} but the resolver returned {order:?}",
+                        expected["error_code"]
+                    ),
+                };
+                assert_eq!(
+                    serde_json::to_value(err.code).unwrap(),
+                    expected["error_code"],
+                    "FAIL [{id}]: error_code"
                 );
-                if let Some((act_mid, act_dep, act_req, act_actual)) = &error_detail {
-                    let exp_mid = expected["module_id"].as_str().unwrap();
-                    let exp_dep = expected["dependency_id"].as_str().unwrap();
-                    let exp_req = expected["required"].as_str().unwrap();
-                    let exp_actual = expected["actual"].as_str().unwrap();
-                    assert_eq!(act_mid, exp_mid, "FAIL [{id}] module_id");
-                    assert_eq!(act_dep, exp_dep, "FAIL [{id}] dependency_id");
-                    assert_eq!(act_req, exp_req, "FAIL [{id}] required");
-                    assert_eq!(act_actual, exp_actual, "FAIL [{id}] actual");
+                for field in ["module_id", "dependency_id", "required", "actual"] {
+                    assert_eq!(
+                        err.details.get(field),
+                        expected.get(field),
+                        "FAIL [{id}]: error details.{field}; full details {:?}",
+                        err.details
+                    );
                 }
             }
             other => panic!("FAIL [{id}]: unknown outcome {other:?}"),
-        }
-    }
-}
-
-/// Check whether `actual` satisfies the version constraint `req`.
-///
-/// Supports: exact (`1.2.3`), partial (`1`, `1.2`), `>=X`, `>=X,<Y`,
-/// `^X.Y.Z` (caret/semver), `~X.Y.Z` (tilde/minor-compatible).
-fn check_version_constraint(req: &str, actual: &str) -> bool {
-    fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-        let parts: Vec<&str> = s.split('.').collect();
-        let major = parts.first().and_then(|p| p.parse().ok())?;
-        let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-        let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
-        Some((major, minor, patch))
-    }
-
-    fn semver_gte(a: (u64, u64, u64), b: (u64, u64, u64)) -> bool {
-        a >= b
-    }
-
-    fn semver_lt(a: (u64, u64, u64), b: (u64, u64, u64)) -> bool {
-        a < b
-    }
-
-    let Some(actual_v) = parse_semver(actual) else {
-        return false;
-    };
-
-    // Range constraint: ">=X,<Y"
-    if req.contains(',') {
-        let parts: Vec<&str> = req.split(',').collect();
-        let mut all_ok = true;
-        for part in parts {
-            if !check_version_constraint(part.trim(), actual) {
-                all_ok = false;
-                break;
-            }
-        }
-        return all_ok;
-    }
-
-    // Caret constraint: "^X.Y.Z"
-    if let Some(stripped) = req.strip_prefix('^') {
-        let Some(req_v) = parse_semver(stripped) else {
-            return false;
-        };
-        let (maj, min, pat) = req_v;
-        return if maj > 0 {
-            // ^1.2.3 → >=1.2.3, <2.0.0
-            semver_gte(actual_v, req_v) && semver_lt(actual_v, (maj + 1, 0, 0))
-        } else if min > 0 {
-            // ^0.2.3 → >=0.2.3, <0.3.0
-            semver_gte(actual_v, req_v) && semver_lt(actual_v, (0, min + 1, 0))
-        } else {
-            // ^0.0.3 → >=0.0.3, <0.0.4
-            semver_gte(actual_v, req_v) && semver_lt(actual_v, (0, 0, pat + 1))
-        };
-    }
-
-    // Tilde constraint: "~X.Y.Z"
-    if let Some(stripped) = req.strip_prefix('~') {
-        let Some(req_v) = parse_semver(stripped) else {
-            return false;
-        };
-        let (maj, min, _pat) = req_v;
-        // ~1.2.3 → >=1.2.3, <1.3.0
-        return semver_gte(actual_v, req_v) && semver_lt(actual_v, (maj, min + 1, 0));
-    }
-
-    // GTE constraint: ">=X.Y.Z"
-    if let Some(stripped) = req.strip_prefix(">=") {
-        let Some(req_v) = parse_semver(stripped) else {
-            return false;
-        };
-        return semver_gte(actual_v, req_v);
-    }
-
-    // LT constraint: "<X.Y.Z"
-    if let Some(stripped) = req.strip_prefix('<') {
-        let Some(req_v) = parse_semver(stripped) else {
-            return false;
-        };
-        return semver_lt(actual_v, req_v);
-    }
-
-    // GT constraint: ">X.Y.Z"
-    if let Some(stripped) = req.strip_prefix('>') {
-        let Some(req_v) = parse_semver(stripped) else {
-            return false;
-        };
-        return actual_v > req_v;
-    }
-
-    // Partial or exact version: "1", "1.2", "1.2.3"
-    let req_parts: Vec<&str> = req.split('.').collect();
-    let req_major: u64 = req_parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
-    match req_parts.len() {
-        1 => actual_v.0 == req_major,
-        2 => {
-            let req_minor: u64 = req_parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-            actual_v.0 == req_major && actual_v.1 == req_minor
-        }
-        _ => {
-            // Exact match
-            let Some(req_v) = parse_semver(req) else {
-                return false;
-            };
-            actual_v == req_v
         }
     }
 }
@@ -2060,37 +2025,87 @@ async fn conformance_context_create() {
             .unwrap();
     }
 
-    let hex_re = regex::Regex::new(r"^[0-9a-f]{32}$").unwrap();
+    // Compile-time pin of the `Context::create` signature.
+    //
+    // This coercion type-checks only while `create` takes exactly these six
+    // parameters. None of them is an executor, a caller_id, or a standalone
+    // tracestate — so adding any of the three breaks the BUILD. That is the
+    // strongest form the fixture's three `*_is_not_a_parameter` expectations
+    // can take in a statically typed SDK: they are about the shape of the API,
+    // and here the compiler is the thing that checks it.
+    type ContextCreateFn = fn(
+        Option<Identity>,
+        Option<TraceParent>,
+        Option<CancelToken>,
+        Option<HashMap<String, Value>>,
+        Value,
+        Option<f64>,
+    ) -> Context<Value>;
+    let context_create_signature: ContextCreateFn = Context::<Value>::create;
+    // Use the pinned pointer so it is not merely a declaration: the very first
+    // Context the loop needs is built through it.
+    let pinned_default_ctx = context_create_signature(None, None, None, None, Value::Null, None);
+    assert!(
+        pinned_default_ctx.executor.is_none() && pinned_default_ctx.caller_id.is_none(),
+        "a Context built through the pinned six-parameter signature is unbound and top-level"
+    );
+
     let fixture = load_fixture("context_create");
 
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
+        let expected = &tc["expected"];
         match id {
             "create_minimal_all_defaults" => {
                 let ctx: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, None);
-                assert!(hex_re.is_match(&ctx.trace_id), "FAIL [{id}]: trace_id");
-                assert!(ctx.identity.is_none(), "FAIL [{id}]: identity must be None");
-                assert!(ctx.executor.is_none(), "FAIL [{id}]: executor must be None");
+
+                // `trace_id_pattern` — the fixture's own regex, applied to the
+                // trace_id the SDK generated.
+                let pattern = expected["trace_id_pattern"].as_str().unwrap();
                 assert!(
+                    regex::Regex::new(pattern).unwrap().is_match(&ctx.trace_id),
+                    "FAIL [{id}]: trace_id {:?} does not match {pattern}",
+                    ctx.trace_id
+                );
+
+                assert_eq!(
+                    json!(ctx.identity.as_ref().map(Identity::id)),
+                    expected["identity"],
+                    "FAIL [{id}]: identity"
+                );
+                assert_eq!(
+                    ctx.executor.is_none(),
+                    expected["executor"].is_null(),
+                    "FAIL [{id}]: executor"
+                );
+                assert_eq!(
                     ctx.cancel_token.is_none(),
-                    "FAIL [{id}]: cancel_token must be None"
+                    expected["cancel_token"].is_null(),
+                    "FAIL [{id}]: cancel_token"
                 );
-                assert!(
-                    ctx.global_deadline.is_none(),
-                    "FAIL [{id}]: global_deadline must be None"
+                assert_eq!(ctx.services, expected["services"], "FAIL [{id}]: services");
+                assert_eq!(
+                    json!(ctx.global_deadline),
+                    expected["global_deadline"],
+                    "FAIL [{id}]: global_deadline"
                 );
-                assert!(
-                    ctx.caller_id.is_none(),
-                    "FAIL [{id}]: caller_id must be None"
+                assert_eq!(
+                    json!(ctx.caller_id),
+                    expected["caller_id"],
+                    "FAIL [{id}]: caller_id"
                 );
-                assert!(
-                    ctx.call_chain.is_empty(),
-                    "FAIL [{id}]: call_chain must be empty"
+                assert_eq!(
+                    json!(ctx.call_chain),
+                    expected["call_chain"],
+                    "FAIL [{id}]: call_chain"
                 );
-                assert!(
+
+                // `data_empty`
+                assert_eq!(
                     ctx.data.read().is_empty(),
-                    "FAIL [{id}]: data must be empty"
+                    expected["data_empty"].as_bool().unwrap(),
+                    "FAIL [{id}]: data_empty"
                 );
             }
             "create_with_identity_only" => {
@@ -2108,36 +2123,57 @@ async fn conformance_context_create() {
                 );
                 let ctx: Context<Value> =
                     Context::create(Some(identity), None, None, None, Value::Null, None);
-                assert!(hex_re.is_match(&ctx.trace_id), "FAIL [{id}]: trace_id");
-                assert_eq!(
-                    ctx.identity.as_ref().map(Identity::id),
-                    Some("user-42"),
-                    "FAIL [{id}]: identity.id"
-                );
-                assert!(ctx.executor.is_none(), "FAIL [{id}]: executor must be None");
+
+                let pattern = expected["trace_id_pattern"].as_str().unwrap();
                 assert!(
+                    regex::Regex::new(pattern).unwrap().is_match(&ctx.trace_id),
+                    "FAIL [{id}]: trace_id {:?} does not match {pattern}",
+                    ctx.trace_id
+                );
+                assert_eq!(
+                    json!(ctx.identity.as_ref().map(Identity::id)),
+                    expected["identity_id"],
+                    "FAIL [{id}]: identity_id"
+                );
+                assert_eq!(
+                    ctx.executor.is_none(),
+                    expected["executor"].is_null(),
+                    "FAIL [{id}]: executor"
+                );
+                assert_eq!(
                     ctx.cancel_token.is_none(),
-                    "FAIL [{id}]: cancel_token must be None"
+                    expected["cancel_token"].is_null(),
+                    "FAIL [{id}]: cancel_token"
                 );
             }
             "create_with_cancel_token" => {
                 let token = CancelToken::new();
                 let ctx: Context<Value> =
                     Context::create(None, None, Some(token.clone()), None, Value::Null, None);
-                assert!(
+
+                // `cancel_token_bound`
+                assert_eq!(
                     ctx.cancel_token.is_some(),
-                    "FAIL [{id}]: cancel_token must be bound"
+                    expected["cancel_token_bound"].as_bool().unwrap(),
+                    "FAIL [{id}]: cancel_token_bound"
                 );
-                // The bound token MUST be the same instance the caller supplied
-                // — cancelling either side observes the other.
+
+                // `cancel_token_matches_input` — the SAME handle, observed by
+                // cancelling the caller's side and reading the context's.
                 token.cancel();
-                assert!(
-                    ctx.cancel_token.as_ref().unwrap().is_cancelled(),
-                    "FAIL [{id}]: cancel_token must reflect caller-supplied handle"
+                let matches_input = ctx.cancel_token.as_ref().unwrap().is_cancelled();
+                assert_eq!(
+                    matches_input,
+                    expected["cancel_token_matches_input"].as_bool().unwrap(),
+                    "FAIL [{id}]: cancel_token_matches_input — the bound token \
+                     does not observe the caller-supplied handle's cancellation"
                 );
-                assert!(
+
+                // `executor_at_create_time`
+                assert_eq!(
                     ctx.executor.is_none(),
-                    "FAIL [{id}]: executor must be None at create time"
+                    expected["executor_at_create_time"].is_null(),
+                    "FAIL [{id}]: executor_at_create_time"
                 );
             }
             "create_with_global_deadline" => {
@@ -2145,17 +2181,27 @@ async fn conformance_context_create() {
                 let ctx: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, Some(deadline));
                 assert_eq!(
-                    ctx.global_deadline,
-                    Some(deadline),
+                    json!(ctx.global_deadline),
+                    expected["global_deadline"],
                     "FAIL [{id}]: global_deadline must be preserved"
                 );
-                assert!(ctx.executor.is_none(), "FAIL [{id}]: executor must be None");
+                assert_eq!(
+                    ctx.executor.is_none(),
+                    expected["executor"].is_null(),
+                    "FAIL [{id}]: executor"
+                );
             }
             "create_rejects_executor_input" => {
-                // Signature-level enforcement: the Rust API exposes no
-                // `executor` parameter on `Context::create`. We assert that
-                // the bound `executor` field starts at None for any caller-
-                // constructed Context.
+                // `executor_is_not_a_parameter` — enforced at compile time by
+                // `_CONTEXT_CREATE_SIGNATURE` above: an `executor` parameter
+                // cannot be added without breaking that coercion. The runtime
+                // half confirms the consequence a caller can see, which is that
+                // no caller-constructed Context arrives pre-bound.
+                assert!(
+                    expected["executor_is_not_a_parameter"].as_bool().unwrap(),
+                    "FAIL [{id}]: this driver only knows how to verify the \
+                     'no such parameter' branch of the contract"
+                );
                 let ctx: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, None);
                 assert!(
@@ -2164,68 +2210,110 @@ async fn conformance_context_create() {
                 );
             }
             "create_rejects_caller_id_input" => {
-                // Signature-level enforcement: the Rust API exposes no
-                // `caller_id` parameter on `Context::create`. The returned
-                // Context always has `caller_id = None` at top level.
+                // `caller_id_is_not_a_parameter` — same compile-time pin.
+                assert!(
+                    expected["caller_id_is_not_a_parameter"].as_bool().unwrap(),
+                    "FAIL [{id}]: this driver only knows how to verify the \
+                     'no such parameter' branch of the contract"
+                );
                 let ctx: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, None);
-                assert!(
-                    ctx.caller_id.is_none(),
-                    "FAIL [{id}]: top-level caller_id must be None"
+
+                // `caller_id_after_create`
+                assert_eq!(
+                    json!(ctx.caller_id),
+                    expected["caller_id_after_create"],
+                    "FAIL [{id}]: caller_id_after_create"
                 );
             }
             "executor_binds_on_first_call_local" => {
                 let client = APCore::new();
-                register_echo(client.registry(), "test.echo");
+                let call_module = tc["input"]["call_module"].as_str().unwrap();
+                register_echo(client.registry(), call_module);
                 let ctx: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, None);
-                assert!(
+
+                // `executor_at_create_time`
+                assert_eq!(
                     ctx.executor.is_none(),
-                    "FAIL [{id}]: executor must be None at create time"
+                    expected["executor_at_create_time"].is_null(),
+                    "FAIL [{id}]: executor_at_create_time"
                 );
-                // Cloning the ctx for the call (executor.call clones internally
-                // anyway); we want to verify the bind by directly observing
-                // the field after a noop-bind via the public helper, since
-                // `Executor::call` clones the Context before binding so the
-                // caller's local handle does not see the mutation.
+
+                // `raised_binding_error` — `Executor::call` clones the Context
+                // before binding, so the caller's handle never observes the
+                // mutation (documented in the fixture). Bind explicitly to get
+                // at the binding result itself.
                 let exec = client.executor();
                 let handle: Arc<dyn std::any::Any + Send + Sync> = exec.instance_handle();
                 let mut ctx_for_bind = ctx.clone();
-                ctx_for_bind.bind_executor(handle).unwrap();
+                let bind_result = ctx_for_bind.bind_executor(handle);
+                assert_eq!(
+                    bind_result.is_err(),
+                    expected["raised_binding_error"].as_bool().unwrap(),
+                    "FAIL [{id}]: raised_binding_error — bind returned {bind_result:?}"
+                );
                 assert!(
                     ctx_for_bind.executor.is_some(),
                     "FAIL [{id}]: executor must be bound after first call"
                 );
-                // Also exercise the actual call path returns Ok (i.e. the
-                // pipeline's binding step did not raise).
-                let result = exec.call("test.echo", json!({"v": 1}), None, None).await;
-                assert!(result.is_ok(), "FAIL [{id}]: call must succeed");
+
+                // `call_succeeded`
+                let result = exec.call(call_module, json!({"v": 1}), None, None).await;
+                assert_eq!(
+                    result.is_ok(),
+                    expected["call_succeeded"].as_bool().unwrap(),
+                    "FAIL [{id}]: call_succeeded — call returned {result:?}"
+                );
             }
             "executor_binds_idempotent_same_instance" => {
                 let client = APCore::new();
-                register_echo(client.registry(), "test.echo");
+                let calls: Vec<&str> = tc["input"]["calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect();
+                register_echo(client.registry(), calls[0]);
                 let exec = client.executor();
-                let handle1: Arc<dyn std::any::Any + Send + Sync> = exec.instance_handle();
-                let handle2: Arc<dyn std::any::Any + Send + Sync> = exec.instance_handle();
                 let mut ctx: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, None);
-                ctx.bind_executor(handle1).unwrap();
-                // Re-binding to the same instance is a noop.
-                ctx.bind_executor(handle2).unwrap();
                 ctx.bind_executor(exec.instance_handle()).unwrap();
-                assert!(
-                    ctx.executor.is_some(),
-                    "FAIL [{id}]: executor remains bound"
+                let first_handle = ctx.executor.clone().expect("bound on first call");
+
+                // `rebind_noop` — re-binding the SAME Executor instance must
+                // neither raise nor replace the stored handle.
+                let rebinds: Vec<Result<(), _>> = vec![
+                    ctx.bind_executor(exec.instance_handle()),
+                    ctx.bind_executor(exec.instance_handle()),
+                ];
+                let rebind_noop = rebinds.iter().all(Result::is_ok)
+                    && Arc::ptr_eq(&first_handle, ctx.executor.as_ref().unwrap());
+                assert_eq!(
+                    rebind_noop,
+                    expected["rebind_noop"].as_bool().unwrap(),
+                    "FAIL [{id}]: rebind_noop — rebinds {rebinds:?}"
                 );
-                // Verify the same Executor identity also survives multiple
-                // top-level call() invocations on the same shared ctx.
-                let r1 = exec
-                    .call("test.echo", json!({"i": 1}), Some(&ctx), None)
-                    .await;
-                let r2 = exec
-                    .call("test.echo", json!({"i": 2}), Some(&ctx), None)
-                    .await;
-                assert!(r1.is_ok() && r2.is_ok(), "FAIL [{id}]: subsequent calls");
+
+                // `raised_error` / `executor_identity_stable` across repeated
+                // top-level calls sharing one Context.
+                let mut results = Vec::new();
+                for (i, module_id) in calls.iter().enumerate() {
+                    results.push(
+                        exec.call(module_id, json!({"i": i}), Some(&ctx), None)
+                            .await,
+                    );
+                }
+                assert_eq!(
+                    results.iter().any(Result::is_err),
+                    expected["raised_error"].as_bool().unwrap(),
+                    "FAIL [{id}]: raised_error — {results:?}"
+                );
+                assert_eq!(
+                    Arc::ptr_eq(&first_handle, ctx.executor.as_ref().unwrap()),
+                    expected["executor_identity_stable"].as_bool().unwrap(),
+                    "FAIL [{id}]: executor_identity_stable"
+                );
             }
             "executor_rejects_cross_executor_rebind" => {
                 // Build two independent Executors and confirm the second
@@ -2251,77 +2339,124 @@ async fn conformance_context_create() {
             "child_propagates_executor" => {
                 let client = APCore::new();
                 let exec = client.executor();
-                let mut parent: Context<Value> =
+                let target = tc["input"]["create_child_module_id"].as_str().unwrap();
+                // The parent is itself a child so its call_chain is non-empty —
+                // otherwise `child_caller_id_from_parent_chain_tip` would be
+                // satisfied vacuously by two Nones.
+                let mut root: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, None);
-                parent.bind_executor(exec.instance_handle()).unwrap();
-                let child = parent.child("test.target");
-                assert!(
-                    child.executor.is_some(),
-                    "FAIL [{id}]: child executor must be propagated"
+                root.bind_executor(exec.instance_handle()).unwrap();
+                let parent = root.child("orchestrator.main");
+                let child = parent.child(target);
+
+                // `child_executor_matches_parent`
+                let executor_matches = match (parent.executor.as_ref(), child.executor.as_ref()) {
+                    (Some(p), Some(c)) => Arc::ptr_eq(p, c),
+                    _ => false,
+                };
+                assert_eq!(
+                    executor_matches,
+                    expected["child_executor_matches_parent"].as_bool().unwrap(),
+                    "FAIL [{id}]: child_executor_matches_parent"
                 );
-                let (a, b) = (
-                    parent.executor.as_ref().unwrap(),
-                    child.executor.as_ref().unwrap(),
+
+                // `child_caller_id_from_parent_chain_tip`
+                let caller_id_from_tip =
+                    child.caller_id.as_deref() == parent.call_chain.last().map(String::as_str);
+                assert_eq!(
+                    caller_id_from_tip,
+                    expected["child_caller_id_from_parent_chain_tip"]
+                        .as_bool()
+                        .unwrap(),
+                    "FAIL [{id}]: child_caller_id_from_parent_chain_tip — child.caller_id={:?}, \
+                     parent.call_chain={:?}",
+                    child.caller_id,
+                    parent.call_chain
                 );
-                assert!(
-                    Arc::ptr_eq(a, b),
-                    "FAIL [{id}]: child must reference same Executor handle"
-                );
-                assert!(
-                    child.call_chain.last().map(String::as_str) == Some("test.target"),
-                    "FAIL [{id}]: child call_chain must append target"
+
+                // `child_call_chain_appends_target`
+                let mut want_chain = parent.call_chain.clone();
+                want_chain.push(target.to_string());
+                assert_eq!(
+                    child.call_chain == want_chain,
+                    expected["child_call_chain_appends_target"]
+                        .as_bool()
+                        .unwrap(),
+                    "FAIL [{id}]: child_call_chain_appends_target — got {:?}, want {want_chain:?}",
+                    child.call_chain
                 );
             }
             "child_propagates_cancel_token" => {
                 let token = CancelToken::new();
                 let parent: Context<Value> =
                     Context::create(None, None, Some(token.clone()), None, Value::Null, None);
-                let child = parent.child("test.target");
-                assert!(
+                let child = parent.child(tc["input"]["create_child_module_id"].as_str().unwrap());
+
+                // `child_cancel_token_bound`
+                assert_eq!(
                     child.cancel_token.is_some(),
-                    "FAIL [{id}]: child cancel_token must be bound"
+                    expected["child_cancel_token_bound"].as_bool().unwrap(),
+                    "FAIL [{id}]: child_cancel_token_bound"
                 );
+
+                // `child_cancel_token_matches_parent` — cancelling through the
+                // parent's handle must be observable from the child's.
                 token.cancel();
-                assert!(
-                    child.cancel_token.as_ref().unwrap().is_cancelled(),
-                    "FAIL [{id}]: child cancel_token must observe parent cancel"
+                let matches_parent = child.cancel_token.as_ref().unwrap().is_cancelled();
+                assert_eq!(
+                    matches_parent,
+                    expected["child_cancel_token_matches_parent"]
+                        .as_bool()
+                        .unwrap(),
+                    "FAIL [{id}]: child_cancel_token_matches_parent — a module deep \
+                     in the call chain would not observe cancellation"
                 );
             }
             "deserialize_then_call_binds_local_executor" => {
                 let serialized = tc["input"]["serialized_context"].clone();
                 let ctx_des: Context<Value> = Context::deserialize(serialized).unwrap();
-                assert!(
+
+                // Fields stripped by §5.7 must arrive absent.
+                assert_eq!(
                     ctx_des.executor.is_none(),
-                    "FAIL [{id}]: deserialize must strip executor"
-                );
-                assert!(
-                    ctx_des.cancel_token.is_none(),
-                    "FAIL [{id}]: deserialize must strip cancel_token"
-                );
-                assert!(
-                    ctx_des.global_deadline.is_none(),
-                    "FAIL [{id}]: deserialize must strip global_deadline"
+                    expected["executor_after_deserialize"].is_null(),
+                    "FAIL [{id}]: executor_after_deserialize"
                 );
                 assert_eq!(
-                    ctx_des.caller_id.as_deref(),
-                    Some("remote.caller"),
-                    "FAIL [{id}]: caller_id must round-trip"
+                    ctx_des.cancel_token.is_none(),
+                    expected["cancel_token_after_deserialize"].is_null(),
+                    "FAIL [{id}]: cancel_token_after_deserialize"
                 );
-                // Bind a local executor handle and verify the post-bind state.
+                assert_eq!(
+                    ctx_des.services, expected["services_after_deserialize"],
+                    "FAIL [{id}]: services_after_deserialize"
+                );
+                assert_eq!(
+                    json!(ctx_des.global_deadline),
+                    expected["global_deadline_after_deserialize"],
+                    "FAIL [{id}]: global_deadline_after_deserialize"
+                );
+                assert_eq!(
+                    json!(ctx_des.caller_id),
+                    expected["caller_id_preserved"],
+                    "FAIL [{id}]: caller_id_preserved"
+                );
+
+                // `executor_bound_on_first_call` — the receiving node binds its
+                // OWN executor to the arriving Context.
                 let client = APCore::new();
                 let exec = client.executor();
                 let mut ctx_bound = ctx_des.clone();
                 ctx_bound.bind_executor(exec.instance_handle()).unwrap();
-                assert!(
+                assert_eq!(
                     ctx_bound.executor.is_some(),
-                    "FAIL [{id}]: executor must bind after deserialize"
+                    expected["executor_bound_on_first_call"].as_bool().unwrap(),
+                    "FAIL [{id}]: executor_bound_on_first_call"
                 );
             }
             "distributed_cancel_token_post_deserialize_null" => {
                 // Negative invariant (PROTOCOL_SPEC §5.7): cancel_token MUST NOT
-                // serialize across process boundaries. Verify (a) a Context
-                // serialized with a live token omits the field, and (b) the
-                // deserialized Context arrives with cancel_token = None.
+                // serialize across process boundaries.
                 use apcore::cancel::CancelToken;
                 let token = CancelToken::new();
                 let ctx_with_token: Context<Value> =
@@ -2331,41 +2466,32 @@ async fn conformance_context_create() {
                     "FAIL [{id}]: pre-condition — cancel_token must be set before serialize"
                 );
                 let serialized = ctx_with_token.serialize();
-                assert!(
-                    !serialized.as_object().unwrap().contains_key("cancel_token"),
-                    "FAIL [{id}]: cancel_token MUST NOT appear in serialized output"
-                );
+                let field_on_the_wire =
+                    serialized.as_object().unwrap().contains_key("cancel_token");
                 let ctx_des: Context<Value> = Context::deserialize(serialized).unwrap();
-                assert!(
+
+                // `cancel_token_after_deserialize`
+                assert_eq!(
                     ctx_des.cancel_token.is_none(),
-                    "FAIL [{id}]: cancel_token MUST be None after deserialize"
+                    expected["cancel_token_after_deserialize"].is_null(),
+                    "FAIL [{id}]: cancel_token_after_deserialize"
                 );
-            }
-            "distributed_cancel_token_synthesized_locally" => {
-                // The Rust pipeline does not currently synthesize a CancelToken
-                // at pipeline entry for deserialized Contexts (the field
-                // simply stays None and the pipeline runs without
-                // cancellation). We assert the precondition only — that a
-                // deserialized Context arrives with cancel_token=None — and
-                // leave the synthesis MUST as a known SDK gap tracked
-                // separately in Issue #66 follow-ups.
-                let serialized = json!({
-                    "_context_version": 1,
-                    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-                    "call_chain": [],
-                    "data": {}
-                });
-                let ctx_des: Context<Value> = Context::deserialize(serialized).unwrap();
-                assert!(
-                    ctx_des.cancel_token.is_none(),
-                    "FAIL [{id}]: deserialized cancel_token MUST be None"
+
+                // `no_in_context_token_rides_across_processes` — neither the
+                // wire form nor the rebuilt Context may carry the token.
+                let no_token_rides = !field_on_the_wire && ctx_des.cancel_token.is_none();
+                assert_eq!(
+                    no_token_rides,
+                    expected["no_in_context_token_rides_across_processes"]
+                        .as_bool()
+                        .unwrap(),
+                    "FAIL [{id}]: no_in_context_token_rides_across_processes — \
+                     cancel_token present on the wire: {field_on_the_wire}"
                 );
             }
             "distributed_global_deadline_post_deserialize_null" => {
-                // Negative invariant (PROTOCOL_SPEC §5.7): global_deadline MUST NOT
-                // serialize across process boundaries. Verify (a) a Context
-                // serialized with a deadline omits the field, and (b) the
-                // deserialized Context arrives with global_deadline = None.
+                // Negative invariant (PROTOCOL_SPEC §5.7): global_deadline MUST
+                // NOT serialize across process boundaries.
                 let ctx_with_deadline: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, Some(9_999_999.0));
                 assert!(
@@ -2373,44 +2499,28 @@ async fn conformance_context_create() {
                     "FAIL [{id}]: pre-condition — global_deadline must be set before serialize"
                 );
                 let serialized = ctx_with_deadline.serialize();
-                assert!(
-                    !serialized
-                        .as_object()
-                        .unwrap()
-                        .contains_key("global_deadline"),
-                    "FAIL [{id}]: global_deadline MUST NOT appear in serialized output"
-                );
+                let field_on_the_wire = serialized
+                    .as_object()
+                    .unwrap()
+                    .contains_key("global_deadline");
                 let ctx_des: Context<Value> = Context::deserialize(serialized).unwrap();
-                assert!(
-                    ctx_des.global_deadline.is_none(),
-                    "FAIL [{id}]: global_deadline MUST be None after deserialize"
+
+                // `global_deadline_after_deserialize`
+                assert_eq!(
+                    json!(ctx_des.global_deadline),
+                    expected["global_deadline_after_deserialize"],
+                    "FAIL [{id}]: global_deadline_after_deserialize"
                 );
-            }
-            "distributed_global_deadline_recomputed_locally" => {
-                // BuiltinContextCreation seeds global_deadline from
-                // executor.global_timeout when the context arrives without
-                // one. We exercise that path by running a no-op call on a
-                // deserialized Context and asserting the call succeeds.
-                let client = APCore::new();
-                register_echo(client.registry(), "local.echo");
-                let serialized = json!({
-                    "_context_version": 1,
-                    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-                    "call_chain": [],
-                    "data": {}
-                });
-                let ctx_des: Context<Value> = Context::deserialize(serialized).unwrap();
-                assert!(
-                    ctx_des.global_deadline.is_none(),
-                    "FAIL [{id}]: deserialized global_deadline MUST be None"
-                );
-                let result = client
-                    .executor()
-                    .call("local.echo", json!({}), Some(&ctx_des), None)
-                    .await;
-                assert!(
-                    result.is_ok(),
-                    "FAIL [{id}]: pipeline must run with recomputed deadline"
+
+                // `no_remote_deadline_rides_via_global_deadline_field`
+                let no_deadline_rides = !field_on_the_wire && ctx_des.global_deadline.is_none();
+                assert_eq!(
+                    no_deadline_rides,
+                    expected["no_remote_deadline_rides_via_global_deadline_field"]
+                        .as_bool()
+                        .unwrap(),
+                    "FAIL [{id}]: no_remote_deadline_rides_via_global_deadline_field — \
+                     global_deadline present on the wire: {field_on_the_wire}"
                 );
             }
             "tracestate_carried_inside_traceparent" => {
@@ -2438,16 +2548,41 @@ async fn conformance_context_create() {
                 let ctx: Context<Value> =
                     Context::create(None, Some(trace_parent), None, None, Value::Null, None);
                 assert_eq!(
-                    ctx.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736",
+                    json!(ctx.trace_id),
+                    expected["trace_id"],
                     "FAIL [{id}]: trace_id must be inherited from trace_parent"
                 );
-                // Verify the inbound tracestate survives into outbound
-                // injection — proves TraceParent.tracestate is the canonical
-                // carrier (no separate Context.create parameter exists).
+
+                // `tracestate_preserved` — every inbound vendor/value pair must
+                // survive into the outbound header.
                 let headers = apcore::trace_context::TraceContext::inject(&ctx);
-                assert!(
-                    headers.contains_key("tracestate"),
-                    "FAIL [{id}]: outbound tracestate header must be emitted"
+                let outbound = headers.get("tracestate").cloned().unwrap_or_default();
+                let preserved = tracestate
+                    .iter()
+                    .all(|(k, v)| outbound.contains(&format!("{k}={v}")));
+                assert_eq!(
+                    preserved,
+                    expected["tracestate_preserved"].as_bool().unwrap(),
+                    "FAIL [{id}]: tracestate_preserved — outbound header was {outbound:?}"
+                );
+
+                // `no_separate_tracestate_parameter` — TraceParent is the ONLY
+                // carrier: the compile-time signature pin above admits no
+                // tracestate argument, and a Context built without a
+                // TraceParent emits no tracestate at all.
+                let bare: Context<Value> =
+                    Context::create(None, None, None, None, Value::Null, None);
+                let bare_headers = apcore::trace_context::TraceContext::inject(&bare);
+                let only_via_trace_parent =
+                    !outbound.is_empty() && !bare_headers.contains_key("tracestate");
+                assert_eq!(
+                    only_via_trace_parent,
+                    expected["no_separate_tracestate_parameter"]
+                        .as_bool()
+                        .unwrap(),
+                    "FAIL [{id}]: no_separate_tracestate_parameter — a Context created \
+                     without a TraceParent emitted {:?}",
+                    bare_headers.get("tracestate")
                 );
             }
             _ => panic!("Unhandled context_create fixture case: {id} — add a branch above."),
