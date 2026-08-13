@@ -62,3 +62,118 @@ fn test_discover_falls_back_to_defaults_when_no_file_found() {
     // Defaults: executor.max_call_depth = 32
     assert_eq!(config.executor.max_call_depth, 32);
 }
+
+// ---------------------------------------------------------------------------
+// apcore#88: `$APCORE_CONFIG_FILE` selects the document, it is not in it.
+// ---------------------------------------------------------------------------
+
+/// Flatten the loaded settings tree into dot-paths.
+fn flatten(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten(child, &path, out);
+            }
+        }
+        _ => out.push(prefix.to_string()),
+    }
+}
+
+/// The declared document as dot-paths: the raw tree the file (plus env
+/// overrides) put there. The typed `executor` / `observability` struct fields
+/// are excluded by construction — they are declared by the schemas and always
+/// resolve, so they say nothing about what the *document* declared.
+fn declared_paths(config: &apcore::Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, value) in &config.user_namespaces {
+        flatten(value, name, &mut out);
+    }
+    out.sort();
+    out
+}
+
+fn write_minimal_yaml(dir: &TempDir, filename: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.path().join(filename);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// §9.2 turns every `APCORE_*` variable into a configuration override, so the
+/// file selector used to lower to the dot-path `config.file` and land in the
+/// declared document — the view §9.1's required-field check runs against via
+/// `get_declared`. `config.file` is declared by no schema
+/// (`conformance/fixtures/config_key_governance.json`).
+///
+/// Asserts the **exact** declared key set, not merely that `config.file` is
+/// gone: absence alone would also hold for an implementation that dropped a key
+/// the file really does declare.
+#[test]
+fn test_config_file_env_var_is_not_a_config_override_legacy_mode() {
+    let dir = TempDir::new().unwrap();
+    let path = write_minimal_yaml(
+        &dir,
+        "custom.yaml",
+        "version: '1.0.0'\nproject:\n  name: demo\n",
+    );
+
+    std::env::set_var("APCORE_CONFIG_FILE", path.to_str().unwrap());
+    let config = apcore::Config::load(&path).unwrap();
+    std::env::remove_var("APCORE_CONFIG_FILE");
+
+    assert_eq!(declared_paths(&config), vec!["project.name", "version"]);
+}
+
+#[test]
+fn test_config_file_env_var_is_not_a_config_override_namespace_mode() {
+    let dir = TempDir::new().unwrap();
+    let path = write_minimal_yaml(
+        &dir,
+        "ns.yaml",
+        "apcore:\n  version: '1.0.0'\n  project:\n    name: demo\n",
+    );
+
+    std::env::set_var("APCORE_CONFIG_FILE", path.to_str().unwrap());
+    let config = apcore::Config::load(&path).unwrap();
+    std::env::remove_var("APCORE_CONFIG_FILE");
+
+    // `version` / `project.name` appear twice: namespace-mode load mirrors the
+    // LEGACY_ROOT_FIELDS to the top level for backward compatibility. That is
+    // pre-existing and unrelated — what matters is that the set is closed.
+    assert_eq!(
+        declared_paths(&config),
+        vec![
+            "apcore.project.name",
+            "apcore.version",
+            "project.name",
+            "version"
+        ]
+    );
+}
+
+/// The exemption is one variable wide: `bindings.dir` IS a declared key, so
+/// `APCORE_BINDINGS_DIR` is §9.2 working as designed.
+#[test]
+fn test_declared_env_override_still_reaches_the_declared_document() {
+    let dir = TempDir::new().unwrap();
+    let path = write_minimal_yaml(
+        &dir,
+        "custom.yaml",
+        "version: '1.0.0'\nproject:\n  name: demo\n",
+    );
+
+    std::env::set_var("APCORE_CONFIG_FILE", path.to_str().unwrap());
+    std::env::set_var("APCORE_BINDINGS_DIR", "./generated");
+    let config = apcore::Config::load(&path).unwrap();
+    std::env::remove_var("APCORE_CONFIG_FILE");
+    std::env::remove_var("APCORE_BINDINGS_DIR");
+
+    assert_eq!(
+        declared_paths(&config),
+        vec!["bindings.dir", "project.name", "version"]
+    );
+}

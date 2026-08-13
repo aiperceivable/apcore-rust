@@ -29,6 +29,18 @@ pub enum MountSource {
 /// Default maximum nesting depth for env var key conversion.
 pub const DEFAULT_MAX_DEPTH: usize = 5;
 
+/// Environment variable naming the configuration file to load (§9.14 discovery).
+///
+/// apcore#88: this variable is an *argument to* [`Config::load`] — it selects
+/// which document is read — and only happens to share the `APCORE_` prefix that
+/// §9.2 turns into configuration overrides. Left in the override map its suffix
+/// becomes the dot-path `config.file`, a key no schema declares (checked
+/// against `conformance/fixtures/config_key_governance.json`), which then sits
+/// inside the **declared** document that [`Config::validate`]'s §9.1
+/// required-field check reads through [`Config::get_declared`].
+/// `discover_config_file` consumes it; both env-override passes drop it.
+const ENV_CONFIG_FILE: &str = "APCORE_CONFIG_FILE";
+
 /// Environment variable key conversion strategy for a namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EnvStyle {
@@ -1867,6 +1879,13 @@ impl Config {
             }
 
             // 2. Standard APCORE_ prefix stripping.
+            //
+            // apcore#88: the file selector is consumed by
+            // `discover_config_file`; it is an argument to load(), not a value
+            // the document declares. Kept here it would inject `config.file`.
+            if key == ENV_CONFIG_FILE {
+                continue;
+            }
             if let Some(suffix) = key.strip_prefix("APCORE_") {
                 let dot_path = Self::env_key_to_dot_path(suffix);
                 tracing::debug!(env = %key, path = %dot_path, "Applying legacy env override");
@@ -1938,7 +1957,9 @@ impl Config {
             // Fallback: APCORE_ prefix with no matching namespace → treat as
             // top-level key (same as legacy mode). Per spec §9.8, un-matched
             // env vars resolve to their natural dot-path without namespace prefix.
-            if !matched {
+            if !matched && env_key != ENV_CONFIG_FILE {
+                // apcore#88: same exemption as the legacy branch — the file
+                // selector is an argument to load(), not configuration.
                 if let Some(suffix) = env_key.strip_prefix("APCORE_") {
                     let dot_path = Self::env_key_to_dot_path(suffix);
                     tracing::debug!(env = %env_key, path = %dot_path, "Applying fallback env override (no namespace match)");
@@ -2262,8 +2283,10 @@ fn init_builtin_namespaces() {
 // Config discovery (§9.14)
 // ---------------------------------------------------------------------------
 
+/// `$APCORE_CONFIG_FILE` is *consumed* here: both env-override passes skip it
+/// so it never becomes the `config.file` override (apcore#88).
 fn discover_config_file() -> Option<std::path::PathBuf> {
-    if let Ok(env_path) = std::env::var("APCORE_CONFIG_FILE") {
+    if let Ok(env_path) = std::env::var(ENV_CONFIG_FILE) {
         if !env_path.is_empty() {
             return Some(std::path::PathBuf::from(env_path));
         }

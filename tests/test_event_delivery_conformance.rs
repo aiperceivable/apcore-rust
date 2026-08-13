@@ -713,3 +713,128 @@ async fn conformance_subscriber_id_sdk_generated_when_omitted() {
         "DLQ events must carry the SDK-generated subscriber ids"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Subscriber retry configuration (apcore#85)
+// ---------------------------------------------------------------------------
+
+/// Assert the policy the DELIVERY PATH resolves, per the fixture's
+/// `read_the_resolved_policy_not_the_config` contract. `retry()` is the trait
+/// method the emitter consults; this SDK previously stored `retry_count` on a
+/// field `retry()` never read, so an assertion against the config the factory
+/// was handed was green while delivery used the default.
+fn assert_resolved_policy(type_name: &str, sub: &dyn EventSubscriber, want: &Value) {
+    let got = sub.retry();
+    let num = |k: &str| want[k].as_u64().expect("policy field is numeric");
+    assert_eq!(
+        u64::from(got.max_attempts),
+        num("max_attempts"),
+        "[{type_name}] max_attempts: the declared policy did not reach retry()"
+    );
+    assert_eq!(
+        got.initial_backoff_ms,
+        num("initial_backoff_ms"),
+        "[{type_name}] initial_backoff_ms"
+    );
+    assert_eq!(
+        got.max_backoff_ms,
+        num("max_backoff_ms"),
+        "[{type_name}] max_backoff_ms"
+    );
+    let want_mult = want["backoff_multiplier"].as_f64().expect("numeric");
+    assert!(
+        (got.backoff_multiplier - want_mult).abs() < 1e-9,
+        "[{type_name}] backoff_multiplier: got {}, want {want_mult}",
+        got.backoff_multiplier
+    );
+}
+
+#[tokio::test]
+async fn conformance_declared_retry_policy_is_read_for_every_subscriber_type() {
+    let fixture = load_fixture();
+    let case = fixture_case(
+        &fixture,
+        "declared_retry_policy_is_read_for_every_subscriber_type",
+    );
+
+    // The fixture's `every_type_or_the_case_is_half_done` contract: the defect
+    // was NOT uniform — `webhook` parsed a different (flat) spelling while
+    // `file` / `stdout` / `filter` had no `retry` field at all here, so a
+    // webhook-only assertion was green while four types ignored their config.
+    let declared = case["subscribers"]
+        .as_array()
+        .expect("subscribers is an array");
+    let expected = &case["expected"]["resolved_policy_per_type"];
+    assert!(
+        case["expected"]["every_field_differs_from_the_default"]
+            .as_bool()
+            .unwrap_or(false),
+        "the fixture must declare a policy differing from the shipped default on every field, \
+         or this case passes whether or not the config was read"
+    );
+
+    let default = EventRetryConfig::default();
+    let mut checked = Vec::new();
+    for entry in declared {
+        let type_name = entry["type"].as_str().expect("type");
+        // The fixture carries every field a type requires to construct, so the
+        // entry goes to the factory verbatim — see its `a_case_must_carry_its_
+        // own_inputs` contract.
+        let sub = apcore::events::subscribers::create_subscriber(entry)
+            .unwrap_or_else(|e| panic!("[{type_name}] factory failed: {}", e.message));
+        let want = &expected[type_name];
+        assert!(
+            want.is_object(),
+            "[{type_name}] fixture declares no expected policy for this type"
+        );
+        assert_ne!(
+            want["max_attempts"].as_u64().unwrap(),
+            u64::from(default.max_attempts),
+            "[{type_name}] the expected policy must differ from the default"
+        );
+        assert_resolved_policy(type_name, sub.as_ref(), want);
+        checked.push(type_name.to_string());
+    }
+
+    let mut want_types: Vec<String> = expected
+        .as_object()
+        .expect("resolved_policy_per_type is an object")
+        .keys()
+        .cloned()
+        .collect();
+    want_types.sort();
+    checked.sort();
+    assert_eq!(
+        checked, want_types,
+        "every built-in subscriber type the fixture names must be exercised"
+    );
+}
+
+#[tokio::test]
+async fn conformance_nested_retry_block_wins_over_legacy_retry_count() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "nested_retry_block_wins_over_legacy_retry_count");
+    let subs = case["subscribers"].as_array().expect("subscribers");
+
+    // [0] carries BOTH spellings — the nested block must win.
+    let both = apcore::events::subscribers::create_subscriber(&subs[0])
+        .expect("factory accepts both spellings");
+    assert_eq!(
+        u64::from(both.retry().max_attempts),
+        case["expected"]["nested_wins"]["max_attempts"]
+            .as_u64()
+            .expect("numeric"),
+        "the nested retry block must win over the legacy flat retry_count"
+    );
+
+    // [1] carries only the legacy spelling — it must still translate.
+    let legacy = apcore::events::subscribers::create_subscriber(&subs[1])
+        .expect("factory accepts the legacy spelling");
+    assert_eq!(
+        u64::from(legacy.retry().max_attempts),
+        case["expected"]["legacy_alone_still_translates"]["max_attempts"]
+            .as_u64()
+            .expect("numeric"),
+        "retry_count alone must still translate as max_attempts = retry_count + 1"
+    );
+}
