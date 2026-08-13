@@ -15,20 +15,26 @@ use serde::{Deserialize, Serialize};
 use super::base::Middleware;
 use super::circuit_breaker::{CircuitBreakerBuilder, CircuitBreakerMiddleware};
 use super::logging::LoggingMiddleware;
-use super::otel_tracing::{TracingBuilder, TracingMiddleware};
 use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::EventEmitter;
+use crate::observability::exporters::StdoutExporter;
+use crate::observability::tracing_middleware::TracingMiddleware;
 
 /// Configuration for the built-in `tracing` middleware type.
+///
+/// Builds the one `TracingMiddleware` the protocol specifies
+/// (`observability.md` § Tracing Architecture, normative span in
+/// `protocol-spec.md` §12). The `service_name`, `propagate_traceparent` and
+/// `enabled` keys of the withdrawn `middleware-system.md` §1.3 formulation are
+/// gone; unknown keys are ignored by serde, so an older `apcore.yaml` still
+/// parses.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TracingMiddlewareConfig {
-    pub service_name: Option<String>,
-    pub propagate_traceparent: Option<bool>,
+    /// Middleware ordering priority (higher runs first). Applied by wrapping
+    /// the middleware, as for a `custom` entry.
     pub priority: Option<u16>,
-    /// Runtime override for the compile-time `opentelemetry` feature.
-    pub enabled: Option<bool>,
     /// Optional glob patterns scoping the middleware to a subset of modules.
     /// Currently informational; future work may apply filtering at the
     /// pipeline level.
@@ -154,7 +160,7 @@ impl MiddlewareFactory {
     /// Build a single middleware instance from a config entry.
     pub fn build(&self, config: &MiddlewareConfig) -> Result<Box<dyn Middleware>, ModuleError> {
         match config {
-            MiddlewareConfig::Tracing(cfg) => Ok(Box::new(Self::build_tracing(cfg))),
+            MiddlewareConfig::Tracing(cfg) => Ok(Self::build_tracing(cfg)),
             MiddlewareConfig::CircuitBreaker(cfg) => Ok(Box::new(self.build_circuit_breaker(cfg))),
             MiddlewareConfig::Logging(cfg) => Ok(Box::new(Self::build_logging(cfg))),
             MiddlewareConfig::Custom(cfg) => self.build_custom(cfg),
@@ -169,21 +175,18 @@ impl MiddlewareFactory {
         chain.middleware.iter().map(|c| self.build(c)).collect()
     }
 
-    fn build_tracing(cfg: &TracingMiddlewareConfig) -> TracingMiddleware {
-        let mut b = TracingBuilder::default();
-        if let Some(ref name) = cfg.service_name {
-            b = b.service_name(name.clone());
+    /// Build the `tracing` entry: the span-exporting `TracingMiddleware` from
+    /// `observability`. The exporter defaults to [`StdoutExporter`], which
+    /// emits each span through the `tracing` crate (so it lands wherever the
+    /// application's subscriber points, and nowhere if there is none). Wire a
+    /// real destination by registering a `span_exporter` extension — it calls
+    /// `TracingMiddleware::set_exporter` on the instance already in the chain.
+    fn build_tracing(cfg: &TracingMiddlewareConfig) -> Box<dyn Middleware> {
+        let mw = TracingMiddleware::new(Box::new(StdoutExporter));
+        match cfg.priority {
+            Some(p) => Box::new(PriorityOverride::new(Box::new(mw), p)),
+            None => Box::new(mw),
         }
-        if let Some(p) = cfg.propagate_traceparent {
-            b = b.propagate_traceparent(p);
-        }
-        if let Some(p) = cfg.priority {
-            b = b.priority(p);
-        }
-        if let Some(en) = cfg.enabled {
-            b = b.enabled(en);
-        }
-        b.build()
     }
 
     fn build_circuit_breaker(
@@ -276,6 +279,14 @@ impl Middleware for PriorityOverride {
         self.priority
     }
 
+    /// Forward the downcast handle of the WRAPPED middleware. Without this,
+    /// `ExtensionManager::apply` would find a priority-wrapped
+    /// `TracingMiddleware` by name, fail to downcast it, and silently drop the
+    /// `span_exporter` extension.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.as_any()
+    }
+
     async fn before(
         &self,
         module_id: &str,
@@ -310,8 +321,38 @@ impl Middleware for PriorityOverride {
 mod tests {
     use super::*;
 
+    // NOTE: the previous version of this test asserted `service_name`,
+    // `propagate_traceparent` and `enabled` round-tripped onto
+    // `TracingMiddlewareConfig`. Those three keys configured the withdrawn
+    // `middleware-system.md` §1.3 middleware and were removed with it —
+    // `propagate_traceparent` never did anything even while it existed, since
+    // there is no outbound-call hook to attach a `traceparent` to.
     #[test]
     fn parses_tracing_entry() {
+        let yaml = r#"
+middleware:
+  - type: tracing
+    priority: 700
+    match_modules: ["executor.*"]
+"#;
+        let chain = MiddlewareChainConfig::from_yaml(yaml).unwrap();
+        assert_eq!(chain.middleware.len(), 1);
+        match &chain.middleware[0] {
+            MiddlewareConfig::Tracing(cfg) => {
+                assert_eq!(cfg.priority, Some(700));
+                assert_eq!(
+                    cfg.match_modules.as_deref(),
+                    Some(&["executor.*".to_string()][..])
+                );
+            }
+            _ => panic!("expected tracing config"),
+        }
+    }
+
+    /// An `apcore.yaml` written against the withdrawn §1.3 keys must keep
+    /// parsing — the keys are ignored, not rejected.
+    #[test]
+    fn withdrawn_tracing_keys_are_ignored_not_rejected() {
         let yaml = r#"
 middleware:
   - type: tracing
@@ -321,14 +362,27 @@ middleware:
 "#;
         let chain = MiddlewareChainConfig::from_yaml(yaml).unwrap();
         assert_eq!(chain.middleware.len(), 1);
-        match &chain.middleware[0] {
-            MiddlewareConfig::Tracing(cfg) => {
-                assert_eq!(cfg.service_name.as_deref(), Some("my-service"));
-                assert_eq!(cfg.propagate_traceparent, Some(true));
-                assert_eq!(cfg.enabled, Some(true));
-            }
-            _ => panic!("expected tracing config"),
-        }
+        assert!(matches!(&chain.middleware[0], MiddlewareConfig::Tracing(_)));
+    }
+
+    /// The `tracing` entry builds the middleware the spec kept — the one that
+    /// exports spans — and a `priority` override must not hide it from the
+    /// `span_exporter` extension point, which finds it by downcast.
+    #[test]
+    fn tracing_entry_builds_the_span_exporting_middleware() {
+        let chain =
+            MiddlewareChainConfig::from_yaml("middleware:\n  - type: tracing\n    priority: 700\n")
+                .unwrap();
+        let built = MiddlewareFactory::new().build_chain(&chain).unwrap();
+        assert_eq!(built[0].name(), "tracing");
+        assert_eq!(built[0].priority(), 700);
+        assert!(
+            built[0]
+                .as_any()
+                .and_then(|any| any.downcast_ref::<TracingMiddleware>())
+                .is_some(),
+            "the built middleware must be downcastable to observability::TracingMiddleware"
+        );
     }
 
     #[test]
@@ -398,7 +452,6 @@ middleware:
         let yaml = r"
 middleware:
   - type: tracing
-    enabled: false
   - type: logging
 ";
         let chain = MiddlewareChainConfig::from_yaml(yaml).unwrap();

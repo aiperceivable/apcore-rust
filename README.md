@@ -279,14 +279,12 @@ client.use_middleware(Box::new(ObsLoggingMiddleware::new(ContextLogger::new("app
 // TracingMiddleware requires a SpanExporter — see observability docs
 ```
 
-> **`TracingMiddleware` vs `OtelTracingMiddleware`** — the Rust SDK ships two
-> tracing adapters. `apcore::TracingMiddleware` (re-exported from
-> `observability::tracing_middleware`) is the built-in span exporter with
-> sampling-based controls and zero external dependencies.
-> `apcore::OtelTracingMiddleware` (alias for
-> `middleware::otel_tracing::TracingMiddleware`) is the OpenTelemetry-backed
-> adapter — use it when you want spans to flow into an existing OTel
-> collector pipeline.
+> **`TracingMiddleware`** — there is exactly one, `apcore::TracingMiddleware`
+> (re-exported from `observability::tracing_middleware`). It opens the
+> `apcore.module.execute` span the protocol specifies, keeps a span stack so
+> nested module-to-module calls get real `parent_span_id` links, and exports
+> through a pluggable `SpanExporter` with sampling controls and zero external
+> dependencies. Point it at an OpenTelemetry collector with `OTLPExporter`.
 
 ### Access control
 

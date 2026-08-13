@@ -169,6 +169,220 @@ fn config_default_values_match_canonical_defaults() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// §9.14 `reject_unknown_framework_keys` — both tiers, driven from the fixture
+// ---------------------------------------------------------------------------
+
+/// Expand the fixture's flat `{"executor.zz": "kept"}` config map into the
+/// nested object a real document carries, and write it to disk.
+///
+/// Every case below goes through `Config::load` from a real file. The
+/// synthetic `Config::from_defaults()` + `.set(…)` path cannot express this
+/// defect: `set` writes a `user_namespaces` shadow entry no YAML file can
+/// produce and skips `Config::deserialize` entirely, which is the step that
+/// discards the key.
+fn write_case_document(
+    case: &serde_json::Value,
+    namespace_mode: bool,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let flat = case["config"]
+        .as_object()
+        .expect("case.config is an object");
+
+    let mut sections = serde_json::Map::new();
+    let mut root = serde_json::Map::new();
+    for (path, value) in flat {
+        // `_config` is a reserved TOP-LEVEL namespace (§9.6.3) and never nests
+        // under `apcore:`.
+        let target = if path.starts_with("_config.") {
+            &mut root
+        } else {
+            &mut sections
+        };
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut cursor = target;
+        for part in &parts[..parts.len() - 1] {
+            cursor = cursor
+                .entry((*part).to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .expect("dot-path segment collides with a scalar");
+        }
+        cursor.insert(parts[parts.len() - 1].to_string(), value.clone());
+    }
+
+    if namespace_mode {
+        // The `apcore:` block selects namespace mode; §9.10 step 2 runs the
+        // sub-algorithm against it.
+        sections.insert("version".to_string(), serde_json::json!("1.0.0"));
+        root.insert(
+            "apcore".to_string(),
+            serde_json::Value::Object(sections.clone()),
+        );
+    } else {
+        // Legacy mode: the whole file IS the apcore namespace (§9.14). The two
+        // §9.1 required fields are added because a legacy document without
+        // them fails validation for an unrelated reason — they are not part of
+        // what the case is testing.
+        root.insert("version".to_string(), serde_json::json!("1.0.0"));
+        root.insert(
+            "project".to_string(),
+            serde_json::json!({ "name": "governance-fixture" }),
+        );
+        for (key, value) in sections {
+            root.insert(key, value);
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("apcore.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(root)).expect("serialize"),
+    )
+    .expect("write config file");
+    (dir, path)
+}
+
+/// Default tier: an undeclared key inside a framework section is RETAINED.
+///
+/// Per `driver_contract.default_tier_must_be_asserted_by_reading_it_back`, the
+/// retained key is asserted by reading it back through `get()` — not by
+/// checking that the load did not raise. Not-raising is also true of an
+/// implementation that discarded the key at parse time, which is exactly the
+/// defect this case exists to catch (apcore-rust#33 did it for every
+/// `observability.*` subkey, and `executor` did it for every undeclared one
+/// until §9.14).
+#[test]
+fn unknown_framework_key_is_retained_by_default() {
+    let fx = fixture();
+    let case = fixture_case(&fx, "unknown_framework_key_is_retained_by_default");
+    let allowed = allowed_keys(&fx);
+    let flat = case["config"]
+        .as_object()
+        .expect("case.config is an object");
+
+    // Both modes: §9.14 clause (b) "applies in legacy mode too, where the whole
+    // file *is* the `apcore` namespace", and the two take different branches
+    // through `Config::deserialize`.
+    for namespace_mode in [false, true] {
+        let (_dir, path) = write_case_document(case, namespace_mode);
+        let config = apcore::config::Config::load(&path).unwrap_or_else(|e| {
+            panic!(
+                "expected.load_succeeds is true but load failed in \
+                 {} mode: {}",
+                if namespace_mode {
+                    "namespace"
+                } else {
+                    "legacy"
+                },
+                e.message
+            )
+        });
+        assert_eq!(case["expected"]["load_succeeds"], serde_json::json!(true));
+        assert_eq!(case["expected"]["error_raised"], serde_json::json!(false));
+
+        // Every key the case declares must read back as written, undeclared or
+        // not. Reported as a list so a driver failure names the offenders.
+        let dropped: Vec<String> = flat
+            .iter()
+            .filter(|(key, want)| config.get(key).as_ref() != Some(*want))
+            .map(|(key, want)| format!("{key}: want {want}, got {:?}", config.get(key)))
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "keys written into a real config file did not read back through \
+             get() in {} mode: {dropped:?}",
+            if namespace_mode {
+                "namespace"
+            } else {
+                "legacy"
+            }
+        );
+
+        // Pin the case's own two expectations against the right keys, derived
+        // from the fixture's canonical key surface rather than hardcoded here.
+        let undeclared: Vec<&String> = flat.keys().filter(|k| !allowed.contains(*k)).collect();
+        assert_eq!(
+            undeclared.len(),
+            1,
+            "the retention case must declare exactly one undeclared key, got \
+             {undeclared:?}"
+        );
+        assert_eq!(
+            config.get(undeclared[0]),
+            Some(case["expected"]["get_undeclared_key"].clone()),
+            "`{}` is the key the case is about; it MUST be retained and \
+             readable through get()",
+            undeclared[0]
+        );
+        let declared: Vec<&String> = flat.keys().filter(|k| allowed.contains(*k)).collect();
+        assert_eq!(
+            declared.len(),
+            1,
+            "expected one declared key, got {declared:?}"
+        );
+        assert_eq!(
+            config.get(declared[0]),
+            Some(case["expected"]["get_declared_key"].clone()),
+            "retaining the undeclared key must not disturb `{}`",
+            declared[0]
+        );
+    }
+}
+
+/// Strict tier: the same key raises `CONFIG_INVALID`, and the error enumerates
+/// EVERY offending key.
+///
+/// Per `driver_contract.strict_enumerates_every_key`, the case declares two
+/// undeclared keys in DIFFERENT sections on purpose and both must appear. An
+/// implementation that fails on the first satisfies a raise-only assertion
+/// while forcing the operator into one restart per typo.
+#[test]
+fn unknown_framework_key_is_rejected_under_strict() {
+    let fx = fixture();
+    let case = fixture_case(&fx, "unknown_framework_key_is_rejected_under_strict");
+    let expected_keys: Vec<&str> = case["expected"]["error_names_all_offending_keys"]
+        .as_array()
+        .expect("error_names_all_offending_keys is an array")
+        .iter()
+        .map(|v| v.as_str().expect("key is a string"))
+        .collect();
+
+    for namespace_mode in [false, true] {
+        let mode = if namespace_mode {
+            "namespace"
+        } else {
+            "legacy"
+        };
+        let (_dir, path) = write_case_document(case, namespace_mode);
+        let err = apcore::config::Config::load(&path).expect_err(&format!(
+            "expected.load_succeeds is false, but the {mode}-mode document loaded"
+        ));
+        assert_eq!(
+            format!("{:?}", err.code),
+            "ConfigInvalid",
+            "expected.error_code is CONFIG_INVALID, got {:?}: {}",
+            err.code,
+            err.message
+        );
+        // Report the offenders, not a boolean.
+        let missing: Vec<&str> = expected_keys
+            .iter()
+            .copied()
+            .filter(|key| !err.message.contains(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the {mode}-mode strict error named only some of the offending \
+             keys — missing {missing:?}. §9.14: the error MUST enumerate every \
+             offending key rather than failing on the first, so one restart is \
+             enough to see the whole problem.\nfull message: {}",
+            err.message
+        );
+    }
+}
+
 /// Guard the guard: if the fixture ever stops naming its generator, the next
 /// person to hand-edit it will make it a second source of truth.
 #[test]

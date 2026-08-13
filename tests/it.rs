@@ -122,12 +122,18 @@ mod test_compute_delay_ms;
 mod test_config_key_governance_conformance;
 #[path = "test_config_key_restricted.rs"]
 mod test_config_key_restricted;
+#[path = "test_config_load_coverage_guard.rs"]
+mod test_config_load_coverage_guard;
 #[path = "test_config_load_executor_namespace.rs"]
 mod test_config_load_executor_namespace;
 #[path = "test_config_load_observability_subkeys.rs"]
 mod test_config_load_observability_subkeys;
+#[path = "test_config_load_sections.rs"]
+mod test_config_load_sections;
 #[path = "test_config_reload_from_disk.rs"]
 mod test_config_reload_from_disk;
+#[path = "test_config_unknown_framework_keys.rs"]
+mod test_config_unknown_framework_keys;
 #[path = "test_context.rs"]
 mod test_context;
 #[path = "test_context_key.rs"]

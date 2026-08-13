@@ -119,6 +119,130 @@ const OBSERVABILITY_NS: &str = "observability";
 /// must agree on the spelling or they disagree on the value.
 const EXECUTOR_NS: &str = "executor";
 
+/// The framework sections `Config` models as a typed field OUTSIDE the
+/// `#[serde(flatten)] user_namespaces` bag, and whose raw object
+/// [`Config::deserialize`] therefore has to retain by hand.
+///
+/// `PROTOCOL_SPEC` §9.14 (`reject_unknown_framework_keys`): with
+/// `_config.strict` absent or false, a key inside a framework section that
+/// `schemas/apcore-config.schema.json` does not declare **MUST** be retained
+/// and readable through `get()`. Serde drops what the typed struct does not
+/// model, silently, at parse time — so for every name in this list the raw
+/// object is inserted into `user_namespaces` as well and the two stores are
+/// reconciled by [`Config::typed_namespace_view`] (typed struct overlaid last).
+///
+/// The third typed field, `modules_path`, is deliberately absent: it is a
+/// scalar, so it has no subkeys to lose and nothing to reconcile.
+/// `test_config_unknown_framework_keys.rs` derives the `ConfigHelper` field
+/// list from this source file and fails if a new typed field appears without
+/// being classified into one of those two groups.
+const TYPED_SECTIONS: &[&str] = &[EXECUTOR_NS, OBSERVABILITY_NS];
+
+/// Every framework section `schemas/apcore-config.schema.json` declares,
+/// paired with the immediate keys that schema declares for it.
+///
+/// Every section in that schema is `additionalProperties: false` (`extensions`
+/// spells it `unevaluatedProperties: false` over a `oneOf`, which is the same
+/// closedness reached through a branch), and `PROTOCOL_SPEC` §9.14 enforces
+/// that closedness under `_config.strict: true`: a key here that the schema
+/// does not declare **MUST** raise `CONFIG_INVALID`, and the error **MUST**
+/// enumerate every offending key rather than failing on the first.
+///
+/// **This table is a projection of the canonical schemas, not a second source
+/// of truth.** The SDK cannot read `apcore/schemas/` at runtime, so the
+/// projection is transcribed here and
+/// `framework_section_keys_match_the_canonical_schema` in
+/// `tests/test_config_unknown_framework_keys.rs` re-derives it from
+/// `schemas/apcore-config.schema.json` on every run and fails on any drift —
+/// including a section added to the schema and not added here, which is the
+/// drift a hand-maintained list would otherwise absorb silently.
+///
+/// `sys_modules` is the one section whose key list is a union of two canonical
+/// files: `apcore-config.schema.json` declares only `enabled`, and the
+/// remaining families (`health`, `usage`, `events`, …) are declared by
+/// `schemas/sys-modules.schema.json`. That union is not this table's
+/// invention — it is exactly how `conformance/fixtures/config_key_governance.json`
+/// projects the canonical key surface ("the last namespaced under
+/// `sys_modules.`"), and without it strict mode would reject
+/// `sys_modules.health.enabled`, a key every SDK documents.
+///
+/// The top-level scalars `$schema` and `version` are absent because they are
+/// not sections — §9.14 iterates the keys *inside* a section.
+///
+/// `#[doc(hidden)]`: public only so the conformance driver can diff it against
+/// the canonical schema. Not part of the supported API surface.
+#[doc(hidden)]
+pub const FRAMEWORK_SECTION_KEYS: &[(&str, &[&str])] = &[
+    // `_config` is declared by the schema (`$defs/ConfigBusMeta`,
+    // `additionalProperties: false`) and so is governed like any other
+    // section. §9.10 skips it as a *namespace*, not as a section — and a typo
+    // in the strict switch itself (`strcit: true`) is the single worst key to
+    // let through silently, since it disables every other check the operator
+    // asked for.
+    ("_config", &["allow_unknown", "strict"]),
+    ("project", &["name", "version"]),
+    (
+        "extensions",
+        &[
+            "auto_discover",
+            "follow_symlinks",
+            "ignore_patterns",
+            "lazy_load",
+            "max_depth",
+            "namespace",
+            "root",
+            "roots",
+        ],
+    ),
+    ("schema", &["max_ref_depth", "root", "strategy"]),
+    ("acl", &["audit", "default_effect", "root"]),
+    ("logging", &["format", "level"]),
+    ("observability", &["metrics", "tracing"]),
+    ("middleware", &["disabled"]),
+    (
+        "executor",
+        &[
+            "default_timeout",
+            "global_timeout",
+            "max_call_depth",
+            "max_module_repeat",
+        ],
+    ),
+    ("pipeline", &["configure", "remove", "steps"]),
+    ("validation", &["binding", "pipeline"]),
+    ("id_map", &["auto_detect", "overrides"]),
+    ("bindings", &["dir", "pattern"]),
+    (
+        "sys_modules",
+        &[
+            "control",
+            "enabled",
+            "error_history",
+            "events",
+            "health",
+            "manifest",
+            "usage",
+        ],
+    ),
+    ("stream", &["max_merge_depth"]),
+    ("obs", &["redaction"]),
+];
+
+/// Is `name` a framework section rather than a Config Bus namespace?
+///
+/// Used by the §9.10 strict unknown-namespace check. Rust flattens the
+/// `apcore:` block's members to the top level of `user_namespaces` (so that
+/// `get("acl.root")` works in both modes), which leaves framework sections
+/// sitting alongside genuine namespaces in the same map. Without this filter,
+/// `_config.strict: true` reported `unknown namespace 'acl'` for a document
+/// whose only sin was declaring an `acl:` block — and `unknown namespace
+/// 'project'` for the §9.1 required field.
+fn is_framework_section(name: &str) -> bool {
+    FRAMEWORK_SECTION_KEYS
+        .iter()
+        .any(|(section, _)| *section == name)
+}
+
 /// A canonical default value. Const-constructible so [`CONFIG_DEFAULTS`] can
 /// stay a plain `const` table rather than a lazily-built map.
 #[derive(Debug, Clone, Copy)]
@@ -372,11 +496,19 @@ pub struct MetricsConfig {
 ///
 /// [`ExecutorConfig`] models *every* key `$defs/ExecutorConfig` in
 /// `schemas/apcore-config.schema.json` declares, and that schema is
-/// `additionalProperties: false`, so — unlike `observability` — **no
-/// spec-declared `executor` subkey is lost at load**. `Config::deserialize`
-/// keeps no raw copy and needs none.
+/// `additionalProperties: false`, so — unlike `observability` — no
+/// *spec-declared* `executor` subkey is lost at load.
 ///
-/// A second store still appears at runtime: `set("executor.<unmodelled>", …)`
+/// An **un**declared one was, until `PROTOCOL_SPEC` §9.14 made retention
+/// normative: `executor: {zz_vendor_knob: …}` reached `ExecutorConfig`, which
+/// does not model it, and serde discarded it before any accessor could see it.
+/// §9.14 requires the opposite under the default (`_config.strict` absent or
+/// false) — the key is kept and readable through `get()` — so
+/// `Config::deserialize` now retains the raw `executor` object in
+/// `user_namespaces` exactly as it does for `observability`. See
+/// [`TYPED_SECTIONS`].
+///
+/// A second store also appears at runtime: `set("executor.<unmodelled>", …)`
 /// falls past `set_typed_field` into `user_namespaces`, and
 /// `mount("executor", …)` writes there directly. Once it exists, every reader
 /// that consulted only one of the two stores was wrong — `Serialize` wrote the
@@ -399,11 +531,12 @@ pub struct Config {
     pub executor: ExecutorConfig,
     pub observability: ObservabilityConfig,
     /// User-defined and vendor namespaces. Captures any top-level key not
-    /// matching a canonical namespace above, plus the raw `observability`
-    /// object (see the struct-level note). An `executor` entry can appear here
-    /// too, but only via `set`/`mount` — never from the file, whose
-    /// `executor:` block the typed field consumes whole. Per spec §9.1, custom
-    /// namespace names should follow `[a-z][a-z0-9-]*`.
+    /// matching a canonical namespace above, plus the raw object of every
+    /// [`TYPED_SECTIONS`] entry — `observability` and `executor` — so the
+    /// subkeys their typed structs do not model survive the load
+    /// (`PROTOCOL_SPEC` §9.14; see the struct-level note). `set`/`mount` can
+    /// create the same entries at runtime. Per spec §9.1, custom namespace
+    /// names should follow `[a-z][a-z0-9-]*`.
     pub user_namespaces: HashMap<String, serde_json::Value>,
     pub yaml_path: Option<PathBuf>,
     pub mode: ConfigMode,
@@ -581,20 +714,33 @@ impl<'de> Deserialize<'de> for Config {
         // overlays the typed struct last. Read from `core_data` rather than
         // `raw` so namespace-mode files that nest the block under `apcore:`
         // are covered too.
-        let raw_observability = core_data
-            .get(OBSERVABILITY_NS)
-            .and_then(serde_json::Value::as_object)
-            .cloned();
+        //
+        // §9.14 generalizes #33's fix to EVERY typed section (see
+        // [`TYPED_SECTIONS`]): with `_config.strict` absent or false, a key
+        // inside a framework section that `apcore-config.schema.json` does not
+        // declare MUST survive the load and be readable through `get()`.
+        // `ExecutorConfig` models every key that schema declares, so no
+        // *declared* `executor` subkey was ever lost — but an undeclared one
+        // was, silently, at parse time, which is the defect §9.14 names: "the
+        // operator wrote it and it vanished" is indistinguishable from "the
+        // operator never wrote it".
+        let raw_typed_sections: Vec<(&str, serde_json::Map<String, serde_json::Value>)> =
+            TYPED_SECTIONS
+                .iter()
+                .filter_map(|name| {
+                    core_data
+                        .get(*name)
+                        .and_then(serde_json::Value::as_object)
+                        .map(|obj| (*name, obj.clone()))
+                })
+                .collect();
 
         let helper: ConfigHelper = serde_json::from_value(serde_json::Value::Object(core_data))
             .map_err(D::Error::custom)?;
 
         let mut user_namespaces = helper.user_namespaces;
-        if let Some(observability) = raw_observability {
-            user_namespaces.insert(
-                OBSERVABILITY_NS.to_string(),
-                serde_json::Value::Object(observability),
-            );
+        for (name, raw) in raw_typed_sections {
+            user_namespaces.insert(name.to_string(), serde_json::Value::Object(raw));
         }
 
         Ok(Config {
@@ -817,21 +963,26 @@ impl Config {
         // 10s". Neither apcore-python, apcore-typescript, nor the PROTOCOL_SPEC
         // §9.3 constraint table rejects it.
 
-        // Namespace-mode validation (A12-NS, §9.14). Mirrors apcore-python
+        // --- 3. Unknown framework keys (§9.14) -----------------------------
+        //
+        // `reject_unknown_framework_keys`. Runs in BOTH modes: §9.10 step 1
+        // invokes it for legacy documents, where the whole file *is* the
+        // `apcore` namespace, and step 2 for the `apcore` namespace of a
+        // namespace-mode document.
+        let strict = self.strict_mode();
+        if strict {
+            self.reject_unknown_framework_keys(&mut errors);
+        }
+
+        // Namespace-mode validation (A12-NS, §9.10). Mirrors apcore-python
         // `_validate_namespace_mode` (config.py:1106) and the TS equivalent
         // (sync finding A-D-02). In namespace mode we additionally:
         //   1. Validate each registered namespace that declares a schema
         //      against its loaded subtree.
         //   2. In strict mode (`_config.strict == true`) reject any top-level
-        //      namespace that is not registered (other than `apcore`/`_config`).
+        //      namespace that is not registered (other than `apcore`/`_config`
+        //      and the framework sections — see `is_framework_section`).
         if self.mode == ConfigMode::Namespace {
-            let strict = self
-                .user_namespaces
-                .get("_config")
-                .and_then(|v| v.get("strict"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-
             // Snapshot the global namespace registry once so we can look up
             // schemas without re-acquiring the lock per namespace.
             let registry_snapshot: HashMap<String, NamespaceRegistration> =
@@ -847,7 +998,13 @@ impl Config {
                 }
                 match registry_snapshot.get(key) {
                     None => {
-                        if strict {
+                        // A framework section is not a namespace. Rust merges
+                        // the `apcore:` block's members up to the top level of
+                        // `user_namespaces`, so `acl`, `extensions`, `project`
+                        // … sit here beside genuine namespaces; §9.10 step 3
+                        // iterates namespaces only. Their keys are governed by
+                        // `reject_unknown_framework_keys` above instead.
+                        if strict && !is_framework_section(key) {
                             errors.push(format!("unknown namespace '{key}' in strict mode"));
                         }
                     }
@@ -872,6 +1029,61 @@ impl Config {
         } else {
             let message = format!("Config validation failed: {}", errors.join("; "));
             Err(ModuleError::new(ErrorCode::ConfigInvalid, message))
+        }
+    }
+
+    /// Is `_config.strict` set on the loaded document (§9.6.3)?
+    ///
+    /// Read from `user_namespaces` rather than `get()` because `_config` is a
+    /// reserved top-level key in both modes and must not pick up the
+    /// implicit-`apcore` fallback or the [`CONFIG_DEFAULTS`] table. Absent or
+    /// non-boolean means `false`, the documented default.
+    fn strict_mode(&self) -> bool {
+        self.user_namespaces
+            .get("_config")
+            .and_then(|v| v.get("strict"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// `PROTOCOL_SPEC` §9.14 `reject_unknown_framework_keys`: under
+    /// `_config.strict: true`, every key inside a framework section MUST be
+    /// declared by `schemas/apcore-config.schema.json`.
+    ///
+    /// **Collects, never short-circuits.** The spec is explicit that the error
+    /// "MUST enumerate every offending key rather than failing on the first, so
+    /// one restart is enough to see the whole problem" — an operator with two
+    /// typos in different sections should not have to restart twice to find
+    /// the second one. `validate` joins everything in `errors` into a single
+    /// `CONFIG_INVALID`, so appending here is what produces that enumeration.
+    ///
+    /// Reads the raw `user_namespaces` tree, which after [`TYPED_SECTIONS`]
+    /// retention carries the file's object for every framework section — in
+    /// namespace mode including the ones nested under `apcore:`, which
+    /// `Config::deserialize` merges up to the top level. Only sections the
+    /// document actually declares are visited; an absent section has no keys
+    /// to reject.
+    ///
+    /// Deliberately one level deep, matching the sub-algorithm ("for each key
+    /// present in `apcore_data[section]`"). Nested closedness (e.g.
+    /// `acl.audit.*`) is the canonical schema's business at validation time,
+    /// not this check's.
+    fn reject_unknown_framework_keys(&self, errors: &mut Vec<String>) {
+        for (section, declared) in FRAMEWORK_SECTION_KEYS {
+            let Some(present) = self
+                .user_namespaces
+                .get(*section)
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for key in present.keys() {
+                if !declared.contains(&key.as_str()) {
+                    errors.push(format!(
+                        "unknown key '{section}.{key}' (strict mode enabled)"
+                    ));
+                }
+            }
         }
     }
 
@@ -1097,19 +1309,21 @@ impl Config {
     /// if one exists, with the typed [`ExecutorConfig`] overlaid last.
     ///
     /// Same precedence rule and same overlay order as
-    /// [`Self::observability_view`], for the same reason — but the two stores
-    /// arise differently. `Config::deserialize` hands the file's whole
-    /// `executor:` block to the typed struct and keeps no raw copy, so for a
-    /// freshly-loaded config the base layer is empty and this is exactly
-    /// `to_value(&self.executor)`. The base layer only ever holds something a
-    /// caller put there at runtime: `set("executor.<key>", …)` for a key
-    /// `set_typed_field` does not match, or `mount("executor", …)`.
+    /// [`Self::observability_view`], for the same reason. Since §9.14 the two
+    /// stores also arise the same way: `Config::deserialize` retains the raw
+    /// `executor:` block alongside the typed struct (see [`TYPED_SECTIONS`]),
+    /// so the base layer carries whatever the file wrote — including the keys
+    /// `ExecutorConfig` does not model, which is the whole point. `set(
+    /// "executor.<key>", …)` for a key `set_typed_field` does not match, and
+    /// `mount("executor", …)`, add to the same base layer at runtime.
     ///
-    /// That is why the loaded value is never lost by overlaying the typed
-    /// struct last: the typed struct *is* where the file's `executor:` block
-    /// ended up. A `mount` that tries to override `max_call_depth` loses to it,
-    /// which is the documented rule ("the typed struct wins for the leaves it
-    /// models") and matches how a mounted `observability.tracing.enabled`
+    /// Overlaying the typed struct last is what stops a stale copy from
+    /// resurfacing: a `set("executor.max_call_depth", …)` lands in the typed
+    /// struct while the file's original value is still sitting in the raw
+    /// tree, and the caller must read back what they just set. A `mount` that
+    /// tries to override `max_call_depth` loses to the typed struct for the
+    /// same reason — the documented rule ("the typed struct wins for the leaves
+    /// it models"), matching how a mounted `observability.tracing.enabled`
     /// behaves.
     fn executor_view(&self) -> serde_json::Value {
         self.typed_namespace_view(EXECUTOR_NS, &self.executor)

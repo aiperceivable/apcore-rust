@@ -7,7 +7,6 @@ pub mod circuit_breaker;
 pub mod context_namespace;
 pub mod logging;
 pub mod manager;
-pub mod otel_tracing;
 pub mod retry;
 pub mod yaml_config;
 
@@ -26,11 +25,6 @@ pub use context_namespace::{
 };
 pub use logging::LoggingMiddleware;
 pub use manager::{MiddlewareManager, MiddlewareRegistration};
-pub use otel_tracing::{
-    TracingBuilder as OtelTracingBuilder, TracingConfig as OtelTracingConfig,
-    TracingMiddleware as OtelTracingMiddleware, TRACING_ATTRIBUTES_KEY, TRACING_SPAN_NAME_KEY,
-    TRACING_SPAN_STATUS_KEY,
-};
 pub use retry::{RetryConfig, RetryMiddleware};
 pub use yaml_config::{
     CircuitBreakerMiddlewareConfig, CustomMiddlewareConfig, CustomMiddlewareFactory,

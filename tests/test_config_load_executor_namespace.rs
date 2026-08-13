@@ -13,10 +13,14 @@
 //! *exactly* the property set `$defs/ExecutorConfig` declares in
 //! `apcore/schemas/apcore-config.schema.json`, and that schema is
 //! `additionalProperties: false`. There is no §9.15 `executor` registration
-//! declaring more. **No spec-declared `executor` subkey is lost at load**, and
-//! [`unmodelled_executor_key_in_the_file_is_not_resolvable`] pins that the
-//! non-preservation of an out-of-schema key is a decision rather than an
-//! oversight.
+//! declaring more. **No spec-declared `executor` subkey is lost at load.**
+//!
+//! An **un**declared one was, until `PROTOCOL_SPEC` §9.14 made retention
+//! normative for every framework section; see
+//! [`unmodelled_executor_key_in_the_file_is_retained`], which used to assert
+//! the opposite and carries the correction. The strict tier that rejects such
+//! a key under `_config.strict: true` lives in
+//! `test_config_unknown_framework_keys.rs`.
 //!
 //! What was broken is the namespace SURFACE over that struct:
 //!
@@ -219,28 +223,37 @@ fn typed_executor_leaves_keep_resolving_from_the_typed_struct() {
 }
 
 /// A key the file declares under `executor:` that `$defs/ExecutorConfig` does
-/// not declare stays unresolvable — deliberately.
+/// not declare is RETAINED and resolvable.
 ///
-/// This is where #34 is genuinely narrower than #33 and must not be "fixed" by
-/// symmetry. `apcore/schemas/apcore-config.schema.json` marks
-/// `$defs/ExecutorConfig` `additionalProperties: false`, so `vendor_knob` is
-/// not configuration this SDK is dropping — it is a document the canonical
-/// schema rejects. Teaching `Config::deserialize` to stash a raw copy (the #33
-/// treatment) would make Rust surface config the spec declares invalid, which
-/// is a normative change, not a bug fix.
+/// **CORRECTED.** This test previously asserted the opposite —
+/// `get("executor.vendor_knob") == None` — on the reasoning that
+/// `$defs/ExecutorConfig` is `additionalProperties: false`, so an undeclared
+/// key is "a document the canonical schema rejects" rather than configuration
+/// the SDK is dropping. It closed by calling the divergence from apcore-python
+/// and apcore-typescript (both of which preserved the key) "a spec question for
+/// the apcore repo".
 ///
-/// apcore-python and apcore-typescript DO preserve it, because their config is
-/// an untyped dict with no typed executor model at all. That divergence is a
-/// spec question for the apcore repo, not a defect here.
+/// `PROTOCOL_SPEC` §9.14 answered that question the other way. Closedness is
+/// enforced under `_config.strict: true`, where the key raises `CONFIG_INVALID`
+/// naming every offender; under the default it **MUST** be retained and
+/// readable through `get()`, because "an SDK that models a section as a typed
+/// record still has to keep what the record does not model" — "the operator
+/// wrote it and it vanished" is indistinguishable from "the operator never
+/// wrote it". So the peers were right and Rust was the outlier, and
+/// `Config::deserialize` now stashes the raw `executor:` block exactly as it
+/// does for `observability`.
+///
+/// The strict half lives in `test_config_unknown_framework_keys.rs`.
 #[test]
-fn unmodelled_executor_key_in_the_file_is_not_resolvable() {
+fn unmodelled_executor_key_in_the_file_is_retained() {
     let (_dir, config) =
         load("apcore:\n  version: \"1.0\"\nexecutor:\n  max_call_depth: 7\n  vendor_knob: hello\n");
 
     assert_eq!(
         config.get("executor.vendor_knob"),
-        None,
-        "out-of-schema executor keys are not preserved; see the doc comment"
+        Some(json!("hello")),
+        "§9.14 default tier: an undeclared key inside a framework section MUST \
+         be retained and readable through get()"
     );
     assert_eq!(
         config.get("executor.max_call_depth"),
@@ -254,8 +267,9 @@ fn unmodelled_executor_key_in_the_file_is_not_resolvable() {
             "default_timeout": 30_000,
             "global_timeout": 60_000,
             "max_module_repeat": 3,
+            "vendor_knob": "hello",
         })),
-        "the container fetch reports exactly the modelled leaves"
+        "the container fetch reports the modelled leaves AND the retained key"
     );
 }
 

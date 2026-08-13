@@ -8,8 +8,15 @@
 //! Each fixture case verifies one normative rule:
 //! - context namespace partitioning (`_apcore.*` vs `ext.*`),
 //! - the `CircuitBreakerMiddleware` state machine and event emission,
-//! - the `TracingMiddleware` span lifecycle and no-op fallback,
+//! - the `TracingMiddleware` no-op fallback when no telemetry is wired,
 //! - the language-specific async-handler detection rule (Rust: static).
+//!
+//! The fixture's `tracing_span_created` case was REMOVED upstream along with
+//! `middleware-system.md` §1.3: it pinned a `module_id`-named span and a
+//! single `_apcore.mw.tracing.span_id` slot, both of which contradict
+//! `protocol-spec.md` §12 (span `apcore.module.execute`, module id as an
+//! attribute) and `observability.md` (a `_apcore.mw.tracing.spans` STACK with
+//! explicit `parent_span_id` links). The driver for it is gone with it.
 
 #![allow(clippy::missing_panics_doc)]
 
@@ -27,10 +34,9 @@ use apcore::events::emitter::{ApCoreEvent, EventEmitter};
 use apcore::events::subscribers::EventSubscriber;
 use apcore::middleware::circuit_breaker::{CircuitBreakerMiddleware, CircuitBreakerState};
 use apcore::middleware::context_namespace::{validate_context_key, ContextWriter};
-use apcore::middleware::otel_tracing::{
-    TracingMiddleware, TRACING_ATTRIBUTES_KEY, TRACING_SPAN_NAME_KEY,
-};
-use apcore::middleware::{Middleware, TRACING_SPAN_STATUS_KEY};
+use apcore::middleware::Middleware;
+use apcore::observability::exporters::InMemoryExporter;
+use apcore::observability::tracing_middleware::{SamplingStrategy, TracingMiddleware};
 
 // ---------------------------------------------------------------------------
 // Fixture loading (mirrors other conformance tests)
@@ -448,65 +454,13 @@ async fn conformance_circuit_breaker_closes_on_success() {
 }
 
 // ---------------------------------------------------------------------------
-// Case 8 — tracing_span_created
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn conformance_tracing_span_created() {
-    let fixture = load_fixture();
-    let case = fixture_case(&fixture, "tracing_span_created");
-    let module_id = case["input"]["module_id"].as_str().unwrap();
-    let caller_id = case["input"]["caller_id"].as_str().unwrap();
-    let trace_id_in = case["input"]["trace_id"].as_str().unwrap();
-    assert_eq!(case["input"]["otel_available"].as_bool(), Some(true));
-
-    // The runtime `enabled(true)` override mirrors "OpenTelemetry SDK is
-    // available" for this language. Real OTel exporter wiring is layered
-    // above this scaffold via the `opentelemetry` cargo feature.
-    let mw = TracingMiddleware::builder().enabled(true).build();
-
-    let mut ctx = make_ctx(caller_id);
-    ctx.trace_id = trace_id_in.to_string();
-    ctx.caller_id = Some(caller_id.to_string());
-
-    mw.before(module_id, Value::Null, &ctx).await.unwrap();
-
-    let data = ctx.data.read();
-    let expected_key = case["expected"]["context_key"].as_str().unwrap();
-    let span_id = data
-        .get(expected_key)
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("expected key '{expected_key}' to be present in context.data"));
-    assert!(!span_id.is_empty(), "span_id must be non-empty");
-    assert_eq!(
-        case["expected"]["span_id_stored_in_context"].as_bool(),
-        Some(true),
-    );
-
-    let span_name = data
-        .get(TRACING_SPAN_NAME_KEY)
-        .and_then(|v| v.as_str())
-        .expect("span name must be recorded");
-    assert_eq!(span_name, module_id);
-    assert_eq!(case["expected"]["span_name"].as_str(), Some(module_id));
-
-    let attributes = data
-        .get(TRACING_ATTRIBUTES_KEY)
-        .and_then(|v| v.as_object())
-        .expect("attributes must be recorded");
-    let expected_attrs = case["expected"]["span_attributes"].as_object().unwrap();
-    for (k, v) in expected_attrs {
-        let actual = attributes
-            .get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("attribute '{k}' missing from span"));
-        assert_eq!(actual, v.as_str().unwrap(), "attribute '{k}' mismatch");
-    }
-    assert_eq!(case["expected"]["span_created"].as_bool(), Some(true));
-}
-
-// ---------------------------------------------------------------------------
-// Case 9 — tracing_noop_without_otel
+// Case 8 — tracing_noop_without_otel
+//
+// The fixture's `otel_available: false` is a language-neutral way of saying
+// "no telemetry pipeline is wired up". apcore-rust's TracingMiddleware links
+// against no OpenTelemetry SDK at all, so the Rust reading of that condition
+// is "nothing is being sampled or exported": every hook must still return
+// Ok(()) and the call must proceed, with no span reaching an exporter.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -517,7 +471,9 @@ async fn conformance_tracing_noop_without_otel() {
     let caller_id = case["input"]["caller_id"].as_str().unwrap();
     assert_eq!(case["input"]["otel_available"].as_bool(), Some(false));
 
-    let mw = TracingMiddleware::builder().enabled(false).build();
+    let exporter = InMemoryExporter::new();
+    let mw =
+        TracingMiddleware::with_sampling(Box::new(exporter.clone()), SamplingStrategy::Never, 0.0);
 
     let mut ctx = make_ctx(caller_id);
     ctx.caller_id = Some(caller_id.to_string());
@@ -536,24 +492,30 @@ async fn conformance_tracing_noop_without_otel() {
     assert!(before.is_ok());
     assert!(after.is_ok());
     assert!(on_err.is_ok());
-    assert_eq!(case["expected"]["error_raised"].as_bool(), Some(false));
-
-    let data = ctx.data.read();
-    assert!(
-        data.get(apcore::middleware::namespace_keys::TRACING_SPAN_ID)
-            .is_none(),
-        "span_id must NOT be written when otel is unavailable"
-    );
-    assert!(data.get(TRACING_SPAN_STATUS_KEY).is_none());
-    assert_eq!(case["expected"]["span_created"].as_bool(), Some(false));
     assert_eq!(
-        case["expected"]["execution_continues"].as_bool(),
-        Some(true),
+        case["expected"]["error_raised"].as_bool(),
+        Some(false),
+        "no hook may raise when no telemetry backend is present"
+    );
+
+    let span_created = !exporter.get_spans().is_empty();
+    assert_eq!(
+        span_created,
+        case["expected"]["span_created"].as_bool().unwrap(),
+        "no span may be exported when nothing is sampled"
+    );
+
+    // `execution_continues` — the pipeline is not short-circuited: `before()`
+    // returned Ok(None), i.e. inputs pass through unmodified.
+    let execution_continues = before.unwrap().is_none();
+    assert_eq!(
+        execution_continues,
+        case["expected"]["execution_continues"].as_bool().unwrap(),
     );
 }
 
 // ---------------------------------------------------------------------------
-// Case 10 — async_detection_coroutine_function
+// Case 9 — async_detection_coroutine_function
 //
 // Rust enforces this rule statically — async fns differ from sync fns at the
 // type level (they return `impl Future`). There is no runtime detection

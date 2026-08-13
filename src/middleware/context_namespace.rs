@@ -5,7 +5,7 @@
 //
 //   `_apcore.*` — owned by framework middleware. Examples:
 //                 `_apcore.mw.logging.start_time`,
-//                 `_apcore.mw.tracing.span_id`,
+//                 `_apcore.mw.tracing.spans`,
 //                 `_apcore.mw.circuit.state`.
 //   `ext.*`     — owned by user-defined middleware. Examples:
 //                 `ext.my_company.request_id`.
@@ -36,8 +36,12 @@ pub const EXT_KEY_PREFIX: &str = "ext.";
 pub mod namespace_keys {
     /// `LoggingMiddleware.before()` writes the call start time (epoch seconds).
     pub const LOGGING_START_TIME: &str = "_apcore.mw.logging.start_time";
-    /// `TracingMiddleware.before()` writes the active span ID for the call.
-    pub const TRACING_SPAN_ID: &str = "_apcore.mw.tracing.span_id";
+    /// `TracingMiddleware` owns the span STACK for the call — see the typed
+    /// [`crate::context_keys::TRACING_SPANS`] key. (The single-slot
+    /// `_apcore.mw.tracing.span_id` that used to be listed here belonged to the
+    /// withdrawn `middleware-system.md` §1.3 formulation; a single slot is
+    /// overwritten by the first nested module-to-module call.)
+    pub const TRACING_SPANS: &str = "_apcore.mw.tracing.spans";
     /// `CircuitBreakerMiddleware` writes the current circuit state for the call.
     pub const CIRCUIT_STATE: &str = "_apcore.mw.circuit.state";
 }
@@ -116,7 +120,7 @@ mod tests {
 
     #[test]
     fn user_writing_apcore_prefix_is_violation() {
-        let check = validate_context_key(ContextWriter::User, "_apcore.mw.tracing.span_id");
+        let check = validate_context_key(ContextWriter::User, "_apcore.mw.tracing.spans");
         assert!(!check.valid);
         assert!(check.warning);
     }
