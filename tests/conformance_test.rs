@@ -935,14 +935,32 @@ fn conformance_schema_validation() {
             boundary.err().map(|e| e.message)
         );
 
-        // The opt-in coercing mode is a separate library-level contract.
-        if let Some(expected_coerce) = tc.get("expected_valid_coerce").and_then(Value::as_bool) {
-            let coerced_result = coercing_validator.validate(input, schema);
-            assert_eq!(
-                coerced_result.valid, expected_coerce,
-                "FAIL [{}] (coerce_types=true): valid={}, expected={}, errors={:?}",
-                id, coerced_result.valid, expected_coerce, coerced_result.errors
-            );
+        // The opt-in coercing mode is a separate library-level contract, whose
+        // BEHAVIOUR (not existence) TYPE_MAPPING §11 makes normative as of spec
+        // v1.12.0: from a string only, `"42"`/`"-7"` → integer, `"1.5"` →
+        // number, and exactly `"true"`/`"false"` case-sensitive → boolean.
+        //
+        // The fixture's `driver_contract.both_halves_or_neither` requires BOTH
+        // halves of a coercion case to be asserted — the failure it exists for
+        // is the strict path and the knob answering the same way, so a case
+        // stating `expected_valid_strict` without `expected_valid_coerce` is a
+        // half-assertion and is refused rather than silently skipped.
+        match tc.get("expected_valid_coerce").and_then(Value::as_bool) {
+            Some(expected_coerce) => {
+                let coerced_result = coercing_validator.validate(input, schema);
+                assert_eq!(
+                    coerced_result.valid, expected_coerce,
+                    "FAIL [{}] (coerce_types=true): valid={}, expected={}, errors={:?}",
+                    id, coerced_result.valid, expected_coerce, coerced_result.errors
+                );
+            }
+            None => assert!(
+                tc.get("expected_valid_strict").is_none(),
+                "FAIL [{id}]: states `expected_valid_strict` without \
+                 `expected_valid_coerce` — the fixture's `both_halves_or_neither` \
+                 contract requires both, and asserting only the strict half hides \
+                 the knob disagreeing with it"
+            ),
         }
 
         // When the fixture pins a coerced value, validate_input must return it.

@@ -521,12 +521,104 @@ fn test_coerce_string_to_number_float() {
 
 #[test]
 fn test_coerce_string_to_bool() {
+    // CORRECTED (apcore#95): this used to assert `"1"` and `"0"` coerce too.
+    // TYPE_MAPPING §11 "What the knob coerces, when it exists" (spec v1.12.0)
+    // CAPS the accepted set at JSON's own two boolean literals rather than
+    // removing the coercion: offering the knob stays a MAY, but an SDK that
+    // offers one MUST coerce exactly `"true"`/`"false"` (case-sensitive) and
+    // MUST NOT coerce anything else. The old assertions are corrected, not
+    // deleted, because the positive half of the contract is unchanged.
     let v = SchemaValidator::with_coerce_types(true);
     let schema = json!({ "type": "object", "properties": { "flag": { "type": "boolean" } } });
     assert!(v.validate(&json!({ "flag": "true" }), &schema).valid);
     assert!(v.validate(&json!({ "flag": "false" }), &schema).valid);
-    assert!(v.validate(&json!({ "flag": "1" }), &schema).valid);
-    assert!(v.validate(&json!({ "flag": "0" }), &schema).valid);
+    // `"1"` / `"0"` are shell and INI spellings, not JSON's. `"0"` is the
+    // sharpest of the removed twelve: R5 makes the NUMBER 0 a MUST-reject for
+    // `boolean` at the module-invocation boundary, so accepting the string
+    // `"0"` here put two paths of this SDK on opposite sides of one value.
+    assert!(!v.validate(&json!({ "flag": "1" }), &schema).valid);
+    assert!(!v.validate(&json!({ "flag": "0" }), &schema).valid);
+}
+
+/// TYPE_MAPPING §11: the boolean row is exactly `"true"` and `"false"`.
+/// Every other spelling apcore-rust once accepted MUST now be left alone for
+/// the raw jsonschema check to reject (apcore#95).
+#[test]
+fn test_coerce_rejects_the_twelve_spelling_dialect() {
+    let v = SchemaValidator::with_coerce_types(true);
+    let schema = json!({ "type": "object", "properties": { "flag": { "type": "boolean" } } });
+    for spelling in [
+        "yes", "no", "on", "off", "y", "n", "t", "f", "1", "0", // the removed ten
+        "True", "False", "TRUE", "FALSE", "Yes", "ON", // case-insensitivity removed too
+        " true", "true ", "", "maybe",
+    ] {
+        let result = v.validate(&json!({ "flag": spelling }), &schema);
+        assert!(
+            !result.valid,
+            "{spelling:?} MUST NOT coerce to a boolean (TYPE_MAPPING §11)"
+        );
+    }
+}
+
+/// The coerced VALUE, not just the verdict: an implementation that coerced every
+/// non-empty string to `true` would pass the `"true"` case above on its own.
+#[test]
+fn test_coerce_string_false_yields_false_not_truthy() {
+    let v = SchemaValidator::with_coerce_types(true);
+    let schema = json!({
+        "type": "object",
+        "properties": { "flag": { "type": "boolean" } },
+        "required": ["flag"]
+    });
+    let coerced = v
+        .validate_input(&json!({ "flag": "false" }), &schema)
+        .expect("\"false\" coerces");
+    assert_eq!(coerced["flag"], json!(false));
+    let coerced = v
+        .validate_input(&json!({ "flag": "true" }), &schema)
+        .expect("\"true\" coerces");
+    assert_eq!(coerced["flag"], json!(true));
+}
+
+/// TYPE_MAPPING §11, integer row: `"3.14"` MUST NOT be accepted for `integer`
+/// even though it parses as a number — the DECLARED type bounds the coercion.
+#[test]
+fn test_coerce_rejects_fractional_string_for_integer() {
+    let v = SchemaValidator::with_coerce_types(true);
+    let schema = json!({
+        "type": "object",
+        "properties": { "count": { "type": "integer" } },
+        "required": ["count"]
+    });
+    assert!(!v.validate(&json!({ "count": "3.14" }), &schema).valid);
+    assert!(!v.validate(&json!({ "count": "-0.5" }), &schema).valid);
+    // ...while the same strings ARE accepted for a declared `number`.
+    let number_schema = json!({
+        "type": "object",
+        "properties": { "count": { "type": "number" } },
+        "required": ["count"]
+    });
+    assert!(
+        v.validate(&json!({ "count": "3.14" }), &number_schema)
+            .valid
+    );
+    assert!(
+        v.validate(&json!({ "count": "-0.5" }), &number_schema)
+            .valid
+    );
+}
+
+/// Coercion is FROM a string only. A number is never coerced to a boolean —
+/// this is R5's rule and it holds on the knob's path too (TYPE_MAPPING §11).
+#[test]
+fn test_coerce_never_turns_a_number_into_a_boolean() {
+    let v = SchemaValidator::with_coerce_types(true);
+    let schema = json!({ "type": "object", "properties": { "flag": { "type": "boolean" } } });
+    assert!(!v.validate(&json!({ "flag": 0 }), &schema).valid);
+    assert!(!v.validate(&json!({ "flag": 1 }), &schema).valid);
+    // ...and a boolean is never coerced toward a number.
+    let int_schema = json!({ "type": "object", "properties": { "n": { "type": "integer" } } });
+    assert!(!v.validate(&json!({ "n": true }), &int_schema).valid);
 }
 
 #[test]

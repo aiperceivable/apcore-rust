@@ -63,7 +63,7 @@ impl SchemaValidator {
     /// that was the divergence this default closes (TYPE_MAPPING §17.3).
     ///
     /// Use [`Self::with_coerce_types`] when a *caller* — not a module contract —
-    /// genuinely wants pydantic-lax-style conversion of its own untyped input.
+    /// genuinely wants string→scalar conversion of its own untyped input.
     #[must_use]
     pub fn new() -> Self {
         Self::with_coerce_types(false)
@@ -71,11 +71,17 @@ impl SchemaValidator {
 
     /// Create a new validator with explicit coercion behavior.
     ///
-    /// `coerce_types = true` enables the pydantic-lax-style coercion pre-pass;
-    /// `false` (the [`Self::new`] default) performs the raw jsonschema check with
-    /// no coercion. This is a library-level knob for callers doing their own
+    /// `coerce_types = true` enables the coercion pre-pass; `false` (the
+    /// [`Self::new`] default) performs the raw jsonschema check with no
+    /// coercion. This is a library-level knob for callers doing their own
     /// validation — it has no effect on the module-invocation boundary, which
     /// never coerces regardless of how any host is configured.
+    ///
+    /// What the pre-pass coerces is normative (TYPE_MAPPING §11, spec v1.12.0):
+    /// from a string only, only toward a declared type — `"42"`/`"-7"` →
+    /// `integer`, `"1.5"`/`"-0.5"` → `number`, and exactly `"true"`/`"false"`
+    /// (case-sensitive) → `boolean`. Nothing else. `"yes"`, `"on"`, `"1"`,
+    /// `"0"` and `"True"` are NOT booleans here (apcore#95).
     #[must_use]
     pub fn with_coerce_types(coerce_types: bool) -> Self {
         Self {
@@ -315,20 +321,25 @@ fn strip_nested_schema(value: &Value, top: bool) -> Value {
     }
 }
 
-/// Recursively coerce `value` toward the scalar types declared by `schema`,
-/// mirroring pydantic's lax mode (apcore-python `model_validate(strict=False)`)
-/// and apcore-typescript `Value.Decode`.
+/// Recursively coerce `value` toward the scalar types declared by `schema`.
 ///
-/// Coercions applied (and ONLY these — matching pydantic lax mode):
+/// The accepted set is normative: TYPE_MAPPING §11 "What the knob coerces, when
+/// it exists" (spec v1.12.0) makes offering this knob a MAY but its behaviour a
+/// MUST, so apcore-python, apcore-typescript and apcore-rust all coerce exactly
+/// this and nothing more. The boolean row in particular is NARROWER than
+/// pydantic's lax mode (apcore#95).
+///
+/// Coercions applied (and ONLY these):
 /// - string → integer: `"42"` → `42`, `"42.0"` → `42` (trailing whitespace
 ///   trimmed); rejected (left unchanged) if not an integral numeric string.
 /// - string → number: `"3.14"` → `3.14`.
-/// - string → boolean: `true/false/yes/no/on/off/y/n/t/f/1/0` (case-insensitive).
+/// - string → boolean: exactly `"true"` / `"false"`, case-sensitive
+///   (TYPE_MAPPING §11; narrowed from a twelve-spelling dialect by apcore#95).
 /// - integer → number: widening is a no-op for serde_json (numbers are unified),
 ///   so no transformation is needed.
 ///
-/// NOT applied (pydantic lax mode does not do these): number → string,
-/// boolean → string, non-integral float → integer.
+/// NOT applied: number → string, boolean → string, non-integral float →
+/// integer, number → boolean, boolean → number, anything → string.
 ///
 /// Unrecognized / non-coercible values are returned unchanged so the downstream
 /// jsonschema validator produces the canonical rejection. Recurses into object
@@ -375,8 +386,9 @@ fn coerce_value(value: &Value, schema: &Value) -> Value {
     }
 
     // Scalar coercion: only attempt when the value is a string and the schema
-    // declares a numeric/boolean target (pydantic only coerces FROM string for
-    // these). If the value already satisfies one of the declared types, leave it.
+    // declares a numeric/boolean target — TYPE_MAPPING §11 makes coercion
+    // string-sourced only. If the value already satisfies one of the declared
+    // types, leave it.
     if let Value::String(s) = value {
         // boolean target
         if declared_types.contains(&"boolean") {
@@ -404,8 +416,13 @@ fn coerce_value(value: &Value, schema: &Value) -> Value {
 }
 
 /// Coerce a string to an integer iff it represents an integral numeric value.
-/// Mirrors pydantic: `"42"` → 42, `"42.0"` → 42, `" 42 "` → 42; rejects
-/// `"3.14"`, `"abc"`, `""`.
+///
+/// TYPE_MAPPING §11's integer row: a string whose entire content parses as an
+/// integer. `"42"` → 42, `"-7"` → -7; the integral-float and surrounding-
+/// whitespace tolerances (`"42.0"` → 42, `" 42 "` → 42) are shared with
+/// apcore-python and apcore-typescript. `"3.14"` is a MUST-reject — the
+/// declared type bounds the coercion, not the string's parseability — as are
+/// `"abc"` and `""`.
 fn coerce_str_to_integer(s: &str) -> Option<i64> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -435,13 +452,27 @@ fn coerce_str_to_number(s: &str) -> Option<f64> {
     trimmed.parse::<f64>().ok().filter(|f| f.is_finite())
 }
 
-/// Coerce a string to a boolean, mirroring pydantic's accepted set
-/// (case-insensitive, no surrounding whitespace): true/false, yes/no, on/off,
-/// y/n, t/f, 1/0.
+/// Coerce a string to a boolean: exactly `"true"` and `"false"`, case-sensitive.
+///
+/// NARROWED (apcore#95, TYPE_MAPPING §11 "What the knob coerces, when it
+/// exists", normative as of spec v1.12.0). This used to accept a twelve-spelling
+/// case-insensitive dialect — `true/yes/on/y/t/1` and their negatives, lowercased
+/// first — that no document described; apcore-typescript ported it verbatim
+/// during apcore#93, so this function was the dialect's origin. §11 caps the set
+/// at JSON's own two boolean literals: those are the same value written as text,
+/// while `"yes"`, `"on"`, `"y"`, `"t"`, `"1"`, `"0"` are shell and INI
+/// conventions belonging to whatever parses `argv`.
+///
+/// `"0"` → `false` is the sharpest removal: R5 makes the *number* `0` a
+/// MUST-reject for `boolean` at the module-invocation boundary, so accepting the
+/// string `"0"` here put two paths of this SDK on opposite sides of one value.
+///
+/// Case-sensitive because JSON's boolean literals are lowercase: `"True"` is not
+/// one of them.
 fn coerce_str_to_bool(s: &str) -> Option<bool> {
-    match s.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "y" | "t" | "1" => Some(true),
-        "false" | "no" | "off" | "n" | "f" | "0" => Some(false),
+    match s {
+        "true" => Some(true),
+        "false" => Some(false),
         _ => None,
     }
 }
