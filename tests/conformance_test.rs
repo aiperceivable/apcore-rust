@@ -13,7 +13,7 @@ use serde_json::Value;
 use apcore::acl::{ACLRule, ACL};
 use apcore::config::{Config, EnvStyle, NamespaceRegistration};
 use apcore::context::{Context, Identity};
-use apcore::errors::ErrorCodeRegistry;
+use apcore::errors::{ErrorCode, ErrorCodeRegistry};
 use apcore::schema::SchemaValidator;
 use apcore::utils::{
     calculate_specificity, guard_call_chain_with_repeat, match_pattern, normalize_to_canonical_id,
@@ -30,6 +30,28 @@ fn load_fixture(name: &str) -> Value {
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("Failed to read fixture: {}", path.display()));
     serde_json::from_str(&content).unwrap_or_else(|e| panic!("Invalid JSON in {name}: {e}"))
+}
+
+/// Resolve a WIRE error code declared by a fixture (`ERROR_CODE_COLLISION`) to
+/// the [`ErrorCode`] variant, through serde — the same spelling the SDK puts on
+/// the wire.
+///
+/// Two failures this exists to prevent, both measured in apcore#92:
+///
+/// * asserting a Rust type name instead of the declared code, which stays green
+///   however the fixture's code is changed — the contract then lives in the
+///   driver's literal and the fixture is decoration; and
+/// * skipping the assertion when the declared code is not recognised, which
+///   turns a wrong fixture value into a passing test.
+///
+/// A code that does not resolve is a hard failure here, never a skipped branch.
+fn wire_error_code(id: &str, fixture: &str, wire: &str) -> ErrorCode {
+    serde_json::from_value(Value::String(wire.to_string())).unwrap_or_else(|e| {
+        panic!(
+            "FAIL [{id}]: {fixture} declares error code `{wire}`, which is not an apcore \
+             ErrorCode ({e}) — teach the driver, do not skip it"
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +120,14 @@ fn conformance_normalize_id() {
 
 // ---------------------------------------------------------------------------
 // 4. Version Negotiation (A14)
+//
+// CORRECTED (apcore#92): this driver branched on whether the `expected_error`
+// KEY existed and then asserted only `is_err()`. The declared value never
+// reached an assertion, so changing `VERSION_INCOMPATIBLE` in the fixture to
+// anything at all left the suite green — measured, 3 of 10 cases could not be
+// made to fail. The fixture's `driver_contract` block states the rule: the
+// expectation is a wire code, and an expectation the driver does not recognise
+// MUST be a hard failure rather than a skipped branch.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -107,22 +137,59 @@ fn conformance_version_negotiation() {
         let id = tc["id"].as_str().unwrap();
         let declared = tc["declared"].as_str().unwrap();
         let sdk = tc["sdk"].as_str().unwrap();
+        let result = negotiate_version(declared, sdk);
 
-        if tc.get("expected_error").is_some() {
-            assert!(
-                negotiate_version(declared, sdk).is_err(),
-                "FAIL [{id}]: expected error but got Ok"
-            );
+        if let Some(expected_error) = tc.get("expected_error") {
+            let wire = expected_error.as_str().unwrap_or_else(|| {
+                panic!("FAIL [{id}]: expected_error must be a string, got {expected_error}")
+            });
+            let err = match result {
+                Err(e) => e,
+                Ok(v) => panic!("FAIL [{id}]: expected {wire} but negotiation returned {v:?}"),
+            };
+            match wire {
+                // The fixture states PARSE_ERROR is language-specific: it is a
+                // sentinel for "this semver string does not parse", not an
+                // apcore wire code, and the Rust SDK has no ParseError variant.
+                // `negotiate_version` reports the malformed input as
+                // VERSION_INCOMPATIBLE with a message naming the offending
+                // string, so both are asserted. Asserting only `is_err()` — the
+                // apcore-python shape for this case — accepts an error raised
+                // for any reason at all, including a panic in the parser.
+                "PARSE_ERROR" => {
+                    assert_eq!(
+                        err.code,
+                        ErrorCode::VersionIncompatible,
+                        "FAIL [{id}]: an unparseable version is reported as \
+                         VERSION_INCOMPATIBLE by this SDK; got {} ({})",
+                        err.code.wire_str(),
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains(declared),
+                        "FAIL [{id}]: the parse failure must name the offending version \
+                         {declared:?}; message was {:?}",
+                        err.message
+                    );
+                }
+                other => {
+                    let want = wire_error_code(id, "version_negotiation.json", other);
+                    assert_eq!(
+                        err.code,
+                        want,
+                        "FAIL [{id}]: expected wire code {other}, got {} ({})",
+                        err.code.wire_str(),
+                        err.message
+                    );
+                }
+            }
         } else {
             let expected = tc["expected"].as_str().unwrap();
-            let result = negotiate_version(declared, sdk);
-            assert!(
-                result.is_ok(),
-                "FAIL [{id}]: expected Ok({expected}) but got {result:?}"
-            );
+            let negotiated = result.unwrap_or_else(|e| {
+                panic!("FAIL [{id}]: expected Ok({expected}) but got {}", e.message)
+            });
             assert_eq!(
-                result.unwrap(),
-                expected,
+                negotiated, expected,
                 "FAIL [{id}]: negotiate({declared:?}, {sdk:?}) expected {expected:?}"
             );
         }
@@ -210,14 +277,93 @@ fn conformance_call_chain() {
 
 // ---------------------------------------------------------------------------
 // 6. Error Code Collision (A17)
+//
+// CORRECTED (apcore#92): this driver branched on whether the `expected_error`
+// KEY existed and then asserted only `is_err()` / `is_ok()`. The fixture's
+// declared WIRE code never reached an assertion, and the nine `expected: "ok"`
+// cases asserted nothing beyond "did not return Err" — an `ErrorCodeRegistry`
+// that stored nothing at all passed every one of them. Measured, 12 of 18 cases
+// could not be made to fail by mutating their expectation.
+//
+// The fixture's `driver_contract` block states the three rules now followed:
+// assert the wire code and never a class name; the VALUE must reach an
+// assertion, not the key's presence; and a positive case needs an OBSERVABLE
+// POST-CONDITION — here, that the registration is queryable afterwards.
 // ---------------------------------------------------------------------------
 
+/// The outcome a case declares: `Some(code)` from `expected_error`, or `None`
+/// from the `"ok"` sentinel.
+///
+/// A case that states neither, both, or an `expected` value this driver does not
+/// recognise is a hard failure. Skipping it is exactly how a wrong fixture value
+/// becomes a passing test.
+fn error_code_case_expectation(id: &str, tc: &Value) -> Option<ErrorCode> {
+    match (tc.get("expected_error"), tc.get("expected")) {
+        (Some(declared), None) => {
+            let wire = declared.as_str().unwrap_or_else(|| {
+                panic!("FAIL [{id}]: expected_error must be a wire code string, got {declared}")
+            });
+            Some(wire_error_code(id, "error_codes.json", wire))
+        }
+        (None, Some(declared)) => {
+            let sentinel = declared.as_str().unwrap_or_else(|| {
+                panic!("FAIL [{id}]: expected must be a string sentinel, got {declared}")
+            });
+            assert!(
+                sentinel == "ok",
+                "FAIL [{id}]: error_codes.json states expected `{sentinel}` this driver does \
+                 not recognise — teach the driver, do not skip it"
+            );
+            None
+        }
+        _ => panic!(
+            "FAIL [{id}]: a case states exactly one of `expected_error` or `expected`; this \
+             one states {:?} — teach the driver, do not skip it",
+            (tc.get("expected_error"), tc.get("expected"))
+        ),
+    }
+}
+
+/// The observable post-condition owed by a case whose expectation is the `"ok"`
+/// sentinel: the code just registered is queryable, both under its owning module
+/// and in the registry-wide set.
+///
+/// Without this the positive cases prove nothing — `register` could drop its
+/// argument and still satisfy them.
+fn assert_code_registered(id: &str, registry: &ErrorCodeRegistry, module_id: &str, code: &str) {
+    let owned = registry.codes_for_module(module_id).unwrap_or_else(|| {
+        panic!("FAIL [{id}]: {module_id} owns no codes at all after a successful register")
+    });
+    assert!(
+        owned.contains(code),
+        "FAIL [{id}]: {module_id} owns {owned:?} after registering {code:?}"
+    );
+    assert!(
+        registry.all_codes().contains(code),
+        "FAIL [{id}]: {code:?} is not in all_codes() after a successful register"
+    );
+}
+
+/// The mirror post-condition for a rejected registration: nothing was stored.
+/// A registry that recorded the code and *then* reported the collision would
+/// hand the next caller a corrupt ownership map.
+fn assert_code_not_registered(id: &str, registry: &ErrorCodeRegistry, module_id: &str, code: &str) {
+    assert!(
+        registry
+            .codes_for_module(module_id)
+            .is_none_or(|owned| !owned.contains(code)),
+        "FAIL [{id}]: {code:?} was stored under {module_id} even though registration failed"
+    );
+}
+
 #[test]
+#[allow(clippy::too_many_lines)] // one arm per fixture action, each with its own post-condition
 fn conformance_error_codes() {
     let fixture = load_fixture("error_codes");
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
         let action = tc["action"].as_str().unwrap();
+        let expectation = error_code_case_expectation(id, tc);
         let mut registry = ErrorCodeRegistry::new();
 
         match action {
@@ -226,52 +372,116 @@ fn conformance_error_codes() {
                 let code = tc["error_code"].as_str().unwrap();
                 let codes: HashSet<String> = [code.to_string()].into_iter().collect();
                 let result = registry.register(module_id, &codes);
-                if tc.get("expected_error").is_some() {
-                    assert!(result.is_err(), "FAIL [{id}]: expected error but got Ok");
-                } else {
-                    assert!(
-                        result.is_ok(),
-                        "FAIL [{id}]: expected Ok but got {result:?}"
+
+                if let Some(want) = expectation {
+                    let err = result.err().unwrap_or_else(|| {
+                        panic!(
+                            "FAIL [{id}]: expected {} registering {code:?}, but it was accepted",
+                            want.wire_str()
+                        )
+                    });
+                    assert_eq!(
+                        err.code,
+                        want,
+                        "FAIL [{id}]: expected wire code {}, got {} ({})",
+                        want.wire_str(),
+                        err.code.wire_str(),
+                        err.message
                     );
+                    assert_code_not_registered(id, &registry, module_id, code);
+                } else {
+                    result.unwrap_or_else(|e| {
+                        panic!(
+                            "FAIL [{id}]: expected ok, got {} ({})",
+                            e.code.wire_str(),
+                            e.message
+                        )
+                    });
+                    assert_code_registered(id, &registry, module_id, code);
                 }
             }
             "register_sequence" => {
                 let steps = tc["steps"].as_array().unwrap();
-                let has_error = tc.get("expected_error").is_some();
                 for (idx, step) in steps.iter().enumerate() {
                     let mid = step["module_id"].as_str().unwrap();
                     let code = step["error_code"].as_str().unwrap();
                     let codes: HashSet<String> = [code.to_string()].into_iter().collect();
                     let result = registry.register(mid, &codes);
                     let is_last = idx == steps.len() - 1;
-                    if is_last && has_error {
-                        assert!(result.is_err(), "FAIL [{id}]: expected error on last step");
+
+                    // Only the final step may fail, and it must fail with the
+                    // code the fixture declares; every earlier step must be
+                    // accepted AND observable.
+                    if let (true, Some(want)) = (is_last, expectation) {
+                        let err = result.err().unwrap_or_else(|| {
+                            panic!(
+                                "FAIL [{id}] step {idx}: expected {} but the registration \
+                                 was accepted",
+                                want.wire_str()
+                            )
+                        });
+                        assert_eq!(
+                            err.code,
+                            want,
+                            "FAIL [{id}] step {idx}: expected wire code {}, got {} ({})",
+                            want.wire_str(),
+                            err.code.wire_str(),
+                            err.message
+                        );
+                        assert_code_not_registered(id, &registry, mid, code);
                     } else {
-                        assert!(result.is_ok(), "FAIL [{id}] step {idx}: {result:?}");
+                        result.unwrap_or_else(|e| {
+                            panic!(
+                                "FAIL [{id}] step {idx}: expected ok, got {} ({})",
+                                e.code.wire_str(),
+                                e.message
+                            )
+                        });
+                        assert_code_registered(id, &registry, mid, code);
                     }
                 }
             }
             "register_unregister_register" => {
+                assert!(
+                    expectation.is_none(),
+                    "FAIL [{id}]: this action drives an all-succeeding sequence; a failing \
+                     expectation on it needs a driver branch — teach the driver, do not skip it"
+                );
                 for step in tc["steps"].as_array().unwrap() {
                     let step_action = step["action"].as_str().unwrap();
+                    let mid = step["module_id"].as_str().unwrap();
                     match step_action {
                         "register" => {
-                            let mid = step["module_id"].as_str().unwrap();
                             let code = step["error_code"].as_str().unwrap();
                             let codes: HashSet<String> = [code.to_string()].into_iter().collect();
-                            registry
-                                .register(mid, &codes)
-                                .unwrap_or_else(|e| panic!("FAIL [{id}]: {e}"));
+                            registry.register(mid, &codes).unwrap_or_else(|e| {
+                                panic!("FAIL [{id}]: {} ({})", e.code.wire_str(), e.message)
+                            });
+                            assert_code_registered(id, &registry, mid, code);
                         }
                         "unregister" => {
-                            let mid = step["module_id"].as_str().unwrap();
                             registry.unregister(mid);
+                            // Post-condition: the release is observable, which
+                            // is the whole point of `unregister_allows_reuse` —
+                            // the later re-registration under another module
+                            // could otherwise succeed for the wrong reason.
+                            assert!(
+                                registry.codes_for_module(mid).is_none(),
+                                "FAIL [{id}]: {mid} still owns {:?} after unregister",
+                                registry.codes_for_module(mid)
+                            );
                         }
-                        _ => panic!("Unknown step action: {step_action}"),
+                        other => panic!(
+                            "FAIL [{id}]: error_codes.json uses step action `{other}` this \
+                             driver does not run — teach the driver, do not skip it"
+                        ),
                     }
                 }
             }
-            _ => panic!("Unknown action: {action}"),
+            other => panic!(
+                "FAIL [{id}]: error_codes.json uses action `{other}` this driver does not \
+                 run — teach the driver, do not skip it"
+            ),
         }
     }
 }
@@ -1018,9 +1228,20 @@ fn conformance_stream_aggregation() {
 
 // ---------------------------------------------------------------------------
 // 13. Identity System (AC-014, AC-015)
+//
+// CORRECTED (apcore#92): `identity_propagates_to_child_context` used to state
+// its expectation as the prose string "child.identity === parent.identity" — a
+// sentence in a value slot, which no driver can assert — so every driver
+// hardcoded the comparison behind `if id == "..."` and the fixture value was
+// decoration. The expectation is now four named fields, and each one is read
+// from the fixture and asserted below.
+//
+// Expectations are matched BY NAME and every `expected*` key a case states must
+// reach an assertion: an unread key is a hard failure, not a silent skip.
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)] // one arm per expectation key, each asserted
 fn conformance_identity_system() {
     let fixture = load_fixture("identity_system");
     for tc in fixture["test_cases"].as_array().unwrap() {
@@ -1049,37 +1270,104 @@ fn conformance_identity_system() {
             input_attrs,
         );
 
-        if let Some(expected_type) = tc.get("expected_type").and_then(|v| v.as_str()) {
-            assert_eq!(identity.identity_type(), expected_type, "FAIL [{id}] type");
-        }
+        let expectation_keys: Vec<&String> = tc
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with("expected"))
+            .collect();
+        assert!(
+            !expectation_keys.is_empty(),
+            "FAIL [{id}]: the case states no expectation, so it asserts nothing"
+        );
 
-        if let Some(expected_roles) = tc.get("expected_roles").and_then(|v| v.as_array()) {
-            let exp: Vec<String> = expected_roles
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect();
-            assert_eq!(identity.roles(), &exp, "FAIL [{id}] roles");
-        }
+        for key in expectation_keys {
+            match key.as_str() {
+                "expected_type" => {
+                    let expected_type = tc[key].as_str().unwrap();
+                    assert_eq!(identity.identity_type(), expected_type, "FAIL [{id}] type");
+                }
+                "expected_roles" => {
+                    let exp: Vec<String> = tc[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect();
+                    assert_eq!(identity.roles(), &exp, "FAIL [{id}] roles");
+                }
+                "expected_attrs" => {
+                    let expected_attrs = tc[key].as_object().unwrap();
+                    for (k, exp_v) in expected_attrs {
+                        let actual_v = identity
+                            .attrs()
+                            .get(k)
+                            .unwrap_or_else(|| panic!("FAIL [{id}] attrs: missing key {k:?}"));
+                        assert_eq!(actual_v, exp_v, "FAIL [{id}] attrs[{k}]");
+                    }
+                }
+                // Child-context propagation, field for field.
+                "expected" => {
+                    let child_module_id = tc
+                        .get("child_module_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| {
+                            panic!("FAIL [{id}]: an `expected` block needs `child_module_id`")
+                        });
+                    let parent: Context<Value> = Context::create(
+                        Some(identity.clone()),
+                        None,
+                        None,
+                        None,
+                        Value::Null,
+                        None,
+                    );
+                    let child = parent.child(child_module_id);
+                    let child_identity = child.identity.as_ref().unwrap_or_else(|| {
+                        panic!("FAIL [{id}]: the child context carries no identity at all")
+                    });
 
-        if let Some(expected_attrs) = tc.get("expected_attrs").and_then(|v| v.as_object()) {
-            for (k, exp_v) in expected_attrs {
-                let actual_v = identity
-                    .attrs()
-                    .get(k)
-                    .unwrap_or_else(|| panic!("FAIL [{id}] attrs: missing key {k:?}"));
-                assert_eq!(actual_v, exp_v, "FAIL [{id}] attrs[{k}]");
+                    for (field, expected) in tc[key].as_object().unwrap() {
+                        match field.as_str() {
+                            "child_identity_id" => assert_eq!(
+                                child_identity.id(),
+                                expected.as_str().unwrap(),
+                                "FAIL [{id}] child_identity_id"
+                            ),
+                            "child_identity_type" => assert_eq!(
+                                child_identity.identity_type(),
+                                expected.as_str().unwrap(),
+                                "FAIL [{id}] child_identity_type"
+                            ),
+                            "child_identity_roles" => assert_eq!(
+                                serde_json::to_value(child_identity.roles()).unwrap(),
+                                *expected,
+                                "FAIL [{id}] child_identity_roles"
+                            ),
+                            // Whole-value equality, which is stronger than the
+                            // three field checks above and is what the retired
+                            // prose expectation meant.
+                            "child_identity_equals_parent" => assert_eq!(
+                                child.identity == parent.identity,
+                                expected.as_bool().unwrap(),
+                                "FAIL [{id}] child_identity_equals_parent: child {:?} vs \
+                                 parent {:?}",
+                                child.identity,
+                                parent.identity
+                            ),
+                            other => panic!(
+                                "FAIL [{id}]: identity_system.json states expected.{other} \
+                                 which this driver does not read — teach the driver, do not \
+                                 skip it"
+                            ),
+                        }
+                    }
+                }
+                other => panic!(
+                    "FAIL [{id}]: identity_system.json states `{other}` which this driver \
+                     does not read — teach the driver, do not skip it"
+                ),
             }
-        }
-
-        // Verify identity propagates into a child context.
-        if id == "identity_propagates_to_child_context" {
-            let ctx: Context<Value> =
-                Context::create(Some(identity), None, None, None, Value::Null, None);
-            assert_eq!(
-                ctx.identity.as_ref().unwrap().id(),
-                &input_id,
-                "FAIL [{id}]: identity not propagated"
-            );
         }
     }
 }
@@ -1463,12 +1751,40 @@ fn conformance_binding_errors() {
                     "FAIL [{id}]: expected PIPELINE_HANDLER_NOT_SUPPORTED error"
                 );
                 let err = result.unwrap_err();
-                let msg = err.message.to_lowercase();
+
+                // Assert the WIRE CODE the fixture declares, not just "it failed".
+                let want_code = tc["error_code"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("FAIL [{id}]: case declares no error_code"));
+                let got_code = serde_json::to_value(err.code)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| panic!("FAIL [{id}]: error code is not a wire string"));
+                assert_eq!(got_code, want_code, "FAIL [{id}]: wire code");
+
+                // Read the fragments FROM THE FIXTURE. They used to be hardcoded
+                // here — `"not supported in apcore-rust" || "register_step_type"`,
+                // an OR of two literals — so the fixture's list was decoration and
+                // mutating it left this test green. This case exists to pin a
+                // Rust-only behaviour and was pinned by no driver at all
+                // (apcore#92).
+                let want = tc["expected_message_contains"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("FAIL [{id}]: expected_message_contains missing"));
                 assert!(
-                    msg.contains("not supported in apcore-rust")
-                        || msg.contains("register_step_type"),
-                    "FAIL [{id}]: message should mention not-supported; got: {msg}"
+                    !want.is_empty(),
+                    "FAIL [{id}]: expected_message_contains is empty, so it asserts nothing"
                 );
+                for fragment in want {
+                    let frag = fragment
+                        .as_str()
+                        .unwrap_or_else(|| panic!("FAIL [{id}]: fragment is not a string"));
+                    assert!(
+                        err.message.contains(frag),
+                        "FAIL [{id}]: message must contain {frag:?}; got: {}",
+                        err.message
+                    );
+                }
             }
 
             "binding_invalid_target_missing_colon" => {
@@ -2287,9 +2603,16 @@ async fn conformance_context_create() {
                 );
             }
             "executor_rejects_cross_executor_rebind" => {
-                // Build two independent Executors and confirm the second
-                // rebind raises ContextBindingError per the "raise" branch of
-                // the spec's `expected_one_of`.
+                // CORRECTED (apcore#92): this branch hardcoded the raise and
+                // named the fixture's `expected_one_of: [raise, silent_accept]`
+                // only in a comment, so mutating the whole expectation block
+                // left the case green — nothing here read the fixture. The
+                // alternation is gone as of spec v1.11.0: all three SDKs raise,
+                // so the SHOULD became a MUST and the expectation is now
+                // `{raises: true, error_code: "CONTEXT_BINDING_ERROR"}`, read
+                // below. The wire code is what is asserted — `ContextBindingError`
+                // as a *type* name is a class two SDKs share and this one does
+                // not have.
                 let registry_a = Arc::new(Registry::new());
                 let registry_b = Arc::new(Registry::new());
                 let cfg = Arc::new(Config::default());
@@ -2298,13 +2621,39 @@ async fn conformance_context_create() {
                 let mut ctx: Context<Value> =
                     Context::create(None, None, None, None, Value::Null, None);
                 ctx.bind_executor(exec_a.instance_handle()).unwrap();
-                let err = ctx
-                    .bind_executor(exec_b.instance_handle())
-                    .expect_err("rebind to a different Executor must raise");
+                let rebind = ctx.bind_executor(exec_b.instance_handle());
+
+                let raises = expected["raises"].as_bool().unwrap_or_else(|| {
+                    panic!(
+                        "FAIL [{id}]: `raises` must be a bool, got {}",
+                        expected["raises"]
+                    )
+                });
+                assert!(
+                    raises,
+                    "FAIL [{id}]: context_create.json says a cross-Executor rebind need not \
+                     raise, but apcore v1.11.0 made raising a MUST — teach the driver against \
+                     the spec, do not weaken the SDK"
+                );
+                let err = rebind.err().unwrap_or_else(|| {
+                    panic!(
+                        "FAIL [{id}]: rebinding a Context to a second Executor was accepted; \
+                         the executor handle is now {:?}",
+                        ctx.executor.is_some()
+                    )
+                });
+                let wire = expected["error_code"].as_str().unwrap_or_else(|| {
+                    panic!(
+                        "FAIL [{id}]: `error_code` must be a wire code string, got {}",
+                        expected["error_code"]
+                    )
+                });
                 assert_eq!(
                     err.code,
-                    apcore::errors::ErrorCode::ContextBindingError,
-                    "FAIL [{id}]: expected ContextBindingError"
+                    wire_error_code(id, "context_create.json", wire),
+                    "FAIL [{id}]: expected wire code {wire}, got {} ({})",
+                    err.code.wire_str(),
+                    err.message
                 );
             }
             "child_propagates_executor" => {
