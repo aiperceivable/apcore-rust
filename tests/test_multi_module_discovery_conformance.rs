@@ -159,29 +159,53 @@ fn conformance_conflict_same_segment() {
 
 #[test]
 fn conformance_full_id_grammar_valid() {
-    // The fixture's `expected.module_ids` field is illustrative only — the
-    // sole input class triggers the single-class identity guarantee, which
-    // returns the bare `base_id` (`executor.math.arithmetic`) rather than the
-    // illustrative `executor.math.arithmetic.addition` string in the fixture.
-    // The apcore-python conformance test for this fixture case (driven by
-    // `_CANONICAL_ID_RE.match`) likewise only verifies grammar conformance
-    // and ignores the fixture's `expected.module_ids` — see
-    // `apcore-python/tests/registry/test_multi_class.py::TestGrammarConformance`.
+    // CORRECTED (apcore#93): this test dismissed the case's `expected.module_ids`
+    // as "illustrative only", on the belief that the fixture declared
+    // `executor.math.arithmetic.addition` where the single-class identity
+    // guarantee returns the bare `executor.math.arithmetic`. The fixture
+    // declares the bare id — the two agree, and have for as long as this
+    // comment has been wrong. With the only fixture-derived assertion discarded
+    // and `grammar_valid` / `error` never read, nothing in the case could fail:
+    // mutating the whole `expected` block left apcore-rust green.
     //
-    // To exercise the multi-class derivation path on top of grammar
-    // conformance, we additionally derive IDs for a 2-class variant of the
-    // same input and assert those match the grammar too.
+    // All three declared expectations are now asserted. The extra 2-class
+    // derivation below stays: it exercises the multi-class path, which this
+    // single-class case does not reach.
     let fixture = load_fixture("multi_module_discovery");
     let case = fixture_case(&fixture, "full_id_grammar_valid");
     let pattern = regex::Regex::new(MODULE_ID_PATTERN).unwrap();
 
-    let ids = run_derive(case).expect("expected success");
-    for id in &ids {
-        assert!(
-            pattern.is_match(id),
-            "single-class derived ID '{id}' must match canonical grammar"
-        );
-    }
+    let outcome = run_derive(case);
+    // `expected.error` is null for a case that must succeed. Compared as a
+    // value so a fixture that starts declaring an error code stops passing here.
+    let observed_error = match &outcome {
+        Ok(_) => Value::Null,
+        Err(e) => serde_json::to_value(e.code).unwrap(),
+    };
+    assert_eq!(
+        observed_error, case["expected"]["error"],
+        "expected.error; derivation returned {outcome:?}"
+    );
+    let ids = outcome.expect("expected success");
+
+    let expected_ids: Vec<String> = case["expected"]["module_ids"]
+        .as_array()
+        .expect("expected.module_ids is an array")
+        .iter()
+        .map(|v| v.as_str().expect("module id is a string").to_string())
+        .collect();
+    assert_eq!(
+        ids, expected_ids,
+        "single-class identity guarantee: the derived ids must be the ones the case declares"
+    );
+
+    let all_valid = ids.iter().all(|id| pattern.is_match(id));
+    assert_eq!(
+        Value::Bool(all_valid),
+        case["expected"]["grammar_valid"],
+        "expected.grammar_valid against canonical_id grammar {MODULE_ID_PATTERN}; ids were \
+         {ids:?}"
+    );
 
     // Two-class variant — exercises the multi-class derivation path.
     let file_path = PathBuf::from(case["input"]["file_path"].as_str().unwrap());

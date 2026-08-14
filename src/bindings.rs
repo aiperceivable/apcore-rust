@@ -231,7 +231,14 @@ impl BindingLoader {
                 format!("Failed to read binding file '{}': {}", path.display(), e),
             )
         })?;
-        let file: BindingsFile = serde_json::from_str(&content).map_err(|e| {
+        let doc: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            ModuleError::new(
+                ErrorCode::BindingFileInvalid,
+                format!("Failed to parse binding JSON '{}': {}", path.display(), e),
+            )
+        })?;
+        require_bindings_key(path, doc.get("bindings"))?;
+        let file: BindingsFile = serde_json::from_value(doc).map_err(|e| {
             ModuleError::new(
                 ErrorCode::BindingFileInvalid,
                 format!("Failed to parse binding JSON '{}': {}", path.display(), e),
@@ -248,7 +255,14 @@ impl BindingLoader {
                 format!("Failed to read binding YAML '{}': {}", path.display(), e),
             )
         })?;
-        let file: BindingsFile = serde_yaml::from_str(&content).map_err(|e| {
+        let doc: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| {
+            ModuleError::new(
+                ErrorCode::BindingFileInvalid,
+                format!("Failed to parse binding YAML '{}': {}", path.display(), e),
+            )
+        })?;
+        require_bindings_key(path, doc.get("bindings"))?;
+        let file: BindingsFile = serde_yaml::from_value(doc).map_err(|e| {
             ModuleError::new(
                 ErrorCode::BindingFileInvalid,
                 format!("Failed to parse binding YAML '{}': {}", path.display(), e),
@@ -282,6 +296,8 @@ impl BindingLoader {
 
         let dir = source_path.parent().unwrap_or_else(|| Path::new("."));
         for mut entry in file.bindings {
+            // §2.2 target syntax, at parse time — see `validate_target`.
+            validate_target(&entry.target)?;
             // Record the originating file so downstream diagnostics can emit
             // the `{file_path}: ` prefix mandated by DECLARATIVE_CONFIG_SPEC
             // §7.2 (parity with apcore-python / apcore-typescript).
@@ -763,6 +779,59 @@ fn strict_inference_failed(entry: &BindingEntry, module_id: &str, reason: &str) 
         ),
     )
     .with_details(details)
+}
+
+/// Reject a bindings document that omits the required top-level `bindings`
+/// key, with the canonical `BindingFileInvalidError` message.
+///
+/// `DECLARATIVE_CONFIG_SPEC.md` §7.2 fixes the template as
+/// `"Invalid binding file '{file_path}': {reason}"` and
+/// `conformance/fixtures/binding_errors.json` pins the exact string for this
+/// condition. apcore-rust used to surface serde's own
+/// `missing field \`bindings\`` text instead, which shares no wording with what
+/// apcore-python and apcore-typescript emit for the same file — a message-parity
+/// divergence that no test could see, because the driver for that fixture case
+/// asserted nothing (apcore#93).
+fn require_bindings_key<T>(path: &Path, bindings: Option<&T>) -> Result<(), ModuleError> {
+    if bindings.is_some() {
+        return Ok(());
+    }
+    Err(ModuleError::new(
+        ErrorCode::BindingFileInvalid,
+        format!(
+            "Invalid binding file '{}': missing required top-level key 'bindings'",
+            path.display()
+        ),
+    ))
+}
+
+/// Validate a binding `target` against the §2.2 string-target syntax.
+///
+/// The canonical regex is
+/// `^[@./a-zA-Z_][-@./a-zA-Z0-9_]*:[a-zA-Z_][a-zA-Z0-9_.]*$`; the part that is
+/// meaningful for every SDK — and the only part apcore-rust can act on — is the
+/// `<module_path>:<symbol>` split, since Rust resolves a target through an
+/// opaque handler-map key and never touches the filesystem (§3.7 "Rust
+/// caveat"), so the traversal-rejection §2.2 asks of TypeScript has no analogue
+/// here.
+///
+/// §2.2: "Such validation produces `BindingInvalidTargetError` at parse time."
+/// Before apcore#93 apcore-rust performed none: `ErrorCode::BindingInvalidTarget`
+/// was declared, categorised, and raised by nothing, so a `target` with no
+/// separator loaded silently and failed much later as an unrelated
+/// handler-lookup miss. The message matches apcore-python's
+/// `BindingInvalidTargetError` byte for byte.
+fn validate_target(target: &str) -> Result<(), ModuleError> {
+    let well_formed = target
+        .split_once(':')
+        .is_some_and(|(module_path, symbol)| !module_path.is_empty() && !symbol.is_empty());
+    if well_formed {
+        return Ok(());
+    }
+    Err(ModuleError::new(
+        ErrorCode::BindingInvalidTarget,
+        format!("Invalid binding target '{target}'. Expected format: 'module.path:callable_name'."),
+    ))
 }
 
 /// Detect which schema-mode fields a binding entry sets.

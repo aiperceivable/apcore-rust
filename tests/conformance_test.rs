@@ -198,9 +198,27 @@ fn conformance_version_negotiation() {
 
 // ---------------------------------------------------------------------------
 // 5. Call Chain Safety (A20)
+//
+// CORRECTED (apcore#93): the six positive cases — `valid_chain`, `empty_chain`,
+// `single_element`, `frequency_within_limit`, `self_call_not_circular`,
+// `default_depth_32_ok` — asserted only `result.is_ok()`. A guard that inspects
+// nothing and returns `Ok(())` unconditionally satisfies that, so mutating
+// their declared `"ok"` left apcore-rust green. The fixture's own
+// `driver_contract.positive_cases_need_a_post_condition` says so in as many
+// words. apcore-python pinned these during apcore#92 and the default sweep went
+// green as soon as one SDK did, which is why the fix never reached here.
+//
+// Two things now make the declared expectation load-bearing:
+//   * the `"ok"` sentinel is asserted rather than inferred from the ABSENCE of
+//     `expected_error`, so an unrecognised expectation is a hard failure; and
+//   * a BOUNDARY PROBE — re-running the same chain with the one limit it sits
+//     under tightened by one, and requiring the matching rejection. That is the
+//     observable post-condition: the guard accepted this chain because it is
+//     within the limits, not because it looks at nothing.
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)] // one case-by-case ladder over the fixture; splitting it would separate each expectation from the branch that states it
 fn conformance_call_chain() {
     let fixture = load_fixture("call_chain");
     for tc in fixture["test_cases"].as_array().unwrap() {
@@ -233,44 +251,112 @@ fn conformance_call_chain() {
         );
         let mut ctx: Context<Value> =
             Context::create(Some(identity), None, None, None, Value::Null, None);
-        ctx.call_chain = call_chain;
+        ctx.call_chain.clone_from(&call_chain);
 
         let result = guard_call_chain_with_repeat(&ctx, module_id, max_depth, max_repeat);
 
         if let Some(expected_error) = tc.get("expected_error").and_then(|v| v.as_str()) {
             assert!(
-                result.is_err(),
-                "FAIL [{id}]: expected error {expected_error} but got Ok"
+                tc.get("expected").is_none(),
+                "FAIL [{id}]: states BOTH `expected` and `expected_error`; the case has no \
+                 single declared outcome"
             );
-            let err_lower = format!("{}", result.unwrap_err()).to_lowercase();
+            let Err(err) = result else {
+                panic!("FAIL [{id}]: expected error {expected_error} but got Ok")
+            };
             match expected_error {
-                "CALL_DEPTH_EXCEEDED" => assert!(
-                    err_lower.contains("depth"),
-                    "FAIL [{id}]: expected depth error, got: {err_lower}"
+                // The three codes the fixture names are real wire codes, so
+                // resolve them THROUGH serde and compare the variant. A message
+                // substring ("depth", "circular") stays green when the fixture's
+                // declared code changes, which is the shape apcore#92 caught.
+                "CALL_DEPTH_EXCEEDED" | "CIRCULAR_CALL" | "CALL_FREQUENCY_EXCEEDED" => {
+                    assert_eq!(
+                        err.code,
+                        wire_error_code(id, "call_chain", expected_error),
+                        "FAIL [{id}]: wire code; message was {}",
+                        err.message
+                    );
+                }
+                // Non-positive limit floor (T-B-005). `INVALID_LIMIT` is the
+                // fixture's cross-language NAME for "this SDK's idiomatic
+                // invalid-argument signal", not a wire code — apcore-python
+                // raises ValueError, apcore-typescript Error, and apcore-rust
+                // GENERAL_INVALID_INPUT. The mapping is asserted, not the name.
+                "INVALID_LIMIT" => {
+                    assert_eq!(
+                        err.code,
+                        ErrorCode::GeneralInvalidInput,
+                        "FAIL [{id}]: invalid-limit floor maps to GENERAL_INVALID_INPUT in \
+                         apcore-rust; message was {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains(">= 1"),
+                        "FAIL [{id}]: expected the floor to be named in the message, got: {}",
+                        err.message
+                    );
+                }
+                other => panic!(
+                    "FAIL [{id}]: call_chain declares expected_error {other:?}, which this \
+                     driver does not know — teach the driver, do not skip it"
                 ),
-                "CIRCULAR_CALL" => assert!(
-                    err_lower.contains("circular"),
-                    "FAIL [{id}]: expected circular error, got: {err_lower}"
-                ),
-                "CALL_FREQUENCY_EXCEEDED" => assert!(
-                    err_lower.contains("frequency"),
-                    "FAIL [{id}]: expected frequency error, got: {err_lower}"
-                ),
-                // Non-positive limit floor (T-B-005): Rust rejects with
-                // GENERAL_INVALID_INPUT and a "must be >= 1" message.
-                "INVALID_LIMIT" => assert!(
-                    err_lower.contains(">= 1"),
-                    "FAIL [{id}]: expected invalid-limit floor error, got: {err_lower}"
-                ),
-                _ => panic!("Unknown expected_error: {expected_error}"),
             }
         } else {
-            assert!(
-                result.is_ok(),
-                "FAIL [{}]: expected Ok but got Err({})",
-                id,
-                result.unwrap_err()
+            // Positive case. The sentinel VALUE is asserted, not inferred from
+            // the absence of `expected_error`: a fixture that states an
+            // expectation this driver does not recognise must go red, never
+            // slide into the positive branch.
+            let expected = tc.get("expected").unwrap_or_else(|| {
+                panic!("FAIL [{id}]: states neither `expected` nor `expected_error`")
+            });
+            assert_eq!(
+                expected, "ok",
+                "FAIL [{id}]: states expectation {expected}, which this driver does not \
+                 recognise. Teach the driver, do not skip it."
             );
+            result.unwrap_or_else(|e| panic!("FAIL [{id}]: expected Ok but got Err({e})"));
+
+            // OBSERVABLE POST-CONDITION (fixture `driver_contract`). A guard
+            // that inspects nothing also returns Ok, so re-run the same chain
+            // with the one limit it sits under tightened by one and require the
+            // matching rejection. Skipped where the chain cannot be pushed over
+            // a LEGAL limit — `empty_chain` and `single_element`, since
+            // max_* < 1 is itself invalid input.
+            //
+            // (There is no Rust analogue of apcore-python's "must not mutate
+            // the caller's chain" post-condition: the guard takes `&Context`,
+            // so the borrow checker already forbids it.)
+            let depth = u32::try_from(call_chain.len()).unwrap();
+            if depth >= 2 {
+                let err = guard_call_chain_with_repeat(&ctx, module_id, depth - 1, max_repeat)
+                    .expect_err(&format!(
+                        "FAIL [{id}]: a chain of {depth} accepted under max_call_depth \
+                         {} must be rejected under {}",
+                        depth,
+                        depth - 1
+                    ));
+                assert_eq!(
+                    err.code,
+                    ErrorCode::CallDepthExceeded,
+                    "FAIL [{id}]: boundary probe; message was {}",
+                    err.message
+                );
+            }
+            let repeats = call_chain.iter().filter(|m| *m == module_id).count();
+            if repeats >= 2 {
+                let err = guard_call_chain_with_repeat(&ctx, module_id, max_depth, repeats - 1)
+                    .expect_err(&format!(
+                        "FAIL [{id}]: {module_id} appears {repeats} times and was accepted \
+                         under max_module_repeat {max_repeat}; it must be rejected under {}",
+                        repeats - 1
+                    ));
+                assert_eq!(
+                    err.code,
+                    ErrorCode::CallFrequencyExceeded,
+                    "FAIL [{id}]: boundary probe; message was {}",
+                    err.message
+                );
+            }
         }
     }
 }
@@ -805,24 +891,48 @@ fn conformance_schema_validation() {
         let input = &tc["input"];
 
         // Determine expected validity for the no-coercion validator.
+        //
+        // CORRECTED (apcore#93): the trailing `else { true }` was a catch-all
+        // that turned "the case states no validity expectation this driver
+        // reads" into a silent assertion that it is valid. A case is now
+        // required to state one.
         let expected_valid = if let Some(v) = tc.get("expected_valid") {
             v.as_bool().unwrap()
-        } else if tc.get("expected_valid_strict").is_some() {
-            tc["expected_valid_strict"].as_bool().unwrap()
+        } else if let Some(v) = tc.get("expected_valid_strict") {
+            v.as_bool().unwrap()
         } else {
-            true
+            panic!(
+                "FAIL [{id}]: states neither `expected_valid` nor `expected_valid_strict` — \
+                 teach the driver, do not default it to valid"
+            )
         };
 
-        // Skip non-object inputs (Rust validator requires object context)
-        if id == "empty_schema_accepts_string" {
-            continue; // Known gap: empty schema + string input
-        }
-
+        // CORRECTED (apcore#93): `empty_schema_accepts_string` used to `continue`
+        // here as a "known gap: empty schema + string input". It is not a gap —
+        // `SchemaValidator` delegates to the `jsonschema` crate, for which `{}`
+        // is the Draft 2020-12 always-true schema and accepts any instance,
+        // scalar roots included. The skip made the one case in this fixture that
+        // pins non-object root handling unpinnable in apcore-rust.
         let result = validator.validate(input, schema);
         assert_eq!(
             result.valid, expected_valid,
             "FAIL [{}]: valid={}, expected={}, errors={:?}",
             id, result.valid, expected_valid, result.errors
+        );
+
+        // The MODULE-INVOCATION boundary must reach the same verdict as the
+        // library validator's default. TYPE_MAPPING §17.3 names apcore-rust for
+        // having once shipped a validator whose default coerced while the
+        // executor path did not, so the two answered differently for the same
+        // schema and input. Asserted here on every case rather than trusted.
+        let boundary = apcore::executor::validate_against_schema(input, schema, "Input");
+        assert_eq!(
+            boundary.is_ok(),
+            expected_valid,
+            "FAIL [{id}]: the executor's module-invocation boundary disagrees with \
+             SchemaValidator::with_coerce_types(false) — boundary said {:?}, the fixture \
+             declares valid={expected_valid}",
+            boundary.err().map(|e| e.message)
         );
 
         // The opt-in coercing mode is a separate library-level contract.
@@ -868,7 +978,90 @@ fn conformance_schema_validation() {
 
 // ---------------------------------------------------------------------------
 // 10. Config Env Mapping (A12-NS, §9.8)
+//
+// CORRECTED (apcore#93): the four `env_style` cases — `env_style_flat`,
+// `env_style_nested`, `env_style_nested_literal_underscore`,
+// `env_style_auto_detect_flat` — were skipped wholesale with `continue`,
+// leaving §9.8's entire style-resolution contract unasserted in apcore-rust.
+// The stated reason was true but not a dead end: the namespace registry IS
+// process-global and a name or prefix can be claimed only once, so the `mcp`
+// namespace the fixture's `namespaces` block registers cannot be re-registered
+// per style. It can, however, be SHADOWED — see `shadow_namespace_for_style`.
 // ---------------------------------------------------------------------------
+
+/// The `env_style` a case declares, as the SDK enum.
+fn env_style_from_fixture(id: &str, style: &str) -> EnvStyle {
+    match style {
+        "flat" => EnvStyle::Flat,
+        "nested" => EnvStyle::Nested,
+        "auto" => EnvStyle::Auto,
+        other => panic!(
+            "FAIL [{id}]: config_env declares env_style {other:?}, which this driver does not \
+             know — teach the driver, do not skip it"
+        ),
+    }
+}
+
+/// The fixture namespace whose `env_prefix` owns `env_var` (longest match),
+/// as `(name, env_prefix, max_depth)`.
+fn owning_namespace(id: &str, fixture: &Value, env_var: &str) -> (String, String, usize) {
+    let owner = fixture["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|ns| ns["name"].as_str() != Some("global"))
+        .filter(|ns| {
+            ns.get("env_prefix")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| env_var.starts_with(p))
+        })
+        .max_by_key(|ns| ns["env_prefix"].as_str().unwrap_or_default().len())
+        .unwrap_or_else(|| {
+            panic!("FAIL [{id}]: no fixture namespace declares a prefix owning {env_var:?}")
+        });
+    #[allow(clippy::cast_possible_truncation)] // max_depth from fixtures is a small integer
+    let max_depth = owner
+        .get("max_depth")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(5) as usize;
+    (
+        owner["name"].as_str().unwrap().to_string(),
+        owner["env_prefix"].as_str().unwrap().to_string(),
+        max_depth,
+    )
+}
+
+/// Register a per-style shadow of the namespace that owns the case's env var,
+/// and return `(shadow_name, shadow_prefix, owner_name, owner_prefix)`.
+///
+/// The shadow carries the SAME `max_depth` and is driven with the SAME env-var
+/// SUFFIX (`SERVER_PORT`, `SERVER__URL`) as the case declares — only the
+/// namespace segment differs, so §9.8's suffix algorithm is what decides the
+/// outcome. Longest-prefix dispatch (asserted by `longest_prefix_rule` in this
+/// same fixture) routes `APCORE_MCPNESTED_*` to the shadow rather than to
+/// `mcp`, so the two coexist in the process-global registry.
+fn shadow_namespace_for_style(
+    id: &str,
+    fixture: &Value,
+    env_var: &str,
+    style: &str,
+) -> (String, String, String, String) {
+    let (owner_name, owner_prefix, max_depth) = owning_namespace(id, fixture, env_var);
+    let shadow_name = format!("{owner_name}{style}");
+    let shadow_prefix = format!("{owner_prefix}{}", style.to_uppercase());
+    // Duplicate registration is expected when several cases share a style;
+    // the registry rejects it and the first registration stands.
+    let _ = Config::register_namespace(NamespaceRegistration {
+        name: shadow_name.clone(),
+        env_prefix: Some(shadow_prefix.clone()),
+        defaults: None,
+        schema: None,
+        env_style: env_style_from_fixture(id, style),
+        max_depth,
+        env_map: None,
+    });
+    (shadow_name, shadow_prefix, owner_name, owner_prefix)
+}
 
 #[test]
 fn conformance_config_env() {
@@ -928,17 +1121,31 @@ fn conformance_config_env() {
     // checking the resolved path.
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
-        let env_var = tc["env_var"].as_str().unwrap();
+        let mut env_var = tc["env_var"].as_str().unwrap().to_string();
         let env_value = tc["env_value"].as_str().unwrap();
-        // Test cases with explicit env_style override the namespace's registered
-        // style. Since the global namespace registry is process-wide and can't be
-        // re-registered per test case, skip env_style-specific cases.
-        // (TypeScript also xfails nested_path_match for similar reasons.)
-        if tc.get("env_style").is_some() {
-            continue;
-        }
 
-        let expected_path = tc.get("expected_path").and_then(|v| v.as_str());
+        // A case declaring an explicit `env_style` is re-anchored onto a
+        // per-style shadow namespace (see `shadow_namespace_for_style`). Only
+        // the namespace segment is substituted: the env-var SUFFIX and every
+        // path segment after the first are the fixture's own text, so the
+        // declared expectation still decides the outcome.
+        let mut expected_path = tc
+            .get("expected_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if let Some(style) = tc.get("env_style").and_then(|v| v.as_str()) {
+            let (shadow_name, shadow_prefix, owner_name, owner_prefix) =
+                shadow_namespace_for_style(id, &fixture, &env_var, style);
+            env_var = format!("{shadow_prefix}{}", &env_var[owner_prefix.len()..]);
+            expected_path = expected_path.map(|p| {
+                p.strip_prefix(&format!("{owner_name}.")).map_or_else(
+                    || panic!("FAIL [{id}]: expected_path {p:?} is not under {owner_name:?}"),
+                    |rest| format!("{shadow_name}.{rest}"),
+                )
+            });
+        }
+        let env_var = env_var.as_str();
+        let expected_path = expected_path.as_deref();
         let expected_value = tc.get("expected_value").and_then(|v| v.as_str());
 
         // Set the env var, build a namespace-mode config, then clean up.
@@ -1114,39 +1321,45 @@ fn load_schema(name: &str) -> Value {
 
 // ---------------------------------------------------------------------------
 // 11. Config Defaults (A12-DEF)
+//
+// CORRECTED (apcore#93): this driver carried a six-entry `supported_keys`
+// allowlist and `continue`d on everything else, so 12 of the fixture's 18 cases
+// — the whole `extensions.*` / `schema.*` / `acl.*` / `sys_modules.*` /
+// `stream.*` half of the canonical default table, plus
+// `observability.tracing.sampling_rate` — never reached an assertion. Mutating
+// any of their declared values left apcore-rust green, which is precisely the
+// cross-language divergence this fixture exists to catch.
+//
+// The allowlist's stated reason ("not part of the Rust SDK's typed Config
+// struct ... and have no default") went stale when `CONFIG_DEFAULTS` landed:
+// `Config::get` now falls back to the canonical default table for exactly
+// these keys. Every case is asserted; a key that resolves to `None` is a hard
+// failure, not a skip.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn conformance_config_defaults() {
     let fixture = load_fixture("config_defaults");
-    // Use Config::default() which returns all default values.
+    // `Config::default()`, NOT `Config::from_defaults()`: the latter applies
+    // env overrides, and `conformance_config_env` sets and clears
+    // `APCORE_OBSERVABILITY_TRACING_ENABLED` (among others) in the same process
+    // while this test runs. Reading process env here would make the canonical
+    // default table's answer depend on another test's timing.
     let config = Config::default();
-
-    // Keys supported by Config::get() in the Rust SDK (typed canonical fields).
-    let supported_keys = [
-        "executor.default_timeout",
-        "executor.global_timeout",
-        "executor.max_call_depth",
-        "executor.max_module_repeat",
-        "observability.tracing.enabled",
-        "observability.metrics.enabled",
-    ];
 
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
         let key = tc["key"].as_str().unwrap();
         let expected = &tc["expected"];
 
-        if !supported_keys.contains(&key) {
-            // Keys like extensions.*, schema.*, acl.*, sys_modules.*, stream.*
-            // are not part of the Rust SDK's typed Config struct (they live in
-            // user_namespaces and have no default). Skip instead of failing.
-            continue;
-        }
-
-        let actual = config
-            .get(key)
-            .unwrap_or_else(|| panic!("FAIL [{id}]: Config::default().get({key:?}) returned None"));
+        let actual = config.get(key).unwrap_or_else(|| {
+            panic!(
+                "FAIL [{id}]: Config::default().get({key:?}) returned None, but \
+                 config_defaults.json declares the canonical default {expected}. A key that \
+                 resolves to null here resolves to the documented value in apcore-python and \
+                 apcore-typescript."
+            )
+        });
 
         // Compare numerically where the expected value is a JSON number.
         match (expected, &actual) {
@@ -1679,12 +1892,92 @@ async fn conformance_approval_gate() {
 
 // ---------------------------------------------------------------------------
 // 16. Binding Errors (DECLARATIVE_CONFIG_SPEC §7)
+//
+// CORRECTED (apcore#93). Four of this fixture's six cases reached no assertion
+// that any SDK behaviour could fail:
+//
+//   * `binding_invalid_target_missing_colon` asserted the FIXTURE'S OWN INPUT
+//     back at itself — `assert!(!target.contains(':'))` — a tautology no
+//     implementation can break;
+//   * `binding_module_not_found` and `binding_schema_inference_failed_python`
+//     shared an arm whose whole body was `let _ = input;`;
+//   * `binding_file_invalid_missing_bindings_key` read `expected_message` and
+//     then discarded it with `let _ = (expected_msg, &err);`, on the stated
+//     grounds that the Rust text "may differ". It did differ, and that was the
+//     finding, not the excuse: see the two SDK fixes below.
+//
+// The fixture asserts MESSAGE PARITY (§7.2), which is why apcore-python and
+// apcore-typescript construct the canonical error and compare its text.
+// apcore-rust has no error classes, so each case here drives the real code path
+// that produces the condition and compares the message the SDK emits.
 // ---------------------------------------------------------------------------
 
+/// Assert the wire `error_code` the case declares against the code the SDK
+/// produced, resolving the fixture's string through serde (never a Rust type
+/// name — see [`wire_error_code`]).
+fn assert_binding_code(id: &str, tc: &Value, code: ErrorCode) {
+    let want = tc["error_code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("FAIL [{id}]: case declares no error_code"));
+    assert_eq!(
+        code,
+        wire_error_code(id, "binding_errors", want),
+        "FAIL [{id}]: wire code"
+    );
+}
+
+/// Assert the case's declared message expectation against `message`.
+///
+/// `expected_message` is byte-exact. The fixture writes it with its own
+/// illustrative `input.file_path` (`bindings.yaml`), so the ONE substitution
+/// applied is that path → the temp path the driver actually loaded; every other
+/// character is the fixture's text and decides the outcome.
+///
+/// A case stating neither expectation is a hard failure — "nothing to assert"
+/// is how a case ends up proving nothing.
+fn assert_binding_message(id: &str, tc: &Value, message: &str, real_path: Option<&str>) {
+    let mut asserted = false;
+    if let Some(want) = tc.get("expected_message").and_then(|v| v.as_str()) {
+        let declared_path = tc["input"].get("file_path").and_then(|v| v.as_str());
+        let want = match (real_path, declared_path) {
+            (Some(real), Some(declared)) => want.replace(declared, real),
+            _ => want.to_string(),
+        };
+        assert_eq!(message, want, "FAIL [{id}]: message");
+        asserted = true;
+    }
+    if let Some(fragments) = tc
+        .get("expected_message_contains")
+        .and_then(|v| v.as_array())
+    {
+        assert!(
+            !fragments.is_empty(),
+            "FAIL [{id}]: expected_message_contains is empty, so it asserts nothing"
+        );
+        for fragment in fragments {
+            let frag = fragment
+                .as_str()
+                .unwrap_or_else(|| panic!("FAIL [{id}]: fragment is not a string"));
+            assert!(
+                message.contains(frag),
+                "FAIL [{id}]: message must contain {frag:?}; got: {message}"
+            );
+        }
+        asserted = true;
+    }
+    assert!(
+        asserted,
+        "FAIL [{id}]: states no message expectation this driver can assert"
+    );
+}
+
 #[test]
+#[allow(clippy::too_many_lines)] // one arm per fixture case; splitting it would separate each case from the code path that produces its condition
 fn conformance_binding_errors() {
     use apcore::bindings::BindingLoader;
+    use apcore::registry::Registry;
 
+    let dir = tempfile::tempdir().expect("tempdir");
     let fixture = load_fixture("binding_errors");
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
@@ -1692,47 +1985,51 @@ fn conformance_binding_errors() {
 
         match id {
             "binding_file_invalid_missing_bindings_key" => {
-                // Parse a JSON string that's missing the required 'bindings' key.
-                let dir = std::env::temp_dir().join("apcore_conformance_binding_errors");
-                std::fs::create_dir_all(&dir).unwrap();
-                let bad_path = dir.join("bindings_missing.json");
-                std::fs::write(&bad_path, r#"{"spec_version": "1.0"}"#).unwrap();
-                let mut loader = BindingLoader::new();
-                let result = loader.load_from_file(&bad_path);
-                assert!(
-                    result.is_err(),
-                    "FAIL [{id}]: expected error for missing 'bindings' key"
-                );
-                let err = result.unwrap_err();
-                let expected_msg = tc["expected_message"].as_str().unwrap();
-                // Note: the Rust error message may differ from the fixture's exact
-                // text since it uses the actual file path. Verify it contains the
-                // key diagnostic substrings.
-                let _ = (expected_msg, &err);
+                // A bindings document with no top-level `bindings` key.
+                let path = dir.path().join("bindings_missing.json");
+                std::fs::write(&path, r#"{"spec_version": "1.0"}"#).unwrap();
+                let err = BindingLoader::new()
+                    .load_from_file(&path)
+                    .expect_err(&format!(
+                        "FAIL [{id}]: a bindings file with no 'bindings' key must be rejected"
+                    ));
+                assert_binding_code(id, tc, err.code);
+                assert_binding_message(id, tc, &err.message, Some(&path.display().to_string()));
             }
 
             "binding_schema_mode_conflict" => {
-                // Create a YAML with conflicting schema modes (auto_schema + input_schema).
-                let dir = std::env::temp_dir().join("apcore_conformance_binding_errors");
-                std::fs::create_dir_all(&dir).unwrap();
-                let yaml_path = dir.join("bindings_conflict.yaml");
+                // Two schema modes on one entry. `modes_listed` is read from the
+                // case so the document produces exactly the modes whose names
+                // the expected message spells out.
+                let module_id = input["module_id"].as_str().unwrap();
+                let modes: Vec<&str> = input["modes_listed"]
+                    .as_array()
+                    .expect("modes_listed is an array")
+                    .iter()
+                    .map(|m| m.as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    modes,
+                    ["auto_schema", "input_schema/output_schema"],
+                    "FAIL [{id}]: this driver builds a document for exactly these two modes"
+                );
+                let path = dir.path().join("bindings_conflict.yaml");
                 std::fs::write(
-                    &yaml_path,
-                    "spec_version: \"1.0\"\nbindings:\n  - module_id: utils.format_date\n    target: \"m:fn\"\n    auto_schema: true\n    input_schema:\n      type: object\n",
+                    &path,
+                    format!(
+                        "spec_version: \"1.0\"\nbindings:\n  - module_id: {module_id}\n    \
+                         target: \"m:fn\"\n    auto_schema: true\n    input_schema:\n      \
+                         type: object\n"
+                    ),
                 )
                 .unwrap();
-                let mut loader = BindingLoader::new();
-                let result = loader.load_from_yaml(&yaml_path);
-                assert!(
-                    result.is_err(),
-                    "FAIL [{id}]: expected schema mode conflict error"
-                );
-                let err = result.unwrap_err();
-                let msg = err.message.to_lowercase();
-                assert!(
-                    msg.contains("multiple schema modes") || msg.contains("schema mode"),
-                    "FAIL [{id}]: error message should mention schema modes; got: {msg}"
-                );
+                let err = BindingLoader::new()
+                    .load_from_yaml(&path)
+                    .expect_err(&format!(
+                        "FAIL [{id}]: two schema modes on one entry must be rejected"
+                    ));
+                assert_binding_code(id, tc, err.code);
+                assert_binding_message(id, tc, &err.message, Some(&path.display().to_string()));
             }
 
             "pipeline_handler_not_supported_rust" => {
@@ -1745,69 +2042,92 @@ fn conformance_binding_errors() {
                 );
                 let yaml_val: Value = serde_yaml_ng::from_str(&yaml_str)
                     .unwrap_or_else(|e| panic!("FAIL [{id}] yaml parse: {e}"));
-                let result = build_strategy_from_config(&yaml_val);
-                assert!(
-                    result.is_err(),
-                    "FAIL [{id}]: expected PIPELINE_HANDLER_NOT_SUPPORTED error"
-                );
-                let err = result.unwrap_err();
-
-                // Assert the WIRE CODE the fixture declares, not just "it failed".
-                let want_code = tc["error_code"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("FAIL [{id}]: case declares no error_code"));
-                let got_code = serde_json::to_value(err.code)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_else(|| panic!("FAIL [{id}]: error code is not a wire string"));
-                assert_eq!(got_code, want_code, "FAIL [{id}]: wire code");
-
-                // Read the fragments FROM THE FIXTURE. They used to be hardcoded
+                let err = build_strategy_from_config(&yaml_val).expect_err(&format!(
+                    "FAIL [{id}]: a `handler:` step must be rejected in apcore-rust"
+                ));
+                assert_binding_code(id, tc, err.code);
+                // Fragments read FROM THE FIXTURE. They used to be hardcoded
                 // here — `"not supported in apcore-rust" || "register_step_type"`,
-                // an OR of two literals — so the fixture's list was decoration and
-                // mutating it left this test green. This case exists to pin a
-                // Rust-only behaviour and was pinned by no driver at all
-                // (apcore#92).
-                let want = tc["expected_message_contains"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("FAIL [{id}]: expected_message_contains missing"));
-                assert!(
-                    !want.is_empty(),
-                    "FAIL [{id}]: expected_message_contains is empty, so it asserts nothing"
-                );
-                for fragment in want {
-                    let frag = fragment
-                        .as_str()
-                        .unwrap_or_else(|| panic!("FAIL [{id}]: fragment is not a string"));
-                    assert!(
-                        err.message.contains(frag),
-                        "FAIL [{id}]: message must contain {frag:?}; got: {}",
-                        err.message
-                    );
-                }
+                // an OR of two literals — so the fixture's list was decoration
+                // and mutating it left this test green (apcore#92).
+                assert_binding_message(id, tc, &err.message, None);
             }
 
             "binding_invalid_target_missing_colon" => {
-                // A target without ':' should fail when registering with handlers.
-                // The YAML itself parses fine; the validation fires on register.
-                // We just verify the fixture loads without crashing and the target
-                // string is preserved.
+                // §2.2: a target with no `<module_path>:<symbol>` split is
+                // rejected AT PARSE TIME. Before apcore#93 apcore-rust validated
+                // nothing here and this arm asserted `!target.contains(':')` —
+                // the fixture's own input, restated.
                 let target = input["target"].as_str().unwrap();
-                assert!(
-                    !target.contains(':'),
-                    "FAIL [{id}]: fixture target should lack a colon"
-                );
+                let path = dir.path().join("bindings_bad_target.yaml");
+                std::fs::write(
+                    &path,
+                    format!(
+                        "spec_version: \"1.0\"\nbindings:\n  - module_id: conformance.bad_target\
+                         \n    target: \"{target}\"\n"
+                    ),
+                )
+                .unwrap();
+                let err = BindingLoader::new()
+                    .load_from_yaml(&path)
+                    .expect_err(&format!(
+                        "FAIL [{id}]: target {target:?} has no ':' separator and must be \
+                         rejected at parse time (DECLARATIVE_CONFIG_SPEC §2.2)"
+                    ));
+                assert_binding_code(id, tc, err.code);
+                assert_binding_message(id, tc, &err.message, None);
             }
 
-            "binding_schema_inference_failed_python" | "binding_module_not_found" => {
-                // These are documented error patterns; verify the fixture parses.
-                let _ = input;
+            "binding_module_not_found" => {
+                // §2.2.1: "`<module_path>` is resolved by the host language's own
+                // module resolution — ... and Rust's handler-map lookup", and a
+                // target that does not resolve "fails ... with
+                // BindingModuleNotFoundError". apcore-python imports and
+                // apcore-typescript `await import()`s; apcore-rust looks the
+                // target up in the caller-supplied handler map, so registering
+                // with an EMPTY map is the same condition.
+                let module_path = input["module_path"].as_str().unwrap();
+                let path = dir.path().join("bindings_unresolvable.yaml");
+                std::fs::write(
+                    &path,
+                    format!(
+                        "spec_version: \"1.0\"\nbindings:\n  - module_id: conformance.unresolvable\
+                         \n    target: \"{module_path}:some_callable\"\n"
+                    ),
+                )
+                .unwrap();
+                let mut loader = BindingLoader::new();
+                loader
+                    .load_from_yaml(&path)
+                    .unwrap_or_else(|e| panic!("FAIL [{id}]: document must parse: {}", e.message));
+                let err = loader
+                    .register_into_with_handlers(&Registry::new(), HashMap::new())
+                    .expect_err(&format!(
+                        "FAIL [{id}]: target {module_path:?} resolves to no handler and must be \
+                         rejected"
+                    ));
+                assert_binding_code(id, tc, err.code);
+                assert_binding_message(id, tc, &err.message, None);
             }
 
-            other => {
-                // Unknown test case — log and skip.
-                eprintln!("WARN [conformance_binding_errors]: unknown case {other:?}");
-            }
+            // Required skip, recorded in the spec repo's
+            // `conformance/case_pinning_allowlist.json`:
+            // BINDING_SCHEMA_INFERENCE_FAILED is raised when a target's schema
+            // cannot be inferred from its signature. apcore-rust resolves a
+            // binding through an opaque handler-map key with no compile-time
+            // linking (DECLARATIVE_CONFIG_SPEC §3.7 "Rust caveat"), performs no
+            // inference from a target, and so has no such failure to produce
+            // for THIS case's shape. Named explicitly rather than folded into a
+            // catch-all, so a case this driver has merely not been taught still
+            // fails below.
+            "binding_schema_inference_failed_python" => {}
+
+            other => panic!(
+                "FAIL [binding_errors :: {other}]: this driver does not know the case — teach \
+                 the driver, do not skip it. A genuinely per-SDK case belongs in the spec \
+                 repo's conformance/case_pinning_allowlist.json with the fixture text that \
+                 says so."
+            ),
         }
     }
 }

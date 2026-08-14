@@ -89,6 +89,13 @@ fn config_constraints_declare_no_undeclared_key() {
 
 /// A missing entry means the key resolves to `None` here while its peers return
 /// the documented value — the exact defect that left 15 keys null in Rust.
+///
+/// CORRECTED (apcore#93): this asserted `missing.is_empty()` and never read the
+/// case's declared `expected.missing`, so mutating that list left the test
+/// green and the case was pinned by no apcore-rust driver. Its two sibling
+/// tests in this file already compared against the fixture's own list; this one
+/// now does the same, so a fixture that ever records a known exception forces
+/// the driver to accept exactly that one and no other.
 #[test]
 fn config_defaults_reproduce_every_canonical_default() {
     let fx = fixture();
@@ -101,13 +108,16 @@ fn config_defaults_reproduce_every_canonical_default() {
     // The behavioural question is "does this key resolve to the documented
     // value?", which is what a caller observes.
     let resolved = apcore::config::Config::from_defaults();
-    let missing: Vec<&String> = canonical
+    let mut missing: Vec<&String> = canonical
         .keys()
         .filter(|k| resolved.get(k).is_none())
         .collect();
-    assert!(
-        missing.is_empty(),
-        "defaults.schema.json declares defaults CONFIG_DEFAULTS does not carry: {missing:?}"
+    missing.sort();
+    let case = fixture_case(&fx, "sdk_reproduces_every_canonical_default");
+    assert_eq!(
+        serde_json::to_value(&missing).unwrap(),
+        case["expected"]["missing"],
+        "defaults.schema.json declares defaults this SDK does not resolve: {missing:?}"
     );
 }
 

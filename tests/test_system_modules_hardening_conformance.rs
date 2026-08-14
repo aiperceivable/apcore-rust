@@ -701,34 +701,49 @@ fn fixture_case_inventory_is_complete() {
     );
 }
 
+/// CORRECTED (apcore#93): the case was loaded into `_case` and then discarded —
+/// the inputs, the expected wire code and the expected message fragment were all
+/// hardcoded here, so mutating the fixture's `expected` block left the test
+/// green and the case was pinned by no apcore-rust driver. Everything the case
+/// declares is now read from it: the inputs from `action.input`, and all three
+/// of `call_success`, `error_code` (through serde, never a Rust variant name)
+/// and `error_message_contains`.
 #[tokio::test]
 async fn case_reload_module_id_and_filter_conflict() {
     let fixture = load_fixture();
-    let _case = fixture_case(&fixture, "reload_module_id_and_filter_conflict");
+    let case = fixture_case(&fixture, "reload_module_id_and_filter_conflict");
 
     let registry = Arc::new(Registry::new());
     let emitter = Arc::new(EventEmitter::new());
     let module = ReloadModule::new(Arc::clone(&registry), emitter);
 
-    let inputs = json!({
-        "module_id": "executor.email.send",
-        "path_filter": "executor.*",
-        "reason": "conflict test",
-    });
+    let inputs = case["action"]["input"].clone();
+    assert!(
+        inputs["module_id"].is_string() && inputs["path_filter"].is_string(),
+        "the case must supply BOTH module_id and path_filter — that is the conflict it pins; \
+         got {inputs}"
+    );
     let ctx = make_ctx(None);
-    let err = module
-        .execute(inputs, &ctx)
-        .await
-        .expect_err("conflict should raise");
+    let outcome = module.execute(inputs, &ctx).await;
 
     assert_eq!(
-        err.code,
-        ErrorCode::ModuleReloadConflict,
-        "expected MODULE_RELOAD_CONFLICT"
+        json!(outcome.is_ok()),
+        case["expected"]["call_success"],
+        "expected.call_success; call returned {outcome:?}"
     );
+    let err = outcome.expect_err("conflict should raise");
+    assert_eq!(
+        serde_json::to_value(err.code).unwrap(),
+        case["expected"]["error_code"],
+        "expected.error_code; message was {}",
+        err.message
+    );
+    let fragment = case["expected"]["error_message_contains"]
+        .as_str()
+        .expect("expected.error_message_contains is a string");
     assert!(
-        err.message.contains("mutually exclusive"),
-        "error message must explain the conflict, got: {}",
+        err.message.contains(fragment),
+        "expected.error_message_contains {fragment:?}; got: {}",
         err.message
     );
 }

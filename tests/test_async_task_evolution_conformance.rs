@@ -394,14 +394,20 @@ async fn case_backoff_multiplier_applied() {
 // Cases 8-10: Reaper opt-in semantics
 // ---------------------------------------------------------------------------
 
+/// CORRECTED (apcore#93): this asserted a hardcoded `remaining.len() == 1` and
+/// a hardcoded task id, and read neither of the case's two declared
+/// expectations. Mutating `expected` left it green, so the case was pinned by no
+/// apcore-rust driver. Both `reaper_running` and `expired_task_still_present`
+/// are now derived from observable SDK state and compared against the fixture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case_reaper_disabled_by_default() {
     let fixture = load_fixture();
     let case = fixture_case(&fixture, "reaper_disabled_by_default");
 
-    // Build a manager with no reaper started — `_handle` is never assigned.
+    // Build a manager with no reaper started — `start_reaper` is never called.
     let store = Arc::new(InMemoryTaskStore::new());
-    for raw in case["stored_expired_tasks"].as_array().unwrap() {
+    let stored = case["stored_expired_tasks"].as_array().unwrap();
+    for raw in stored {
         store.save(&parse_task_info(raw)).await.unwrap();
     }
     let mgr = AsyncTaskManager::with_store(
@@ -410,14 +416,46 @@ async fn case_reaper_disabled_by_default() {
         100,
         store.clone() as Arc<dyn TaskStore>,
     );
-    let _ = &mgr; // silence unused
 
-    // Wait a short window — without start_reaper(), nothing should run.
+    // Wait a window longer than any sweep interval a default reaper could use.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let remaining = store.list(None).await.unwrap();
-    assert_eq!(remaining.len(), 1, "no reaper means no automatic cleanup");
-    assert_eq!(remaining[0].task_id, "old-task-001");
+    // `expired_task_still_present` — every task the case pre-stored is expired
+    // relative to its `now_timestamp`, so surviving the wait is exactly the
+    // declared post-condition.
+    let mut all_present = true;
+    for raw in stored {
+        let task_id = raw["task_id"].as_str().expect("task_id is a string");
+        all_present &= store.get(task_id).await.unwrap().is_some();
+    }
+    assert_eq!(
+        Value::Bool(all_present),
+        case["expected"]["expired_task_still_present"],
+        "expired_task_still_present; store held {:?}",
+        store
+            .list(None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.task_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // `reaper_running` — there is no public accessor for the flag, but
+    // `start_reaper` returns `Err(REAPER_ALREADY_RUNNING)` when a reaper IS
+    // live (A-D-AT-05), so a successful start is direct evidence that none was.
+    // Probed AFTER the store check so the probe cannot delete what the previous
+    // assertion is about, and stopped immediately.
+    let probe = mgr.start_reaper(ReaperConfig::default());
+    assert_eq!(
+        Value::Bool(probe.is_err()),
+        case["expected"]["reaper_running"],
+        "reaper_running: start_reaper returned {:?}",
+        probe.as_ref().err().map(|e| e.code)
+    );
+    if let Ok(handle) = probe {
+        handle.stop().await;
+    }
 }
 
 /// Helper: directly invoke a single reaper sweep against a store. We do not
