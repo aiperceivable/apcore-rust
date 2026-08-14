@@ -366,14 +366,13 @@ fn contradicts(schema: &Value, data: &Value) -> bool {
 
     match obj.get("type") {
         Some(Value::String(name)) if !type_matches(name, data) => return true,
-        Some(Value::Array(names)) => {
+        Some(Value::Array(names))
             if !names
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|name| type_matches(name, data))
-            {
-                return true;
-            }
+                .any(|name| type_matches(name, data)) =>
+        {
+            return true;
         }
         _ => {}
     }
