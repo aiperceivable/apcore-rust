@@ -14,7 +14,7 @@ rust-version = "1.86"
 # aggregator `tests/it.rs` pulls them all in as modules → one codegen + one
 # link. See tests/it.rs. (apcore#dev-ergonomics)
 autotests = false
-description = "Schema-driven module standard for AI-perceivable interfaces"
+description = "Build once, invoke by code or AI — with schema, ACL, approval, and audit enforced at every call"
 license = "Apache-2.0"
 readme = "README.md"
 authors = ["aiperceivable <tercel.yi@gmail.com>"]
