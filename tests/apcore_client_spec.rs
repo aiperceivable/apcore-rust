@@ -702,21 +702,23 @@ async fn validate_error_no_raise_on_failure() {
                 .to_string()
         })
         .collect();
-    // Two entries, in this order: the trace-derived check keeps its own
-    // `STEP_<NAME>_FAILED` code (apcore-python executor.py:96,
-    // apcore-typescript executor.ts:1045), and the categorized check built
-    // from the unwrapped pipeline error carries the WIRE code.
+    // ONE entry, carrying the WIRE code. The trace-derived
+    // `STEP_MODULE_LOOKUP_FAILED` entry for the same step is dropped on the
+    // error path: the categorized check supersedes it with the real code and
+    // message, and keeping both put one failure in `checks` twice, so
+    // `errors()` reported two problems where one existed.
     //
-    // DIVERGENCE: apcore-python emits only the SECOND entry — its
-    // `except PipelineStepError` branch leaves `trace` unset "to avoid
-    // _trace_to_checks adding a second, redundant failure entry for the same
-    // step" (executor.py:595-598). Rust extends from the trace first and then
-    // pushes the categorized check, so a polyglot caller counting failed
-    // checks sees two here and one in Python.
+    // This closes the divergence this assertion used to record. apcore-python
+    // also emits one entry — it gets there by dropping the whole trace
+    // ("to avoid _trace_to_checks adding a second, redundant failure entry for
+    // the same step", executor.py), which also loses the checks that PASSED.
+    // Rust keeps those, so its list is strictly more informative at the same
+    // failure count.
     assert_eq!(
         lookup_codes,
-        vec!["STEP_MODULE_LOOKUP_FAILED", "MODULE_NOT_FOUND"],
-        "preflight check errors carry the wire code, not the Debug variant name"
+        vec!["MODULE_NOT_FOUND"],
+        "preflight check errors carry the wire code, not the Debug variant name, \
+         and one failed step yields exactly one failed check"
     );
 }
 

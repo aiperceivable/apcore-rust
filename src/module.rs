@@ -592,6 +592,17 @@ pub struct PreviewResult {
     pub changes: Vec<Change>,
 }
 
+/// Canonical name for the `acl` preflight check (PROTOCOL_SPEC §12.8.4 enum).
+/// `Executor::validate` emits it for a denied call, and §12.8.5.1 makes it the
+/// switch that withholds module-level introspection. Use this instead of the
+/// literal string to avoid drift with other SDKs.
+pub const ACL_CHECK_NAME: &str = "acl";
+
+/// Canonical name for the `module_preflight` preflight check (PROTOCOL_SPEC
+/// §12.8.4 enum). Use this instead of the literal string to avoid drift with
+/// other SDKs.
+pub const MODULE_PREFLIGHT_CHECK_NAME: &str = "module_preflight";
+
 /// Canonical name for the `module_preview` preflight check (PROTOCOL_SPEC
 /// §12.8.4 enum). Use this instead of the literal string to avoid drift with
 /// other SDKs.

@@ -175,7 +175,7 @@ fn step_to_check_name(step_name: &str) -> &str {
         "context_creation" => "context",
         "call_chain_guard" => "call_chain",
         "module_lookup" => "module_lookup",
-        "acl_check" => "acl",
+        "acl_check" => crate::module::ACL_CHECK_NAME,
         "approval_gate" => "approval",
         "middleware_before" => "middleware",
         "input_validation" => "schema",
@@ -990,13 +990,27 @@ impl Executor {
             }
             Err(e) => {
                 // Pipeline step raised an error; convert to a failed check.
-                checks.extend(trace_to_checks(&pipe_ctx.trace));
+                //
+                // The trace's own entry for the aborting step is dropped: the
+                // typed entry pushed below supersedes it, carrying the WIRE
+                // error code and the real message where the trace carries only
+                // `STEP_<NAME>_FAILED`. Keeping both put the SAME failure in
+                // `checks` twice, so `errors()` reported two problems where one
+                // existed and §12.8.4's one-entry-per-check shape did not hold.
+                // The passed steps are kept — apcore-python drops the whole
+                // trace here and loses them, which is why its `acl` entry
+                // disappears from a schema failure.
+                checks.extend(
+                    trace_to_checks(&pipe_ctx.trace)
+                        .into_iter()
+                        .filter(|c| c.passed),
+                );
                 // §1.1 fail-fast: unwrap `PipelineStepError` to the original
                 // typed cause for preflight categorization (mirrors Python).
                 let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
                 let check_name = match underlying.code {
                     ErrorCode::ModuleNotFound => "module_lookup",
-                    ErrorCode::ACLDenied => "acl",
+                    ErrorCode::ACLDenied => crate::module::ACL_CHECK_NAME,
                     ErrorCode::SchemaValidationError | ErrorCode::GeneralInvalidInput => "schema",
                     ErrorCode::CallDepthExceeded | ErrorCode::CircularCall => "call_chain",
                     _ => "unknown",
@@ -1042,17 +1056,33 @@ impl Executor {
                 .is_some_and(|a| a.requires_approval)
         };
 
-        // Invoke module-level preflight — matches apcore-python executor.py:547-571
-        // and apcore-typescript executor.ts:632-653 (D11-009 alignment).
-        // Gating: called whenever module lookup succeeded (mirrors Python/TS
-        // guard on `pipe_ctx.module` being non-null), regardless of whether
-        // earlier checks passed. Preflight returns advisory warnings only —
-        // it never fails the preflight pass.
+        // Module-level introspection is gated on TWO conditions, not one.
+        //
+        // 1. Module lookup succeeded (mirrors the Python/TS guard on
+        //    `pipe_ctx.module` being non-null).
+        // 2. The ACL did not deny the call — PROTOCOL_SPEC §12.8.5.1.
+        //
+        // Condition 2 is the security half. `preflight()` and `preview()` are
+        // module-authored code, and what they return names what the call would
+        // do: the resolved binary and argv of a command-wrapping module, the
+        // target of a write. Module lookup is Step 3 and the ACL check is Step
+        // 4, so gating on lookup alone runs module code for a caller the ACL
+        // just denied and hands back what it said. `apcore-mcp-rust` had to
+        // filter these three check names out of `__apcore_module_preview` by
+        // string to keep argv away from a denied caller; the gate belongs here.
+        //
+        // Scoped to authorization deliberately: a failed `schema` check does
+        // NOT suppress introspection, because a caller the ACL permits is
+        // entitled to the module's account of what would happen even when its
+        // inputs are malformed.
+        let acl_denied = checks
+            .iter()
+            .any(|c| c.check == crate::module::ACL_CHECK_NAME && !c.passed);
         let mut predicted_changes: Vec<crate::module::Change> = Vec::new();
-        if let Ok(Some(module)) = self.registry.get(module_id) {
+        if let (false, Ok(Some(module))) = (acl_denied, self.registry.get(module_id)) {
             let warnings = module.preflight(inputs, ctx);
             checks.push(PreflightCheckResult {
-                check: "module_preflight".to_string(),
+                check: crate::module::MODULE_PREFLIGHT_CHECK_NAME.to_string(),
                 passed: true,
                 error: None,
                 warnings,

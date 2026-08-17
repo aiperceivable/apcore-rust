@@ -224,6 +224,8 @@ mod test_pipeline_step_middleware_conformance;
 mod test_pipeline_tasks;
 #[path = "test_pipeline_types.rs"]
 mod test_pipeline_types;
+#[path = "test_preflight_disclosure_conformance.rs"]
+mod test_preflight_disclosure_conformance;
 #[path = "test_redaction_config.rs"]
 mod test_redaction_config;
 #[path = "test_redaction_config_conformance.rs"]

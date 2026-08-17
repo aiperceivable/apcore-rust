@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Release note:** this section contains BREAKING changes. It must ship as a
 > **minor** (or major) version bump, never a patch.
 
+### Changed
+
+- **BREAKING (security): a failed `acl` check now withholds module-level introspection from `validate()` (spec v1.13.0 §12.8.5.1, apcore#96).** `validate()` looked the module up at Step 3 and ran `preflight()` and `preview()` at Check 7 on the strength of that lookup alone, so a caller the ACL had just denied still made module-authored code run and still received what it returned. For a command-wrapping module that is the resolved binary and its argv; for a writer it is the target of the side effect. All three SDKs did it, and `apcore-mcp-rust` had already grown a string-matched disclosure filter over the top of it, which is the evidence the gap was reachable in a shipped product rather than theoretical.
+
+  `validate()` no longer invokes either hook, emits a `module_preflight` / `module_preview` check, or populates `predicted_changes` when the `acl` check failed. The failed `acl` check itself is still reported, so a denied caller still learns *why*, and no other check is suppressed: the rule is about **authorization**, not validity. A failed `schema` check does **not** suppress introspection — a caller the ACL permits is entitled to the module's account of what would happen even when its inputs are malformed, which is what it needs in order to fix the call. Pinned by `conformance/fixtures/preflight_disclosure.json` (4 cases), whose control case exists so that an implementation which never introspects at all cannot pass the denial cases for the wrong reason.
+
+- **`ACL_CHECK_NAME` and `MODULE_PREFLIGHT_CHECK_NAME` are exported (apcore#96).** `MODULE_PREVIEW_CHECK_NAME` had been public since the preview hook landed, with doc text asking callers to use it "instead of the literal string to avoid drift with other SDKs" — while its two siblings stayed as bare literals in `Executor::validate` and in the private `step_to_check_name`. `apcore-mcp-rust` matches all three by string to keep argv away from a denied caller, and could bind only one of them; the other two carry a runtime guard test precisely because a rename upstream produces no compile error and no test failure, just a filter that silently stops matching. Both are now `pub const` and re-exported from the crate root, and `executor.rs` uses them at every site.
+
+- **`validate()` emitted the same failure twice.** On the error path it extended `checks` from the pipeline trace — which already carries a failed entry for the aborting step, coded `STEP_<NAME>_FAILED` — and then pushed a second, categorized entry carrying the WIRE code. `errors()` therefore reported two problems where one existed, and §12.8.4's one-entry-per-check shape did not hold. The trace's entry for the aborting step is now dropped in favour of the typed one; the steps that **passed** are kept, which apcore-python loses by dropping the whole trace. Same failure count as apcore-python now, with a more informative list.
+
 ### Added
 
 
