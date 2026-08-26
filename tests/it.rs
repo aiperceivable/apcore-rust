@@ -314,6 +314,12 @@ mod test_usage_period_contract;
 
 #[path = "test_governance_state.rs"]
 mod test_governance_state;
+
+#[path = "test_governance_state_conformance.rs"]
+mod test_governance_state_conformance;
+
+#[path = "test_usage_contract_conformance.rs"]
+mod test_usage_contract_conformance;
 #[path = "test_v0_21_preview_and_ephemeral.rs"]
 mod test_v0_21_preview_and_ephemeral;
 #[path = "test_webhook_http_retry_contract.rs"]
