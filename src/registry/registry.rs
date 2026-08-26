@@ -1552,7 +1552,15 @@ impl Registry {
     /// Calling `watch()` while already watching is a no-op (returns `Ok(())`).
     /// Use [`Self::unwatch`] to stop and re-call `watch()` to pick up new
     /// `extension_roots`.
-    #[allow(clippy::unused_async)] // async kept for cross-language API parity (Python/TS use await registry.watch())
+    // `async` is kept for cross-language API parity: Python and TypeScript both
+    // expose `await registry.watch()`, and dropping it here would make the Rust
+    // surface the odd one out for a function whose whole job is to run for a
+    // long time. Rust 1.98 split the lint, so both names are needed; the
+    // `unknown_lints` allow keeps older toolchains from rejecting the newer
+    // name, which they have never heard of.
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async_trait_impl)]
     pub async fn watch(self: &Arc<Self>) -> Result<(), ModuleError> {
         use notify::{RecursiveMode, Watcher};
 
