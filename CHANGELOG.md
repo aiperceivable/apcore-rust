@@ -14,7 +14,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(nothing yet)
+### Added
+
+- **`Executor::governance_state()` (spec v1.16.0 §6.6.5, apcore#97).** A read-only accessor returning a `GovernanceState` of eight observations plus one derived flag: what is *configured* on this executor versus what is actually *wired* into the running pipeline. apcore-rust already exposed `acl`, `approval_handler` and `policy` as public struct fields — raw state with no defined semantics, which is exactly what an adapter would read to conclude "protected" from `acl.is_some()`. The gates are pipeline steps, and the `internal`, `testing` and `minimal` presets remove them, so an executor can hold an ACL that no step consults. **The existing public fields are unchanged**; this answers a different question.
+
+- **`Step::builtin_gate() -> Option<BuiltinGate>` and the `BuiltinGate` enum.** The capability marker PROTOCOL_SPEC 6.6.5.2 requires: gate detection **MUST NOT** be by step name. It defaults to `None`, and only `BuiltinACLCheck` and `BuiltinApprovalGate` override it, so a custom step calling itself `acl_check` cannot be mistaken for the gate. Reporting a gate that is not present is the one direction the accessor must never fail in. Additive with a default body — existing `Step` implementations are unaffected.
+
+- **`UsageCollector::get_module_summary_for_period`, `get_p99_latency_ms_for_period`, `get_caller_breakdown_for_period`, `get_hourly_distribution_for_period`.** Period-aware forms of the four accessors the detail usage module needs; none of the originals took a period.
+
+### Changed
+
+- **BREAKING: `system.usage.*` honours `period` (spec v1.14.0 §6.7.1.1, apcore#96).** Both modules read `period`, echoed it back, and then computed every statistic over the full retained history — `get_all_summaries()` for the summary; `get_module_summary` / `get_p99_latency_ms` / `get_caller_breakdown` / `get_hourly_distribution` for the detail module, not one of which took a period. Silent by construction: the response named a window it had not applied. `call_count`, `error_count`, `avg_latency_ms`, `p99_latency_ms`, `trend`, `callers` and `hourly_distribution` are now all computed over `[now − period, now]`.
+
+- **BREAKING: `hourly_distribution[].hour` is `YYYY-MM-DDTHH` (spec v1.14.0 §6.7.1.2, apcore#96).** The `:00:00Z` suffix was appended in **two** places: `HOUR_KEY_FORMAT` in the sys-module layer, and `format!("{hour}:00:00Z")` inside `UsageCollector::get_hourly_distribution`. `HOUR_KEY_FORMAT` was documented as *"matching `UsageCollector` bucket hours"* while `bucket_key` produced `%Y-%m-%dT%H` — so the comment asserted an alignment that did not hold, and apcore-rust was internally inconsistent rather than merely different from the other two SDKs. The existing padding test asserted the entry count and the totals but never the key format, which is why this survived.
+
+- **`output_schema()` declares the full field contract for both usage modules (spec v1.14.0 §6.7.1.6, apcore#96).** Both returned a bare `{"type": "object"}`, which satisfies §6.7's "equivalent output schemas" only in the sense that any two such declarations are equivalent to each other. `input_schema` also gains `"pattern": "^[1-9][0-9]*[hd]$"` on `period`, so a malformed value is rejected at input validation with `SCHEMA_VALIDATION_ERROR` rather than being silently ignored — apcore-rust previously parsed no period at all, so every spelling was accepted.
+
+### Removed
+
+- **`UsageCollector::get_caller_breakdown` and `get_hourly_distribution` (`pub(crate)`, internal).** Replaced by their `_for_period` forms. Keeping a period-ignoring accessor beside a period-aware one is how the divergence above happened; there is now one way to read each statistic.
 
 ---
 

@@ -310,62 +310,151 @@ impl UsageCollector {
         }
     }
 
-    /// Get per-caller breakdown for a module.
-    pub(crate) fn get_caller_breakdown(&self, module_id: &str) -> Vec<CallerStats> {
+    /// Summary for one module over `period` (PROTOCOL_SPEC 6.7.1.1).
+    ///
+    /// `None` summarises the full retained history with trend `"stable"`,
+    /// matching [`Self::get_summary_for_period`].
+    #[must_use]
+    pub fn get_module_summary_for_period(
+        &self,
+        module_id: &str,
+        period: Option<Duration>,
+    ) -> Option<UsageStats> {
+        let now = Utc::now();
         let data = self.data.lock();
-        let Some(module_data) = data.get(module_id) else {
-            return Vec::new();
-        };
-        let mut callers: HashMap<String, (u64, u64, f64)> = HashMap::new(); // (calls, errors, total_lat)
-        for records in module_data.records.values() {
-            for rec in records {
-                let cid = rec.caller_id.as_deref().unwrap_or("unknown").to_string();
-                let entry = callers.entry(cid).or_insert((0, 0, 0.0));
-                entry.0 += 1;
-                if !rec.success {
-                    entry.1 += 1;
-                }
-                entry.2 += rec.latency_ms;
+        let module_data = data.get(module_id)?;
+        Some(match period {
+            None => {
+                let records: Vec<UsageRecord> =
+                    module_data.records.values().flatten().cloned().collect();
+                Self::aggregate_records(module_id, &records, "stable".to_string())
             }
-        }
-        callers
-            .into_iter()
-            .map(|(cid, (calls, errs, total_lat))| CallerStats {
-                caller_id: cid,
-                call_count: calls,
-                error_count: errs,
-                avg_latency_ms: if calls > 0 {
-                    #[allow(clippy::cast_precision_loss)] // metrics avg: precision loss acceptable
-                    let avg = total_lat / calls as f64;
-                    avg
-                } else {
-                    0.0
-                },
-            })
-            .collect()
+            Some(delta) => {
+                let cutoff = now - delta;
+                let prev_cutoff = cutoff - delta;
+                let current = Self::collect_records_in_window(module_data, cutoff, now);
+                let previous = Self::collect_records_in_window(module_data, prev_cutoff, cutoff);
+                let trend = Self::compute_trend(current.len(), previous.len()).to_string();
+                Self::aggregate_records(module_id, &current, trend)
+            }
+        })
     }
 
-    /// Get hourly distribution for a module (sorted by hour ascending).
-    pub(crate) fn get_hourly_distribution(&self, module_id: &str) -> Vec<HourlyBucket> {
+    /// Per-caller breakdown over `period` (PROTOCOL_SPEC 6.7.1.1).
+    ///
+    /// A record with no caller identity is attributed to the literal
+    /// `"unknown"` (6.7.1.4).
+    #[must_use]
+    pub(crate) fn get_caller_breakdown_for_period(
+        &self,
+        module_id: &str,
+        period: Option<Duration>,
+    ) -> Vec<CallerStats> {
+        let now = Utc::now();
         let data = self.data.lock();
         let Some(module_data) = data.get(module_id) else {
             return Vec::new();
         };
+        let records: Vec<UsageRecord> = match period {
+            None => module_data.records.values().flatten().cloned().collect(),
+            Some(delta) => Self::collect_records_in_window(module_data, now - delta, now),
+        };
+        let mut callers: HashMap<String, (u64, u64, f64)> = HashMap::new();
+        for rec in &records {
+            let cid = rec.caller_id.as_deref().unwrap_or("unknown").to_string();
+            let entry = callers.entry(cid).or_insert((0, 0, 0.0));
+            entry.0 += 1;
+            if !rec.success {
+                entry.1 += 1;
+            }
+            entry.2 += rec.latency_ms;
+        }
+        #[allow(clippy::cast_precision_loss)] // call counts comfortably fit in f64
+        let mut out: Vec<CallerStats> = callers
+            .into_iter()
+            .map(
+                |(caller_id, (call_count, error_count, total_latency))| CallerStats {
+                    caller_id,
+                    call_count,
+                    error_count,
+                    avg_latency_ms: if call_count > 0 {
+                        total_latency / call_count as f64
+                    } else {
+                        0.0
+                    },
+                },
+            )
+            .collect();
+        out.sort_by(|a, b| {
+            b.call_count
+                .cmp(&a.call_count)
+                .then_with(|| a.caller_id.cmp(&b.caller_id))
+        });
+        out
+    }
+
+    /// Hourly distribution over `period`, ascending by hour key.
+    ///
+    /// `period` filters the counts inside each bucket; the 24-entry span the
+    /// sys-module pads to is fixed and is not widened by it (6.7.1.2).
+    #[must_use]
+    pub(crate) fn get_hourly_distribution_for_period(
+        &self,
+        module_id: &str,
+        period: Option<Duration>,
+    ) -> Vec<HourlyBucket> {
+        let now = Utc::now();
+        let data = self.data.lock();
+        let Some(module_data) = data.get(module_id) else {
+            return Vec::new();
+        };
+        let cutoff = period.map(|delta| now - delta);
         let mut buckets: Vec<HourlyBucket> = module_data
             .records
             .iter()
             .map(|(hour, records)| {
-                let call_count = records.len() as u64;
-                let error_count = records.iter().filter(|r| !r.success).count() as u64;
+                let in_window = |r: &&UsageRecord| {
+                    cutoff.is_none_or(|c| r.timestamp >= c && r.timestamp <= now)
+                };
                 HourlyBucket {
-                    hour: format!("{hour}:00:00Z"),
-                    call_count,
-                    error_count,
+                    hour: hour.clone(),
+                    call_count: records.iter().filter(in_window).count() as u64,
+                    error_count: records
+                        .iter()
+                        .filter(in_window)
+                        .filter(|r| !r.success)
+                        .count() as u64,
                 }
             })
             .collect();
         buckets.sort_by(|a, b| a.hour.cmp(&b.hour));
         buckets
+    }
+
+    /// Nearest-rank p99 latency (ms) over `period` (PROTOCOL_SPEC 6.7.1.3).
+    #[must_use]
+    pub fn get_p99_latency_ms_for_period(&self, module_id: &str, period: Option<Duration>) -> f64 {
+        let now = Utc::now();
+        let data = self.data.lock();
+        let Some(module_data) = data.get(module_id) else {
+            return 0.0;
+        };
+        let mut latencies: Vec<f64> = match period {
+            None => module_data
+                .records
+                .values()
+                .flat_map(|recs| recs.iter().map(|r| r.latency_ms))
+                .collect(),
+            Some(delta) => Self::collect_records_in_window(module_data, now - delta, now)
+                .iter()
+                .map(|r| r.latency_ms)
+                .collect(),
+        };
+        if latencies.is_empty() {
+            return 0.0;
+        }
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        estimate_p99_from_sorted(&latencies)
     }
 
     /// Compute p99 latency (ms) for a module from stored records.

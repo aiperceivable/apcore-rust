@@ -10,7 +10,7 @@ use crate::context::Identity;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::ApCoreEvent;
 use crate::executor::{has_schema, redact_sensitive, validate_against_schema};
-use crate::pipeline::{ExecutionStrategy, PipelineContext, Step, StepResult};
+use crate::pipeline::{BuiltinGate, ExecutionStrategy, PipelineContext, Step, StepResult};
 use crate::policy::PolicyDecision;
 
 // Macro for step metadata — execute is implemented manually per step.
@@ -366,6 +366,14 @@ impl Step for BuiltinModuleLookup {
 #[async_trait]
 impl Step for BuiltinACLCheck {
     impl_step_meta!(BuiltinACLCheck);
+
+    /// PROTOCOL_SPEC 6.6.5.2 — the capability marker that identifies this as
+    /// the framework's ACL gate, so `governance_state()` never has to match on
+    /// the step's name.
+    fn builtin_gate(&self) -> Option<BuiltinGate> {
+        Some(BuiltinGate::Acl)
+    }
+
     fn requires(&self) -> &[&str] {
         &["context", "module"]
     }
@@ -574,6 +582,11 @@ impl BuiltinApprovalGate {
 #[async_trait]
 impl Step for BuiltinApprovalGate {
     impl_step_meta!(BuiltinApprovalGate);
+
+    /// PROTOCOL_SPEC 6.6.5.2 — see [`BuiltinACLCheck::builtin_gate`].
+    fn builtin_gate(&self) -> Option<BuiltinGate> {
+        Some(BuiltinGate::Approval)
+    }
     fn requires(&self) -> &[&str] {
         &["context", "module"]
     }

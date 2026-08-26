@@ -26,7 +26,7 @@ use crate::middleware::manager::MiddlewareManager;
 use crate::module::PreflightCheckResult as PfCheck;
 use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::pipeline::{
-    ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
+    BuiltinGate, ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
 use crate::policy::ExecutionPolicy;
 use crate::registry::registry::{module_id_pattern, Registry};
@@ -518,6 +518,54 @@ pub fn register_strategy_by_name(name: impl Into<String>, strategy: &ExecutionSt
 /// List all registered strategy summaries.
 pub fn list_strategies() -> Vec<StrategyInfo> {
     STRATEGY_REGISTRY.read().clone()
+}
+
+/// What is actually gating an executor's registry (PROTOCOL_SPEC 6.6.5).
+///
+/// Eight plain observations plus one derived flag. `acl.is_some()` is not the
+/// answer to "what is gating this registry": the ACL and approval gates are
+/// pipeline *steps*, and the `internal`, `testing` and `minimal` strategies all
+/// remove them — so an executor can hold an ACL that no step ever consults.
+///
+/// Returned by [`Executor::governance_state`]. Pure data: reading it enforces
+/// nothing and changes nothing. The existing public `acl` / `approval_handler`
+/// / `policy` fields are unaffected; this answers a different question.
+// Nine booleans is the shape PROTOCOL_SPEC 6.6.5.1 mandates, field for field,
+// so that an adapter reads the same facts from all three SDKs. Collapsing any
+// pair into an enum would make apcore-rust the only SDK where the accessor
+// answers a different set of questions.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GovernanceState {
+    /// At least one `system.control.*` module is in the registry.
+    pub control_modules_registered: bool,
+    /// At least one read-only `system.*` module is in the registry.
+    pub read_modules_registered: bool,
+    /// An ACL object is attached to the executor.
+    pub acl_configured: bool,
+    /// The running strategy contains the built-in ACL gate, matched by capability.
+    pub builtin_acl_gate_wired: bool,
+    /// An `ApprovalHandler` is attached.
+    pub approval_handler_configured: bool,
+    /// The running strategy contains the built-in approval gate, matched by capability.
+    pub builtin_approval_gate_wired: bool,
+    /// An `ExecutionPolicy` with `strict = true` is attached.
+    pub policy_strict: bool,
+    /// Every registered `system.control.*` module declares `requires_approval`.
+    ///
+    /// Required by the derived flag because the two gates are not symmetric
+    /// (PROTOCOL_SPEC 6.6.5.1.1): `acl_check` evaluates every call, but
+    /// `approval_gate` resolves per module and returns before consulting the
+    /// handler when the module does not need approval. `false` when no control
+    /// module is registered.
+    pub all_control_modules_require_approval: bool,
+    /// Control modules are registered and no recognised built-in gate engages.
+    ///
+    /// Reports the **absence of a gate**, never the presence of protection: a
+    /// wired ACL that permits every call still yields `false`. And `true` does
+    /// not mean the call will succeed — a custom step, custom middleware or an
+    /// upstream gateway is invisible here by construction.
+    pub unprotected_control_surface: bool,
 }
 
 /// Responsible for executing modules with middleware, ACL, and context management.
@@ -1577,6 +1625,93 @@ impl Executor {
     /// Get a reference to the executor's execution strategy.
     pub fn strategy(&self) -> &ExecutionStrategy {
         &self.strategy
+    }
+
+    /// Return what is actually gating this executor (PROTOCOL_SPEC 6.6.5).
+    ///
+    /// A **pure read**: it never enforces, warns, panics or mutates. What to do
+    /// about an unprotected control surface belongs to the caller — a
+    /// serve-time adapter may warn or refuse, a test may assert, a health
+    /// endpoint may report. Putting the reaction here would make it
+    /// unavoidable and untestable.
+    ///
+    /// Computed fresh on every call, so attaching an ACL or swapping the
+    /// strategy is visible in the next one.
+    #[must_use]
+    pub fn governance_state(&self) -> GovernanceState {
+        // Gate detection is by CAPABILITY, never by step name
+        // (PROTOCOL_SPEC 6.6.5.2). `Step::builtin_gate` defaults to `None`, so
+        // a custom step calling itself `acl_check` cannot be mistaken for the
+        // gate — reporting a gate that is not there is the one direction this
+        // accessor must never fail in.
+        let builtin_acl_gate_wired = self
+            .strategy
+            .steps()
+            .iter()
+            .any(|step| step.builtin_gate() == Some(BuiltinGate::Acl));
+        let builtin_approval_gate_wired = self
+            .strategy
+            .steps()
+            .iter()
+            .any(|step| step.builtin_gate() == Some(BuiltinGate::Approval));
+
+        // `visibility` includes hidden: the accessor reports what is
+        // REGISTERED, and the default is public-only. A control module
+        // registered with `discoverable: false` is still callable by ID, so
+        // omitting it would under-report the write surface.
+        let all_ids = self.registry.list(None, None, Some(&["public", "hidden"]));
+        let control_ids: Vec<&String> = all_ids
+            .iter()
+            .filter(|id| id.starts_with("system.control."))
+            .collect();
+        let read_modules_registered = all_ids.iter().any(|id| {
+            id.starts_with("system.health.")
+                || id.starts_with("system.usage.")
+                || id.starts_with("system.manifest.")
+        });
+
+        // Read the annotation off the descriptor — the same source the approval
+        // gate reads when it decides whether to fire. A second reading here
+        // would be a second way for the accessor to disagree with the pipeline
+        // it describes.
+        let all_control_modules_require_approval = !control_ids.is_empty()
+            && control_ids.iter().all(|id| {
+                self.registry
+                    .get_definition(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|d| d.annotations)
+                    .is_some_and(|a| a.requires_approval)
+            });
+
+        let acl_configured = self.acl.is_some();
+        let approval_handler_configured = self.approval_handler.is_some();
+        let policy_strict = self.policy.as_ref().is_some_and(|p| p.strict);
+
+        // PROTOCOL_SPEC 6.6.5.1. The approval conjunct carries
+        // `all_control_modules_require_approval` because `approval_gate` is
+        // per-module conditional while `acl_check` is not (6.6.5.1.1).
+        // Written to mirror PROTOCOL_SPEC 6.6.5.1 term for term. clippy offers a
+        // De Morgan rewrite; taking it would leave the code and the normative
+        // formula looking different, which is how a transcription error hides.
+        #[allow(clippy::nonminimal_bool)]
+        let unprotected_control_surface = !control_ids.is_empty()
+            && !(acl_configured && builtin_acl_gate_wired)
+            && !(builtin_approval_gate_wired
+                && all_control_modules_require_approval
+                && (approval_handler_configured || policy_strict));
+
+        GovernanceState {
+            control_modules_registered: !control_ids.is_empty(),
+            read_modules_registered,
+            acl_configured,
+            builtin_acl_gate_wired,
+            approval_handler_configured,
+            builtin_approval_gate_wired,
+            policy_strict,
+            all_control_modules_require_approval,
+            unprotected_control_surface,
+        }
     }
 
     /// Return structured info about the configured pipeline.

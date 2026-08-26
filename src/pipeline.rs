@@ -106,6 +106,18 @@ pub trait StepMiddleware: Send + Sync {
 // Step trait
 // ---------------------------------------------------------------------------
 
+/// Identifies a step as one of the framework's built-in governance gates.
+///
+/// See [`Step::builtin_gate`] — this exists so gate detection is by capability
+/// rather than by the step's name (PROTOCOL_SPEC 6.6.5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinGate {
+    /// The built-in ACL check (`acl_check`).
+    Acl,
+    /// The built-in approval gate (`approval_gate`).
+    Approval,
+}
+
 /// A single unit of work in the execution pipeline.
 ///
 /// Step implementations receive their configuration via constructor — the trait
@@ -148,6 +160,20 @@ pub trait Step: Send + Sync {
     /// `PipelineContext` fields this step reads (e.g. `["module", "context"]`). Advisory only.
     fn requires(&self) -> &[&str] {
         &[]
+    }
+
+    /// Which built-in governance gate this step *is*, if any.
+    ///
+    /// The capability marker PROTOCOL_SPEC 6.6.5.2 requires: gate detection
+    /// **MUST NOT** be by step name. A custom step is free to call itself
+    /// `acl_check`, and it gets the `None` default here, so
+    /// `Executor::governance_state` cannot mistake it for the gate. Reporting a
+    /// gate that is not there is the one direction that accessor must never
+    /// fail in.
+    ///
+    /// Only the framework's own gates override this.
+    fn builtin_gate(&self) -> Option<BuiltinGate> {
+        None
     }
 
     /// `PipelineContext` fields this step writes (e.g. `["output"]`). Advisory only.

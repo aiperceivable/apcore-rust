@@ -308,6 +308,12 @@ mod test_usage_exporter;
 mod test_usage_exporter_conformance;
 #[path = "test_usage_hourly_padding.rs"]
 mod test_usage_hourly_padding;
+
+#[path = "test_usage_period_contract.rs"]
+mod test_usage_period_contract;
+
+#[path = "test_governance_state.rs"]
+mod test_governance_state;
 #[path = "test_v0_21_preview_and_ephemeral.rs"]
 mod test_v0_21_preview_and_ephemeral;
 #[path = "test_webhook_http_retry_contract.rs"]

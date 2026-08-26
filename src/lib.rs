@@ -100,7 +100,7 @@ pub use events::subscribers::{
     OutputFormat, StdoutSubscriber, WebhookSubscriber,
 };
 pub use executor::{
-    list_strategies, redact_sensitive, register_strategy, Executor, REDACTED_VALUE,
+    list_strategies, redact_sensitive, register_strategy, Executor, GovernanceState, REDACTED_VALUE,
 };
 pub use extensions::{ExtensionKind, ExtensionManager, ExtensionPoint};
 pub use middleware::{
@@ -140,8 +140,8 @@ pub use observability::tracing_middleware::{SamplingStrategy, TracingMiddleware}
 pub use observability::usage::{UsageCollector, UsageMiddleware, UsageStats};
 pub use observability::usage_exporter::{NoopUsageExporter, PeriodicUsageExporter, UsageExporter};
 pub use pipeline::{
-    ExecutionStrategy, PipelineContext, PipelineEngine, PipelineState, PipelineTrace, RunOptions,
-    RunUntilPredicate, Step, StepMiddleware, StepResult, StepTrace, StrategyInfo,
+    BuiltinGate, ExecutionStrategy, PipelineContext, PipelineEngine, PipelineState, PipelineTrace,
+    RunOptions, RunUntilPredicate, Step, StepMiddleware, StepResult, StepTrace, StrategyInfo,
 };
 pub use pipeline_config::{
     build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,

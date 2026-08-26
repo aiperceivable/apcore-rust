@@ -104,6 +104,36 @@ async fn usage_module_pads_hourly_distribution_to_24_entries() {
         .map(|h| h["call_count"].as_u64().unwrap_or(0))
         .sum();
     assert_eq!(total_calls, 2, "padding must preserve recorded call counts");
+
+    // PROTOCOL_SPEC 6.7.1.2: the key is the collector's own bucket key,
+    // YYYY-MM-DDTHH. This assertion did not exist, which is why the module
+    // layer could reformat it to `%Y-%m-%dT%H:00:00Z` -- a spelling neither
+    // apcore-python nor apcore-typescript emits -- with every test green.
+    for entry in hourly {
+        let hour = entry["hour"].as_str().expect("hour must be a string");
+        assert_eq!(
+            hour.len(),
+            13,
+            "hour key must be YYYY-MM-DDTHH (13 chars), got {hour:?}"
+        );
+        assert!(
+            !hour.ends_with('Z') && !hour.contains(":00:00"),
+            "hour key must not be reformatted with a time suffix, got {hour:?}"
+        );
+        let (date, hh) = hour.split_at(10);
+        assert!(
+            date.chars().enumerate().all(|(i, c)| if i == 4 || i == 7 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }),
+            "hour key date part malformed: {hour:?}"
+        );
+        assert!(
+            hh.starts_with('T') && hh[1..].chars().all(|c| c.is_ascii_digit()),
+            "hour key hour part malformed: {hour:?}"
+        );
+    }
 }
 
 #[tokio::test]
