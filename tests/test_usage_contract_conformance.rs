@@ -22,6 +22,36 @@ use serde_json::{json, Value};
 
 use crate::conformance_env::find_fixtures_root;
 
+/// driver_contract.output_validates_against_the_canonical_schema: the same file
+/// the spec repo ships, not a copy. `additionalProperties: false` is the point —
+/// a field one SDK emits and the others do not fails here — and the `hour`
+/// pattern rejects the `YYYY-MM-DDTHH:00:00Z` spelling this SDK used to emit.
+///
+/// Validated through `apcore::executor::validate_against_schema`, the same
+/// entry point the executor's own input/output validation uses, so the driver
+/// cannot pass through machinery a real module call never touches.
+fn validate_against_canonical_schema(module: &str, output: &Value) {
+    let file = match module {
+        "system.usage.summary" => "sys-usage-summary.schema.json",
+        "system.usage.module" => "sys-usage-module.schema.json",
+        other => panic!("fixture names an unknown module {other:?}"),
+    };
+    let path = find_fixtures_root()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("fixtures root has a repo root")
+        .join("schemas")
+        .join(file);
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("failed to read {}", path.display())),
+    )
+    .expect("canonical schema is valid JSON");
+
+    apcore::executor::validate_against_schema(output, &schema, "Output")
+        .unwrap_or_else(|e| panic!("{module} output does not satisfy the canonical schema: {e}"));
+}
+
 fn load_fixture(name: &str) -> Value {
     let path = find_fixtures_root().join(format!("{name}.json"));
     let content = std::fs::read_to_string(&path)
@@ -197,6 +227,7 @@ async fn conformance_usage_contract() {
         }
 
         let result = run(case).await;
+        validate_against_canonical_schema(case["module"].as_str().unwrap(), &result);
 
         if let Some(want) = expected.get("caller_ids") {
             let ids: Vec<&str> = result["callers"]
