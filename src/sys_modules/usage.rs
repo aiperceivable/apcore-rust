@@ -26,10 +26,16 @@ const HOUR_KEY_FORMAT: &str = "%Y-%m-%dT%H";
 /// Parse a `period` input into a [`Duration`] (PROTOCOL_SPEC 6.7.1.1).
 ///
 /// The grammar `^[1-9][0-9]*[hd]$` is declared in both modules' `input_schema`,
-/// so a malformed value is rejected at input validation before reaching here.
-/// This function is the second line of that contract, not the first: it returns
-/// `None` for anything it cannot parse, and the caller treats `None` as the
-/// default window rather than silently summarising all of history.
+/// so a malformed value is normally rejected at input validation before
+/// reaching here. This function is the second line of that contract, not the
+/// first — and it has to be, because §6.6.3.2 documents three strategy presets
+/// that remove the `input_validation` step, so a direct module call can arrive
+/// unvalidated.
+///
+/// `None` means "not parseable" and callers MUST surface it as an error.
+/// Passing it downstream aggregates the full retained history while the
+/// response still echoes the requested `period` — the exact shape §6.7.1.1
+/// forbids, and what both call sites used to do.
 fn parse_period(period: &str) -> Option<Duration> {
     let (digits, unit) = period.split_at(period.len().checked_sub(1)?);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -44,6 +50,24 @@ fn parse_period(period: &str) -> Option<Duration> {
         "d" => Some(Duration::days(n)),
         _ => None,
     }
+}
+
+/// Parse `period`, or fail with the same error input validation would raise.
+///
+/// apcore-python's `_parse_period` raises ValueError and apcore-typescript's
+/// `parsePeriod` throws; both surface as an error to the caller. This SDK
+/// passed `None` downstream instead, which silently produced full-history
+/// numbers under the requested window's label (§6.7.1.1).
+fn reject_malformed_period(period: &str) -> Result<Duration, ModuleError> {
+    parse_period(period).ok_or_else(|| {
+        ModuleError::new(
+            ErrorCode::SchemaValidationError,
+            format!(
+                "Invalid `period` '{period}': expected the grammar ^[1-9][0-9]*[hd]$ \
+                 (for example \"24h\" or \"7d\")"
+            ),
+        )
+    })
 }
 
 /// Pad an hourly distribution to exactly 24 entries, zero-filling gaps.
@@ -181,7 +205,7 @@ impl Module for UsageSummaryModule {
         // to call get_all_summaries(), so every statistic covered the full
         // retained history while the response named a window it had not
         // applied -- silent by construction.
-        let window = parse_period(period);
+        let window = Some(reject_malformed_period(period)?);
         let mut summaries = self.collector.get_summary_for_period(window);
         // Sort by call_count descending per spec.
         summaries.sort_by_key(|b| std::cmp::Reverse(b.call_count));
@@ -321,7 +345,7 @@ impl Module for UsageModule {
         // PROTOCOL_SPEC 6.7.1.1: every statistic below is computed over the
         // requested window. These four accessors previously had no period-aware
         // form at all, so `period` was echoed back over full-history numbers.
-        let window = parse_period(period);
+        let window = Some(reject_malformed_period(period)?);
         let stats = self
             .collector
             .get_module_summary_for_period(module_id, window);
@@ -377,7 +401,18 @@ impl Module for UsageModule {
                 "error_count": 0,
                 "avg_latency_ms": 0.0,
                 "p99_latency_ms": 0.0,
-                "trend": "inactive",
+                // A module with no records at all is `current == 0` AND
+                // `previous == 0`, which §6.7.1.5's table decides as "stable" —
+                // the zero-zero row is ordered FIRST precisely so it wins over
+                // the `current == 0` row. `inactive` means "had traffic, now has
+                // none" and is wrong for a module that never ran.
+                //
+                // `UsageCollector::compute_trend` gets this right; this arm
+                // bypassed it because `get_module_summary_for_period` returns
+                // None for an unknown module. apcore-python and
+                // apcore-typescript route through `_build_detail` /
+                // `_buildDetail`, which run the table, and answer "stable".
+                "trend": "stable",
                 "callers": [],
                 "hourly_distribution": hourly,
             })),

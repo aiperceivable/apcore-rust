@@ -264,3 +264,86 @@ async fn period_pattern_is_declared_in_the_input_schema() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// sync-2026-08-26 A-D-016: a malformed `period` must fail, not silently widen
+// the window to the full retained history.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn malformed_period_is_rejected_by_the_detail_module() {
+    // `parse_period` returns Option and both call sites passed `None` straight
+    // through to `get_*_for_period`, whose None arm aggregates EVERY retained
+    // record — while the response still echoed the requested `period`. That is
+    // the exact shape §6.7.1.1 forbids. The input_schema `pattern` is the first
+    // line of defence, but §6.6.3.2 documents three presets that remove the
+    // `input_validation` step, so a direct module call can arrive unvalidated.
+    //
+    // apcore-python raises ValueError and apcore-typescript throws for the same
+    // input (verified 2026-08-27).
+    let registry = Arc::new(Registry::new());
+    register_dummy(&registry, "a.b");
+    let module = UsageModule::new(Arc::clone(&registry), UsageCollector::new());
+
+    for bad in ["xyz", "0h", "-5d", "+3h", "24", "24x", ""] {
+        let err = module
+            .execute(json!({ "module_id": "a.b", "period": bad }), &dummy_ctx())
+            .await
+            .expect_err(&format!("period {bad:?} must be rejected, not widened"));
+        assert_eq!(
+            err.code,
+            apcore::errors::ErrorCode::SchemaValidationError,
+            "period {bad:?} should fail schema validation, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_period_is_rejected_by_the_summary_module() {
+    let module = UsageSummaryModule::new(UsageCollector::new());
+    let err = module
+        .execute(json!({ "period": "xyz" }), &dummy_ctx())
+        .await
+        .expect_err("a malformed period must be rejected by the summary module too");
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaValidationError);
+}
+
+#[tokio::test]
+async fn well_formed_periods_still_parse() {
+    let module = UsageSummaryModule::new(UsageCollector::new());
+    for good in ["1h", "24h", "7d", "168h"] {
+        module
+            .execute(json!({ "period": good }), &dummy_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("period {good:?} must parse, got {e:?}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sync-2026-08-26 A-D-018: a module that has never been called is
+// `current == 0 && previous == 0`, which §6.7.1.5 decides as "stable".
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn never_called_module_reports_stable_not_inactive() {
+    // §6.7.1.5's table orders the zero-zero row FIRST, ahead of the
+    // `current == 0` row, precisely so a module with no history reads "stable".
+    // `inactive` means "had traffic, now has none".
+    //
+    // `UsageCollector::compute_trend` implements the table correctly; the
+    // module layer bypassed it, because `get_module_summary_for_period` returns
+    // None for a module with no records and the None arm hardcoded "inactive".
+    // apcore-python and apcore-typescript route through _build_detail /
+    // _buildDetail, which run the table, and answer "stable" (verified).
+    let registry = Arc::new(Registry::new());
+    register_dummy(&registry, "never.called");
+    let module = UsageModule::new(Arc::clone(&registry), UsageCollector::new());
+
+    let out = module
+        .execute(json!({ "module_id": "never.called" }), &dummy_ctx())
+        .await
+        .expect("a module with no usage is not an error");
+
+    assert_eq!(out["trend"], json!("stable"), "got {out:#?}");
+    assert_eq!(out["call_count"], json!(0));
+}
