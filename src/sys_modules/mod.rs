@@ -593,7 +593,10 @@ pub fn register_sys_modules_with_options(
             .and_then(|v| v.as_f64())
             .unwrap_or(5000.0);
         let pn_middleware = PlatformNotifyMiddleware::new(
-            EventEmitter::new(),
+            // Share the bus the configured subscribers are attached to. This was
+            // `EventEmitter::new()` — a private, subscriber-less bus, so
+            // apcore.health.* threshold alerts were emitted and dropped.
+            Arc::clone(&emitter_arc),
             metrics_collector.clone(),
             error_rate_threshold,
             latency_p99_threshold,

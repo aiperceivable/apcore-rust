@@ -427,3 +427,61 @@ async fn update_config_audit_event_includes_caller_id_from_context() {
         "default caller_id should be @external when context has none"
     );
 }
+
+/// sync-2026-08-27 finding A-D-014 — PlatformNotifyMiddleware must emit onto the
+/// bus the configured subscribers are attached to.
+///
+/// `register_sys_modules` built the middleware with `EventEmitter::new()`, a
+/// private bus. `EventEmitter` holds subscribers in a per-instance
+/// `RwLock<Vec<Arc<dyn EventSubscriber>>>`, so every `apcore.health.*` threshold
+/// alert was emitted into a bus with no subscribers and dropped, while
+/// apcore-python and apcore-typescript delivered them.
+#[tokio::test]
+async fn platform_notify_emits_onto_the_shared_bus() {
+    let metrics = MetricsCollector::new();
+    let mut labels = HashMap::new();
+    labels.insert("module".to_string(), "mod.shared".to_string());
+    labels.insert("status".to_string(), "error".to_string());
+    metrics.increment("apcore_module_calls_total", labels, 10.0);
+
+    // The bus the subscribers live on — as `register_sys_modules` builds it.
+    let shared: Arc<EventEmitter> = Arc::new(EventEmitter::new());
+    let (sub, received) = RecordingSub::new("apcore.health.*");
+    shared.subscribe(sub);
+
+    // Hand the middleware a CLONE of that Arc, not a fresh emitter.
+    let pn = PlatformNotifyMiddleware::new(Arc::clone(&shared), Some(metrics), 0.1, 5000.0);
+
+    let ctx = build_ctx_with_caller(None, None);
+    let _ = pn
+        .on_error(
+            "mod.shared",
+            json!({}),
+            &apcore::errors::ModuleError::new(
+                apcore::errors::ErrorCode::GeneralInternalError,
+                "boom",
+            ),
+            &ctx,
+        )
+        .await;
+
+    wait_for_events(&received, |evts| {
+        evts.iter()
+            .any(|e| e.event_type == "apcore.health.error_threshold_exceeded")
+    })
+    .await;
+
+    assert!(
+        received
+            .lock()
+            .iter()
+            .any(|e| e.event_type == "apcore.health.error_threshold_exceeded"),
+        "a subscriber on the shared bus must receive the threshold alert; \
+         got {:?}",
+        received
+            .lock()
+            .iter()
+            .map(|e| &e.event_type)
+            .collect::<Vec<_>>()
+    );
+}

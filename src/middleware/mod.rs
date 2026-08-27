@@ -33,6 +33,7 @@ pub use yaml_config::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -58,7 +59,12 @@ use crate::observability::metrics::{estimate_p99_from_histogram, MetricsCollecto
 /// Hysteresis prevents repeated alerts until recovery is observed.
 #[derive(Debug)]
 pub struct PlatformNotifyMiddleware {
-    emitter: EventEmitter,
+    /// `Arc` so the middleware shares the emitter its subscribers are attached
+    /// to. Holding an `EventEmitter` by value meant `register_sys_modules`
+    /// handed it a freshly-constructed bus — `EventEmitter` keeps subscribers
+    /// in a per-instance `RwLock<Vec<..>>`, so every threshold event was
+    /// emitted to a bus nobody was listening on.
+    emitter: Arc<EventEmitter>,
     metrics_collector: Option<MetricsCollector>,
     error_rate_threshold: f64,
     latency_p99_threshold_ms: f64,
@@ -71,20 +77,23 @@ impl PlatformNotifyMiddleware {
     /// Create a new platform notify middleware.
     ///
     /// # Arguments
-    /// * `emitter` — `EventEmitter` to emit threshold events to.
+    /// * `emitter` — `EventEmitter` to emit threshold events to. Pass an
+    ///   `Arc<EventEmitter>` to share the bus that carries the configured
+    ///   subscribers; a bare `EventEmitter` is accepted for convenience and
+    ///   produces a private bus with no subscribers.
     /// * `metrics_collector` — Optional `MetricsCollector` to read error rates
     ///   and latency from. If None, all checks return 0.
     /// * `error_rate_threshold` — Error rate (0.0-1.0) above which to alert.
     /// * `latency_p99_threshold_ms` — p99 latency in ms above which to alert.
     #[must_use]
     pub fn new(
-        emitter: EventEmitter,
+        emitter: impl Into<Arc<EventEmitter>>,
         metrics_collector: Option<MetricsCollector>,
         error_rate_threshold: f64,
         latency_p99_threshold_ms: f64,
     ) -> Self {
         Self {
-            emitter,
+            emitter: emitter.into(),
             metrics_collector,
             error_rate_threshold,
             latency_p99_threshold_ms,
@@ -95,7 +104,7 @@ impl PlatformNotifyMiddleware {
     /// Create with default thresholds (10% error rate, 5000ms p99 latency).
     #[must_use]
     pub fn with_defaults(
-        emitter: EventEmitter,
+        emitter: impl Into<Arc<EventEmitter>>,
         metrics_collector: Option<MetricsCollector>,
     ) -> Self {
         Self::new(emitter, metrics_collector, 0.1, 5000.0)
