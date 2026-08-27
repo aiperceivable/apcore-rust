@@ -1486,3 +1486,110 @@ fn test_register_module_populates_descriptor_tags_from_module() {
         "register_module must populate descriptor.tags from module.tags() (A-D-017)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// sync-2026-08-26 A-D-005: a discovery-path on_load failure must fire the same
+// two signals as the manual register() path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn discovery_on_load_failure_fires_callbacks_and_event() {
+    use apcore::registry::registry::{DiscoveredModule, Discoverer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // `register_core`'s Err arm fires `load_failed_callbacks` AND
+    // `emit_module_load_failed`. `register_discovered`'s Err arm had only a
+    // tracing line and the in_flight release, so an on_load failure reached
+    // through discovery notified nobody — while the identical failure through
+    // `register()` notified both. registry-system.md names "discovery-driven
+    // paths (discover(), register_discovered, hot-reload, etc.)" explicitly.
+
+    struct FailingOnLoad;
+    #[async_trait::async_trait]
+    impl Module for FailingOnLoad {
+        fn description(&self) -> &'static str {
+            "fails on load"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn output_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _i: serde_json::Value,
+            _c: &Context<serde_json::Value>,
+        ) -> Result<serde_json::Value, ModuleError> {
+            Ok(serde_json::json!({}))
+        }
+        fn on_load(&self) -> Result<(), ModuleError> {
+            Err(ModuleError::new(
+                apcore::errors::ErrorCode::ModuleLoadError,
+                "boom",
+            ))
+        }
+    }
+
+    struct OneModuleDiscoverer;
+    #[async_trait::async_trait]
+    impl Discoverer for OneModuleDiscoverer {
+        async fn discover(&self, _roots: &[String]) -> Result<Vec<DiscoveredModule>, ModuleError> {
+            Ok(vec![DiscoveredModule {
+                name: "discovered.failing".to_string(),
+                source: "test".to_string(),
+                descriptor: ModuleDescriptor {
+                    module_id: "discovered.failing".to_string(),
+                    name: None,
+                    description: "fails on load".to_string(),
+                    documentation: None,
+                    input_schema: serde_json::json!({}),
+                    output_schema: serde_json::json!({}),
+                    version: "1.0.0".to_string(),
+                    tags: vec![],
+                    annotations: None,
+                    examples: vec![],
+                    metadata: std::collections::HashMap::new(),
+                    display: None,
+                    sunset_date: None,
+                    dependencies: vec![],
+                    enabled: true,
+                },
+                module: Arc::new(FailingOnLoad),
+            }])
+        }
+    }
+
+    let registry = Arc::new(Registry::new());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen_id = Arc::new(parking_lot::Mutex::new(String::new()));
+
+    let h = Arc::clone(&hits);
+    let sid = Arc::clone(&seen_id);
+    registry.on_load_failed(Arc::new(move |module_id: &str, _e: &ModuleError| {
+        h.fetch_add(1, Ordering::SeqCst);
+        *sid.lock() = module_id.to_string();
+    }));
+    registry.set_discoverer(Box::new(OneModuleDiscoverer));
+
+    let count = registry
+        .discover_internal()
+        .await
+        .expect("discovery itself succeeds; the module's on_load is what fails");
+
+    assert_eq!(
+        count, 0,
+        "a module whose on_load fails must not be registered"
+    );
+    assert!(
+        !registry.has("discovered.failing"),
+        "the failed module must not be visible"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "on_load_failed callbacks must fire on the discovery path, as they do on register()"
+    );
+    assert_eq!(*seen_id.lock(), "discovered.failing");
+}

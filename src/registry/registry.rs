@@ -1868,6 +1868,25 @@ impl Registry {
                         "Discovered module on_load failed; skipping registration"
                     );
                     self.in_flight.lock().remove(&dm.name);
+                    // The same two signals `register_core` fires on this branch.
+                    // Only the tracing line and the in_flight release were here,
+                    // so an on_load failure on the DISCOVERY path was invisible
+                    // to both `on_load_failed` callbacks and to subscribers of
+                    // `apcore.registry.module_load_failed` — while the identical
+                    // failure through the manual `register()` path notified both.
+                    // registry-system.md names "discovery-driven paths
+                    // (discover(), register_discovered, hot-reload, etc.)"
+                    // explicitly (sync finding A-D-005).
+                    let cbs: Vec<Arc<LoadFailedCallbackFn>> = self
+                        .load_failed_callbacks
+                        .read()
+                        .iter()
+                        .map(Arc::clone)
+                        .collect();
+                    for cb in cbs {
+                        cb(&dm.name, &e);
+                    }
+                    self.emit_module_load_failed(&dm.name, &e);
                 }
             }
         }
