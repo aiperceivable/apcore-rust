@@ -934,6 +934,67 @@ impl Step for BuiltinMiddlewareBefore {
     }
 }
 
+/// Resolve the effective per-call timeout in milliseconds.
+///
+/// Starts from the module's declared `annotations.extra["resources"]["timeout"]`
+/// (spec D-11), falls back to `config.executor.default_timeout`, then clamps
+/// against whatever remains of `global_deadline` — the dual-timeout model in
+/// docs/features/core-executor.md §Step 8. `0` means "no timeout".
+///
+/// Shared by `BuiltinExecute` and `Executor::stream`'s non-streaming fallback.
+/// The streaming path drives `run_until_step(.., "execute")`, so it never
+/// enters `BuiltinExecute`; before this was extracted, that fallback awaited
+/// `module.execute()` bare, with neither the per-module timeout nor the
+/// deadline clamp, while both peer SDKs run the full pipeline and get both.
+pub(crate) fn resolve_effective_timeout_ms(
+    registry: Option<&std::sync::Arc<crate::registry::registry::Registry>>,
+    module_id: &str,
+    global_deadline: Option<f64>,
+    default_timeout: u64,
+) -> Result<u64, ModuleError> {
+    let declared_timeout: Option<serde_json::Value> = registry
+        .and_then(|reg| reg.get_definition(module_id).ok().flatten())
+        .and_then(|desc| desc.annotations)
+        .and_then(|ann| ann.extra.get("resources").cloned())
+        .and_then(|res| res.get("timeout").cloned());
+    // A negative declared timeout is invalid and MUST be rejected rather than
+    // silently swallowed (`as_u64()` would return None and fall back to the
+    // default). Spec Edge Cases table; peer Python builtin_steps.py:620 raises
+    // InvalidInputError (sync finding A-D-W1).
+    if let Some(ref v) = declared_timeout {
+        let is_negative = v.as_i64().is_some_and(|n| n < 0) || v.as_f64().is_some_and(|f| f < 0.0);
+        if is_negative {
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Module '{module_id}' declares a negative timeout ({v}); timeout must be non-negative"
+                ),
+            ));
+        }
+    }
+    let per_module_timeout_ms: Option<u64> = declared_timeout.and_then(|v| v.as_u64());
+    let mut timeout_ms = per_module_timeout_ms.unwrap_or(default_timeout);
+    if let Some(deadline) = global_deadline {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // intentional: remaining_ms is non-negative and fits in u64 for any reasonable deadline
+        let remaining_ms = ((deadline - now) * 1000.0) as u64;
+        if remaining_ms == 0 {
+            return Err(ModuleError::new(
+                ErrorCode::ModuleTimeout,
+                format!("Module '{module_id}' execution aborted: global deadline already exceeded"),
+            ));
+        }
+        if timeout_ms == 0 || remaining_ms < timeout_ms {
+            timeout_ms = remaining_ms;
+        }
+    }
+    Ok(timeout_ms)
+}
+
 #[async_trait]
 impl Step for BuiltinExecute {
     impl_step_meta!(BuiltinExecute);
@@ -962,53 +1023,12 @@ impl Step for BuiltinExecute {
         // D-11), fall back to `config.executor.default_timeout`. Both are
         // then clamped against the remaining global deadline below.
         // Spec: docs/features/core-executor.md §Step 8 (dual-timeout model).
-        let declared_timeout: Option<serde_json::Value> = ctx
-            .registry
-            .as_ref()
-            .and_then(|reg| reg.get_definition(&ctx.module_id).ok().flatten())
-            .and_then(|desc| desc.annotations)
-            .and_then(|ann| ann.extra.get("resources").cloned())
-            .and_then(|res| res.get("timeout").cloned());
-        // A negative declared timeout is invalid and MUST be rejected rather
-        // than silently swallowed (`as_u64()` would return None and fall back
-        // to the default). Spec Edge Cases table; peer Python builtin_steps.py:620
-        // raises InvalidInputError (sync finding A-D-W1).
-        if let Some(ref v) = declared_timeout {
-            let is_negative =
-                v.as_i64().is_some_and(|n| n < 0) || v.as_f64().is_some_and(|f| f < 0.0);
-            if is_negative {
-                return Err(ModuleError::new(
-                    ErrorCode::GeneralInvalidInput,
-                    format!(
-                        "Module '{}' declares a negative timeout ({}); timeout must be non-negative",
-                        ctx.module_id, v
-                    ),
-                ));
-            }
-        }
-        let per_module_timeout_ms: Option<u64> = declared_timeout.and_then(|v| v.as_u64());
-        let mut timeout_ms = per_module_timeout_ms.unwrap_or(config.executor.default_timeout);
-        if let Some(deadline) = ctx.context.global_deadline {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            // intentional: remaining_ms is non-negative and fits in u64 for any reasonable deadline
-            let remaining_ms = ((deadline - now) * 1000.0) as u64;
-            if remaining_ms == 0 {
-                return Err(ModuleError::new(
-                    ErrorCode::ModuleTimeout,
-                    format!(
-                        "Module '{}' execution aborted: global deadline already exceeded",
-                        ctx.module_id
-                    ),
-                ));
-            }
-            if timeout_ms == 0 || remaining_ms < timeout_ms {
-                timeout_ms = remaining_ms;
-            }
-        }
+        let timeout_ms = resolve_effective_timeout_ms(
+            ctx.registry.as_ref(),
+            &ctx.module_id,
+            ctx.context.global_deadline,
+            config.executor.default_timeout,
+        )?;
 
         // Note: Streaming is handled exclusively by `Executor::stream()`, which
         // bypasses this step entirely. `ctx.stream` is intentionally ignored

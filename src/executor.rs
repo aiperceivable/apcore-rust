@@ -242,6 +242,12 @@ struct StreamSetup {
     /// can publish `apcore.stream.post_validation_failed` when a post-stream
     /// failure is swallowed (parity with apcore-python / apcore-typescript).
     event_emitter: Option<Arc<EventEmitter>>,
+    /// Carried so the non-streaming fallback can resolve the same effective
+    /// timeout `BuiltinExecute` would have applied. The streaming path stops
+    /// the pipeline before `execute`, so that step never runs.
+    module_id: String,
+    registry: Option<Arc<crate::registry::registry::Registry>>,
+    default_timeout_ms: u64,
 }
 
 /// Internal: outcome of `Executor::prepare_stream`. A Phase-1 (pre-execute)
@@ -873,20 +879,7 @@ impl Executor {
         loop {
             match PipelineEngine::run(&self.strategy, &mut pipe_ctx).await {
                 Ok((output, trace)) => {
-                    if !trace.success {
-                        let (aborted_step, explanation) = trace
-                            .steps
-                            .iter()
-                            .find_map(|s| {
-                                if s.result.action == "abort" {
-                                    Some((s.name.as_str(), s.result.explanation.as_deref()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(("unknown", None));
-                        return Err(ModuleError::pipeline_abort(aborted_step, explanation));
-                    }
+                    Self::reject_aborted_trace(&trace)?;
                     return Ok(output.unwrap_or(serde_json::Value::Null));
                 }
                 Err(e) => {
@@ -1106,8 +1099,18 @@ impl Executor {
 
         // Module-level introspection is gated on TWO conditions, not one.
         //
-        // 1. Module lookup succeeded (mirrors the Python/TS guard on
-        //    `pipe_ctx.module` being non-null).
+        // 1. The PIPELINE resolved a module — `pipe_ctx.module`, exactly the
+        //    handle apcore-python and apcore-typescript guard on. This used to
+        //    re-query `self.registry.get(module_id)` independently, which is a
+        //    different question: the registry still holds a module the pipeline
+        //    deliberately refused to resolve. `module_lookup` raises
+        //    ModuleDisabled for a module toggled off via
+        //    `system.control.toggle_feature` BEFORE assigning `ctx.module`, and
+        //    `call_chain_guard` runs before `module_lookup` at all — so a
+        //    disabled module, or one rejected by the depth/cycle guard, still
+        //    had its `preflight()` and `preview()` executed here and its
+        //    `predicted_changes` returned, where the peers emit no
+        //    `module_preflight` / `module_preview` check at all.
         // 2. The ACL did not deny the call — PROTOCOL_SPEC §12.8.5.1.
         //
         // Condition 2 is the security half. `preflight()` and `preview()` are
@@ -1127,7 +1130,7 @@ impl Executor {
             .iter()
             .any(|c| c.check == crate::module::ACL_CHECK_NAME && !c.passed);
         let mut predicted_changes: Vec<crate::module::Change> = Vec::new();
-        if let (false, Ok(Some(module))) = (acl_denied, self.registry.get(module_id)) {
+        if let (false, Some(module)) = (acl_denied, pipe_ctx.module.clone()) {
             let warnings = module.preflight(inputs, ctx);
             checks.push(PreflightCheckResult {
                 check: crate::module::MODULE_PREFLIGHT_CHECK_NAME.to_string(),
@@ -1350,10 +1353,42 @@ impl Executor {
             } else {
                 // Fallback: module doesn't support streaming. Run execute() and
                 // yield its result as a single chunk.
-                let output = setup
-                    .module
-                    .execute(setup.inputs.clone(), &setup.context)
-                    .await?;
+                //
+                // Under the SAME timeout BuiltinExecute would have applied. The
+                // streaming path drives `run_until_step(.., "execute")`, so that
+                // step never runs and this call used to be awaited bare — no
+                // per-module `resources.timeout`, no global-deadline clamp, so
+                // `stream()` on a non-streaming slow module hung indefinitely
+                // where apcore-python and apcore-typescript raise MODULE_TIMEOUT
+                // (both run the full pipeline in stream Phase 1, so their
+                // fallback goes through BuiltinExecute).
+                let timeout_ms = crate::builtin_steps::resolve_effective_timeout_ms(
+                    setup.registry.as_ref(),
+                    &setup.module_id,
+                    setup.context.global_deadline,
+                    setup.default_timeout_ms,
+                )?;
+                let output = if timeout_ms > 0 {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(timeout_ms),
+                        setup.module.execute(setup.inputs.clone(), &setup.context),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_elapsed) => {
+                            Err(ModuleError::new(
+                                ErrorCode::ModuleTimeout,
+                                format!(
+                                    "Module '{}' execution timed out after {}ms",
+                                    setup.module_id, timeout_ms
+                                ),
+                            ))?
+                        }
+                    }
+                } else {
+                    setup.module.execute(setup.inputs.clone(), &setup.context).await?
+                };
                 accumulated.push(output.clone());
                 yield output;
             }
@@ -1619,6 +1654,9 @@ impl Executor {
             middleware_manager: pipe_ctx.middleware_manager.clone(),
             executed_middlewares,
             event_emitter,
+            module_id: module_id.to_string(),
+            registry: pipe_ctx.registry.clone(),
+            default_timeout_ms: self.config.executor.default_timeout,
         })))
     }
 
@@ -1760,6 +1798,30 @@ impl Executor {
     /// recovery the returned `PipelineTrace` is the trace captured during
     /// the failing pipeline run (including any `on_error` events recorded
     /// inside it).
+    /// Convert a pipeline trace carrying `success == false` into the
+    /// `PIPELINE_ABORT` error a caller expects.
+    ///
+    /// `PipelineEngine::run` reports a step-returned `action: "abort"` as a
+    /// successful return with the flag cleared, not as an `Err`. Shared by
+    /// `call` and `call_with_trace` so the two cannot drift on it again.
+    fn reject_aborted_trace(trace: &crate::pipeline::PipelineTrace) -> Result<(), ModuleError> {
+        if trace.success {
+            return Ok(());
+        }
+        let (aborted_step, explanation) = trace
+            .steps
+            .iter()
+            .find_map(|s| {
+                if s.result.action == "abort" {
+                    Some((s.name.as_str(), s.result.explanation.as_deref()))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(("unknown", None));
+        Err(ModuleError::pipeline_abort(aborted_step, explanation))
+    }
+
     pub async fn call_with_trace(
         &self,
         module_id: &str,
@@ -1791,7 +1853,19 @@ impl Executor {
         self.bind_to_context(&mut pipeline_ctx)?;
 
         match PipelineEngine::run(effective_strategy, &mut pipeline_ctx).await {
-            Ok((output, trace)) => Ok((output.unwrap_or(Value::Null), trace)),
+            Ok((output, trace)) => {
+                // A pipeline ABORT must surface here exactly as it does in
+                // `call`. This SDK's engine signals abort by returning
+                // `Ok((output, trace))` with `trace.success == false` rather
+                // than by erroring, so every caller carries the obligation to
+                // re-check the flag — and this one did not, handing back `Ok`
+                // for an aborted pipeline while `call` returned `Err` and both
+                // peer SDKs raised. features/core-executor.md §Trace Variants
+                // (D-19): an error that propagates in `call()` MUST also
+                // propagate in the trace variant.
+                Self::reject_aborted_trace(&trace)?;
+                Ok((output.unwrap_or(Value::Null), trace))
+            }
             Err(e) => {
                 // Unwrap PipelineStepError + MiddlewareChainError so callers
                 // and on_error middleware see the typed cause (D-22).
