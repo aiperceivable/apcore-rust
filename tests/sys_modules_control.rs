@@ -463,6 +463,7 @@ async fn test_reload_module_captures_actual_previous_version_from_descriptor() {
     registry
         .register_internal("demo.mod", Box::new(Demo), descriptor)
         .unwrap();
+    crate::reload_support::RestoringDiscoverer::attach_for(&registry, &["demo.mod".to_string()]);
 
     let reload = ReloadModule::new(Arc::clone(&registry), Arc::clone(&emitter));
     let result = reload
@@ -482,8 +483,18 @@ async fn test_reload_module_captures_actual_previous_version_from_descriptor() {
         "reload_module should capture the actual version, got {result:#?}"
     );
     assert_eq!(result["success"], true);
-    // After reload (with no discoverer attached), the module is unregistered.
-    assert!(!registry.has("demo.mod"));
+    // A reload that reports success must leave the module registered.
+    //
+    // This assertion previously read `assert!(!registry.has("demo.mod"))` with the
+    // comment "after reload (with no discoverer attached), the module is
+    // unregistered" — it pinned success-plus-deletion as correct. Reload
+    // unregisters and then re-discovers; if re-discovery cannot restore the module
+    // the call now fails with RELOAD_FAILED (matching apcore-python) instead of
+    // returning success over an empty registry.
+    assert!(
+        registry.has("demo.mod"),
+        "a reload reporting success must leave the module registered"
+    );
 }
 
 #[tokio::test]

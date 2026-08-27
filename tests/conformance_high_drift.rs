@@ -339,6 +339,12 @@ async fn invoke_module(
                 .as_str()
                 .unwrap_or("executor.email.send");
             register_dummy(&registry, module_id);
+            // reload unregisters before re-discovering; restore it so this
+            // audit-event fixture asserts the event, not a RELOAD_FAILED.
+            crate::reload_support::RestoringDiscoverer::attach_for(
+                &registry,
+                &[module_id.to_string()],
+            );
             let module = ReloadModule::new(registry, emitter);
             module.execute(inputs, ctx).await
         }

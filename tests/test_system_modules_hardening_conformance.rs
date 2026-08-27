@@ -451,6 +451,19 @@ async fn case_reload_with_path_filter() {
         register_dummy_module(&registry, module_id.as_str().unwrap());
     }
 
+    // Bulk reload unregisters before re-discovering, so a registry with no
+    // discoverer cannot restore the matched modules. Model the filesystem
+    // discoverer whose files are still present — otherwise this case can only
+    // pass on an implementation that reports success without re-discovering
+    // (the A-D-011 defect fixed in sync-2026-08-27).
+    let all_ids: Vec<String> = case["setup"]["registered_modules"]
+        .as_array()
+        .expect("setup.registered_modules is an array")
+        .iter()
+        .map(|v| v.as_str().expect("module id is a string").to_string())
+        .collect();
+    registry.set_discoverer(Box::new(HardeningRestoringDiscoverer { ids: all_ids }));
+
     let emitter = Arc::new(EventEmitter::new());
     let module = ReloadModule::new(Arc::clone(&registry), emitter);
 
@@ -514,6 +527,13 @@ async fn case_reload_with_path_filter() {
     let dep_registry = Arc::new(Registry::new());
     register_dummy_module(&dep_registry, "executor.pdf.render");
     register_dummy_module_with_dep(&dep_registry, "executor.email.send", "executor.pdf.render");
+    crate::reload_support::RestoringDiscoverer::attach_for(
+        &dep_registry,
+        &[
+            "executor.pdf.render".to_string(),
+            "executor.email.send".to_string(),
+        ],
+    );
     let dep_module = ReloadModule::new(Arc::clone(&dep_registry), Arc::new(EventEmitter::new()));
     let dep_out = dep_module
         .execute(case["action"]["input"].clone(), &make_ctx(None))
@@ -607,6 +627,8 @@ async fn case_reload_order_is_topological_not_alphabetical() {
             recorder.lock().unwrap().push(name.to_string());
         }),
     );
+
+    crate::reload_support::RestoringDiscoverer::attach_for(&registry, &registered);
 
     let module = ReloadModule::new(Arc::clone(&registry), Arc::new(EventEmitter::new()));
     let out = module
@@ -1308,5 +1330,48 @@ impl Module for DummyModule {
         _ctx: &Context<Value>,
     ) -> Result<Value, apcore::errors::ModuleError> {
         Ok(json!({}))
+    }
+}
+
+/// Re-supplies a fixed set of module ids on `discover()` — see the note in
+/// `case_reload_with_path_filter`.
+struct HardeningRestoringDiscoverer {
+    ids: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl apcore::registry::registry::Discoverer for HardeningRestoringDiscoverer {
+    async fn discover(
+        &self,
+        _roots: &[String],
+    ) -> Result<Vec<apcore::registry::registry::DiscoveredModule>, apcore::errors::ModuleError>
+    {
+        use apcore::registry::registry::{DiscoveredModule, ModuleDescriptor};
+        Ok(self
+            .ids
+            .iter()
+            .map(|id| DiscoveredModule {
+                name: id.clone(),
+                source: "conformance".to_string(),
+                descriptor: ModuleDescriptor {
+                    module_id: id.clone(),
+                    name: None,
+                    description: "test module".to_string(),
+                    documentation: None,
+                    input_schema: json!({"type": "object"}),
+                    output_schema: json!({"type": "object"}),
+                    version: "1.0.0".to_string(),
+                    tags: vec![],
+                    annotations: None,
+                    examples: vec![],
+                    metadata: HashMap::new(),
+                    display: None,
+                    sunset_date: None,
+                    dependencies: vec![],
+                    enabled: true,
+                },
+                module: Arc::new(DummyModule),
+            })
+            .collect())
     }
 }

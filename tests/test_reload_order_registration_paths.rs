@@ -325,6 +325,11 @@ async fn four_arg_register_metadata_dependencies_survive_registration_and_order_
 
     assert_dependencies_survived(&registry, &case.declared, "register_versioned metadata");
 
+    // Path 1 above installs a DefaultDiscoverer; this path registers
+    // programmatically, so supply the equivalent restoring discoverer or the
+    // reload fails with RELOAD_FAILED before order can be observed.
+    crate::reload_support::RestoringDiscoverer::attach_for(&registry, &case.registered);
+
     let actual = observe_reload_order(&registry, case.input.clone()).await;
     assert_topological_not_alphabetical(&actual, &case, "register_versioned metadata");
 }

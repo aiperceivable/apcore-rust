@@ -129,6 +129,24 @@ async fn conformance_reload_path_filter() {
             );
         }
 
+        // Attach a discoverer that still "sees" every registered module, modelling
+        // a filesystem discoverer whose files are untouched by the reload.
+        //
+        // Without this the driver asserted the fixture's semantics on a false
+        // premise: the fixture states "Only matching IDs are re-discovered and
+        // reloaded", but the registry had no discoverer at all, so the only way
+        // this driver could pass was an implementation that reported success
+        // WITHOUT re-discovering — which is exactly the defect fixed in
+        // sync-2026-08-27 (A-D-011). apcore-python's driver for this same fixture
+        // patches `_rediscover_module` with a restoring stub for the same reason.
+        let all_ids: Vec<String> = tc["registered_modules"]
+            .as_array()
+            .expect("registered_modules is an array")
+            .iter()
+            .map(|v| v.as_str().expect("module id is a string").to_string())
+            .collect();
+        registry.set_discoverer(Box::new(RestoringDiscoverer { ids: all_ids }));
+
         let reload = ReloadModule::new(Arc::clone(&registry), Arc::new(EventEmitter::new()));
         let outcome = reload.execute(tc["input"].clone(), &dummy_ctx()).await;
 
@@ -195,5 +213,67 @@ async fn conformance_reload_path_filter() {
                 ),
             }
         }
+    }
+}
+
+/// Re-supplies a fixed set of module ids on `discover()`, standing in for the
+/// filesystem discoverer that repopulates the registry after an unregister.
+struct RestoringDiscoverer {
+    ids: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl apcore::registry::registry::Discoverer for RestoringDiscoverer {
+    async fn discover(
+        &self,
+        _roots: &[String],
+    ) -> Result<Vec<apcore::registry::registry::DiscoveredModule>, apcore::errors::ModuleError>
+    {
+        struct Restored;
+        #[async_trait::async_trait]
+        impl Module for Restored {
+            fn description(&self) -> &'static str {
+                "restored"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn output_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(
+                &self,
+                _i: serde_json::Value,
+                _c: &Context<serde_json::Value>,
+            ) -> Result<serde_json::Value, apcore::errors::ModuleError> {
+                Ok(serde_json::json!({}))
+            }
+        }
+        Ok(self
+            .ids
+            .iter()
+            .map(|id| apcore::registry::registry::DiscoveredModule {
+                name: id.clone(),
+                source: "conformance".to_string(),
+                descriptor: ModuleDescriptor {
+                    module_id: id.clone(),
+                    name: None,
+                    description: "restored".to_string(),
+                    documentation: None,
+                    input_schema: serde_json::json!({}),
+                    output_schema: serde_json::json!({}),
+                    version: "1.0.0".to_string(),
+                    tags: vec![],
+                    annotations: Some(ModuleAnnotations::default()),
+                    examples: vec![],
+                    metadata: HashMap::new(),
+                    display: None,
+                    sunset_date: None,
+                    dependencies: vec![],
+                    enabled: true,
+                },
+                module: Arc::new(Restored),
+            })
+            .collect())
     }
 }

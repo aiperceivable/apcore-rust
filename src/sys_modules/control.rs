@@ -419,25 +419,48 @@ impl ReloadModule {
         self.registry.safe_unregister(&module_id, 5000).await?;
 
         // (4) Re-run the configured discoverer to repopulate the registry.
-        // Best-effort: if no discoverer is attached (NoDiscovererConfigured)
-        // or discovery fails, log and continue — the SDK still emits the
-        // reload event so observers are notified.
-        match self.registry.discover_internal().await {
-            Ok(count) => tracing::debug!(
-                module_id = %module_id,
-                count,
-                "Reload: discover_internal repopulated registry"
-            ),
-            Err(e) => tracing::warn!(
+        //
+        // NOT best-effort: step 3 already unregistered the module, so swallowing a
+        // discovery failure here reports `success: true` for a module that is now
+        // gone. The spec Contract lists ReloadFailedError for exactly this —
+        // "registry.discover() raised or module_id was absent after discovery" —
+        // and apcore-python / apcore-typescript both raise it.
+        if let Err(e) = self.registry.discover_internal().await {
+            tracing::error!(
                 module_id = %module_id,
                 error = %e.message,
-                "Reload: discover_internal returned error (best-effort, continuing)"
-            ),
+                "Reload: discover_internal failed after unregistering"
+            );
+            return Err(ModuleError::new(
+                ErrorCode::ReloadFailed,
+                format!(
+                    "Reload of '{module_id}' unregistered the module but re-discovery \
+                     failed: {}",
+                    e.message
+                ),
+            ));
         }
 
         // (5) register_internal: in Rust we don't carry stand-alone factory
         // closures, so re-registration is delegated to the discoverer in step
         // 4. This branch is intentionally a no-op for cross-language parity.
+        //
+        // The presence check the delegation makes necessary: if the discoverer
+        // ran without error but did not bring this module back, the reload has
+        // still failed and must not report success.
+        if !self.registry.has(&module_id) {
+            tracing::error!(
+                module_id = %module_id,
+                "Reload: module absent after re-discovery"
+            );
+            return Err(ModuleError::new(
+                ErrorCode::ReloadFailed,
+                format!(
+                    "Reload of '{module_id}': module was not restored by re-discovery \
+                     and is no longer registered"
+                ),
+            ));
+        }
 
         // (6) on_resume (best-effort) — handoff state to the freshly loaded module.
         let new_version = self
@@ -518,6 +541,45 @@ impl ReloadModule {
         }))
     }
 
+    /// Partition freshly re-discovered ids into those that came back (emitting
+    /// `apcore.module.reloaded` for each) and those that did not.
+    ///
+    /// Split out of `execute_bulk` to keep it under the function-length lint.
+    async fn verify_and_emit_reloaded(
+        &self,
+        unregistered: Vec<String>,
+        reason: &str,
+        ctx: &Context<serde_json::Value>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut reloaded: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for mid in unregistered {
+            if !self.registry.has(&mid) {
+                missing.push(mid);
+                continue;
+            }
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let event_data = augment_with_context_identity(
+                json!({
+                    "previous_version": "unknown",
+                    "new_version": "unknown",
+                    "reason": reason,
+                }),
+                ctx,
+            );
+            emit_event(
+                &self.emitter,
+                "apcore.module.reloaded",
+                &mid,
+                &timestamp,
+                event_data,
+            )
+            .await;
+            reloaded.push(mid);
+        }
+        (reloaded, missing)
+    }
+
     async fn execute_bulk(
         &self,
         path_filter: String,
@@ -542,36 +604,69 @@ impl ReloadModule {
         let order = self.topo_sort_modules(&matched);
         let start = std::time::Instant::now();
 
-        let mut reloaded: Vec<String> = Vec::new();
+        // Phase 1 — unregister every match, recording what we actually took out.
+        // Nothing may be reported as reloaded on the strength of this phase alone:
+        // an unregister that is never followed by a successful re-discovery is a
+        // deletion, and this method previously returned `success: true` for exactly
+        // that (it pushed each id here and never re-discovered at all).
+        let mut unregistered: Vec<String> = Vec::new();
         for mid in order {
             if !self.registry.has(&mid) {
                 continue;
             }
             match self.registry.safe_unregister(&mid, 5000).await {
-                Ok(_) => {
-                    let timestamp = chrono::Utc::now().to_rfc3339();
-                    let event_data = augment_with_context_identity(
-                        json!({
-                            "previous_version": "unknown",
-                            "new_version": "unknown",
-                            "reason": reason,
-                        }),
-                        ctx,
-                    );
-                    emit_event(
-                        &self.emitter,
-                        "apcore.module.reloaded",
-                        &mid,
-                        &timestamp,
-                        event_data,
-                    )
-                    .await;
-                    reloaded.push(mid);
-                }
+                Ok(_) => unregistered.push(mid),
                 Err(e) => {
                     tracing::error!(error = %e, module_id = %mid, "Bulk reload: failed to unregister");
                 }
             }
+        }
+
+        // Phase 2 — one re-discovery for the whole batch, mirroring `execute_single`
+        // step 4 and apcore-typescript's single `registry.discover()`.
+        //
+        // Unlike `execute_single`, a discovery error here is FATAL rather than
+        // best-effort: the batch is already unregistered, so continuing would
+        // silently delete every matched module and report success.
+        if let Err(e) = self.registry.discover_internal().await {
+            tracing::error!(
+                error = %e.message,
+                path_filter = %path_filter,
+                count = unregistered.len(),
+                "Bulk reload: re-discovery failed after unregistering"
+            );
+            return Err(ModuleError::new(
+                ErrorCode::ReloadFailed,
+                format!(
+                    "Bulk reload of '{path_filter}' unregistered {} module(s) but re-discovery \
+                     failed: {}. Affected: {}",
+                    unregistered.len(),
+                    e.message,
+                    unregistered.join(", ")
+                ),
+            ));
+        }
+
+        // Phase 3 — a module counts as reloaded only if it is actually back.
+        let (reloaded, missing) = self
+            .verify_and_emit_reloaded(unregistered, reason, ctx)
+            .await;
+
+        if !missing.is_empty() {
+            tracing::error!(
+                path_filter = %path_filter,
+                missing = %missing.join(", "),
+                "Bulk reload: modules absent after re-discovery"
+            );
+            return Err(ModuleError::new(
+                ErrorCode::ReloadFailed,
+                format!(
+                    "Bulk reload of '{path_filter}': {} module(s) were not restored by \
+                     re-discovery and are no longer registered: {}",
+                    missing.len(),
+                    missing.join(", ")
+                ),
+            ));
         }
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;

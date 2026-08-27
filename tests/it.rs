@@ -66,6 +66,8 @@ mod observability_spec;
 mod policy_governance;
 #[path = "registry_system_spec.rs"]
 mod registry_system_spec;
+#[path = "reload_support.rs"]
+mod reload_support;
 #[path = "schema_system_spec.rs"]
 mod schema_system_spec;
 #[path = "streaming_spec.rs"]

@@ -121,6 +121,10 @@ fn register_dummy(registry: &Arc<Registry>, id: &str) {
 fn registry_with_module(id: &str) -> Arc<Registry> {
     let reg = make_registry();
     register_dummy(&reg, id);
+    // reload unregisters before re-discovering; without a discoverer the module
+    // cannot come back and the call fails with RELOAD_FAILED (matching
+    // apcore-python). Tests here assert other properties, so restore it.
+    crate::reload_support::RestoringDiscoverer::attach_for(&reg, &[id.to_string()]);
     reg
 }
 
