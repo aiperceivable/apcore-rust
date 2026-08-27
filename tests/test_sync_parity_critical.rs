@@ -391,15 +391,23 @@ fn c4_file_value_wins_over_default() {
 #[test]
 fn c4_defaults_do_not_satisfy_required_field_validation() {
     let config = Config::default();
+    // `schema.root` HAS a canonical default, so it exercises the two accessors'
+    // split; `version` has none, which is why it is required at all.
     assert_eq!(
-        config.get("version"),
-        Some(json!("0.16.0")),
+        config.get("schema.root"),
+        Some(json!("./schemas")),
         "get() must surface the canonical default"
     );
     assert_eq!(
-        config.get_declared("version"),
+        config.get_declared("schema.root"),
         None,
         "get_declared() must not surface a defaulted value"
+    );
+    assert_eq!(
+        config.get("version"),
+        None,
+        "`version` has no canonical default — defaults.schema.json declares \
+         none, and neither peer SDK invents one"
     );
     let err = config
         .validate()

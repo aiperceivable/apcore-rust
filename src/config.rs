@@ -377,12 +377,13 @@ pub fn config_default_keys() -> Vec<&'static str> {
 }
 
 const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
-    // Not modelled in defaults.schema.json; sourced from apcore-python
-    // `_DEFAULTS["version"]` — the frozen baseline spec version that
-    // legacy-mode configs are parsed against, NOT the SDK version.
-    ("version", DefaultValue::Str("0.16.0")),
-    // Not modelled in defaults.schema.json; sourced from apcore-python
-    // `_DEFAULTS["project"]`.
+    // No `version` entry, and no `project.name`: `defaults.schema.json`
+    // declares neither, which is exactly what makes them §9.1's two required
+    // fields. This table used to carry `version: "0.16.0"` — half of the
+    // invented `version`/`project.name` pair every SDK once shipped — so
+    // `get("version")` answered a stale frozen spec version here while
+    // apcore-python and apcore-typescript answered nothing (A-D-021). The
+    // required-field check was never affected: it reads `get_declared`.
     ("extensions.root", DefaultValue::Str("./extensions")),
     ("extensions.auto_discover", DefaultValue::Bool(true)),
     ("extensions.max_depth", DefaultValue::Int(8)),
@@ -2382,6 +2383,15 @@ fn init_builtin_namespaces() {
                     "manifest": { "enabled": true },
                     "usage": { "enabled": true, "retention_hours": 168, "bucketing_strategy": "hourly" },
                     "control": { "enabled": true },
+                    // `error_history` is declared with defaults by
+                    // schemas/sys-modules.schema.json and was missing here.
+                    // `control.overrides_path` is the one deliberate omission:
+                    // its declared default is null, which a namespace default
+                    // cannot express distinctly from absence (A-D-021).
+                    "error_history": {
+                        "max_entries_per_module": 50,
+                        "max_total_entries": 1000
+                    },
                     "events": {
                         "enabled": false,
                         "subscribers": [],

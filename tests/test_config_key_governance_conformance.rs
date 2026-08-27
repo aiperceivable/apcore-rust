@@ -392,3 +392,140 @@ fn governance_fixture_is_derived_not_authored() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Default tiers mirror the canonical schemas (sync finding A-D-021)
+// ---------------------------------------------------------------------------
+
+fn schemas_root() -> std::path::PathBuf {
+    find_fixtures_root()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("fixtures live under <spec repo>/conformance/fixtures")
+        .join("schemas")
+}
+
+fn read_schema_file(name: &str) -> serde_json::Value {
+    let path = schemas_root().join(name);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()))
+}
+
+/// Every `default:` a schema declares, as full dot-paths.
+fn schema_defaults(node: &serde_json::Value, prefix: &str) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    let Some(props) = node
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return out;
+    };
+    for (key, value) in props {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if let Some(default) = value.get("default") {
+            out.push((path.clone(), default.clone()));
+        }
+        out.extend(schema_defaults(value, &path));
+    }
+    out
+}
+
+/// Every default `defaults.schema.json` declares must be readable, with its
+/// declared value, from a Config that was given nothing.
+///
+/// Narrower than [`config_defaults_declare_no_undeclared_key`], which passes on
+/// a table carrying EXTRA keys because some other schema allows them too.
+/// `defaults.schema.json` IS the legacy default tier — apcore-python carried
+/// six extra `sys_modules` leaves under exactly that gap, so `get` on them
+/// answered a value there and `None` here over the same call (A-D-021).
+///
+/// Read back through `get` rather than compared against `CONFIG_DEFAULTS`:
+/// this SDK resolves `executor.*` and `observability.*` from the typed structs'
+/// `Default` impls rather than the const table, so a key-set comparison would
+/// report seven false absences.
+#[test]
+fn every_canonical_default_is_readable_from_a_bare_config() {
+    let canonical = schema_defaults(&read_schema_file("defaults.schema.json"), "");
+    assert!(
+        canonical.len() >= 18,
+        "the canonical default set looks wrong: {canonical:?}"
+    );
+
+    let config = apcore::config::Config::from_defaults();
+    let mut wrong: Vec<String> = Vec::new();
+    for (key, expected) in &canonical {
+        match config.get(key) {
+            None => wrong.push(format!("{key}: absent, schema declares {expected}")),
+            Some(actual) if !numbers_equal(&actual, expected) => {
+                wrong.push(format!("{key}: got {actual}, schema declares {expected}"));
+            }
+            Some(_) => {}
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the default tier disagrees with defaults.schema.json:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// JSON numbers compare across int/float spellings; everything else by value.
+fn numbers_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) if !a.is_boolean() && !b.is_boolean() => (x - y).abs() < f64::EPSILON,
+        _ => a == b,
+    }
+}
+
+/// §9.15.3 gives `sys-modules.schema.json` ownership of that namespace, and it
+/// declares fourteen defaults. The registration supplied twelve —
+/// `error_history.*` was missing, so those keys resolved to `None` in namespace
+/// mode while the schema documents a value.
+///
+/// Read back through `get` rather than off the registration struct: what the
+/// contract owes a caller is the resolved value, and the registry's `defaults`
+/// field is not public.
+///
+/// `control.overrides_path` is excluded — its declared default is null, which a
+/// namespace default cannot express distinctly from absence.
+#[test]
+fn the_sys_modules_namespace_supplies_every_default_its_schema_declares() {
+    let declared: Vec<(String, serde_json::Value)> =
+        schema_defaults(&read_schema_file("sys-modules.schema.json"), "")
+            .into_iter()
+            .filter(|(_, v)| !v.is_null())
+            .collect();
+    assert!(
+        declared.len() >= 13,
+        "the schema's default set looks wrong: {declared:?}"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("apcore.json");
+    std::fs::write(&path, r#"{"apcore": {"version": "1.0"}}"#).expect("write config");
+    let config = apcore::config::Config::load(&path).expect("namespace-mode load");
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (key, expected) in &declared {
+        let dotted = format!("sys_modules.{key}");
+        match config.get(&dotted) {
+            None => wrong.push(format!("{dotted}: absent, schema declares {expected}")),
+            Some(actual) if &actual != expected => {
+                wrong.push(format!(
+                    "{dotted}: got {actual}, schema declares {expected}"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the sys_modules namespace disagrees with its own schema:\n  {}",
+        wrong.join("\n  ")
+    );
+}

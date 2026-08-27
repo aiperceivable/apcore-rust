@@ -316,10 +316,11 @@ fn required_fields_are_read_from_the_file() {
         config.get_declared("project.name"),
         Some(json!("sections-fixture"))
     );
-    assert_ne!(
-        config.get("version"),
+    assert_eq!(
         Config::default_for("version"),
-        "the file's version must win over the `0.16.0` baseline in CONFIG_DEFAULTS"
+        None,
+        "`version` must have no canonical default — it is required precisely \
+         because defaults.schema.json declares none"
     );
 }
 
