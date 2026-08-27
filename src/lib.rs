@@ -107,9 +107,10 @@ pub use middleware::{
     AfterMiddleware, BeforeMiddleware, CircuitBreakerBuilder, CircuitBreakerConfig,
     CircuitBreakerMiddleware, CircuitBreakerMiddlewareConfig, CircuitBreakerState, ContextWriter,
     CustomMiddlewareConfig, CustomMiddlewareFactory, LoggingMiddleware, LoggingMiddlewareConfig,
-    Middleware, MiddlewareChainConfig, MiddlewareConfig, MiddlewareFactory, MiddlewareManager,
-    MiddlewareRegistration, NamespaceCheck, OnErrorOutcome, PlatformNotifyMiddleware, RetryConfig,
-    RetryMiddleware, RetrySignal, TracingMiddlewareConfig, APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
+    Middleware, MiddlewareChainConfig, MiddlewareConfig, MiddlewareFactory, MiddlewareHandle,
+    MiddlewareManager, MiddlewareRegistration, NamespaceCheck, OnErrorOutcome,
+    PlatformNotifyMiddleware, RetryConfig, RetryMiddleware, RetrySignal, TracingMiddlewareConfig,
+    APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
 };
 pub use module::{
     Change, ChunkStream, Module, ModuleAnnotations, ModuleExample, PreflightCheckResult,

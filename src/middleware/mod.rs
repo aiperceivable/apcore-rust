@@ -24,7 +24,7 @@ pub use context_namespace::{
     APCORE_KEY_PREFIX, EXT_KEY_PREFIX,
 };
 pub use logging::LoggingMiddleware;
-pub use manager::{MiddlewareManager, MiddlewareRegistration};
+pub use manager::{MiddlewareHandle, MiddlewareManager, MiddlewareRegistration};
 pub use retry::{RetryConfig, RetryMiddleware};
 pub use yaml_config::{
     CircuitBreakerMiddlewareConfig, CustomMiddlewareConfig, CustomMiddlewareFactory,

@@ -14,6 +14,7 @@ use crate::events::subscribers::EventSubscriber;
 use crate::executor::Executor;
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
+use crate::middleware::manager::MiddlewareHandle;
 use crate::module::ModuleAnnotations;
 use crate::observability::metrics::MetricsCollector;
 use crate::registry::registry::{ModuleDescriptor, Registry, DEFAULT_MODULE_VERSION};
@@ -431,6 +432,36 @@ impl APCore {
         Ok(self)
     }
 
+    /// Add a middleware and keep a token that names exactly this registration.
+    ///
+    /// The chaining form above returns `&Self`, which is what most call sites
+    /// want; this one returns the [`MiddlewareHandle`] instead, for a caller
+    /// that intends to remove this specific middleware later via
+    /// [`remove_handle`](Self::remove_handle).
+    ///
+    /// `Contract: APCore.remove` removes by IDENTITY — apcore-python and
+    /// apcore-typescript take the middleware object back and compare it with
+    /// `is` / `===`. Rust cannot: `use_middleware` consumes the `Box`, so the
+    /// caller has no object left to hand back. The handle is that identity.
+    /// It matters because duplicate registration only WARNS — it never fails —
+    /// so two instances answering the same `name()` is a reachable state, and
+    /// [`remove`](Self::remove) drops whichever comes first in pipeline order
+    /// rather than the one the caller meant (sync finding A-C-001).
+    pub fn use_middleware_handle(
+        &self,
+        middleware: Box<dyn Middleware>,
+    ) -> Result<MiddlewareHandle, crate::errors::ModuleError> {
+        self.executor.use_middleware(middleware)
+    }
+
+    /// Remove exactly the middleware that
+    /// [`use_middleware_handle`](Self::use_middleware_handle) returned `handle`
+    /// for. Returns `false` if it is no longer registered — idempotent, like
+    /// the two peer SDKs' `remove`.
+    pub fn remove_handle(&self, handle: MiddlewareHandle) -> bool {
+        self.executor.remove_handle(handle)
+    }
+
     /// Remove a middleware by its name string.
     ///
     /// This is a Rust-specific convenience that accepts a `&str` directly.
@@ -448,10 +479,20 @@ impl APCore {
     /// Remove a middleware by reference, extracting its name via
     /// [`Middleware::name()`].
     ///
-    /// This mirrors the Python and TypeScript `remove(middleware)` API,
-    /// which accept the middleware object directly. In Rust, since trait
-    /// objects do not support identity comparison, the middleware is matched
-    /// by its [`name()`](Middleware::name) return value.
+    /// This mirrors the shape of the Python and TypeScript `remove(middleware)`
+    /// API, which accept the middleware object directly — but not its
+    /// semantics: the middleware is matched by its
+    /// [`name()`](Middleware::name), so with two instances answering the same
+    /// name it removes whichever comes first in pipeline order, not the one
+    /// passed in.
+    ///
+    /// The reason is NOT that trait objects cannot be compared by identity —
+    /// `Arc::ptr_eq` has ignored vtable metadata since Rust 1.76, below this
+    /// crate's MSRV. It is that [`use_middleware`](Self::use_middleware)
+    /// consumes the `Box`, so by the time a caller wants to remove one it holds
+    /// no pointer to compare against. For identity-exact removal, register with
+    /// [`use_middleware_handle`](Self::use_middleware_handle) and remove with
+    /// [`remove_handle`](Self::remove_handle) (sync finding A-C-001).
     pub fn remove_middleware(&self, middleware: &dyn Middleware) -> bool {
         self.executor.remove(middleware.name())
     }

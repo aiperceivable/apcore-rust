@@ -192,6 +192,7 @@ mod test_middleware;
 mod test_middleware_duplicate_detection;
 #[path = "test_middleware_hardening_conformance.rs"]
 mod test_middleware_hardening_conformance;
+mod test_middleware_identity_removal;
 #[path = "test_middleware_on_error_single_site.rs"]
 mod test_middleware_on_error_single_site;
 #[path = "test_module.rs"]

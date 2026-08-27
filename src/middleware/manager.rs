@@ -2,6 +2,7 @@
 // Spec reference: Middleware pipeline execution
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -56,9 +57,30 @@ impl<M: Middleware + 'static> MiddlewareRegistration<M> {
 #[derive(Debug)]
 pub struct MiddlewareManager {
     middlewares: Mutex<Vec<Arc<dyn Middleware>>>,
+    /// Parallel to `middlewares`: the handle issued for each registration, so
+    /// [`MiddlewareManager::remove_handle`] can remove exactly one even when
+    /// several answer the same `name()`. Duplicate registration only WARNS —
+    /// it never fails — so two instances sharing a name is a reachable state,
+    /// and `remove(name)` drops the first in pipeline order rather than the one
+    /// the caller holds (sync finding A-C-001).
+    handles: Mutex<Vec<MiddlewareHandle>>,
+    next_handle: AtomicU64,
     /// Tracks identity -> first registration location hint for duplicate detection.
     registered_identities: Mutex<HashMap<String, String>>,
 }
+
+/// Opaque token identifying one middleware registration, returned by
+/// [`MiddlewareManager::add`] and consumed by
+/// [`MiddlewareManager::remove_handle`].
+///
+/// The cross-language contract (`Contract: APCore.remove`) removes by IDENTITY:
+/// apcore-python and apcore-typescript take the middleware object and compare
+/// with `is` / `===`. Rust cannot take the object back — `use_middleware`
+/// consumes the `Box` — so the handle is the identity the caller keeps. Mirrors
+/// [`SubscriberHandle`](crate::events::SubscriberHandle), which exists for the
+/// same reason on the event bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MiddlewareHandle(u64);
 
 impl MiddlewareManager {
     /// Create a new empty middleware manager.
@@ -66,6 +88,8 @@ impl MiddlewareManager {
     pub fn new() -> Self {
         Self {
             middlewares: Mutex::new(vec![]),
+            handles: Mutex::new(vec![]),
+            next_handle: AtomicU64::new(0),
             registered_identities: Mutex::new(HashMap::new()),
         }
     }
@@ -82,7 +106,7 @@ impl MiddlewareManager {
     /// is possible through a shared reference. This allows `MiddlewareManager`
     /// to be held as `Arc<MiddlewareManager>` and mutated without `Arc::get_mut`
     /// hacks, even after the `Arc` has been cloned into pipeline contexts.
-    pub fn add(&self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
+    pub fn add(&self, middleware: Box<dyn Middleware>) -> Result<MiddlewareHandle, ModuleError> {
         let priority = middleware.priority();
         if priority > 1000 {
             tracing::warn!(
@@ -101,6 +125,7 @@ impl MiddlewareManager {
             ));
         }
         let mut mws = self.middlewares.lock();
+        let mut handles = self.handles.lock();
         let arc: Arc<dyn Middleware> = Arc::from(middleware);
         // Find the first position where existing priority is strictly less than
         // the new priority. Insert before that position to maintain stable
@@ -109,8 +134,10 @@ impl MiddlewareManager {
             .iter()
             .position(|m| m.priority() < priority)
             .unwrap_or(mws.len());
+        let handle = MiddlewareHandle(self.next_handle.fetch_add(1, Ordering::SeqCst));
         mws.insert(pos, arc);
-        Ok(())
+        handles.insert(pos, handle);
+        Ok(handle)
     }
 
     /// Register a middleware with duplicate-detection options.
@@ -127,7 +154,7 @@ impl MiddlewareManager {
     pub fn add_with_opts<M: Middleware + 'static>(
         &self,
         opts: MiddlewareRegistration<M>,
-    ) -> Result<(), ModuleError> {
+    ) -> Result<MiddlewareHandle, ModuleError> {
         let location = std::panic::Location::caller().to_string();
         let identity = opts
             .identity_key
@@ -188,13 +215,33 @@ impl MiddlewareManager {
     /// Takes `&self` — mutation goes through the internal `Mutex`.
     pub fn remove(&self, name: &str) -> bool {
         let mut mws = self.middlewares.lock();
-        let pos = mws.iter().position(|m| m.name() == name);
-        if let Some(i) = pos {
-            mws.remove(i);
-            true
-        } else {
-            false
-        }
+        let Some(i) = mws.iter().position(|m| m.name() == name) else {
+            return false;
+        };
+        mws.remove(i);
+        self.handles.lock().remove(i);
+        true
+    }
+
+    /// Remove exactly the middleware that [`Self::add`] returned `handle` for.
+    ///
+    /// Unambiguous regardless of `name()`, which is what the identity-based
+    /// contract requires and what `remove(name)` cannot provide: duplicate
+    /// registration warns but always succeeds, so two instances answering the
+    /// same name is a reachable state and `remove` drops whichever comes first
+    /// in pipeline order (sync finding A-C-001).
+    ///
+    /// Returns `false` when the handle names a middleware that is no longer
+    /// registered — the same shape `remove` uses, and idempotent for the same
+    /// reason.
+    pub fn remove_handle(&self, handle: MiddlewareHandle) -> bool {
+        let mut handles = self.handles.lock();
+        let Some(i) = handles.iter().position(|h| *h == handle) else {
+            return false;
+        };
+        handles.remove(i);
+        self.middlewares.lock().remove(i);
+        true
     }
 
     /// Return a snapshot of middleware names in pipeline order.

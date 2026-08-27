@@ -22,7 +22,7 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
 use crate::middleware::base::Middleware;
-use crate::middleware::manager::MiddlewareManager;
+use crate::middleware::manager::{MiddlewareHandle, MiddlewareManager};
 use crate::module::PreflightCheckResult as PfCheck;
 use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::pipeline::{
@@ -812,13 +812,34 @@ impl Executor {
     /// middleware added after construction. This removes the previous
     /// `Arc::get_mut` hack that panicked once the middleware manager was
     /// cloned into a pipeline context.
-    pub fn use_middleware(&self, middleware: Box<dyn Middleware>) -> Result<(), ModuleError> {
+    ///
+    /// Returns the [`MiddlewareHandle`] for this registration. Keep it to remove
+    /// exactly this middleware later via [`Self::remove_handle`]; `remove(name)`
+    /// cannot, because duplicate registration only warns and two instances
+    /// answering the same `name()` is a reachable state (sync finding A-C-001).
+    /// Discarding the handle with `?;` stays valid, so existing callers are
+    /// unaffected.
+    pub fn use_middleware(
+        &self,
+        middleware: Box<dyn Middleware>,
+    ) -> Result<MiddlewareHandle, ModuleError> {
         self.middleware_manager.add(middleware)
     }
 
     /// Remove a middleware by name.
+    ///
+    /// Removes the FIRST match in pipeline order. When the caller means one
+    /// specific instance, use [`Self::remove_handle`] — that is the
+    /// identity-based removal `Contract: APCore.remove` describes, which
+    /// apcore-python and apcore-typescript get from comparing the object itself.
     pub fn remove(&self, name: &str) -> bool {
         self.middleware_manager.remove(name)
+    }
+
+    /// Remove exactly the middleware that [`Self::use_middleware`] returned
+    /// `handle` for. Returns `false` if it is no longer registered.
+    pub fn remove_handle(&self, handle: MiddlewareHandle) -> bool {
+        self.middleware_manager.remove_handle(handle)
     }
 
     /// Remove a middleware by name (legacy alias).
@@ -1959,13 +1980,19 @@ impl Executor {
     }
 
     /// Add a before middleware.
-    pub fn use_before(&self, middleware: Box<dyn BeforeMiddleware>) -> Result<(), ModuleError> {
+    pub fn use_before(
+        &self,
+        middleware: Box<dyn BeforeMiddleware>,
+    ) -> Result<MiddlewareHandle, ModuleError> {
         self.middleware_manager
             .add(Box::new(BoxedBeforeMiddlewareAdapter(middleware)))
     }
 
     /// Add an after middleware.
-    pub fn use_after(&self, middleware: Box<dyn AfterMiddleware>) -> Result<(), ModuleError> {
+    pub fn use_after(
+        &self,
+        middleware: Box<dyn AfterMiddleware>,
+    ) -> Result<MiddlewareHandle, ModuleError> {
         self.middleware_manager
             .add(Box::new(BoxedAfterMiddlewareAdapter(middleware)))
     }
