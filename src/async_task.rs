@@ -43,9 +43,13 @@ impl TaskStatus {
 
 /// Metadata and result tracking for a submitted async task.
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern. `task_id` and `module_id`
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1. `task_id` and `module_id`
 /// default to empty strings and SHOULD be set explicitly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -186,9 +190,13 @@ impl TaskStore for InMemoryTaskStore {
 
 /// Retry policy applied per task on failure.
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct RetryConfig {
@@ -266,9 +274,13 @@ impl RetryConfig {
 
 /// Configuration for the [`AsyncTaskManager`] background reaper.
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ReaperConfig {

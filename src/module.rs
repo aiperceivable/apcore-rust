@@ -356,9 +356,13 @@ pub static DEFAULT_ANNOTATIONS: LazyLock<ModuleAnnotations> =
 
 /// An example input/output pair for documentation.
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ModuleExample {
@@ -411,9 +415,13 @@ impl ValidationErrorDetail {
 
 /// Result of validating a single aspect (used by `SchemaValidator` and `ModuleValidator`).
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ValidationResult {
@@ -428,9 +436,13 @@ pub struct ValidationResult {
 
 /// Result of a single preflight check (spec §12.8.4).
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PreflightCheckResult {
@@ -448,9 +460,13 @@ pub struct PreflightCheckResult {
 
 /// Aggregated preflight results returned by `Executor::validate()` (spec §12.8.3).
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PreflightResult {
@@ -491,8 +507,12 @@ pub struct PreflightResult {
 /// rejected at deserialization time, matching the apcore-typescript TypeBox
 /// schema (which sets `additionalProperties: false`).
 ///
-/// Marked `#[non_exhaustive]` so future spec extensions can add fields without
-/// breaking downstream struct-literal construction.
+/// Marked `#[non_exhaustive]` so a future spec revision can add a field without
+/// a major version bump. That works by **removing struct-literal construction
+/// from every crate but this one** — `..Default::default()` included, since it
+/// is itself a struct expression (`error[E0639]`). Build one with
+/// [`Change::new`], which sets the three required fields; assign `before`,
+/// `after` and `extra` afterwards. See `api-surface-conventions.md` §9.1/§9.2.
 #[derive(Debug, Clone, Default, Serialize)]
 #[non_exhaustive]
 pub struct Change {
@@ -512,6 +532,40 @@ pub struct Change {
     /// with `x-`; deserialization rejects any other unknown keys.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Change {
+    /// Build a `Change` from its three required fields
+    /// (`api-surface-conventions.md` §9.2 rule 4).
+    ///
+    /// `#[non_exhaustive]` removes struct-literal construction for downstream
+    /// crates, and `Default::default()` alone would produce a value that is
+    /// structurally valid and semantically empty — three empty strings where
+    /// the RFC requires an action, a target and a summary. Set `before`,
+    /// `after` and `extra` on the returned value as needed.
+    ///
+    /// ```
+    /// use apcore::Change;
+    ///
+    /// let mut change = Change::new("delete", "users.42", "Delete user 42");
+    /// change.before = Some(serde_json::json!({ "active": true }));
+    /// assert_eq!(change.action, "delete");
+    /// ```
+    #[must_use]
+    pub fn new(
+        action: impl Into<String>,
+        target: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            target: target.into(),
+            summary: summary.into(),
+            before: None,
+            after: None,
+            extra: HashMap::new(),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Change {
@@ -583,13 +637,38 @@ impl<'de> Deserialize<'de> for Change {
 /// [`Module::preview`] hook; folded into [`PreflightResult::predicted_changes`]
 /// by `Executor::validate()`.
 ///
-/// Marked `#[non_exhaustive]` so future spec extensions can add fields.
+/// Marked `#[non_exhaustive]` so a future spec revision can add a field without
+/// a major version bump. That works by **removing struct-literal construction
+/// from every crate but this one** — `..Default::default()` included, since it
+/// is itself a struct expression (`error[E0639]`). Build one with
+/// [`PreviewResult::new`]. See `api-surface-conventions.md` §9.1/§9.2.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PreviewResult {
     /// Ordered list of predicted side-effects.
     #[serde(default)]
     pub changes: Vec<Change>,
+}
+
+impl PreviewResult {
+    /// Build a `PreviewResult` from its predicted changes
+    /// (`api-surface-conventions.md` §9.2 rule 2 — a `#[non_exhaustive]` type
+    /// must offer a construction path usable from a foreign crate).
+    ///
+    /// ```
+    /// use apcore::{Change, PreviewResult};
+    ///
+    /// let preview = PreviewResult::new(vec![Change::new(
+    ///     "send",
+    ///     "smtp:user@example.com",
+    ///     "Send the welcome email",
+    /// )]);
+    /// assert_eq!(preview.changes.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn new(changes: Vec<Change>) -> Self {
+        Self { changes }
+    }
 }
 
 /// Canonical name for the `acl` preflight check (PROTOCOL_SPEC §12.8.4 enum).

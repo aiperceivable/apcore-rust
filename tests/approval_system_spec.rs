@@ -61,12 +61,16 @@ fn result_with_status(status: &str) -> ApprovalResult {
 /// A handler whose `request_approval` resolves to the given status.
 /// Mirrors the Python `_status_handler` helper.
 fn status_handler(status: &'static str) -> CallbackApprovalHandler {
-    CallbackApprovalHandler::new(move |_req| {
+    // apcore#104: `new` is now async + fallible (parity with apcore-python /
+    // apcore-typescript); `new_sync` is the in-process, no-I/O form, and still
+    // returns a Result so a decision that could not be made is distinguishable
+    // from a rejection.
+    CallbackApprovalHandler::new_sync(move |_req| {
         let mut result = result_with_status(status);
         if status == "pending" {
             result.approval_id = Some("tok-1".to_string());
         }
-        result
+        Ok(result)
     })
 }
 
@@ -184,12 +188,12 @@ async fn approval_system_request_approval_property_thread_safe() {
     // N concurrent request_approval calls with distinct inputs complete without
     // panic and each returns the result correlated with its own input.
     let n = 12usize;
-    let handler: Arc<dyn ApprovalHandler> = Arc::new(CallbackApprovalHandler::new(|req| {
+    let handler: Arc<dyn ApprovalHandler> = Arc::new(CallbackApprovalHandler::new_sync(|req| {
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("mod".to_string(), json!(req.module_id));
         let mut result = result_with_status("approved");
         result.metadata = Some(metadata);
-        result
+        Ok(result)
     }));
 
     let mut join_handles = Vec::with_capacity(n);
@@ -224,9 +228,13 @@ async fn approval_system_request_approval_property_idempotent() {
     // distinct results for the same request.
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = Arc::clone(&counter);
-    let handler = CallbackApprovalHandler::new(move |_req| {
+    let handler = CallbackApprovalHandler::new_sync(move |_req| {
         let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        result_with_status(if n == 0 { "approved" } else { "rejected" })
+        Ok(result_with_status(if n == 0 {
+            "approved"
+        } else {
+            "rejected"
+        }))
     });
 
     let req = make_request("test.mod", json!({}));
@@ -281,8 +289,8 @@ async fn approval_system_request_approval_property_protocol_conformance() {
     let handlers: Vec<Box<dyn ApprovalHandler>> = vec![
         Box::new(AlwaysDenyHandler),
         Box::new(AutoApproveHandler),
-        Box::new(CallbackApprovalHandler::new(|_r| {
-            result_with_status("approved")
+        Box::new(CallbackApprovalHandler::new_sync(|_r| {
+            Ok(result_with_status("approved"))
         })),
     ];
     assert_eq!(handlers.len(), 3);

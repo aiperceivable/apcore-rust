@@ -94,8 +94,12 @@ mod test_acl_root_discovery;
 mod test_acl_root_discovery_conformance;
 #[path = "test_acl_sync_handler_error.rs"]
 mod test_acl_sync_handler_error;
+#[path = "test_acl_unevaluable_conditions.rs"]
+mod test_acl_unevaluable_conditions;
 #[path = "test_approval.rs"]
 mod test_approval;
+#[path = "test_approval_callback_handler.rs"]
+mod test_approval_callback_handler;
 #[path = "test_approval_decision_event.rs"]
 mod test_approval_decision_event;
 #[path = "test_approval_request_live_module_metadata.rs"]
@@ -227,6 +231,8 @@ mod test_pipeline_step_middleware_conformance;
 mod test_pipeline_tasks;
 #[path = "test_pipeline_types.rs"]
 mod test_pipeline_types;
+#[path = "test_policy_call_site.rs"]
+mod test_policy_call_site;
 #[path = "test_preflight_disclosure_conformance.rs"]
 mod test_preflight_disclosure_conformance;
 #[path = "test_redaction_config.rs"]

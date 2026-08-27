@@ -610,10 +610,22 @@ impl Step for BuiltinApprovalGate {
 
         // Consult the ExecutionPolicy (apcore#76). A matched rule (or
         // gate_destructive) overrides the module's declared governance values.
-        let decision: Option<PolicyDecision> = ctx
-            .policy
-            .clone()
-            .map(|policy| policy.resolve(&ctx.module_id, desc_annotations.as_ref()));
+        //
+        // PROTOCOL_SPEC §7.9.6 (v1.24.0, apcore#102): resolution receives the
+        // call site — the invocation `arguments` and the `Context` — which are
+        // already in scope here because the gate is Step 5. The built-in
+        // pattern rules MUST NOT consult them, so no existing verdict moves;
+        // the inputs exist so the call site reaches the audit trail and so a
+        // host-supplied policy could decide on arguments. Those arguments have
+        // NOT been schema-validated: input validation is Step 7.
+        let decision: Option<PolicyDecision> = ctx.policy.clone().map(|policy| {
+            policy.resolve_with_call_site(
+                &ctx.module_id,
+                desc_annotations.as_ref(),
+                Some(&ctx.inputs),
+                Some(&ctx.context),
+            )
+        });
 
         let (needs_approval, effective_destructive) = match &decision {
             Some(d) => (d.needs_approval, d.destructive),

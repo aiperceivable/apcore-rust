@@ -24,6 +24,7 @@
 
 use serde::Deserialize;
 
+use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::module::ModuleAnnotations;
 use crate::utils::{calculate_specificity, match_pattern};
@@ -188,6 +189,12 @@ impl ExecutionPolicy {
     /// Compute the effective governance decision for a module.
     ///
     /// Only `requires_approval` and `destructive` of `annotations` are consulted.
+    ///
+    /// Prefer [`Self::resolve_with_call_site`] from inside the execution
+    /// pipeline: PROTOCOL_SPEC §7.9.6 rule 1 requires policy resolution to
+    /// *receive* the invocation's arguments and `Context`. This form remains
+    /// for callers that have no call site (preflight tooling, tests, an
+    /// operator asking "what would this policy do to module X?").
     #[must_use]
     pub fn resolve(
         &self,
@@ -217,6 +224,71 @@ impl ExecutionPolicy {
             overridden: effective_requires_approval != base_requires_approval
                 || effective_destructive != base_destructive,
         }
+    }
+
+    /// Compute the effective governance decision for a module, given the call
+    /// site (PROTOCOL_SPEC §7.9.6, spec v1.24.0, apcore#102).
+    ///
+    /// Through v1.23.0 a policy could see only *which* module was being called,
+    /// never *what it was being called with*, so an operator who needed to gate
+    /// **some** calls to a module had to gate **all** of them — audit noise,
+    /// and `requires_approval` weakened from "this needs approval" to "this
+    /// might". The pipeline already holds the missing data at the point of the
+    /// decision: the approval gate is Step 5 and the invocation's `arguments`
+    /// and [`Context`] are in scope there.
+    ///
+    /// # The built-in rules do not consult the call site
+    ///
+    /// §7.9.6 rule 2 is a **MUST NOT**: a rule set's verdict stays a function
+    /// of the module ID and the annotations alone, so it remains statically
+    /// auditable and reproducible from the policy document. Rule 5 makes it a
+    /// MUST that adding the call site changes no existing verdict, and this
+    /// method delivers that by construction — it forwards to [`Self::resolve`].
+    /// The call site is carried into the trace (rule 3a) so it reaches the
+    /// audit trail alongside `apcore.policy.override`.
+    ///
+    /// # `arguments` have NOT been schema-validated
+    ///
+    /// §7.9.6 rule 4: the approval gate is Step 5 and input validation is
+    /// Step 7 (§12.8), so `arguments` here is whatever the caller passed,
+    /// possibly after `middleware_before` mutated it. It may be absent, of the
+    /// wrong type, or missing required properties. Any code reading it MUST
+    /// treat it as untrusted and MUST NOT assume it is well-formed.
+    ///
+    /// # Why an added method rather than a wider `resolve`
+    ///
+    /// §7.9.6 rule 5 explicitly permits an additional method "where extending
+    /// the existing signature would break its public API". `resolve` is `pub`
+    /// on a published crate and is the documented entry point in §7.9's status
+    /// line; widening it would break every external caller at compile time for
+    /// no behavioural gain, since rule 2 forbids the new inputs from changing
+    /// the verdict. Rust also has no default arguments and no overloading, so
+    /// the alternatives are a wider signature or an options struct — and an
+    /// options struct for two borrowed parameters buys nothing.
+    #[must_use]
+    pub fn resolve_with_call_site(
+        &self,
+        module_id: &str,
+        annotations: Option<&ModuleAnnotations>,
+        arguments: Option<&serde_json::Value>,
+        context: Option<&Context<serde_json::Value>>,
+    ) -> PolicyDecision {
+        // §7.9.6 rule 3(a): carry the call site into the trace. Only the shape
+        // is recorded, never argument values — the gate runs before input
+        // validation and an argument may hold whatever the caller sent,
+        // including credentials a module would later redact.
+        tracing::trace!(
+            module_id = %module_id,
+            has_arguments = arguments.is_some(),
+            argument_count = arguments
+                .and_then(serde_json::Value::as_object)
+                .map_or(0, serde_json::Map::len),
+            trace_id = context.map(|c| c.trace_id.as_str()),
+            call_depth = context.map(|c| c.call_chain.len()),
+            "policy resolution call site (§7.9.6; NOT consulted by the built-in pattern rules, \
+             and NOT schema-validated — the approval gate is Step 5, input validation is Step 7)"
+        );
+        self.resolve(module_id, annotations)
     }
 
     /// Return the winning rule for a module ID, or `None`.

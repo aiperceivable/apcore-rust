@@ -1109,8 +1109,12 @@ impl Executor {
             .flatten()
             .and_then(|desc| desc.annotations);
         let requires_approval = if let Some(policy) = self.policy.as_ref() {
+            // §7.9.6: preflight resolves through the same call-site-aware entry
+            // point the Step-5 gate uses, so the two cannot report different
+            // verdicts. The built-in rules ignore the call site (§7.9.6 rule 2),
+            // so this is identical to `resolve()` for any rule-based policy.
             policy
-                .resolve(module_id, desc_annotations.as_ref())
+                .resolve_with_call_site(module_id, desc_annotations.as_ref(), Some(inputs), ctx)
                 .needs_approval
         } else {
             desc_annotations

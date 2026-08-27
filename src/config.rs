@@ -404,9 +404,13 @@ const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
 ///
 /// All timeouts are in milliseconds.
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
@@ -434,9 +438,13 @@ impl Default for ExecutorConfig {
 
 /// Observability namespace configuration (`PROTOCOL_SPEC` §9.1).
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction. Construct
-/// via `..Default::default()` or a builder pattern.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
@@ -447,8 +455,13 @@ pub struct ObservabilityConfig {
 
 /// Tracing sub-config of `ObservabilityConfig` (`PROTOCOL_SPEC` §9.1).
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
@@ -482,8 +495,13 @@ impl Default for TracingConfig {
 
 /// Metrics sub-config of `ObservabilityConfig` (`PROTOCOL_SPEC` §9.1).
 ///
-/// Marked `#[non_exhaustive]` (issue #24) so future spec extensions can add
-/// fields without breaking downstream struct-literal construction.
+/// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
+/// field without a major version bump. That works by **removing struct-literal
+/// construction from every crate but this one** — `..Default::default()`
+/// included, since it is itself a struct expression (`error[E0639]`). From a
+/// downstream crate, start from `Default::default()` and assign the fields you
+/// need; there is no builder for this type. See
+/// `api-surface-conventions.md` §9.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]

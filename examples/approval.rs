@@ -112,22 +112,25 @@ fn build_registry() -> Registry {
 /// A request-dependent approval policy: approve only when the caller passed
 /// `confirmed=true`, otherwise reject with an explanatory reason. A real handler
 /// would block on a reviewer UI / Slack / e-mail; this one is deterministic.
+/// A synchronous, in-process decision — no I/O, so `new_sync` is the right
+/// constructor (apcore#104). This reviewer is a pure function of the request
+/// and cannot fail; the `Ok(...)` is added at the call site below, where the
+/// comment explains what the fallible shape buys a real handler.
 fn review(request: &ApprovalRequest) -> ApprovalResult {
     let approver = request
         .context
         .as_ref()
         .and_then(|c| c.identity.as_ref())
         .map_or_else(|| "anonymous".to_string(), |id| id.id().to_string());
-    // ApprovalResult is #[non_exhaustive]; construct via Default + field
-    // mutation rather than a cross-crate struct literal.
-    let mut result = ApprovalResult::default();
-    result.approved_by = Some(approver);
-    if request.arguments.get("confirmed") == Some(&Value::Bool(true)) {
-        result.status = "approved".to_string();
+    // ApprovalResult is #[non_exhaustive]: no cross-crate struct literal, and
+    // no `..Default::default()` either. The semantic constructors set `status`
+    // to a canonical value; `approved_by` is assigned afterwards.
+    let mut result = if request.arguments.get("confirmed") == Some(&Value::Bool(true)) {
+        ApprovalResult::approved(approver.clone())
     } else {
-        result.status = "rejected".to_string();
-        result.reason = Some("caller did not confirm the destructive operation".to_string());
-    }
+        ApprovalResult::rejected("caller did not confirm the destructive operation")
+    };
+    result.approved_by = Some(approver);
     result
 }
 
@@ -191,7 +194,15 @@ async fn run_scenarios(executor: &Executor, scenarios: &[Scenario]) -> u32 {
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut executor = Executor::new(build_registry(), Config::default());
-    executor.set_approval_handler(Box::new(CallbackApprovalHandler::new(review)));
+    // apcore#104: `CallbackApprovalHandler::new` is async and fallible (parity
+    // with apcore-python and apcore-typescript); `new_sync` is the in-process,
+    // no-I/O form. Both return a `Result`, so a handler that could not reach
+    // its approval service reports a FAILURE rather than fabricating a
+    // "rejected" result that reads in the audit log like a human saying no.
+    // This reviewer is pure, so it always succeeds.
+    executor.set_approval_handler(Box::new(CallbackApprovalHandler::new_sync(|req| {
+        Ok(review(req))
+    })));
 
     #[rustfmt::skip]
     let scenarios = [

@@ -7,10 +7,132 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use crate::context::Context;
+
+/// The three outcomes of evaluating an ACL condition (PROTOCOL_SPEC §6.1.1,
+/// spec v1.22.0, apcore#100).
+///
+/// A condition that **is false** and a condition that **cannot be evaluated**
+/// are different outcomes, and the difference decides what a `deny` rule does.
+/// Collapsing them into a `bool` is the defect §6.1.1 exists to prevent: it
+/// made a `deny` rule carrying a misspelled condition key silently inert.
+///
+/// | Rule `effect` | `Unsatisfied` | `Unevaluable` |
+/// |---|---|---|
+/// | `allow` | rule does not match → continue | rule does not match → continue (MUST NOT grant) |
+/// | `deny`  | rule does not match → continue | rule **takes effect** → the call is denied |
+///
+/// Exactly three situations produce [`ConditionOutcome::Unevaluable`]:
+/// the condition key has no registered handler; the handler panicked; or the
+/// handler was asynchronous and could not be resolved on the synchronous
+/// [`ACL::check`](crate::ACL::check) path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConditionOutcome {
+    /// A registered handler ran to completion and returned `true`.
+    Satisfied,
+    /// A registered handler ran to completion and returned `false`. An
+    /// ordinary non-match: evaluation continues with the next rule.
+    Unsatisfied,
+    /// No answer was obtainable at all (§6.1.1).
+    Unevaluable,
+}
+
+impl ConditionOutcome {
+    /// Map a handler's plain boolean answer onto the three-valued outcome.
+    #[must_use]
+    pub fn from_bool(value: bool) -> Self {
+        if value {
+            Self::Satisfied
+        } else {
+            Self::Unsatisfied
+        }
+    }
+
+    /// `true` only for [`ConditionOutcome::Satisfied`].
+    #[must_use]
+    pub fn is_satisfied(self) -> bool {
+        self == Self::Satisfied
+    }
+
+    /// `true` only for [`ConditionOutcome::Unevaluable`].
+    #[must_use]
+    pub fn is_unevaluable(self) -> bool {
+        self == Self::Unevaluable
+    }
+
+    /// Three-valued (Kleene) AND, per §6.1.1's composition table:
+    /// an outright `Unsatisfied` wins even against an unevaluable sibling;
+    /// otherwise any `Unevaluable` child makes the conjunction unevaluable.
+    #[must_use]
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unsatisfied, _) | (_, Self::Unsatisfied) => Self::Unsatisfied,
+            (Self::Unevaluable, _) | (_, Self::Unevaluable) => Self::Unevaluable,
+            (Self::Satisfied, Self::Satisfied) => Self::Satisfied,
+        }
+    }
+
+    /// Three-valued (Kleene) OR, per §6.1.1's composition table:
+    /// an outright `Satisfied` wins even against an unevaluable sibling;
+    /// otherwise any `Unevaluable` child makes the disjunction unevaluable.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Satisfied, _) | (_, Self::Satisfied) => Self::Satisfied,
+            (Self::Unevaluable, _) | (_, Self::Unevaluable) => Self::Unevaluable,
+            (Self::Unsatisfied, Self::Unsatisfied) => Self::Unsatisfied,
+        }
+    }
+
+    /// Three-valued (Kleene) NOT. `$not` of an unevaluable condition is
+    /// **unevaluable**, never satisfied (§6.1.1) — negating "no answer" into
+    /// "yes" would let a misspelled key inside a `$not` satisfy the very rule
+    /// it was meant to gate.
+    #[must_use]
+    pub fn negate(self) -> Self {
+        match self {
+            Self::Satisfied => Self::Unsatisfied,
+            Self::Unsatisfied => Self::Satisfied,
+            Self::Unevaluable => Self::Unevaluable,
+        }
+    }
+}
+
+/// Per-call accumulation of unevaluable-condition diagnostics, keyed by the
+/// offending condition key.
+///
+/// A `BTreeMap` rather than a `HashMap` on purpose: §6.1.1 rule 2 requires
+/// `handler_error` to list every unevaluable condition **ordered
+/// lexicographically by condition key**, not in evaluation order, because
+/// evaluation order is not portable across SDKs. `BTreeMap` iterates in
+/// ascending key order, so the required ordering is a property of the
+/// container we chose and not an accident of whatever map `serde_json`
+/// happens to use. See [`join_handler_errors`].
+type HandlerErrors = BTreeMap<String, String>;
+
+/// Join accumulated diagnostics into the single `AuditEntry.handler_error`
+/// string, ordered lexicographically by condition key and separated by `"; "`
+/// (PROTOCOL_SPEC §6.1.1 rule 2). Returns `None` when nothing was reported.
+fn join_handler_errors(errors: &HandlerErrors) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+    // Explicit: collect the values in ascending-key order, then join. The sort
+    // is `BTreeMap`'s ordering invariant, restated here so the rule is visible
+    // at the point it is applied.
+    let mut ordered: Vec<(&String, &String)> = errors.iter().collect();
+    ordered.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Some(
+        ordered
+            .into_iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
 
 // Per-call slot for the latest handler error message. Mirrors Python's
 // `_handler_error_var` ContextVar and TypeScript's `_lastHandlerError`
@@ -34,14 +156,66 @@ use crate::context::Context;
 // `with_handler_error_capture_sync`, so a stray report outside any check is a
 // no-op (matching the async task-local's behavior).
 tokio::task_local! {
-    pub(crate) static HANDLER_ERROR: RefCell<Option<String>>;
+    pub(crate) static HANDLER_ERROR: RefCell<HandlerErrors>;
 }
 
 thread_local! {
     // `(active_depth, slot)`. The depth guards against a stray
     // `report_handler_error` leaking into an unrelated later read: writes and
     // reads only apply while a `with_handler_error_capture_sync` scope is open.
-    static HANDLER_ERROR_SYNC: RefCell<(u32, Option<String>)> = const { RefCell::new((0, None)) };
+    static HANDLER_ERROR_SYNC: RefCell<(u32, HandlerErrors)> =
+        const { RefCell::new((0, BTreeMap::new())) };
+}
+
+/// Record that condition `key` was **unevaluable** (PROTOCOL_SPEC §6.1.1).
+///
+/// Unlike [`report_handler_error`], the condition key is supplied separately so
+/// the §6.1.1 rule 2 ordering ("lexicographically by condition key") is applied
+/// to the key itself rather than to a formatted message. The stored message is
+/// `"{key}: {reason}"`, matching the format all three SDKs emit.
+pub(crate) fn report_condition_unevaluable(key: &str, reason: impl std::fmt::Display) {
+    record_handler_error(key.to_string(), format!("{key}: {reason}"));
+}
+
+/// Insert one `(sort key, message)` pair into whichever capture scope is
+/// active. Shared by [`report_handler_error`] and
+/// [`report_condition_unevaluable`].
+fn record_handler_error(key: String, message: String) {
+    // Prefer the async task-local scope when present.
+    let key_for_sync = key.clone();
+    let message_for_sync = message.clone();
+    if HANDLER_ERROR
+        .try_with(move |cell| {
+            cell.borrow_mut().insert(key, message);
+        })
+        .is_ok()
+    {
+        return;
+    }
+    // Fall back to the synchronous thread-local scope, if one is active.
+    HANDLER_ERROR_SYNC.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.0 > 0 {
+            state.1.insert(key_for_sync, message_for_sync);
+        }
+    });
+}
+
+/// The condition keys reported as unevaluable in the active capture scope,
+/// in ascending key order. Empty outside any scope.
+///
+/// Used by the ACL rule loop to name the offending keys in the §6.1.1 rule 3
+/// warning, which must also carry the rule index and the rule's `effect` —
+/// neither of which is known this far down the call stack.
+pub(crate) fn reported_condition_keys() -> Vec<String> {
+    if let Ok(keys) =
+        HANDLER_ERROR.try_with(|cell| cell.borrow().keys().cloned().collect::<Vec<_>>())
+    {
+        if !keys.is_empty() {
+            return keys;
+        }
+    }
+    HANDLER_ERROR_SYNC.with(|cell| cell.borrow().1.keys().cloned().collect())
 }
 
 /// Record a handler-evaluation error for the current ACL check.
@@ -52,24 +226,20 @@ thread_local! {
 /// thread-local scope. If called outside any active capture scope (i.e.
 /// outside an ACL check entirely), the call is a no-op so handlers never panic
 /// on a missing scope.
+/// Messages are accumulated, not overwritten: §6.1.1 rule 2 requires
+/// `handler_error` to report **every** unevaluable condition in one `check()`,
+/// ordered lexicographically by condition key. This free-form entry point has
+/// no separate key argument, so the sort key is taken from the conventional
+/// `"{key}: {reason}"` message prefix (everything before the first `':'`),
+/// falling back to the whole message when it carries no colon. SDK-internal
+/// call sites use [`report_condition_unevaluable`], which passes the key
+/// explicitly.
 pub fn report_handler_error(message: impl Into<String>) {
     let msg = message.into();
-    // Prefer the async task-local scope when present.
-    if HANDLER_ERROR
-        .try_with(|cell| {
-            *cell.borrow_mut() = Some(msg.clone());
-        })
-        .is_ok()
-    {
-        return;
-    }
-    // Fall back to the synchronous thread-local scope, if one is active.
-    HANDLER_ERROR_SYNC.with(|cell| {
-        let mut state = cell.borrow_mut();
-        if state.0 > 0 {
-            state.1 = Some(msg);
-        }
-    });
+    let key = msg
+        .split_once(':')
+        .map_or_else(|| msg.clone(), |(prefix, _)| prefix.trim().to_string());
+    record_handler_error(key, msg);
 }
 
 /// Read the handler error recorded for the current ACL check, if any.
@@ -79,12 +249,12 @@ pub fn report_handler_error(message: impl Into<String>) {
 /// `ACL::build_audit_entry` so a handler error populates the audit entry on
 /// both the sync and async paths (A-D-002).
 pub(crate) fn current_handler_error() -> Option<String> {
-    if let Ok(v) = HANDLER_ERROR.try_with(|cell| cell.borrow().clone()) {
+    if let Ok(v) = HANDLER_ERROR.try_with(|cell| join_handler_errors(&cell.borrow())) {
         if v.is_some() {
             return v;
         }
     }
-    HANDLER_ERROR_SYNC.with(|cell| cell.borrow().1.clone())
+    HANDLER_ERROR_SYNC.with(|cell| join_handler_errors(&cell.borrow().1))
 }
 
 /// Run an async evaluation under a fresh handler-error capture scope.
@@ -96,10 +266,10 @@ pub async fn with_handler_error_capture<F, T>(fut: F) -> (T, Option<String>)
 where
     F: std::future::Future<Output = T>,
 {
-    let cell = RefCell::new(None);
+    let cell = RefCell::new(HandlerErrors::new());
     let result = HANDLER_ERROR.scope(cell, async move {
         let value = fut.await;
-        let captured = HANDLER_ERROR.with(|c| c.borrow().clone());
+        let captured = HANDLER_ERROR.with(|c| join_handler_errors(&c.borrow()));
         (value, captured)
     });
     result.await
@@ -119,16 +289,16 @@ where
     let previous = HANDLER_ERROR_SYNC.with(|cell| {
         let mut state = cell.borrow_mut();
         state.0 += 1;
-        state.1.take()
+        std::mem::take(&mut state.1)
     });
 
     let value = f();
 
     let captured = HANDLER_ERROR_SYNC.with(|cell| {
         let mut state = cell.borrow_mut();
-        let captured = state.1.take();
+        let captured = join_handler_errors(&state.1);
         state.0 -= 1;
-        // Restore the enclosing scope's slot (None at the outermost level).
+        // Restore the enclosing scope's slot (empty at the outermost level).
         state.1 = previous;
         captured
     });
@@ -153,7 +323,28 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Trait for evaluating a single ACL condition.
 #[async_trait]
 pub trait ACLConditionHandler: Send + Sync {
+    /// Answer the condition. `true` = satisfied, `false` = **unsatisfied**.
+    ///
+    /// A handler cannot report "unevaluable" through this method, and does not
+    /// need to: PROTOCOL_SPEC §6.1.1's three unevaluable situations are all
+    /// detected by the evaluator around the handler (no registration, a panic,
+    /// or a future that is not ready on the synchronous path). Returning
+    /// `false` therefore always means an ordinary non-match.
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool;
+
+    /// Three-valued evaluation (PROTOCOL_SPEC §6.1.1).
+    ///
+    /// The default implementation maps [`Self::evaluate`] onto
+    /// `Satisfied` / `Unsatisfied`, which is correct for every leaf handler.
+    /// Only the compound operators `$or` and `$not` override it, because they
+    /// have to *propagate* an unevaluable sub-condition rather than collapse
+    /// it — `$not` of `Unevaluable` is `Unevaluable`, never `Satisfied`.
+    ///
+    /// Overriding is optional and additive: a handler written before spec
+    /// v1.22.0 keeps working unchanged.
+    async fn evaluate_outcome(&self, value: &Value, ctx: &Context<Value>) -> ConditionOutcome {
+        ConditionOutcome::from_bool(self.evaluate(value, ctx).await)
+    }
 }
 
 /// Global registry of condition handlers (sync entry point — consulted by
@@ -195,67 +386,125 @@ pub fn register_async_condition(key: impl Into<String>, handler: Arc<dyn ACLCond
     map.insert(key.into(), handler);
 }
 
+/// Whether `key` resolves on the **synchronous** [`ACL::check`](crate::ACL::check)
+/// path — i.e. whether it is present in [`CONDITION_HANDLERS`].
+///
+/// PROTOCOL_SPEC §6.1.3 keeps the two registries deliberately separate: a key
+/// registered only through [`register_async_condition`] is a working condition
+/// under `async_check()` and an **unevaluable** one under `check()`.
+#[must_use]
+pub fn is_sync_registered(key: &str) -> bool {
+    CONDITION_HANDLERS.read().contains_key(key)
+}
+
+/// Whether `key` resolves on the **asynchronous**
+/// [`ACL::async_check`](crate::ACL::async_check) path.
+///
+/// `async_check()` consults [`ASYNC_CONDITION_HANDLERS`] first and falls back
+/// to [`CONDITION_HANDLERS`], so a sync-only registration resolves here too
+/// (PROTOCOL_SPEC §6.1.3).
+#[must_use]
+pub fn is_async_registered(key: &str) -> bool {
+    ASYNC_CONDITION_HANDLERS.read().contains_key(key) || is_sync_registered(key)
+}
+
 // ---------------------------------------------------------------------------
 // Free async evaluator (used by compound operators and re-exported to ACL)
 // ---------------------------------------------------------------------------
 
+/// One condition key paired with the handler it resolved to (if any) and its
+/// configured value. `None` in the middle slot is PROTOCOL_SPEC §6.1.1
+/// situation 1 — no registered handler, i.e. an unevaluable condition.
+type ResolvedCondition = (String, Option<Arc<dyn ACLConditionHandler>>, Value);
+
 /// Evaluate all conditions with AND logic using the handler registry.
 ///
-/// Resolves each condition key by consulting [`ASYNC_CONDITION_HANDLERS`]
-/// first (async-only overrides), then falling back to [`CONDITION_HANDLERS`]
-/// (the sync registry). Unknown keys are treated as unsatisfied
-/// (fail-closed). Handlers are cloned out of the registries before any
-/// `.await` so no `parking_lot` read guard is held across await points.
+/// Boolean façade over [`evaluate_conditions_async_outcome`], kept for callers
+/// that only care whether the conditions were satisfied. An
+/// [`ConditionOutcome::Unevaluable`] result maps to `false` here, which is
+/// exactly the collapse PROTOCOL_SPEC §6.1.1 forbids the **rule loop** from
+/// making — use the `_outcome` form anywhere the rule's `effect` matters.
 pub async fn evaluate_conditions_async<S: ::std::hash::BuildHasher>(
     conditions: &HashMap<String, Value, S>,
     ctx: &Context<Value>,
 ) -> bool {
-    let mut to_evaluate: Vec<(String, Arc<dyn ACLConditionHandler>, Value)> =
-        Vec::with_capacity(conditions.len());
+    evaluate_conditions_async_outcome(conditions, ctx)
+        .await
+        .is_satisfied()
+}
+
+/// Evaluate all conditions with three-valued AND logic (PROTOCOL_SPEC §6.1.1).
+///
+/// Resolves each condition key by consulting [`ASYNC_CONDITION_HANDLERS`]
+/// first (async-only overrides), then falling back to [`CONDITION_HANDLERS`]
+/// (the sync registry). A key with no handler in either registry is
+/// **unevaluable**, not unsatisfied; so is a handler that panics. Handlers are
+/// cloned out of the registries before any `.await` so no `parking_lot` read
+/// guard is held across await points.
+///
+/// **Every** child is evaluated — no short-circuit. §6.1.1 permits
+/// short-circuiting AND on the first `Unsatisfied`, but explicitly allows an
+/// implementation to evaluate every child instead "for deterministic
+/// diagnostics", and that is what we do: `handler_error` must list *all*
+/// unevaluable conditions (rule 2), and a key skipped by a short-circuit would
+/// make the audit entry depend on map iteration order. The decision is
+/// identical either way — an outright `Unsatisfied` still wins the conjunction.
+pub async fn evaluate_conditions_async_outcome<S: ::std::hash::BuildHasher>(
+    conditions: &HashMap<String, Value, S>,
+    ctx: &Context<Value>,
+) -> ConditionOutcome {
+    use futures_util::FutureExt;
+
+    // Resolve handlers first; an unresolved key is a leaf outcome of its own.
+    // `None` in the middle slot is PROTOCOL_SPEC §6.1.1 situation 1.
+    let mut to_evaluate: Vec<ResolvedCondition> = Vec::with_capacity(conditions.len());
     {
         let async_handlers = ASYNC_CONDITION_HANDLERS.read();
         let sync_handlers = CONDITION_HANDLERS.read();
         for (key, value) in conditions {
-            let handler = if let Some(h) = async_handlers.get(key.as_str()) {
-                h.clone()
-            } else if let Some(h) = sync_handlers.get(key.as_str()) {
-                h.clone()
-            } else {
-                tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
-                // A typo'd condition key must leave a forensic record, not just
-                // an identical DENY. apcore-typescript sets `handlerError` on
-                // this branch too; Rust previously left it null so the audit
-                // entry could not distinguish "rule did not match" from
-                // "rule referenced a condition nobody registered".
-                report_handler_error(format!("{key}: unknown ACL condition"));
-                return false;
-            };
+            let handler = async_handlers
+                .get(key.as_str())
+                .or_else(|| sync_handlers.get(key.as_str()))
+                .cloned();
             to_evaluate.push((key.clone(), handler, value.clone()));
         }
     }
+
+    // AND over three-valued children, starting from the vacuous truth of an
+    // empty `conditions` object.
+    let mut outcome = ConditionOutcome::Satisfied;
     for (key, handler, value) in &to_evaluate {
-        // A-D-011 (SECURITY): a panicking custom handler must NOT unwind out of
-        // the ACL gate. Catch the panic, record it as a handler error, and fail
-        // closed (deny). Mirrors Python `try/except` and TypeScript `try/catch`
-        // around handler.evaluate.
-        use futures_util::FutureExt;
-        let fut = std::panic::AssertUnwindSafe(handler.evaluate(value, ctx)).catch_unwind();
-        match fut.await {
-            Ok(true) => {}
-            Ok(false) => return false,
+        let Some(handler) = handler else {
+            // §6.1.1 situation 1: no registered handler.
+            tracing::warn!(
+                condition = %key,
+                "Unknown ACL condition — unevaluable (PROTOCOL_SPEC §6.1.1)"
+            );
+            report_condition_unevaluable(key, "unknown ACL condition");
+            outcome = outcome.and(ConditionOutcome::Unevaluable);
+            continue;
+        };
+        // §6.1.1 situation 2 (SECURITY, A-D-011): a panicking custom handler
+        // must NOT unwind out of the ACL gate. Catch the panic, record it, and
+        // report the condition unevaluable. Mirrors Python `try/except` and
+        // TypeScript `try/catch` around handler.evaluate.
+        let fut = std::panic::AssertUnwindSafe(handler.evaluate_outcome(value, ctx)).catch_unwind();
+        let child = match fut.await {
+            Ok(child) => child,
             Err(payload) => {
                 let msg = panic_message(payload.as_ref());
                 tracing::error!(
                     condition = %key,
                     panic = %msg,
-                    "ACL condition handler panicked — denying (fail-closed)"
+                    "ACL condition handler panicked — unevaluable (PROTOCOL_SPEC §6.1.1)"
                 );
-                report_handler_error(format!("{key}: handler panicked: {msg}"));
-                return false;
+                report_condition_unevaluable(key, format!("handler panicked: {msg}"));
+                ConditionOutcome::Unevaluable
             }
-        }
+        };
+        outcome = outcome.and(child);
     }
-    true
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -373,15 +622,16 @@ pub(crate) enum CompoundMode {
     Async,
 }
 
-/// Evaluate a sub-condition set in the mode of the enclosing call.
+/// Evaluate a sub-condition set in the mode of the enclosing call, preserving
+/// the three-valued outcome so `$or` / `$not` can propagate it (§6.1.1).
 async fn evaluate_sub_conditions(
     mode: CompoundMode,
     map: &HashMap<String, Value>,
     ctx: &Context<Value>,
-) -> bool {
+) -> ConditionOutcome {
     match mode {
         CompoundMode::Sync => crate::acl::ACL::evaluate_conditions(map, ctx),
-        CompoundMode::Async => evaluate_conditions_async(map, ctx).await,
+        CompoundMode::Async => evaluate_conditions_async_outcome(map, ctx).await,
     }
 }
 
@@ -403,17 +653,29 @@ impl OrHandler {
 #[async_trait]
 impl ACLConditionHandler for OrHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
+        self.evaluate_outcome(value, ctx).await.is_satisfied()
+    }
+
+    /// §6.1.1: an outright `Satisfied` child wins even against an unevaluable
+    /// sibling; otherwise any unevaluable child makes the whole `$or`
+    /// unevaluable. Every child is evaluated (no short-circuit on the first
+    /// `Satisfied`) so that `handler_error` reports every unevaluable sibling
+    /// deterministically — the decision is unchanged either way.
+    async fn evaluate_outcome(&self, value: &Value, ctx: &Context<Value>) -> ConditionOutcome {
         let Some(arr) = value.as_array() else {
-            return false;
+            return ConditionOutcome::Unsatisfied;
         };
+        // OR over three-valued children, starting from the identity of an
+        // empty `$or: []` (which stays a non-match, as before).
+        let mut outcome = ConditionOutcome::Unsatisfied;
         for sub in arr {
-            if let Some(obj) = sub.as_object() {
-                if evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx).await {
-                    return true;
-                }
-            }
+            let child = match sub.as_object() {
+                Some(obj) => evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx).await,
+                None => ConditionOutcome::Unsatisfied,
+            };
+            outcome = outcome.or(child);
         }
-        false
+        outcome
     }
 }
 
@@ -431,9 +693,19 @@ impl NotHandler {
 #[async_trait]
 impl ACLConditionHandler for NotHandler {
     async fn evaluate(&self, value: &Value, ctx: &Context<Value>) -> bool {
+        self.evaluate_outcome(value, ctx).await.is_satisfied()
+    }
+
+    /// §6.1.1: `$not` of an unevaluable sub-condition is **unevaluable**, never
+    /// satisfied. Negating "no answer" into "yes" would let a misspelled key
+    /// inside a `$not` satisfy the very rule it was meant to gate — the bypass
+    /// this section exists to close, reintroduced one nesting level down.
+    async fn evaluate_outcome(&self, value: &Value, ctx: &Context<Value>) -> ConditionOutcome {
         match value.as_object() {
-            Some(obj) => !evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx).await,
-            None => false,
+            Some(obj) => evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx)
+                .await
+                .negate(),
+            None => ConditionOutcome::Unsatisfied,
         }
     }
 }

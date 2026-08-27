@@ -9,7 +9,8 @@ use std::future::Future;
 use std::sync::{Arc, Once};
 
 use crate::acl_handlers::{
-    evaluate_conditions_async as handlers_evaluate_conditions_async, register_builtin_handlers,
+    evaluate_conditions_async_outcome as handlers_evaluate_conditions_async_outcome,
+    is_async_registered, is_sync_registered, register_builtin_handlers, ConditionOutcome,
     CONDITION_HANDLERS,
 };
 use crate::context::Context;
@@ -60,6 +61,73 @@ pub struct AuditEntry {
 
 /// Type alias for the audit logger callback.
 type AuditLoggerFn = dyn Fn(&AuditEntry) + Send + Sync;
+
+/// One rule referencing a condition key that does not resolve to a handler.
+///
+/// Produced by [`ACL::validate_conditions`] (PROTOCOL_SPEC §6.1.2 rule 3,
+/// §6.1.3). `sync_registered` and `async_registered` are reported separately
+/// and MUST NOT be collapsed into a single boolean: `async_check()` consults
+/// the async registry and falls back to the sync one, while `check()` consults
+/// only the sync registry, so a key registered **only** as an async handler is
+/// a working condition on one path and an unevaluable one on the other.
+///
+/// Marked `#[non_exhaustive]` so a future spec revision can add a field without
+/// a major version bump. That works by removing struct-literal construction
+/// from every crate but this one — `..Default::default()` included, since it is
+/// itself a struct expression (`error[E0639]`). Build one with
+/// [`ConditionValidationFinding::new`]; the fields are public to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConditionValidationFinding {
+    /// Index of the offending rule in definition order.
+    pub rule_index: usize,
+    /// The condition key that does not resolve.
+    pub condition_key: String,
+    /// The rule's effect. A finding on a `deny` rule is the consequential one:
+    /// per §6.1.1 that rule now denies every call it matches.
+    pub effect: String,
+    /// Whether the key resolves for `check()`.
+    pub sync_registered: bool,
+    /// Whether the key resolves for `async_check()`.
+    pub async_registered: bool,
+}
+
+impl ConditionValidationFinding {
+    /// Build a finding. Provided because `#[non_exhaustive]` removes
+    /// struct-literal construction for downstream crates
+    /// (`api-surface-conventions.md` §9.2 rule 2).
+    #[must_use]
+    pub fn new(
+        rule_index: usize,
+        condition_key: impl Into<String>,
+        effect: impl Into<String>,
+        sync_registered: bool,
+        async_registered: bool,
+    ) -> Self {
+        Self {
+            rule_index,
+            condition_key: condition_key.into(),
+            effect: effect.into(),
+            sync_registered,
+            async_registered,
+        }
+    }
+}
+
+/// Outcome of matching one ACL rule against a call (PROTOCOL_SPEC §6.3).
+///
+/// Three variants rather than a `bool`, because a rule whose conditions could
+/// not be evaluated is neither "matched" nor "did not match" until the rule's
+/// `effect` is consulted (§6.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleMatch {
+    /// Patterns did not match, or the conditions were UNSATISFIED.
+    NoMatch,
+    /// Patterns matched and the conditions (if any) were SATISFIED.
+    Match,
+    /// Patterns matched but the conditions were UNEVALUABLE (§6.1.1).
+    Unevaluable,
+}
 
 /// Access control list manager.
 ///
@@ -166,6 +234,13 @@ impl ACL {
         // key is unclaimed, so a handler the deployment registered before the
         // first ACL is not replaced by the permissive default (A-D-010).
         Self::init_builtin_handlers();
+        // PROTOCOL_SPEC §6.1.2: warn (never fail) for every rule referencing a
+        // condition key that does not resolve on the sync path. Emitted AFTER
+        // `init_builtin_handlers` so the built-ins are never reported. Rule 4
+        // makes direct construction an entry point that MUST be covered, not
+        // just file loading — `try_new`, `new`, `load`, `discover` and
+        // `reload` all funnel through here.
+        Self::warn_unresolved_conditions(&rules, 0);
         Self {
             rules,
             default_effect: default_effect.into(),
@@ -174,118 +249,286 @@ impl ACL {
         }
     }
 
+    /// Emit PROTOCOL_SPEC §6.1.2 rule 2's load-time warning for every rule
+    /// whose conditions reference a key with no handler on the sync path.
+    ///
+    /// `index_offset` is added to the position within `rules`, so `add_rule`
+    /// can report the index the rule will actually occupy.
+    ///
+    /// Loading MUST NOT fail here: `register_condition()` writes to a runtime,
+    /// process-wide registry, and `acl.root` discovery commonly runs during
+    /// framework bootstrap ahead of application code, so failing would reject
+    /// valid configurations on ordering alone. [`ACL::validate_conditions`] is
+    /// the deterministic check to run once registration is complete.
+    fn warn_unresolved_conditions(rules: &[ACLRule], index_offset: usize) {
+        for (i, rule) in rules.iter().enumerate() {
+            let Some(conditions) = rule.conditions.as_ref() else {
+                continue;
+            };
+            for key in Self::condition_keys(conditions) {
+                if is_sync_registered(&key) {
+                    continue;
+                }
+                tracing::warn!(
+                    rule_index = index_offset + i,
+                    condition_key = %key,
+                    effect = %rule.effect,
+                    async_registered = is_async_registered(&key),
+                    "ACL rule references a condition key with no registered handler; the rule \
+                     will be UNEVALUABLE (PROTOCOL_SPEC §6.1.1) — a deny rule denies, an allow \
+                     rule does not grant. Register a handler, or call ACL::validate_conditions() \
+                     after bootstrap to assert on this."
+                );
+            }
+        }
+    }
+
+    /// Every condition key a `conditions` block references, including keys
+    /// nested inside `$or` / `$not` sub-objects.
+    ///
+    /// Returned as a `BTreeSet` so the order is deterministic (ascending) and
+    /// a key repeated across sub-objects is reported once per rule.
+    fn condition_keys(conditions: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        Self::collect_condition_keys(conditions, &mut keys);
+        keys
+    }
+
+    fn collect_condition_keys(
+        conditions: &serde_json::Value,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        let Some(obj) = conditions.as_object() else {
+            return;
+        };
+        for (key, value) in obj {
+            out.insert(key.clone());
+            // Descend into the compound operators. `$or` / `$not` are
+            // themselves registered keys (so they never produce a finding of
+            // their own), but the keys they wrap are just as capable of being
+            // misspelled — §6.1.2 rule 3 requires those to be reported too.
+            match key.as_str() {
+                "$or" => {
+                    if let Some(arr) = value.as_array() {
+                        for sub in arr {
+                            Self::collect_condition_keys(sub, out);
+                        }
+                    }
+                }
+                "$not" => Self::collect_condition_keys(value, out),
+                _ => {}
+            }
+        }
+    }
+
     /// Set the audit logger callback.
     pub fn set_audit_logger(&mut self, logger: impl Fn(&AuditEntry) + Send + Sync + 'static) {
         self.audit_logger = Some(Arc::new(logger));
     }
 
-    /// Evaluate all conditions with AND logic using the handler registry. Fail-closed on unknown.
+    /// Evaluate all conditions with three-valued AND logic using the sync
+    /// handler registry (PROTOCOL_SPEC §6.1.1).
     ///
-    /// This is a **sync** function. It drives each handler's future by polling it once with a
-    /// noop waker. If the handler future is `Pending` on the first poll (i.e., the handler is
-    /// genuinely async and needs to yield), the condition is treated as **unsatisfied** and a
-    /// `tracing::warn!` is emitted. This is the correct fail-closed behaviour for a synchronous
-    /// ACL gate, but callers should prefer [`ACL::async_check`] / [`Self::evaluate_conditions_async`]
-    /// for any handler that may perform I/O. Registering an async handler that returns `Pending`
-    /// and using `check()` will silently deny the call.
+    /// Returns a [`ConditionOutcome`], not a `bool`: "a handler answered no"
+    /// and "no answer was obtainable" reach the rule loop as different values,
+    /// because a `deny` rule resolves them in opposite directions. §6.3 makes
+    /// carrying that distinction a MUST — collapsing the two is what let a
+    /// misspelled condition key silently disable a `deny` rule before v1.22.0.
     ///
-    /// **Architecture note:** two parallel paths exist — this sync path and the async
-    /// [`Self::evaluate_conditions_async`]. Keep both in sync when adding new condition logic to avoid
-    /// drift. New conditions should be tested against both paths.
+    /// This is a **sync** function. It drives each handler's future by polling
+    /// it once with a noop waker:
+    ///
+    /// * `Poll::Ready(v)` — the handler's answer, `Satisfied` / `Unsatisfied`.
+    /// * `Poll::Pending` — §6.1.1 situation 3: the handler is genuinely async
+    ///   and could not be resolved on this path, so the condition is
+    ///   **`Unevaluable`**, not unsatisfied. Callers with I/O-performing
+    ///   handlers must use [`ACL::async_check`].
+    /// * a panic — §6.1.1 situation 2, caught here and reported `Unevaluable`.
+    ///
+    /// A key with no handler in [`CONDITION_HANDLERS`] is §6.1.1 situation 1.
+    /// Note that the async registry is deliberately NOT consulted: §6.1.3 makes
+    /// an async-only key unevaluable on the sync path by design.
+    ///
+    /// **Every** child is evaluated — no short-circuit. §6.1.1 permits
+    /// short-circuiting AND on the first `Unsatisfied` and explicitly allows
+    /// evaluating every child instead "for deterministic diagnostics"; the
+    /// latter is what makes `handler_error` list every unevaluable key (rule 2)
+    /// rather than whichever one map iteration happened to reach first. The
+    /// decision is identical either way.
+    ///
+    /// **Architecture note:** two parallel paths exist — this sync path and the
+    /// async [`Self::evaluate_conditions_async_outcome`]. Keep both in sync when
+    /// adding new condition logic to avoid drift. New conditions should be
+    /// tested against both paths.
     pub fn evaluate_conditions(
         conditions: &HashMap<String, serde_json::Value>,
         ctx: &Context<serde_json::Value>,
-    ) -> bool {
+    ) -> ConditionOutcome {
+        // Resolve handlers first; an unresolved key is a leaf outcome of its own.
         let mut to_evaluate = Vec::with_capacity(conditions.len());
         {
             let handlers = CONDITION_HANDLERS.read();
             for (key, value) in conditions {
-                let handler = if let Some(h) = handlers.get(key.as_str()) {
-                    h.clone()
-                } else {
-                    tracing::warn!("Unknown ACL condition '{}' — treated as unsatisfied", key);
-                    // Leave a forensic record so the audit entry distinguishes
-                    // "rule did not match" from "rule referenced a condition
-                    // nobody registered". apcore-typescript sets `handlerError`
-                    // here as well.
-                    crate::acl_handlers::report_handler_error(format!(
-                        "{key}: unknown ACL condition"
-                    ));
-                    return false;
-                };
-                to_evaluate.push((key, handler, value));
+                to_evaluate.push((key, handlers.get(key.as_str()).cloned(), value));
             }
         }
 
+        // AND over three-valued children, starting from the vacuous truth of an
+        // empty `conditions` object (which keeps `$not: {}` fail-closed).
+        let mut outcome = ConditionOutcome::Satisfied;
         for (key, handler, value) in to_evaluate {
-            // Built-in handlers are trivially async (return immediately).
-            // We poll the future once — if it's not ready, treat as unsatisfied.
-            //
+            let Some(handler) = handler else {
+                // §6.1.1 situation 1: no registered handler.
+                tracing::warn!(
+                    condition = %key,
+                    "Unknown ACL condition — unevaluable (PROTOCOL_SPEC §6.1.1)"
+                );
+                crate::acl_handlers::report_condition_unevaluable(key, "unknown ACL condition");
+                outcome = outcome.and(ConditionOutcome::Unevaluable);
+                continue;
+            };
+
             // A-D-011 (SECURITY): wrap both the future construction and the
             // single poll in catch_unwind so a panicking custom handler does
-            // NOT unwind out of the ACL gate. On panic we record a handler
-            // error and fail closed (deny). Mirrors the Python `try/except`
+            // NOT unwind out of the ACL gate. Mirrors the Python `try/except`
             // and TypeScript `try/catch` around handler.evaluate.
             let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let fut = handler.evaluate(value, ctx);
+                let fut = handler.evaluate_outcome(value, ctx);
                 let mut fut = std::pin::pin!(fut);
                 let waker = std::task::Waker::noop();
                 let mut cx = std::task::Context::from_waker(waker);
                 fut.as_mut().poll(&mut cx)
             }));
-            let result = match poll_result {
+            let child = match poll_result {
                 Ok(std::task::Poll::Ready(val)) => val,
                 Ok(std::task::Poll::Pending) => {
+                    // §6.1.1 situation 3. Through spec v1.21.0 this was
+                    // "treated as unsatisfied", which made a `deny` rule
+                    // guarded by an async-only handler inert on the sync path
+                    // — the same failure mode as a misspelled key, reached by
+                    // a different route.
                     tracing::warn!(
-                        "Async condition '{}' not immediately ready in sync context — treated as unsatisfied",
-                        key,
+                        condition = %key,
+                        "Async ACL condition not ready in a sync context — unevaluable \
+                         (PROTOCOL_SPEC §6.1.1; use ACL::async_check)"
                     );
-                    // Same forensic contract as the unknown-key and panic
-                    // branches: a handler that could not be resolved
-                    // synchronously is an operator-visible problem, not a
-                    // plain non-match.
-                    crate::acl_handlers::report_handler_error(format!(
-                        "{key}: handler is not ready synchronously (use ACL::async_check)"
-                    ));
-                    return false;
+                    crate::acl_handlers::report_condition_unevaluable(
+                        key,
+                        "handler is not ready synchronously (use ACL::async_check)",
+                    );
+                    ConditionOutcome::Unevaluable
                 }
                 Err(payload) => {
                     let msg = crate::acl_handlers::panic_message(payload.as_ref());
                     tracing::error!(
                         condition = %key,
                         panic = %msg,
-                        "ACL condition handler panicked — denying (fail-closed)"
+                        "ACL condition handler panicked — unevaluable (PROTOCOL_SPEC §6.1.1)"
                     );
-                    crate::acl_handlers::report_handler_error(format!(
-                        "{key}: handler panicked: {msg}"
-                    ));
-                    return false;
+                    crate::acl_handlers::report_condition_unevaluable(
+                        key,
+                        format!("handler panicked: {msg}"),
+                    );
+                    ConditionOutcome::Unevaluable
                 }
             };
-            if !result {
-                return false;
-            }
+            outcome = outcome.and(child);
         }
-        true
+        outcome
     }
 
     /// Async evaluate all conditions with AND logic using the handler registry.
     ///
-    /// Delegates to `acl_handlers::evaluate_conditions_async` so compound
-    /// operators (`$or`, `$not`) share the same async evaluation path.
+    /// Boolean façade over [`Self::evaluate_conditions_async_outcome`]. An
+    /// unevaluable result maps to `false`, which is exactly the collapse
+    /// §6.1.1 forbids the **rule loop** from making — use the `_outcome` form
+    /// anywhere the rule's `effect` matters.
     pub async fn evaluate_conditions_async(
         conditions: &HashMap<String, serde_json::Value>,
         ctx: &Context<serde_json::Value>,
     ) -> bool {
-        handlers_evaluate_conditions_async(conditions, ctx).await
+        Self::evaluate_conditions_async_outcome(conditions, ctx)
+            .await
+            .is_satisfied()
+    }
+
+    /// Async, three-valued counterpart to [`Self::evaluate_conditions`]
+    /// (PROTOCOL_SPEC §6.1.1).
+    ///
+    /// Delegates to `acl_handlers::evaluate_conditions_async_outcome` so
+    /// compound operators (`$or`, `$not`) share the same async evaluation path.
+    pub async fn evaluate_conditions_async_outcome(
+        conditions: &HashMap<String, serde_json::Value>,
+        ctx: &Context<serde_json::Value>,
+    ) -> ConditionOutcome {
+        handlers_evaluate_conditions_async_outcome(conditions, ctx).await
     }
 
     /// Add a rule to the ACL (inserted at position 0, highest priority).
     ///
     /// Spec contract `acl-system.md` §Contract.ACL.add_rule declares
     /// `On success: None` — the body is infallible, so no `Result` wrapper.
+    ///
+    /// PROTOCOL_SPEC §6.1.2 rule 4 makes runtime rule insertion an entry point
+    /// that MUST be covered by the load-time condition-key check: if the rule
+    /// carries `conditions`, every key it references — including keys nested
+    /// inside `$or` / `$not` — is checked against the sync handler registry and
+    /// a warning naming the rule index (`0`), the key and the rule's `effect`
+    /// is emitted for each that does not resolve. Insertion still succeeds;
+    /// this is the same warn-never-fail contract [`ACL::load`] has, for the
+    /// same reason.
     pub fn add_rule(&mut self, rule: ACLRule) {
+        Self::warn_unresolved_conditions(std::slice::from_ref(&rule), 0);
         self.rules.insert(0, rule);
+    }
+
+    /// Report every rule that references a condition key with no registered
+    /// handler (PROTOCOL_SPEC §6.1.2 rule 3, §6.1.3).
+    ///
+    /// Condition handlers are registered at runtime into a process-wide
+    /// registry, and an ACL may legitimately be loaded before a deployment
+    /// registers its custom handlers, so loading only warns. This method is the
+    /// deterministic check to run **after** registration is complete: the
+    /// intended shape is to call it once bootstrap has finished and to treat
+    /// any finding on a `deny` rule as a startup error.
+    ///
+    /// A finding is emitted whenever `sync_registered` is false — **including**
+    /// when `async_registered` is true. §6.1.3: `check()` consults only the
+    /// sync registry, so an async-only key is a working condition under
+    /// `async_check()` and an unevaluable one under `check()`. A caller that
+    /// only ever uses `async_check()` may ignore such a finding; that choice
+    /// belongs to the caller, not to the validator.
+    ///
+    /// Pure read — never mutates the ACL, never registers a handler, never
+    /// emits an audit event. Findings are ordered by rule index, then
+    /// ascending by condition key. An empty result is not a guarantee about the
+    /// future: a later [`Self::add_rule`] can introduce a new key.
+    ///
+    /// This is diagnostics, not enforcement. The guarantee that a broken `deny`
+    /// rule cannot silently pass traffic is §6.1.1's, and holds whether or not
+    /// anyone calls this.
+    #[must_use]
+    pub fn validate_conditions(&self) -> Vec<ConditionValidationFinding> {
+        let mut findings = Vec::new();
+        for (idx, rule) in self.rules.iter().enumerate() {
+            let Some(conditions) = rule.conditions.as_ref() else {
+                continue;
+            };
+            for key in Self::condition_keys(conditions) {
+                let sync_registered = is_sync_registered(&key);
+                if sync_registered {
+                    continue;
+                }
+                findings.push(ConditionValidationFinding::new(
+                    idx,
+                    key.clone(),
+                    rule.effect.clone(),
+                    sync_registered,
+                    is_async_registered(&key),
+                ));
+            }
+        }
+        findings
     }
 
     /// Remove the first rule matching the given callers and targets.
@@ -371,8 +614,17 @@ impl ACL {
         }
 
         for (idx, rule) in rules.iter().enumerate() {
-            if self.matches_rule(rule, caller, target_id, ctx) {
-                return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
+            let keys_before = crate::acl_handlers::reported_condition_keys();
+            match self.matches_rule(rule, caller, target_id, ctx) {
+                RuleMatch::Match => {
+                    return self.finalize_rule_match(idx, rule, caller, target_id, ctx)
+                }
+                RuleMatch::Unevaluable => {
+                    if Self::resolve_unevaluable_rule(idx, rule, &keys_before) {
+                        return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
+                    }
+                }
+                RuleMatch::NoMatch => {}
             }
         }
 
@@ -604,40 +856,105 @@ impl ACL {
         Ok(())
     }
 
-    /// Return a reference to the current rules.
+    /// The current rule list, in definition order (PROTOCOL_SPEC §6.8).
     ///
-    /// Returns a snapshot of the current rules.
+    /// Read-only introspection: an immutable slice, so a caller can neither
+    /// reorder nor mutate the ACL's own list through it (§6.8 rule 3). It is a
+    /// pure read — no audit event, no state change, no lock the caller has to
+    /// release — and it reads the live object, so it reflects a
+    /// [`Self::reload`] (§6.8 rule 4).
     #[must_use]
     pub fn rules(&self) -> &[ACLRule] {
         &self.rules
     }
 
+    /// The effect applied when no rule matches — `"allow"` or `"deny"`
+    /// (PROTOCOL_SPEC §6.8).
+    ///
+    /// `default_effect` is the single most consequential value in an ACL, and
+    /// §6.8 makes reading it back a MUST: without it, tooling that reports or
+    /// audits the enforced policy has to re-read and re-parse the ACL file to
+    /// recover a value the loaded object already holds — a second copy that can
+    /// drift across [`Self::reload`], and on Rust the only option available at
+    /// all while the field was private.
+    ///
+    /// Pure read, and reads the live object, so it reflects a `reload()`.
+    #[must_use]
+    pub fn default_effect(&self) -> &str {
+        &self.default_effect
+    }
+
     // --- Private helpers ---
 
+    /// Apply PROTOCOL_SPEC §6.1.1 to a rule whose conditions were UNEVALUABLE.
+    ///
+    /// Returns `true` when the rule must take effect (so the caller finalizes
+    /// it as a rule match — a `deny` rule denies), `false` when evaluation must
+    /// continue with the next rule (an `allow` rule MUST NOT grant).
+    ///
+    /// Also emits §6.1.1 rule 3's warning, which must name the condition key,
+    /// the rule's index and the rule's `effect`. The `effect` is in the message
+    /// because a misconfigured `deny` rule is the consequential case. The keys
+    /// are recovered by diffing the per-call handler-error scope, which is the
+    /// only place a key nested inside `$or` / `$not` surfaces.
+    fn resolve_unevaluable_rule(idx: usize, rule: &ACLRule, keys_before: &[String]) -> bool {
+        let keys_after = crate::acl_handlers::reported_condition_keys();
+        let new_keys: Vec<String> = keys_after
+            .into_iter()
+            .filter(|k| !keys_before.contains(k))
+            .collect();
+        let conditions = if new_keys.is_empty() {
+            // Already reported by an earlier rule in this same check().
+            "(see AuditEntry.handler_error)".to_string()
+        } else {
+            new_keys.join(", ")
+        };
+
+        let takes_effect = rule.effect == "deny";
+        tracing::warn!(
+            rule_index = idx,
+            effect = %rule.effect,
+            conditions = %conditions,
+            "ACL rule has unevaluable conditions — {} (PROTOCOL_SPEC §6.1.1)",
+            if takes_effect {
+                "the deny rule TAKES EFFECT and the call is denied"
+            } else {
+                "the allow rule does not match and MUST NOT grant"
+            }
+        );
+        takes_effect
+    }
+
     /// Check if a rule matches the caller, target, and context.
+    ///
+    /// Returns [`RuleMatch`] rather than a `bool`: a rule whose conditions were
+    /// unevaluable is neither matched nor unmatched until its `effect` is
+    /// consulted (PROTOCOL_SPEC §6.1.1).
     fn matches_rule(
         &self,
         rule: &ACLRule,
         caller: &str,
         target: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> RuleMatch {
         if !Self::match_patterns(&rule.callers, caller, ctx) {
-            return false;
+            return RuleMatch::NoMatch;
         }
 
         if !Self::match_patterns(&rule.targets, target, ctx) {
-            return false;
+            return RuleMatch::NoMatch;
         }
 
         // Conditions check.
         if let Some(ref conditions) = rule.conditions {
-            if !self.check_conditions(conditions, ctx) {
-                return false;
-            }
+            return match self.check_conditions(conditions, ctx) {
+                ConditionOutcome::Satisfied => RuleMatch::Match,
+                ConditionOutcome::Unsatisfied => RuleMatch::NoMatch,
+                ConditionOutcome::Unevaluable => RuleMatch::Unevaluable,
+            };
         }
 
-        true
+        RuleMatch::Match
     }
 
     /// Match a list of patterns against a value.
@@ -697,18 +1014,25 @@ impl ACL {
     }
 
     /// Evaluate conditions block against the context using registered handlers.
+    ///
+    /// A missing context is `Unsatisfied`, NOT `Unevaluable`: PROTOCOL_SPEC
+    /// §6.5 keeps "conditions present but no context provided" an ordinary
+    /// non-match on purpose, because calling with no context is a legitimate
+    /// shape for external entry points rather than a misconfiguration. Treating
+    /// it as an evaluation failure would flip the decision for every
+    /// `@external` call that meets a conditional `deny` rule.
     #[allow(clippy::unused_self)] // method must be on `&self` for trait-object dispatch consistency
     fn check_conditions(
         &self,
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> ConditionOutcome {
         let Some(ctx) = ctx else {
-            return false; // conditions require context
+            return ConditionOutcome::Unsatisfied; // §6.5: conditions require context
         };
 
         let Some(obj) = conditions.as_object() else {
-            return false;
+            return ConditionOutcome::Unsatisfied;
         };
 
         let map: HashMap<String, serde_json::Value> =
@@ -718,26 +1042,26 @@ impl ACL {
     }
 
     /// Async counterpart to `check_conditions`. Drives async condition handlers
-    /// via `evaluate_conditions_async` so handlers that genuinely suspend are
-    /// awaited rather than treated as unsatisfied.
+    /// via `evaluate_conditions_async_outcome` so handlers that genuinely
+    /// suspend are awaited rather than reported unevaluable.
     #[allow(clippy::unused_self)] // method must be on `&self` for trait-object dispatch consistency
     async fn check_conditions_async(
         &self,
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> ConditionOutcome {
         let Some(ctx) = ctx else {
-            return false;
+            return ConditionOutcome::Unsatisfied; // §6.5
         };
 
         let Some(obj) = conditions.as_object() else {
-            return false;
+            return ConditionOutcome::Unsatisfied;
         };
 
         let map: HashMap<String, serde_json::Value> =
             obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
-        Self::evaluate_conditions_async(&map, ctx).await
+        Self::evaluate_conditions_async_outcome(&map, ctx).await
     }
 
     /// Audit + return for the empty-rules path. Shared by `check` and `async_check`.
@@ -898,8 +1222,17 @@ impl ACL {
         }
 
         for (idx, rule) in rules.iter().enumerate() {
-            if self.matches_rule_async(rule, caller, target_id, ctx).await {
-                return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
+            let keys_before = crate::acl_handlers::reported_condition_keys();
+            match self.matches_rule_async(rule, caller, target_id, ctx).await {
+                RuleMatch::Match => {
+                    return self.finalize_rule_match(idx, rule, caller, target_id, ctx)
+                }
+                RuleMatch::Unevaluable => {
+                    if Self::resolve_unevaluable_rule(idx, rule, &keys_before) {
+                        return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
+                    }
+                }
+                RuleMatch::NoMatch => {}
             }
         }
 
@@ -916,22 +1249,24 @@ impl ACL {
         caller: &str,
         target: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> RuleMatch {
         if !Self::match_patterns(&rule.callers, caller, ctx) {
-            return false;
+            return RuleMatch::NoMatch;
         }
 
         if !Self::match_patterns(&rule.targets, target, ctx) {
-            return false;
+            return RuleMatch::NoMatch;
         }
 
         if let Some(ref conditions) = rule.conditions {
-            if !self.check_conditions_async(conditions, ctx).await {
-                return false;
-            }
+            return match self.check_conditions_async(conditions, ctx).await {
+                ConditionOutcome::Satisfied => RuleMatch::Match,
+                ConditionOutcome::Unsatisfied => RuleMatch::NoMatch,
+                ConditionOutcome::Unevaluable => RuleMatch::Unevaluable,
+            };
         }
 
-        true
+        RuleMatch::Match
     }
 
     /// Emit an audit entry to the registered audit logger, if any.
