@@ -35,8 +35,9 @@ A governed runtime for agent-callable capabilities — schema, ACL, approval, an
 
 The Rust SDK tracks the apcore protocol spec and ships full feature parity
 with the Python and TypeScript SDKs. The table below covers the v0.23
-hardening items (#60–#65), the v0.24–v0.26 governance surfaces, and the
-long-standing background-task and extension surfaces.
+hardening items (#60–#65), the v0.24–v0.26 governance surfaces, the v0.27
+authorization and descriptor fixes, and the long-standing background-task and
+extension surfaces.
 
 | Feature | Python | TypeScript | Rust |
 |---------|:------:|:----------:|:----:|
@@ -48,6 +49,18 @@ long-standing background-task and extension surfaces.
 | Registry load-ordering guarantees (#65) | Yes | Yes | Yes |
 | `AsyncTaskManager` (background task execution) | Yes | Yes | Yes |
 | `ExtensionManager` / `ExtensionPoint` (plugin registry) | Yes | Yes | Yes |
+| `validate()` withholds introspection from a denied caller (apcore#96) | Yes | Yes | Yes |
+| `get_definition().dependencies` is a parsed field (apcore#90) | Yes | Yes | Yes |
+
+**v0.27.0, BREAKING (security).** `validate()` used to run `preflight()` and
+`preview()` on the strength of a module lookup alone, so a caller the ACL had
+just denied still made module-authored code run and still received what it
+returned — for a command-wrapping module, the resolved binary and its argv. All
+three SDKs did it; all three now suppress it when the `acl` check fails, while
+still reporting that failed check so a denied caller learns *why*. A failed
+`schema` check does **not** suppress introspection: a permitted caller is
+entitled to the module's account of what would happen even when its inputs are
+malformed. See spec v1.13.0 §12.8.5.1 and `preflight_disclosure.json`.
 
 See the [`AsyncTaskManager`](./src/async_task.rs) and
 [`ExtensionManager`](./src/extensions.rs) source, plus the corresponding
