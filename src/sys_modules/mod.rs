@@ -518,7 +518,9 @@ pub fn register_sys_modules_with_options(
             if let Some(arr) = subs.as_array() {
                 for sub_config in arr {
                     match create_subscriber(sub_config) {
-                        Ok(subscriber) => emitter.subscribe(subscriber),
+                        Ok(subscriber) => {
+                            emitter.subscribe(subscriber);
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to create subscriber from config");
                         }

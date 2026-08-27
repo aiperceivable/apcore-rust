@@ -1,7 +1,7 @@
 // APCore Protocol — Event emitter
 // Spec reference: Event types and emission
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,7 +79,21 @@ pub struct EventEmitter {
     /// deliveries to drain (sync findings A-D-024 / A-D-027). Completed
     /// handles are pruned lazily on each `emit`/`flush`.
     pending: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Parallel to `subscribers`: the handle issued for each registration, so
+    /// `unsubscribe_handle` can remove exactly one even when several share a
+    /// `subscriber_id()` (sync finding A-D-025).
+    handles: RwLock<Vec<SubscriberHandle>>,
+    next_handle: AtomicU64,
 }
+
+/// Opaque token identifying one subscription, returned by
+/// [`EventEmitter::subscribe`] and consumed by
+/// [`EventEmitter::unsubscribe_handle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriberHandle(u64);
+
+/// The `EventSubscriber::subscriber_id` trait default.
+const DEFAULT_SUBSCRIBER_ID: &str = "default";
 
 impl EventEmitter {
     /// Create a new event emitter.
@@ -90,14 +104,45 @@ impl EventEmitter {
             max_workers: 4,
             is_shutdown: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(Vec::new())),
+            handles: RwLock::new(vec![]),
+            next_handle: AtomicU64::new(0),
         }
     }
 
-    /// Add a subscriber (matching Python's void return signature).
-    pub fn subscribe(&self, subscriber: Box<dyn EventSubscriber>) {
+    /// Add a subscriber, returning a handle that removes exactly this one.
+    ///
+    /// The handle exists because Rust's ownership model makes the peer SDKs'
+    /// removal contract unreachable. `event-system.md`'s unsubscribe Contract
+    /// requires "the same object reference that was passed to `subscribe`",
+    /// which apcore-python (`list.remove`) and apcore-typescript (`indexOf`)
+    /// can honour because the caller keeps its reference. This method takes the
+    /// `Box`, so the caller has nothing left to pass back — and
+    /// [`Self::unsubscribe`] therefore approximates identity by
+    /// `subscriber_id()`, whose trait default is the literal `"default"`, so
+    /// two custom subscribers that do not override it are indistinguishable
+    /// (sync finding A-D-025).
+    ///
+    /// The return value may be discarded by callers that never remove.
+    pub fn subscribe(&self, subscriber: Box<dyn EventSubscriber>) -> SubscriberHandle {
         // Convert Box -> Arc so subscribers can be cloned into spawned
         // tasks by `emit_spawn` (sync finding A-D-501).
-        self.subscribers.write().push(Arc::from(subscriber));
+        let mut subs = self.subscribers.write();
+        let handle = SubscriberHandle(self.next_handle.fetch_add(1, Ordering::SeqCst));
+        subs.push(Arc::from(subscriber));
+        self.handles.write().push(handle);
+        handle
+    }
+
+    /// Remove exactly the subscriber that [`Self::subscribe`] returned `handle`
+    /// for. Unambiguous regardless of `subscriber_id()`.
+    pub fn unsubscribe_handle(&self, handle: SubscriberHandle) -> bool {
+        let mut handles = self.handles.write();
+        let Some(pos) = handles.iter().position(|h| *h == handle) else {
+            return false;
+        };
+        handles.remove(pos);
+        self.subscribers.write().remove(pos);
+        true
     }
 
     /// Remove the first subscriber whose `subscriber_id()` matches the given
@@ -113,6 +158,27 @@ impl EventEmitter {
     /// subscriber a unique id.
     pub fn unsubscribe(&self, subscriber: &dyn EventSubscriber) -> bool {
         let target_id = subscriber.subscriber_id();
+        // Removal by the trait-default id is ambiguous: every subscriber that
+        // did not override `subscriber_id()` reports the same literal, so this
+        // removes the FIRST such registration, which may not be the one the
+        // caller meant. Warn rather than silently removing the wrong one —
+        // `unsubscribe_handle` is the unambiguous form.
+        if target_id == DEFAULT_SUBSCRIBER_ID {
+            let ambiguous = self
+                .subscribers
+                .read()
+                .iter()
+                .filter(|s| s.subscriber_id() == DEFAULT_SUBSCRIBER_ID)
+                .count();
+            if ambiguous > 1 {
+                tracing::warn!(
+                    count = ambiguous,
+                    "unsubscribe() called with the default subscriber_id and {ambiguous} \
+                     subscribers share it — removing the first. Use unsubscribe_handle(), \
+                     or override subscriber_id(), to remove a specific one."
+                );
+            }
+        }
         self.unsubscribe_by_id(target_id)
     }
 

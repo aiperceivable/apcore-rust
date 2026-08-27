@@ -310,11 +310,19 @@ async fn subscribe_error_none_raised() {
 // clause: event_system.subscribe.property.async
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_property_async() {
-    // subscribe() is synchronous (not async) and returns unit.
+    // The clause under test is that subscribe() is SYNCHRONOUS — it completes
+    // without an await. It used to assert `let result: () = ...` as a proxy for
+    // that, which pinned the return type rather than the property: subscribe now
+    // returns a SubscriberHandle so a caller can remove exactly one subscriber
+    // (sync finding A-D-025), and the synchronous property is unchanged.
     let emitter = EventEmitter::new();
     let sub = RecordingSubscriber::new("s", "*");
-    let result: () = emitter.subscribe(Box::new(sub));
-    assert_eq!(result, ());
+    let handle = emitter.subscribe(Box::new(sub));
+    // No await was needed to get here, which is the property.
+    assert!(
+        emitter.unsubscribe_handle(handle),
+        "the returned handle must identify the subscription just created"
+    );
 }
 
 // clause: event_system.subscribe.property.thread_safe
@@ -1053,4 +1061,84 @@ mod a2a_deliver {
         let res4 = sub4.on_event(&make_event()).await;
         assert!(res4.is_ok(), "4xx is permanent: Ok, not retried");
     }
+}
+
+// ---------------------------------------------------------------------------
+// sync-2026-08-26 A-D-025: removal must be able to name exactly one subscriber.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsubscribe_handle_removes_exactly_one_of_two_sharing_an_id() {
+    // `unsubscribe(&dyn EventSubscriber)` resolves to
+    // `unsubscribe_by_id(subscriber.subscriber_id())`, and the trait default id
+    // is the literal "default" — so two custom subscribers that do not override
+    // it are indistinguishable, and removing one removed whichever was first.
+    //
+    // event-system.md's unsubscribe Contract requires "the same object
+    // reference that was passed to subscribe", which apcore-python
+    // (`list.remove`) and apcore-typescript (`indexOf`) honour because the
+    // caller keeps its reference. `subscribe` here takes the Box, so the caller
+    // has nothing left to pass back — the handle is what makes an unambiguous
+    // removal expressible at all.
+    #[derive(Debug)]
+    struct Anon {
+        tag: &'static str,
+        seen: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait::async_trait]
+    impl EventSubscriber for Anon {
+        // deliberately does NOT override subscriber_id()
+        fn event_pattern(&self) -> &str {
+            "*"
+        }
+        async fn on_event(&self, _e: &ApCoreEvent) -> Result<(), apcore::errors::ModuleError> {
+            self.seen.lock().push(self.tag);
+            Ok(())
+        }
+    }
+
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let emitter = EventEmitter::new();
+    let h_a = emitter.subscribe(Box::new(Anon {
+        tag: "a",
+        seen: Arc::clone(&seen),
+    }));
+    let _h_b = emitter.subscribe(Box::new(Anon {
+        tag: "b",
+        seen: Arc::clone(&seen),
+    }));
+
+    assert!(emitter.unsubscribe_handle(h_a), "handle a must resolve");
+
+    emitter.emit(&make_event()).await;
+    emitter.flush(2_000).await.ok();
+
+    let got = seen.lock().clone();
+    assert_eq!(
+        got,
+        vec!["b"],
+        "removing a's handle must leave b subscribed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsubscribe_handle_is_idempotent_and_reports_absence() {
+    #[derive(Debug)]
+    struct Noop;
+    #[async_trait::async_trait]
+    impl EventSubscriber for Noop {
+        fn event_pattern(&self) -> &str {
+            "*"
+        }
+        async fn on_event(&self, _e: &ApCoreEvent) -> Result<(), apcore::errors::ModuleError> {
+            Ok(())
+        }
+    }
+    let emitter = EventEmitter::new();
+    let h = emitter.subscribe(Box::new(Noop));
+    assert!(emitter.unsubscribe_handle(h), "first removal succeeds");
+    assert!(
+        !emitter.unsubscribe_handle(h),
+        "a handle already removed must report absence, not remove someone else"
+    );
 }
