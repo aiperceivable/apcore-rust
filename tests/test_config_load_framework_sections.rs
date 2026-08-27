@@ -88,6 +88,7 @@ use serde_json::{json, Value};
 /// loads this same body with strict on, which would fail on any key the
 /// canonical schema does not bless.
 const SECTIONS_YAML: &str = r#"
+$schema: "https://apcore.dev/schemas/apcore-config.schema.json"
 logging:
   level: debug
   format: text
@@ -176,6 +177,14 @@ const SECTIONS: &[&str] = &[
 /// Every `(dot-path key, value the file declares)` pair in [`SECTIONS_YAML`].
 fn declared_pairs() -> Vec<(&'static str, Value)> {
     vec![
+        // Not a section — a scalar top-level key, and the last framework key
+        // with no load-path coverage at all. It went unnoticed because the
+        // coverage guard read the section table, which never listed it
+        // (sync finding A-D-020).
+        (
+            "$schema",
+            json!("https://apcore.dev/schemas/apcore-config.schema.json"),
+        ),
         ("logging.level", json!("debug")),
         ("logging.format", json!("text")),
         ("middleware.disabled", json!(["audit", "tracing"])),
@@ -392,6 +401,28 @@ fn namespace_returns_exactly_the_files_subtree() {
     }
 }
 
+/// `$schema` survives a load in both modes.
+///
+/// It is the one framework key that is a root scalar rather than a section, so
+/// the per-section loops above cannot carry it, and it had no load-path
+/// coverage of any kind: nothing verified that a document declaring the
+/// customary JSON-Schema pointer still loads, or that the value comes back
+/// unchanged rather than being swallowed as an unknown root key.
+#[test]
+fn the_schema_pointer_survives_a_load() {
+    let expected = json!("https://apcore.dev/schemas/apcore-config.schema.json");
+    for (tag, (_dir, config)) in [
+        ("namespace mode", loaded_ns()),
+        ("legacy mode", loaded_legacy()),
+    ] {
+        assert_eq!(
+            config.get("$schema"),
+            Some(expected.clone()),
+            "[{tag}] the `$schema` pointer the file declares must survive the load"
+        );
+    }
+}
+
 /// The invariant #33 and #34 both broke: `namespace()` and `get()` must not
 /// disagree about the same namespace.
 ///
@@ -407,7 +438,12 @@ fn namespace_agrees_with_get_for_every_declared_key() {
         ("legacy mode", loaded_legacy()),
     ] {
         for (key, expected) in declared_pairs() {
-            let (section, rest) = key.split_once('.').expect("every fixture key is dotted");
+            // `$schema` is a root scalar, not a section, so there is no
+            // namespace for the two readers to disagree about. `get` on it is
+            // asserted by the tests above.
+            let Some((section, rest)) = key.split_once('.') else {
+                continue;
+            };
             let ns = namespace_value(&config, section);
             assert_eq!(
                 walk(&ns, rest),

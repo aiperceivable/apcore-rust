@@ -515,7 +515,7 @@ fn allow_unknown_does_not_soften_the_strict_framework_key_check() {
 
 /// Locate `apcore/schemas/` the same way the conformance drivers locate
 /// `apcore/conformance/fixtures/`.
-use crate::conformance_env::find_schemas_root;
+use crate::conformance_env::{find_fixtures_root, find_schemas_root};
 
 fn read_schema(name: &str) -> Value {
     let path = find_schemas_root().join(name);
@@ -550,90 +550,209 @@ fn declared_keys(def: &Value) -> BTreeSet<String> {
     out
 }
 
-/// `FRAMEWORK_SECTION_KEYS` must equal what the canonical schemas declare —
-/// section for section, key for key.
+/// `FRAMEWORK_CONFIG_KEYS` must equal what the canonical schemas declare —
+/// path for path, at every depth.
 ///
 /// The SDK cannot read `apcore/schemas/` at runtime, so the projection is
 /// transcribed into `src/config.rs`. Transcriptions drift: this re-derives the
 /// projection from the schema files on every run so a section added upstream
 /// fails here instead of being quietly exempt from strict mode forever.
+/// Guard the guard: every enforced section is closed upstream.
+///
+/// Enforcing closedness against a section the canonical schema leaves OPEN
+/// makes strict mode reject documents the schema accepts — a rejection with
+/// nothing normative behind it. Mirrors apcore-python's
+/// `test_every_section_the_schema_closes_is_enforced`; Rust had no equivalent,
+/// so the two `$defs` readers below sat unused (sync finding A-D-020).
 #[test]
-fn framework_section_keys_match_the_canonical_schema() {
+fn every_section_enforced_as_closed_is_closed_upstream() {
     let schema = read_schema("apcore-config.schema.json");
-    let defs = schema["$defs"].as_object().expect("$defs is an object");
     let properties = schema["properties"]
         .as_object()
-        .expect("properties is an object");
+        .expect("apcore-config.schema.json declares properties");
 
-    // A framework SECTION is a top-level property that refs a `$defs` object.
-    // `$schema` and `version` are scalars — §9.14 iterates the keys *inside* a
-    // section, so a scalar has nothing to iterate.
-    let mut derived: Vec<(String, BTreeSet<String>)> = Vec::new();
-    for (name, prop) in properties {
-        let Some(reference) = prop.get("$ref").and_then(Value::as_str) else {
-            continue;
-        };
-        let def_name = reference
-            .strip_prefix("#/$defs/")
-            .unwrap_or_else(|| panic!("`{name}` has a non-local $ref: {reference}"));
-        let def = defs
-            .get(def_name)
-            .unwrap_or_else(|| panic!("`{name}` refs missing $defs/{def_name}"));
-        derived.push((name.clone(), declared_keys(def)));
-    }
-
-    // `sys_modules` is declared across two canonical files: apcore-config
-    // carries only `enabled`, and sys-modules.schema.json carries the rest.
-    // This is the same projection `config_key_governance.json` performs when it
-    // builds `allowed_keys` ("the last namespaced under `sys_modules.`").
-    // Without the union, strict mode would reject `sys_modules.health.enabled`.
-    let sys_modules_keys = declared_keys(&read_schema("sys-modules.schema.json"));
-    assert!(
-        sys_modules_keys.contains("health"),
-        "sys-modules.schema.json no longer declares the families this union \
-         depends on: {sys_modules_keys:?}"
-    );
-    for (name, keys) in &mut derived {
-        if name == "sys_modules" {
-            keys.extend(sys_modules_keys.iter().cloned());
-        }
-    }
-    derived.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut table: Vec<(String, BTreeSet<String>)> = apcore::config::FRAMEWORK_SECTION_KEYS
+    let sections: BTreeSet<&str> = apcore::config::FRAMEWORK_CONFIG_KEYS
         .iter()
-        .map(|(section, keys)| {
-            (
-                (*section).to_string(),
-                keys.iter().map(|k| (*k).to_string()).collect(),
-            )
-        })
+        .filter_map(|path| path.split_once('.').map(|(head, _)| head))
         .collect();
-    table.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let derived_sections: Vec<&String> = derived.iter().map(|(n, _)| n).collect();
-    let table_sections: Vec<&String> = table.iter().map(|(n, _)| n).collect();
-    assert_eq!(
-        table_sections, derived_sections,
-        "FRAMEWORK_SECTION_KEYS lists a different set of sections than \
-         apcore-config.schema.json declares. A section added upstream and not \
-         added here is silently exempt from strict mode; one removed upstream \
-         is dead weight."
+    assert!(
+        sections.len() >= 10,
+        "the section set is derived from dot-paths — if that projection breaks \
+         this test passes while asserting nothing, got {sections:?}"
     );
 
-    let mut drift: Vec<String> = Vec::new();
-    for ((name, want), (_, got)) in derived.iter().zip(table.iter()) {
-        if want != got {
-            let missing: Vec<&String> = want.difference(got).collect();
-            let extra: Vec<&String> = got.difference(want).collect();
-            drift.push(format!("{name}: missing {missing:?}, extra {extra:?}"));
+    let mut open_sections: Vec<String> = Vec::new();
+    for section in sections {
+        let Some(node) = properties.get(section) else {
+            panic!("`{section}` is enforced but apcore-config.schema.json does not declare it");
+        };
+        let node = resolve_ref(node, &schema);
+        let closed = node.get("additionalProperties") == Some(&Value::Bool(false))
+            || node.get("unevaluatedProperties") == Some(&Value::Bool(false));
+        if !closed {
+            open_sections.push(section.to_string());
+        }
+        assert!(
+            !declared_keys(&node).is_empty(),
+            "`{section}` resolved to a node with no properties — the $ref \
+             resolution is not reaching the definition"
+        );
+    }
+
+    assert!(
+        open_sections.is_empty(),
+        "these sections are enforced as closed but the canonical schema leaves \
+         them open: {open_sections:?}"
+    );
+}
+
+/// Follow a `$ref` to the node it names, across files as well as within one.
+///
+/// Cross-file refs are not incidental here: `sys_modules` delegates wholesale
+/// to `sys-modules.schema.json`, which owns that namespace, so a resolver that
+/// only handled `#/$defs/Name` would see an empty node and read the section as
+/// declaring nothing.
+fn resolve_ref(node: &Value, doc: &Value) -> Value {
+    let mut current = node.clone();
+    let mut doc = doc.clone();
+    for _ in 0..8 {
+        let Some(target) = current
+            .get("$ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return current;
+        };
+        let (file, pointer) = match target.split_once('#') {
+            Some((file, fragment)) => (file, fragment),
+            None => (target.as_str(), ""),
+        };
+        if !file.is_empty() {
+            doc = read_schema(file);
+        }
+        // A JSON pointer is always rooted at the document, never at the node
+        // that carried the `$ref`.
+        current = doc.clone();
+        for segment in pointer.split('/').filter(|s| !s.is_empty()) {
+            let decoded = segment.replace("~1", "/").replace("~0", "~");
+            current = current
+                .get(&decoded)
+                .unwrap_or_else(|| panic!("`{target}` does not resolve at `{decoded}`"))
+                .clone();
         }
     }
+    panic!("`$ref` chain from {node:?} did not terminate");
+}
+
+#[test]
+fn framework_key_surface_matches_the_canonical_schema() {
+    // Drift guard for the runtime enforcement: the schema files ship with the
+    // spec repo, not this crate, so `reject_unknown_framework_keys` reads a
+    // mirror. A key added upstream and not added here is silently exempt from
+    // strict mode; one removed upstream is dead weight.
+    //
+    // Compared as full dot-paths at every depth. It used to compare a
+    // `section -> direct child names` table, which could not express — and so
+    // could not guard — the nested closedness those schemas declare
+    // (sync finding A-D-020).
+    let fixture_root = find_fixtures_root();
+    let raw = std::fs::read_to_string(fixture_root.join("config_key_governance.json"))
+        .expect("config_key_governance.json is readable");
+    let fixture: Value = serde_json::from_str(&raw).expect("fixture parses");
+
+    fn find_allowed(node: &Value) -> Option<&Vec<Value>> {
+        match node {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    if k == "allowed_keys" {
+                        if let Some(arr) = v.as_array() {
+                            return Some(arr);
+                        }
+                    }
+                    if let Some(found) = find_allowed(v) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            Value::Array(items) => items.iter().find_map(find_allowed),
+            _ => None,
+        }
+    }
+
+    let declared: BTreeSet<String> = find_allowed(&fixture)
+        .expect("the fixture carries an allowed_keys list")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    let enforced: BTreeSet<String> = apcore::config::FRAMEWORK_CONFIG_KEYS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+
+    let missing: Vec<&String> = declared.difference(&enforced).collect();
+    let extra: Vec<&String> = enforced.difference(&declared).collect();
     assert!(
-        drift.is_empty(),
-        "FRAMEWORK_SECTION_KEYS disagrees with the canonical schema:\n  {}",
-        drift.join("\n  ")
+        missing.is_empty() && extra.is_empty(),
+        "FRAMEWORK_CONFIG_KEYS has drifted from the canonical schemas.\n  \
+         declared by the schemas but not enforced here: {missing:?}\n  \
+         enforced here but not declared by the schemas: {extra:?}"
     );
+}
+
+#[test]
+fn nested_typo_is_rejected_under_strict() {
+    // `observability.tracing.sampling_rat` is invalid under the canonical
+    // schema, but a one-level check passed it because its parent `tracing` IS
+    // declared — and the misspelled sampling rate then fell back to its
+    // default silently, which is the failure strict mode exists to prevent.
+    let flat = vec![
+        ("_config.strict", json!(true)),
+        ("observability.tracing.enabled", json!(true)),
+        ("observability.tracing.sampling_rat", json!(1.0)),
+    ];
+    let (_dir, loaded) = load_doc(&legacy_doc(&flat));
+    let err = loaded.expect_err("a nested undeclared key must be rejected under strict");
+    assert!(
+        err.message.contains("observability.tracing.sampling_rat"),
+        "the error must name the full path, got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn declared_nested_keys_are_accepted_under_strict() {
+    // The recursion must not over-reach into rejecting declared nested keys.
+    let flat = vec![
+        ("_config.strict", json!(true)),
+        ("observability.tracing.enabled", json!(true)),
+        ("observability.tracing.sampling_rate", json!(1.0)),
+        ("acl.audit.enabled", json!(true)),
+    ];
+    let (_dir, loaded) = load_doc(&legacy_doc(&flat));
+    assert!(
+        loaded.is_ok(),
+        "declared nested keys must pass: {:?}",
+        loaded.err()
+    );
+}
+
+#[test]
+fn an_undeclared_subtree_reports_once_not_per_leaf() {
+    let flat = vec![
+        ("_config.strict", json!(true)),
+        ("observability.tracin.enabled", json!(true)),
+        ("observability.tracin.sampling_rate", json!(1.0)),
+    ];
+    let (_dir, loaded) = load_doc(&legacy_doc(&flat));
+    let err = loaded.expect_err("an unknown container must be rejected");
+    assert_eq!(
+        err.message.matches("unknown key").count(),
+        1,
+        "an unknown container is ONE error, not one per key beneath it: {}",
+        err.message
+    );
+    assert!(err.message.contains("observability.tracin'"));
 }
 
 /// Every typed field on `ConfigHelper` must be classified: either it is in

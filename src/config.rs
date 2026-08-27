@@ -184,60 +184,89 @@ const TYPED_SECTIONS: &[&str] = &[EXECUTOR_NS, OBSERVABILITY_NS];
 /// `#[doc(hidden)]`: public only so the conformance driver can diff it against
 /// the canonical schema. Not part of the supported API surface.
 #[doc(hidden)]
-pub const FRAMEWORK_SECTION_KEYS: &[(&str, &[&str])] = &[
-    // `_config` is declared by the schema (`$defs/ConfigBusMeta`,
-    // `additionalProperties: false`) and so is governed like any other
-    // section. §9.10 skips it as a *namespace*, not as a section — and a typo
-    // in the strict switch itself (`strcit: true`) is the single worst key to
-    // let through silently, since it disables every other check the operator
-    // asked for.
-    ("_config", &["allow_unknown", "strict"]),
-    ("project", &["name", "version"]),
-    (
-        "extensions",
-        &[
-            "auto_discover",
-            "follow_symlinks",
-            "ignore_patterns",
-            "lazy_load",
-            "max_depth",
-            "namespace",
-            "root",
-            "roots",
-        ],
-    ),
-    ("schema", &["max_ref_depth", "root", "strategy"]),
-    ("acl", &["audit", "default_effect", "root"]),
-    ("logging", &["format", "level"]),
-    ("observability", &["metrics", "tracing"]),
-    ("middleware", &["disabled"]),
-    (
-        "executor",
-        &[
-            "default_timeout",
-            "global_timeout",
-            "max_call_depth",
-            "max_module_repeat",
-        ],
-    ),
-    ("pipeline", &["configure", "remove", "steps"]),
-    ("validation", &["binding", "pipeline"]),
-    ("id_map", &["auto_detect", "overrides"]),
-    ("bindings", &["dir", "pattern"]),
-    (
-        "sys_modules",
-        &[
-            "control",
-            "enabled",
-            "error_history",
-            "events",
-            "health",
-            "manifest",
-            "usage",
-        ],
-    ),
-    ("stream", &["max_merge_depth"]),
-    ("obs", &["redaction"]),
+/// Every key the canonical schemas declare, as full dot-paths.
+///
+/// Generated from `schemas/*.schema.json` and pinned by
+/// `conformance/fixtures/config_key_governance.json`.
+///
+/// `_config` is declared by the schema (`$defs/ConfigBusMeta`,
+/// `additionalProperties: false`) and so is governed like any other section.
+/// §9.10 skips it as a *namespace*, not as a section — and a typo in the strict
+/// switch itself (`strcit: true`) is the single worst key to let through
+/// silently, since it disables every other check the operator asked for.
+///
+/// This replaced a `section -> direct child names` table. Those schemas are
+/// `additionalProperties: false` at EVERY level, not only at the section root,
+/// so a one-level check left strict mode blind exactly where a typo is hardest
+/// to spot: `observability.tracing.sampling_rat` passed it (its parent
+/// `tracing` IS declared) while the canonical schema rejects it (sync finding
+/// A-D-020).
+pub const FRAMEWORK_CONFIG_KEYS: &[&str] = &[
+    "$schema",
+    "_config.allow_unknown",
+    "_config.strict",
+    "acl.audit.enabled",
+    "acl.audit.include_denied",
+    "acl.audit.log_level",
+    "acl.default_effect",
+    "acl.root",
+    "bindings.dir",
+    "bindings.pattern",
+    "executor.default_timeout",
+    "executor.global_timeout",
+    "executor.max_call_depth",
+    "executor.max_module_repeat",
+    "extensions.auto_discover",
+    "extensions.follow_symlinks",
+    "extensions.ignore_patterns",
+    "extensions.lazy_load",
+    "extensions.max_depth",
+    "extensions.namespace",
+    "extensions.root",
+    "extensions.roots",
+    "id_map.auto_detect",
+    "id_map.overrides",
+    "logging.format",
+    "logging.level",
+    "middleware.disabled",
+    "obs.redaction.regex_patterns",
+    "obs.redaction.replacement",
+    "obs.redaction.sensitive_keys",
+    "observability.metrics.enabled",
+    "observability.metrics.exporter",
+    "observability.tracing.enabled",
+    "observability.tracing.exporter",
+    "observability.tracing.sampling_rate",
+    "pipeline.configure",
+    "pipeline.remove",
+    "pipeline.steps",
+    "project.name",
+    "project.version",
+    "schema.max_ref_depth",
+    "schema.root",
+    "schema.strategy",
+    "stream.max_merge_depth",
+    "sys_modules.control.enabled",
+    "sys_modules.control.overrides_path",
+    "sys_modules.enabled",
+    "sys_modules.error_history.max_entries_per_module",
+    "sys_modules.error_history.max_total_entries",
+    "sys_modules.events.enabled",
+    "sys_modules.events.subscribers",
+    "sys_modules.events.thresholds.error_rate",
+    "sys_modules.events.thresholds.latency_p99_ms",
+    "sys_modules.health.enabled",
+    "sys_modules.manifest.enabled",
+    "sys_modules.usage.bucketing_strategy",
+    "sys_modules.usage.enabled",
+    "sys_modules.usage.retention_hours",
+    "validation.binding.description_max_length",
+    "validation.binding.documentation_max_length",
+    "validation.binding.tags_pattern",
+    "validation.binding.version_require_semver",
+    "validation.pipeline.step_name_max_length",
+    "validation.pipeline.timeout_ms_max",
+    "version",
 ];
 
 /// Is `name` a framework section rather than a Config Bus namespace?
@@ -249,10 +278,26 @@ pub const FRAMEWORK_SECTION_KEYS: &[(&str, &[&str])] = &[
 /// `_config.strict: true` reported `unknown namespace 'acl'` for a document
 /// whose only sin was declaring an `acl:` block — and `unknown namespace
 /// 'project'` for the §9.1 required field.
-fn is_framework_section(name: &str) -> bool {
-    FRAMEWORK_SECTION_KEYS
+/// True when `path` is itself a declared key, or a declared prefix of one.
+fn is_declared_prefix(path: &str) -> bool {
+    FRAMEWORK_CONFIG_KEYS
         .iter()
-        .any(|(section, _)| *section == name)
+        .any(|k| *k == path || k.starts_with(&format!("{path}.")))
+}
+
+/// True when `path` names a declared CONTAINER (something is declared beneath
+/// it), as opposed to a declared leaf.
+fn is_declared_container(path: &str) -> bool {
+    let with_dot = format!("{path}.");
+    FRAMEWORK_CONFIG_KEYS
+        .iter()
+        .any(|k| k.starts_with(&with_dot))
+}
+
+fn is_framework_section(name: &str) -> bool {
+    FRAMEWORK_CONFIG_KEYS
+        .iter()
+        .any(|path| path.split('.').next() == Some(name) && path.contains('.'))
 }
 
 /// A canonical default value. Const-constructible so [`CONFIG_DEFAULTS`] can
@@ -1081,21 +1126,51 @@ impl Config {
     /// `acl.audit.*`) is the canonical schema's business at validation time,
     /// not this check's.
     fn reject_unknown_framework_keys(&self, errors: &mut Vec<String>) {
-        for (section, declared) in FRAMEWORK_SECTION_KEYS {
+        // Recursive: the canonical schemas are `additionalProperties: false` at
+        // every level, so a nested typo such as
+        // `observability.tracing.sampling_rat` is rejected too. This checked one
+        // level only, which let exactly that case through — its parent
+        // `tracing` IS declared (sync finding A-D-020).
+        fn walk(
+            data: &serde_json::Map<String, serde_json::Value>,
+            prefix: &str,
+            errors: &mut Vec<String>,
+        ) {
+            let mut keys: Vec<&String> = data.keys().collect();
+            keys.sort();
+            for key in keys {
+                let path = format!("{prefix}.{key}");
+                if !is_declared_prefix(&path) {
+                    errors.push(format!("unknown key '{path}' (strict mode enabled)"));
+                    continue; // do not descend into an undeclared subtree
+                }
+                // A declared leaf ends the walk whatever its value is; a
+                // declared container holding a non-object is a type error the
+                // A12 constraint table owns, not an undeclared key.
+                if let Some(child) = data[key].as_object() {
+                    if is_declared_container(&path) {
+                        walk(child, &path, errors);
+                    }
+                }
+            }
+        }
+
+        let mut sections: Vec<&str> = FRAMEWORK_CONFIG_KEYS
+            .iter()
+            .filter_map(|p| p.split_once('.').map(|(head, _)| head))
+            .collect();
+        sections.sort_unstable();
+        sections.dedup();
+
+        for section in sections {
             let Some(present) = self
                 .user_namespaces
-                .get(*section)
+                .get(section)
                 .and_then(serde_json::Value::as_object)
             else {
                 continue;
             };
-            for key in present.keys() {
-                if !declared.contains(&key.as_str()) {
-                    errors.push(format!(
-                        "unknown key '{section}.{key}' (strict mode enabled)"
-                    ));
-                }
-            }
+            walk(present, section, errors);
         }
     }
 

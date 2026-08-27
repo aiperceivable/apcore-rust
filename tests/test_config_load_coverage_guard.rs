@@ -22,7 +22,7 @@
 //!
 //! The section list has to be assembled from **every** place `src/config.rs`
 //! names one, not the convenient ones. This guard originally read five of the
-//! six and skipped `FRAMEWORK_SECTION_KEYS` — the longest list, and the only
+//! six and skipped `FRAMEWORK_CONFIG_KEYS` — the longest list, and the only
 //! one that is a projection of the canonical schema. Seven sections
 //! (`bindings`, `id_map`, `logging`, `middleware`, `obs`, `pipeline`,
 //! `validation`) appear *only* there, so they had no `Config::load` coverage
@@ -145,50 +145,8 @@ fn string_literals(body: &str) -> Vec<String> {
     out
 }
 
-/// Every string literal in `body` that is immediately followed by `, &[` —
-/// i.e. the KEY half of a `("section", &["key", …])` tuple.
-///
-/// Written as "literal followed by a slice" rather than "literal after an open
-/// paren" because the table is rustfmt-wrapped: a long entry puts the `(` on
-/// its own line, so the paren is not adjacent to the name. The trailing marker
-/// is unambiguous — a section name is the only literal followed by a slice,
-/// since the inner key literals are followed by `, "` or by `]`.
-fn slice_keyed_literals(body: &str) -> Vec<String> {
-    let chars: Vec<char> = body.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '"' {
-            i += 1;
-            continue;
-        }
-        let mut j = i + 1;
-        let mut lit = String::new();
-        while j < chars.len() && chars[j] != '"' {
-            if chars[j] == '\\' {
-                j += 1;
-            }
-            if j < chars.len() {
-                lit.push(chars[j]);
-            }
-            j += 1;
-        }
-        // `j` is the closing quote. Look at what follows, ignoring whitespace.
-        let tail: String = chars[(j + 1).min(chars.len())..]
-            .iter()
-            .filter(|c| !c.is_whitespace())
-            .take(3)
-            .collect();
-        if tail.starts_with(",&[") {
-            out.push(lit);
-        }
-        i = j + 1;
-    }
-    out
-}
-
 /// Every framework section `schemas/apcore-config.schema.json` declares, as
-/// projected into `FRAMEWORK_SECTION_KEYS`.
+/// projected into `FRAMEWORK_CONFIG_KEYS`.
 ///
 /// This is the longest of the section lists in `src/config.rs` and the one the
 /// guard originally did not read — which is precisely why `bindings`, `id_map`,
@@ -196,9 +154,17 @@ fn slice_keyed_literals(body: &str) -> Vec<String> {
 /// `Config::load` coverage while the guard stayed green (apcore-rust#34).
 /// Every name here is a top-level key an operator can write in `apcore.yaml`
 /// and the canonical schema will accept, so every one needs load-path coverage.
+///
+/// The constant holds full dot-paths since A-D-020 made the strict-mode check
+/// recursive, so a section is the head of a path. It used to hold
+/// `("section", &["key", …])` tuples, which needed a positional parser to tell
+/// the section half from the key half.
 fn framework_schema_sections() -> Vec<String> {
-    let body = const_body(CONFIG_RS, "pub const FRAMEWORK_SECTION_KEYS:");
-    let mut out = slice_keyed_literals(&body);
+    let body = const_body(CONFIG_RS, "pub const FRAMEWORK_CONFIG_KEYS:");
+    let mut out: Vec<String> = string_literals(&body)
+        .iter()
+        .map(|path| path.split('.').next().unwrap_or(path).to_string())
+        .collect();
     out.sort();
     out.dedup();
     out
@@ -401,19 +367,19 @@ fn the_section_extractors_are_not_vacuous() {
     let framework = framework_schema_sections();
     assert!(
         framework.len() >= 10,
-        "FRAMEWORK_SECTION_KEYS should yield every section of \
+        "FRAMEWORK_CONFIG_KEYS should yield every section of \
          apcore-config.schema.json, got {framework:?}"
     );
     for expected in ["acl", "bindings", "id_map", "logging", "obs", "validation"] {
         assert!(
             framework.contains(&expected.to_string()),
-            "`{expected}` must be recovered from FRAMEWORK_SECTION_KEYS, got {framework:?}"
+            "`{expected}` must be recovered from FRAMEWORK_CONFIG_KEYS, got {framework:?}"
         );
     }
     assert!(
         !framework.contains(&"strict".to_string()) && !framework.contains(&"redaction".to_string()),
         "`strict` and `redaction` are declared KEYS, not sections — the \
-         key/section split in slice_keyed_literals broke: {framework:?}"
+         dot-path head split broke: {framework:?}"
     );
 
     let defaults = default_table_sections();
