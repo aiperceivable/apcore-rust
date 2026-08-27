@@ -516,3 +516,47 @@ async fn test_reload_module_unknown_module_returns_module_not_found() {
         .expect_err("unknown module must error");
     assert_eq!(err.code, ErrorCode::ModuleNotFound);
 }
+
+// ---------------------------------------------------------------------------
+// sync-2026-08-26 A-D-015: `sys_modules.control.overrides_path` must be read
+// from Config, not only from SysModulesOptions.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn overrides_path_is_resolved_from_the_config_key() {
+    // apcore-python resolves this key from Config when no explicit path is
+    // passed (registration.py:382). This SDK read `SysModulesOptions` alone,
+    // so a project declaring the key in apcore.yaml got neither persistence
+    // nor restore.
+    //
+    // Asserted through an observable consequence: `load_overrides` routes
+    // `toggle.*` keys into the shared ToggleState, so a restored disable proves
+    // the file named by the config key was actually read.
+    use apcore::config::Config;
+    use apcore::executor::Executor;
+    use apcore::registry::registry::Registry;
+    use apcore::sys_modules::register_sys_modules;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let overrides = dir.path().join("overrides.yaml");
+    std::fs::write(&overrides, "toggle.executor.email.send: false\n").expect("write overrides");
+
+    let mut cfg = Config::from_defaults();
+    cfg.set("sys_modules.enabled", serde_json::json!(true));
+    cfg.set(
+        "sys_modules.control.overrides_path",
+        serde_json::json!(overrides.to_string_lossy()),
+    );
+
+    let registry = Arc::new(Registry::new());
+    let config = Arc::new(cfg);
+    let executor = Executor::new(Arc::clone(&registry), Arc::clone(&config));
+
+    let ctx = register_sys_modules(Arc::clone(&registry), &executor, &config, None)
+        .expect("registration succeeds");
+
+    assert!(
+        ctx.toggle_state.is_disabled("executor.email.send"),
+        "the overrides file named by the config key must be loaded and applied"
+    );
+}

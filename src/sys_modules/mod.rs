@@ -452,8 +452,31 @@ pub fn register_sys_modules_with_options(
 
     // --- §1.1: load overrides into a mutable Config clone, then share it ---
     let mut effective_config = config.clone();
-    if let Some(path) = overrides_path.as_deref() {
+    // Explicit option wins; otherwise fall back to the
+    // `sys_modules.control.overrides_path` CONFIG key, as apcore-python does
+    // (registration.py:382). Reading `SysModulesOptions` alone meant a project
+    // that declared the key in apcore.yaml got neither persistence nor restore
+    // (sync finding A-D-015).
+    let resolved_overrides_path: Option<PathBuf> = overrides_path.clone().or_else(|| {
+        config
+            .get("sys_modules.control.overrides_path")
+            .and_then(|v| v.as_str().map(PathBuf::from))
+    });
+    if let Some(path) = resolved_overrides_path.as_deref() {
         overrides::load_overrides(path, &mut effective_config, Some(&toggle_state));
+    } else if overrides_store.is_some() {
+        // An injected OverridesStore is written to by the control modules but
+        // cannot be READ here: `OverridesStore::load` is async and
+        // `register_sys_modules` is sync, so awaiting it would change this
+        // function's signature and every caller with it. apcore-typescript hits
+        // the same wall and logs the same way. Callers needing restore from a
+        // programmatic store should pre-load it and pass the values through
+        // `Config`, or use `overrides_path`.
+        tracing::warn!(
+            "An OverridesStore was supplied but cannot be loaded during synchronous \
+             register_sys_modules; its persisted values will not be restored. Pre-load \
+             into Config, or use sys_modules.control.overrides_path."
+        );
     }
 
     // --- Step 2: ErrorHistory + middleware ---
