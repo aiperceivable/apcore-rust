@@ -422,9 +422,15 @@ fn set_on_an_unmodelled_key_wins_over_the_file_without_clobbering_siblings() {
 // Absent / empty observability blocks
 // ---------------------------------------------------------------------------
 
-/// A file with NO `observability:` block must behave exactly as before: the
-/// typed defaults answer `get`, and `namespace()` returns the registered
-/// §9.15.2 defaults untouched.
+/// A file with NO `observability:` block resolves through the registered
+/// §9.15.2 defaults in BOTH readers.
+///
+/// Until spec v1.17.0 `get` consulted only the typed fields and the flat
+/// `CONFIG_DEFAULTS` table, so an unmodelled key such as
+/// `observability.logging.enabled` answered `None` here while
+/// `namespace("observability")["logging"]["enabled"]` answered `true` — and
+/// apcore-python and apcore-typescript both answered `true` from either reader
+/// (verified 2026-08-27). `get` now consults the registration defaults too.
 #[test]
 fn absent_observability_block_falls_back_to_defaults() {
     let (_dir, config) = load("apcore:\n  version: \"1.0\"\n");
@@ -436,16 +442,22 @@ fn absent_observability_block_falls_back_to_defaults() {
     );
     assert_eq!(
         config.get("observability.logging.enabled"),
-        None,
-        "an unmodelled key nobody declared has no CONFIG_DEFAULTS entry, so \
-         `get` must report absence rather than inventing a value"
+        Some(json!(true)),
+        "resolved from the §9.15.2 registration defaults, matching what \
+         apcore-python and apcore-typescript answer for the same document"
     );
     assert_eq!(
-        config.get("observability"),
+        config.get("observability").is_some(),
+        true,
+        "the namespace key resolves to its registered defaults, as it does in \
+         apcore-python and apcore-typescript"
+    );
+    assert_eq!(
+        config.get_declared("observability"),
         None,
-        "the document declared no observability block, so the namespace key \
-         itself must not resolve — `get_declared`-based required-field \
-         validation depends on this distinction"
+        "`get_declared` still reports absence — required-field validation \
+         depends on that distinction, and the registration lookup lives in \
+         `get`, not in the `get_direct` that `get_declared` delegates to"
     );
 
     let ns = config.namespace("observability");
@@ -473,7 +485,13 @@ fn empty_observability_block_is_inert() {
         Some(json!(false)),
         "typed default, unchanged"
     );
-    assert_eq!(config.get("observability.logging.enabled"), None);
+    assert_eq!(
+        config.get("observability.logging.enabled"),
+        Some(json!(true)),
+        "an empty block overlays nothing, so the §9.15.2 registration default \
+         stands in `get` as it does in `namespace` — and as it does in \
+         apcore-python and apcore-typescript"
+    );
 
     let ns = config.namespace("observability");
     assert_eq!(

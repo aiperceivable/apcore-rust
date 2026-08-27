@@ -668,37 +668,32 @@ fn absent_sections_resolve_to_the_default_table_and_nothing_more() {
     assert!(config.namespace("my_vendor").is_empty());
 }
 
-/// A cross-language divergence found while closing the coverage gap
-/// (apcore-rust#34) — pinned so it cannot change silently, NOT endorsed.
+/// `Config::get` and `Config::namespace` agree on a registered namespace's
+/// defaults (§9.15) — the cross-language divergence pinned here is closed.
 ///
-/// `Config::namespace` deep-merges a registered namespace's §9.15 defaults as
-/// its base layer. `Config::get` does not: it consults `user_namespaces` and
-/// then the flat `CONFIG_DEFAULTS` table only. So for a subkey the file leaves
-/// undeclared, the two readers disagree — `namespace("sys_modules")["health"]
-/// ["enabled"]` is `true` while `get("sys_modules.health.enabled")` is `None`.
-/// That is the same "two readers, one namespace" shape as #33 and #34, reached
-/// from a third direction.
+/// Previously `namespace()` deep-merged the registration defaults as its base
+/// layer while `get()` consulted only `user_namespaces` and the flat
+/// `CONFIG_DEFAULTS` table, so the two readers disagreed on any subkey the file
+/// left undeclared: `namespace("sys_modules")["usage"]["enabled"]` was `true`
+/// while `get("sys_modules.usage.enabled")` was `None`. apcore-python and
+/// apcore-typescript never had it — both seed the registration defaults into
+/// their data tree at load in namespace mode.
 ///
-/// **apcore-python and apcore-typescript do not have it.** Both merge the
-/// registered defaults into their data tree at load in namespace mode
-/// (`_apply_namespace_defaults` in `config.py:829`; the `_globalNsRegistry`
-/// loop in `config.ts:743`), so their `get` answers `true` here.
-///
-/// It is left as-is deliberately, because unlike #33 and #34 the fix is not
-/// contained. Rust would have to decide the precedence between the registered
-/// namespace defaults and `CONFIG_DEFAULTS` — which disagree outright on
-/// `sys_modules.enabled` (registration says `true`, `defaults.schema.json` says
-/// `false`, a split `src/config.rs` documents and both peers share) — and do it
-/// without letting the defaults leak into `get_declared`, on which legacy-mode
-/// required-field validation depends. That is a spec question for the apcore
-/// repo, not a local repair.
-///
-/// If it is resolved, this test SHOULD fail: update it rather than deleting it.
+/// The earlier version of this test recorded the fix as blocked on a spec
+/// question: Rust could not order the registration defaults against
+/// `CONFIG_DEFAULTS` while the two disagreed outright on `sys_modules.enabled`
+/// (registration `true`, `defaults.schema.json` `false`). PROTOCOL_SPEC §9.15.3
+/// is corrected in spec v1.17.0 — both now say `false` — so the ordering could
+/// finally be stated: loaded config, then registration defaults, then
+/// CONFIG_DEFAULTS. The lookup lives in `get` and NOT in `get_direct`, so
+/// `get_declared` still distinguishes "declared" from "defaulted" and
+/// legacy-mode required-field validation is unaffected.
 #[test]
-fn known_divergence_get_does_not_consult_registered_namespace_defaults() {
+fn get_and_namespace_agree_on_registered_namespace_defaults() {
     let (_dir, config) = loaded_ns();
 
     // The file declares `usage.retention_hours` but not `usage.enabled`.
+    // Both readers now resolve it from the §9.15.3 registration.
     assert_eq!(
         config.namespace("sys_modules")["usage"]["enabled"],
         json!(true),
@@ -706,22 +701,49 @@ fn known_divergence_get_does_not_consult_registered_namespace_defaults() {
     );
     assert_eq!(
         config.get("sys_modules.usage.enabled"),
-        None,
-        "get() does not — see this test's doc comment for the cross-language \
-         divergence this pins"
+        Some(json!(true)),
+        "get() now consults it too — previously None, which is what made the \
+         two readers disagree"
     );
 
-    // And the flat default table wins over the registration where they differ.
+    // A value the file DID declare still wins over the registration default.
+    assert_eq!(
+        config.get("sys_modules.usage.retention_hours"),
+        config.namespace("sys_modules")["usage"]["retention_hours"]
+            .clone()
+            .into(),
+        "the loaded config outranks the registration defaults"
+    );
+
+    // The activation flag agrees across both readers and both default tables.
     let (_dir2, bare) = load_file("apcore.yaml", "apcore:\n  version: \"1.0\"\n");
     assert_eq!(
         bare.get("sys_modules.enabled"),
         Some(json!(false)),
-        "CONFIG_DEFAULTS (defaults.schema.json) says false"
+        "CONFIG_DEFAULTS and the §9.15.3 registration both say false as of spec v1.17.0"
     );
     assert_eq!(
         bare.namespace("sys_modules")["enabled"],
-        json!(true),
-        "the §9.15.3 registration says true"
+        json!(false),
+        "namespace() agrees — this pair used to read false vs true"
+    );
+}
+
+/// `get_declared` must NOT see registration defaults: legacy-mode required-field
+/// validation (§9.3 step 1) distinguishes declared from defaulted, and a default
+/// leaking there would let the check pass on a key nobody wrote.
+#[test]
+fn registered_namespace_defaults_do_not_leak_into_get_declared() {
+    let (_dir, config) = loaded_ns();
+    assert_eq!(
+        config.get("sys_modules.usage.enabled"),
+        Some(json!(true)),
+        "get() resolves it"
+    );
+    assert_eq!(
+        config.get_declared("sys_modules.usage.enabled"),
+        None,
+        "get_declared() must not — the file never declared it"
     );
 }
 

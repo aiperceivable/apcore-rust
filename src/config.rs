@@ -1255,6 +1255,23 @@ impl Config {
             }
         }
 
+        // Then the registered namespace's own defaults (§9.15). apcore-python
+        // and apcore-typescript seed these into the data tree at load in
+        // namespace mode (`_apply_namespace_defaults`, config.py; the
+        // `_globalNsRegistry` loop, config.ts), so their `get` answers from
+        // them. Rust consulted them only inside `namespace()`, which left the
+        // two readers disagreeing on any subkey the file omitted —
+        // `namespace("sys_modules")["usage"]["enabled"]` was `true` while
+        // `get("sys_modules.usage.enabled")` was `None`.
+        //
+        // Deliberately placed in `get` and NOT in `get_direct`: `get_declared`
+        // delegates to `get_direct`, and legacy-mode required-field validation
+        // depends on it distinguishing "declared" from "defaulted". A default
+        // leaking there would let §9.3 step 1 pass on an undeclared key.
+        if let Some(val) = Self::registered_namespace_default(key) {
+            return Some(val);
+        }
+
         // Fall back to the canonical default table. apcore-python deep-merges
         // `_DEFAULTS` into its data tree at load and apcore-typescript merges
         // `DEFAULTS`, so both return the canonical value for a key a legacy
@@ -1262,6 +1279,31 @@ impl Config {
         // without mutating the loaded tree (so `data()` still round-trips the
         // file as written).
         Self::default_for(key)
+    }
+
+    /// Resolve `key` against the `defaults` of its registered namespace (§9.15).
+    ///
+    /// Returns `None` when the key names no registered namespace, when that
+    /// namespace declared no defaults, or when the path is absent from them.
+    ///
+    /// Ordered AFTER the loaded config and BEFORE [`CONFIG_DEFAULTS`]: a value
+    /// the operator wrote always wins, and a namespace that declares its own
+    /// default for a key is more specific than the flat canonical table. The
+    /// two tables no longer disagree on `sys_modules.enabled` — both say
+    /// `false` as of spec v1.17.0 — which is what made this ordering safe to
+    /// state at all.
+    fn registered_namespace_default(key: &str) -> Option<serde_json::Value> {
+        let (ns_name, rest) = Self::match_registered_namespace(key)?;
+        let registry = global_ns_registry().read();
+        let defaults = registry.get(&ns_name)?.defaults.as_ref()?;
+        if rest.is_empty() {
+            return Some(defaults.clone());
+        }
+        let mut current = defaults;
+        for part in rest.split('.') {
+            current = current.get(part)?;
+        }
+        Some(current.clone())
     }
 
     /// Like [`Self::get`] but WITHOUT the [`CONFIG_DEFAULTS`] fallback: returns
@@ -2254,8 +2296,13 @@ fn init_builtin_namespaces() {
             NamespaceRegistration {
                 name: "sys_modules".to_string(),
                 env_prefix: Some("APCORE_SYS".to_string()),
+                // Activation is off by default: PROTOCOL_SPEC §6.6.3 states
+                // `sys_modules.enabled = false (default)` -> 0 modules
+                // registered, and schemas/sys-modules.schema.json declares
+                // `default: false`. The per-module sub-flags stay true: they
+                // select WHICH modules register once activation has happened.
                 defaults: Some(serde_json::json!({
-                    "enabled": true,
+                    "enabled": false,
                     "health": { "enabled": true },
                     "manifest": { "enabled": true },
                     "usage": { "enabled": true, "retention_hours": 168, "bucketing_strategy": "hourly" },
