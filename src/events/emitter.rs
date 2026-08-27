@@ -321,6 +321,19 @@ impl EventEmitter {
     /// remaining (still-running) tasks are left in place and `flush` returns
     /// `Ok(())` — delivery continues in the background, mirroring Python which
     /// swallows per-future timeouts. A `timeout_ms` of 0 waits indefinitely.
+    /// Default flush timeout in milliseconds, matching the 5-second default the
+    /// `flush` Contract declares and the one apcore-typescript uses.
+    pub const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 5_000;
+
+    /// [`Self::flush`] with the Contract's default timeout.
+    ///
+    /// The Contract declares `timeout` OPTIONAL with a default; Rust has no
+    /// default arguments, so this is where that default lives. Without it this
+    /// SDK was the only one with no default at all (sync finding A-D-026).
+    pub async fn flush_default(&self) -> Result<(), ModuleError> {
+        self.flush(Self::DEFAULT_FLUSH_TIMEOUT_MS).await
+    }
+
     pub async fn flush(&self, timeout_ms: u64) -> Result<(), ModuleError> {
         // Take ownership of the current in-flight handles.
         let handles: Vec<JoinHandle<()>> = {

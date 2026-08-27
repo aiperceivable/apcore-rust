@@ -1142,3 +1142,16 @@ async fn unsubscribe_handle_is_idempotent_and_reports_absence() {
         "a handle already removed must report absence, not remove someone else"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flush_default_uses_the_contract_default() {
+    // The flush Contract declares `timeout` OPTIONAL with a 5-second default.
+    // Rust has no default arguments, and this SDK was the only one that
+    // therefore had no default at all (sync finding A-D-026).
+    assert_eq!(EventEmitter::DEFAULT_FLUSH_TIMEOUT_MS, 5_000);
+    let emitter = EventEmitter::new();
+    emitter
+        .flush_default()
+        .await
+        .expect("flushing an idle emitter is a no-op");
+}
