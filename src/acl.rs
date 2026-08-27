@@ -162,7 +162,9 @@ impl ACL {
         // Auto-register built-in condition handlers ($or, $not, identity_types,
         // roles, max_call_depth) — matches apcore-python and apcore-typescript
         // module-load auto-registration. Idempotent via std::sync::Once
-        // (sync finding A-D-027).
+        // (sync finding A-D-027), and each built-in is seeded only where the
+        // key is unclaimed, so a handler the deployment registered before the
+        // first ACL is not replaced by the permissive default (A-D-010).
         Self::init_builtin_handlers();
         Self {
             rules,

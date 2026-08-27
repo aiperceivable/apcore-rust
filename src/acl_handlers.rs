@@ -172,6 +172,10 @@ pub static ASYNC_CONDITION_HANDLERS: LazyLock<
 
 /// Register a condition handler globally. Replaces any existing handler for the same key.
 ///
+/// An explicit registration always wins over the built-in for that key, in
+/// either order: built-ins are seeded only where the key is unclaimed (see
+/// `register_builtin_handlers`).
+///
 /// See also [`ACL::register_condition`](crate::ACL::register_condition) for the convenience
 /// static method on the ACL type, which delegates here.
 pub fn register_condition(key: impl Into<String>, handler: Arc<dyn ACLConditionHandler>) {
@@ -436,14 +440,36 @@ impl ACLConditionHandler for NotHandler {
 
 /// Register all built-in handlers. Called once during initialization.
 pub fn register_builtin_handlers() {
-    register_condition("identity_types", Arc::new(IdentityTypesHandler));
-    register_condition("roles", Arc::new(RolesHandler));
-    register_condition("max_call_depth", Arc::new(MaxCallDepthHandler));
+    seed_condition("identity_types", || Arc::new(IdentityTypesHandler));
+    seed_condition("roles", || Arc::new(RolesHandler));
+    seed_condition("max_call_depth", || Arc::new(MaxCallDepthHandler));
     // Mode-matched pairs — see `CompoundMode`.
-    register_condition("$or", Arc::new(OrHandler::new(CompoundMode::Sync)));
-    register_condition("$not", Arc::new(NotHandler::new(CompoundMode::Sync)));
-    register_async_condition("$or", Arc::new(OrHandler::new(CompoundMode::Async)));
-    register_async_condition("$not", Arc::new(NotHandler::new(CompoundMode::Async)));
+    seed_condition("$or", || Arc::new(OrHandler::new(CompoundMode::Sync)));
+    seed_condition("$not", || Arc::new(NotHandler::new(CompoundMode::Sync)));
+    seed_async_condition("$or", || Arc::new(OrHandler::new(CompoundMode::Async)));
+    seed_async_condition("$not", || Arc::new(NotHandler::new(CompoundMode::Async)));
+}
+
+/// Install a built-in handler ONLY if `key` is unclaimed.
+///
+/// Built-ins are a floor, not an override. apcore-python and apcore-typescript
+/// seed theirs at module load, so a deployment's `register_condition` call
+/// always lands afterwards and wins. Rust seeds lazily, from the first
+/// `ACL::new` — with an unconditional insert, a stricter handler registered at
+/// startup was silently replaced by the permissive built-in the moment the
+/// first ACL was constructed, and the ACL then evaluated `roles` against the
+/// built-in rule the deployment had deliberately replaced. Same call after the
+/// first ACL survived, so the failure was ordering-dependent and invisible
+/// (sync finding A-D-010).
+fn seed_condition(key: &str, build: impl FnOnce() -> Arc<dyn ACLConditionHandler>) {
+    let mut map = CONDITION_HANDLERS.write();
+    map.entry(key.to_string()).or_insert_with(build);
+}
+
+/// [`seed_condition`] for the async-only registry.
+fn seed_async_condition(key: &str, build: impl FnOnce() -> Arc<dyn ACLConditionHandler>) {
+    let mut map = ASYNC_CONDITION_HANDLERS.write();
+    map.entry(key.to_string()).or_insert_with(build);
 }
 
 #[cfg(test)]
@@ -616,6 +642,82 @@ mod tests {
         async fn evaluate(&self, value: &Value, _ctx: &Context<Value>) -> bool {
             value.as_bool().unwrap_or(false)
         }
+    }
+
+    /// A built-in must not replace a handler the deployment already claimed.
+    ///
+    /// Tested on `seed_condition` directly, with a key no other test uses: the
+    /// registries are process-global, so driving this through `ACL::new` and a
+    /// real built-in key would leave a window in which any concurrently
+    /// running ACL test reads the wrong handler.
+    #[test]
+    fn seed_condition_does_not_replace_a_claimed_key() {
+        const KEY: &str = "_test_seed_if_absent_rs";
+        register_condition(KEY, Arc::new(PassHandler));
+
+        let claimed = Arc::as_ptr(
+            CONDITION_HANDLERS
+                .read()
+                .get(KEY)
+                .expect("the explicit registration landed"),
+        );
+
+        seed_condition(KEY, || Arc::new(IdentityTypesHandler));
+
+        let after = Arc::as_ptr(
+            CONDITION_HANDLERS
+                .read()
+                .get(KEY)
+                .expect("the key is still registered"),
+        );
+        assert!(
+            std::ptr::addr_eq(claimed, after),
+            "seeding replaced a handler that was already registered — a \
+             deployment's stricter handler would be silently swapped for the \
+             permissive built-in (A-D-010)"
+        );
+    }
+
+    /// The same call installs the handler when the key is unclaimed.
+    #[test]
+    fn seed_condition_installs_when_the_key_is_free() {
+        const KEY: &str = "_test_seed_when_free_rs";
+        assert!(!CONDITION_HANDLERS.read().contains_key(KEY));
+        seed_condition(KEY, || Arc::new(IdentityTypesHandler));
+        assert!(CONDITION_HANDLERS.read().contains_key(KEY));
+    }
+
+    /// Guard the fix at its source: every built-in must go through the
+    /// if-absent seed, never through the overwriting `register_condition`.
+    ///
+    /// The unit tests above pin `seed_condition`'s semantics; this pins that
+    /// `register_builtin_handlers` still uses it. Rewriting one line back to
+    /// `register_condition("roles", …)` would otherwise reintroduce A-D-010
+    /// with both unit tests still green.
+    #[test]
+    fn built_ins_are_seeded_never_overwritten() {
+        let src = include_str!("acl_handlers.rs");
+        let start = src
+            .find("pub fn register_builtin_handlers() {")
+            .expect("register_builtin_handlers still exists");
+        let body_end = src[start..]
+            .find("\n}")
+            .expect("its body is brace-terminated")
+            + start;
+        let body = &src[start..body_end];
+
+        assert!(
+            !body.contains("register_condition(") && !body.contains("register_async_condition("),
+            "register_builtin_handlers overwrites instead of seeding — a \
+             handler registered before the first ACL::new would be replaced \
+             by the built-in (A-D-010):\n{body}"
+        );
+        assert_eq!(
+            body.matches("seed_condition(").count() + body.matches("seed_async_condition(").count(),
+            7,
+            "expected all seven built-in registrations to be seeded — three \
+             sync-only handlers plus the two mode-matched compound pairs:\n{body}"
+        );
     }
 
     /// Register "pass" handler and ensure built-ins are present before compound tests.
