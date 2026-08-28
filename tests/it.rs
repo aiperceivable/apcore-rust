@@ -92,6 +92,8 @@ mod test_acl_panic_boundary;
 mod test_acl_root_discovery;
 #[path = "test_acl_root_discovery_conformance.rs"]
 mod test_acl_root_discovery_conformance;
+#[path = "test_acl_rule_key_closure_conformance.rs"]
+mod test_acl_rule_key_closure_conformance;
 #[path = "test_acl_sync_handler_error.rs"]
 mod test_acl_sync_handler_error;
 #[path = "test_acl_unevaluable_conditions.rs"]
