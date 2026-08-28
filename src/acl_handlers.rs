@@ -158,7 +158,7 @@ fn join_handler_errors(errors: &HandlerErrors) -> Option<String> {
     // is `BTreeMap`'s ordering invariant, restated here so the rule is visible
     // at the point it is applied.
     let mut ordered: Vec<(&String, &String)> = errors.iter().collect();
-    ordered.sort_by(|(a, _), (b, _)| a.cmp(b));
+    ordered.sort_by_key(|(path, _)| *path);
     Some(
         ordered
             .into_iter()
