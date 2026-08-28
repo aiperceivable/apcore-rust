@@ -186,6 +186,8 @@ mod test_executor_hardening;
 mod test_executor_trace_cancellation_conformance;
 #[path = "test_extensions.rs"]
 mod test_extensions;
+#[path = "test_id_conflict_reserved_words_conformance.rs"]
+mod test_id_conflict_reserved_words_conformance;
 #[path = "test_inject_inbound_flags.rs"]
 mod test_inject_inbound_flags;
 #[path = "test_inject_malformed_parent_id.rs"]
