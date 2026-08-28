@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.28.0] - Unreleased
+
 ### Added
 
 - **`ConditionOutcome` and three-valued ACL condition evaluation (spec v1.22.0 / v1.25.0 §6.1.1, apcore#100).** Condition evaluation returned a plain `bool`, so "a handler answered no" and "no answer was obtainable" reached the rule loop identically and both meant *this rule does not match*. That is safe in one direction only: an `allow` rule that cannot evaluate its condition does not grant, but a `deny` rule that cannot evaluate its condition does not block — evaluation continued to the next rule and then to `default_effect`. See the BREAKING entry below for the behaviour change; the type is listed here because it is the new public surface. `ConditionOutcome::{and, or, negate}` carry §6.1.1's Kleene composition table, and `$not` of `Unevaluable` is `Unevaluable`, never `Satisfied` — negating "no answer" into "yes" would let a misspelled key inside a `$not` satisfy the rule it was meant to gate.
