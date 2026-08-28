@@ -615,9 +615,12 @@ impl Step for BuiltinApprovalGate {
         // call site — the invocation `arguments` and the `Context` — which are
         // already in scope here because the gate is Step 5. The built-in
         // pattern rules MUST NOT consult them, so no existing verdict moves;
-        // the inputs exist so the call site reaches the audit trail and so a
-        // host-supplied policy could decide on arguments. Those arguments have
-        // NOT been schema-validated: input validation is Step 7.
+        // the inputs exist so the call site reaches the audit trail (rule 3).
+        // Those arguments have NOT been schema-validated: input validation is
+        // Step 7. `resolve_with_call_site` strips `_approval_token` before
+        // resolving (rule 5) — §7.4's "before passing to subsequent steps" does
+        // not reach inside Step 5, so the strip below happens too late for the
+        // policy and the API boundary is where it has to be enforced.
         let decision: Option<PolicyDecision> = ctx.policy.clone().map(|policy| {
             policy.resolve_with_call_site(
                 &ctx.module_id,

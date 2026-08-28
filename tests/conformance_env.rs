@@ -78,6 +78,37 @@ pub fn find_fixtures_root() -> PathBuf {
     spec_repo_subdir(&["conformance", "fixtures"], "conformance/fixtures/")
 }
 
+/// Locate a fixture that is deliberately **staged** outside
+/// `conformance/fixtures/` while a cross-SDK rollout is in flight.
+///
+/// A fixture whose expectations changed cannot land in the canonical directory
+/// until every SDK driver implements the new behaviour, or CI goes red in each
+/// repository for the duration. The spec repo therefore stages it under
+/// `planning/<topic>/staged-fixtures/`, and a driver that has already converged
+/// reads it from there.
+///
+/// Returns `None` when the staged copy is absent — which is what happens once
+/// the fixture is promoted, so the driver falls back to the canonical location
+/// with no code change.
+pub fn find_staged_fixture(topic: &str, file_name: &str) -> Option<PathBuf> {
+    let roots: Vec<PathBuf> = match spec_repo_env() {
+        Some((_, value)) => vec![PathBuf::from(value)],
+        None => vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("apcore")],
+    };
+    roots
+        .into_iter()
+        .map(|root| {
+            root.join("planning")
+                .join(topic)
+                .join("staged-fixtures")
+                .join(file_name)
+        })
+        .find(|path| path.is_file())
+}
+
 /// Locate the canonical `schemas/` directory.
 pub fn find_schemas_root() -> PathBuf {
     spec_repo_subdir(&["schemas"], "schemas/")

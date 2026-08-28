@@ -10,7 +10,7 @@ use std::sync::{Arc, Once};
 
 use crate::acl_handlers::{
     evaluate_conditions_async_outcome as handlers_evaluate_conditions_async_outcome,
-    is_async_registered, is_sync_registered, register_builtin_handlers, ConditionOutcome,
+    precheck_conditions, register_builtin_handlers, ConditionOutcome, PrecheckPath, RuleFault,
     CONDITION_HANDLERS,
 };
 use crate::context::Context;
@@ -62,54 +62,72 @@ pub struct AuditEntry {
 /// Type alias for the audit logger callback.
 type AuditLoggerFn = dyn Fn(&AuditEntry) + Send + Sync;
 
-/// One rule referencing a condition key that does not resolve to a handler.
+/// One rule that fails PROTOCOL_SPEC §6.1.4's structural and registry
+/// precheck.
 ///
-/// Produced by [`ACL::validate_conditions`] (PROTOCOL_SPEC §6.1.2 rule 3,
-/// §6.1.3). `sync_registered` and `async_registered` are reported separately
-/// and MUST NOT be collapsed into a single boolean: `async_check()` consults
-/// the async registry and falls back to the sync one, while `check()` consults
-/// only the sync registry, so a key registered **only** as an async handler is
-/// a working condition on one path and an unevaluable one on the other.
+/// Produced by [`ACL::validate_rules`] (§6.1.2 rule 3, §6.1.3). A fault is
+/// either a condition key with no resolvable handler, a compound operator
+/// whose operand has the wrong shape (`$or` that is not a list, `$not` that is
+/// not an object), or a `conditions` value that is not a mapping at all.
+///
+/// `sync_resolvable` and `async_resolvable` are reported separately and MUST
+/// NOT be collapsed into a single boolean: `async_check()` consults the async
+/// registry and falls back to the sync one, while `check()` consults only the
+/// sync registry, so a key registered **only** as an async handler is a working
+/// condition on one path and an unevaluable one on the other. They are named
+/// `*_resolvable` rather than `*_registered` because they mean "resolvable on
+/// that evaluation path", not "present in that registry" — `async_resolvable`
+/// is the union of both, and would otherwise read as false for every built-in
+/// leaf handler (§6.1.3 rule 2).
 ///
 /// Marked `#[non_exhaustive]` so a future spec revision can add a field without
 /// a major version bump. That works by removing struct-literal construction
 /// from every crate but this one — `..Default::default()` included, since it is
 /// itself a struct expression (`error[E0639]`). Build one with
-/// [`ConditionValidationFinding::new`]; the fields are public to read.
+/// [`RuleValidationFinding::new`]; the fields are public to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ConditionValidationFinding {
+pub struct RuleValidationFinding {
     /// Index of the offending rule in definition order.
     pub rule_index: usize,
-    /// The condition key that does not resolve.
-    pub condition_key: String,
+    /// Where the fault sits in the rule (§6.1.4 condition paths): `roles`,
+    /// `$or[1].mispelled`, `$not.k`, or `$` for a non-mapping `conditions`.
+    ///
+    /// Findings order by this, not by key, because a nested `$or` may carry the
+    /// same key at several positions and ordering by key alone is undefined.
+    pub condition_path: String,
+    /// The offending key, where one exists. `None` for a `conditions` value
+    /// that is not a mapping — there is no key to name.
+    pub condition_key: Option<String>,
     /// The rule's effect. A finding on a `deny` rule is the consequential one:
     /// per §6.1.1 that rule now denies every call it matches.
     pub effect: String,
-    /// Whether the key resolves for `check()`.
-    pub sync_registered: bool,
-    /// Whether the key resolves for `async_check()`.
-    pub async_registered: bool,
+    /// Whether the condition resolves for `check()`.
+    pub sync_resolvable: bool,
+    /// Whether it resolves for `async_check()`.
+    pub async_resolvable: bool,
 }
 
-impl ConditionValidationFinding {
+impl RuleValidationFinding {
     /// Build a finding. Provided because `#[non_exhaustive]` removes
     /// struct-literal construction for downstream crates
     /// (`api-surface-conventions.md` §9.2 rule 2).
     #[must_use]
     pub fn new(
         rule_index: usize,
-        condition_key: impl Into<String>,
+        condition_path: impl Into<String>,
+        condition_key: Option<String>,
         effect: impl Into<String>,
-        sync_registered: bool,
-        async_registered: bool,
+        sync_resolvable: bool,
+        async_resolvable: bool,
     ) -> Self {
         Self {
             rule_index,
-            condition_key: condition_key.into(),
+            condition_path: condition_path.into(),
+            condition_key,
             effect: effect.into(),
-            sync_registered,
-            async_registered,
+            sync_resolvable,
+            async_resolvable,
         }
     }
 }
@@ -234,13 +252,13 @@ impl ACL {
         // key is unclaimed, so a handler the deployment registered before the
         // first ACL is not replaced by the permissive default (A-D-010).
         Self::init_builtin_handlers();
-        // PROTOCOL_SPEC §6.1.2: warn (never fail) for every rule referencing a
-        // condition key that does not resolve on the sync path. Emitted AFTER
+        // PROTOCOL_SPEC §6.1.2: warn (never fail) for every rule that fails
+        // §6.1.4's precheck on the sync path. Emitted AFTER
         // `init_builtin_handlers` so the built-ins are never reported. Rule 4
         // makes direct construction an entry point that MUST be covered, not
         // just file loading — `try_new`, `new`, `load`, `discover` and
         // `reload` all funnel through here.
-        Self::warn_unresolved_conditions(&rules, 0);
+        Self::warn_rule_faults(&rules, 0);
         Self {
             rules,
             default_effect: default_effect.into(),
@@ -249,8 +267,8 @@ impl ACL {
         }
     }
 
-    /// Emit PROTOCOL_SPEC §6.1.2 rule 2's load-time warning for every rule
-    /// whose conditions reference a key with no handler on the sync path.
+    /// Emit PROTOCOL_SPEC §6.1.2 rule 2's load-time warning for every rule that
+    /// fails §6.1.4's precheck on the sync path.
     ///
     /// `index_offset` is added to the position within `rules`, so `add_rule`
     /// can report the index the rule will actually occupy.
@@ -258,65 +276,26 @@ impl ACL {
     /// Loading MUST NOT fail here: `register_condition()` writes to a runtime,
     /// process-wide registry, and `acl.root` discovery commonly runs during
     /// framework bootstrap ahead of application code, so failing would reject
-    /// valid configurations on ordering alone. [`ACL::validate_conditions`] is
-    /// the deterministic check to run once registration is complete.
-    fn warn_unresolved_conditions(rules: &[ACLRule], index_offset: usize) {
+    /// valid configurations on ordering alone. [`ACL::validate_rules`] is the
+    /// deterministic check to run once registration is complete.
+    fn warn_rule_faults(rules: &[ACLRule], index_offset: usize) {
         for (i, rule) in rules.iter().enumerate() {
             let Some(conditions) = rule.conditions.as_ref() else {
                 continue;
             };
-            for key in Self::condition_keys(conditions) {
-                if is_sync_registered(&key) {
-                    continue;
-                }
+            for fault in precheck_conditions(conditions, PrecheckPath::Sync) {
                 tracing::warn!(
                     rule_index = index_offset + i,
-                    condition_key = %key,
+                    condition_path = %fault.path,
+                    condition_key = fault.key.as_deref().unwrap_or("-"),
                     effect = %rule.effect,
-                    async_registered = is_async_registered(&key),
-                    "ACL rule references a condition key with no registered handler; the rule \
-                     will be UNEVALUABLE (PROTOCOL_SPEC §6.1.1) — a deny rule denies, an allow \
-                     rule does not grant. Register a handler, or call ACL::validate_conditions() \
-                     after bootstrap to assert on this."
+                    async_resolvable = fault.async_resolvable,
+                    reason = %fault.reason,
+                    "ACL rule fails the §6.1.4 precheck; it will be UNEVALUABLE \
+                     (PROTOCOL_SPEC §6.1.1) — a deny rule denies, an allow rule does not \
+                     grant. Fix the rule or register a handler, and call \
+                     ACL::validate_rules() after bootstrap to assert on this."
                 );
-            }
-        }
-    }
-
-    /// Every condition key a `conditions` block references, including keys
-    /// nested inside `$or` / `$not` sub-objects.
-    ///
-    /// Returned as a `BTreeSet` so the order is deterministic (ascending) and
-    /// a key repeated across sub-objects is reported once per rule.
-    fn condition_keys(conditions: &serde_json::Value) -> std::collections::BTreeSet<String> {
-        let mut keys = std::collections::BTreeSet::new();
-        Self::collect_condition_keys(conditions, &mut keys);
-        keys
-    }
-
-    fn collect_condition_keys(
-        conditions: &serde_json::Value,
-        out: &mut std::collections::BTreeSet<String>,
-    ) {
-        let Some(obj) = conditions.as_object() else {
-            return;
-        };
-        for (key, value) in obj {
-            out.insert(key.clone());
-            // Descend into the compound operators. `$or` / `$not` are
-            // themselves registered keys (so they never produce a finding of
-            // their own), but the keys they wrap are just as capable of being
-            // misspelled — §6.1.2 rule 3 requires those to be reported too.
-            match key.as_str() {
-                "$or" => {
-                    if let Some(arr) = value.as_array() {
-                        for sub in arr {
-                            Self::collect_condition_keys(sub, out);
-                        }
-                    }
-                }
-                "$not" => Self::collect_condition_keys(value, out),
-                _ => {}
             }
         }
     }
@@ -339,13 +318,13 @@ impl ACL {
     /// it once with a noop waker:
     ///
     /// * `Poll::Ready(v)` — the handler's answer, `Satisfied` / `Unsatisfied`.
-    /// * `Poll::Pending` — §6.1.1 situation 3: the handler is genuinely async
+    /// * `Poll::Pending` — §6.1.1 case 3: the handler is genuinely async
     ///   and could not be resolved on this path, so the condition is
     ///   **`Unevaluable`**, not unsatisfied. Callers with I/O-performing
     ///   handlers must use [`ACL::async_check`].
-    /// * a panic — §6.1.1 situation 2, caught here and reported `Unevaluable`.
+    /// * a panic — §6.1.1 case 2, caught here and reported `Unevaluable`.
     ///
-    /// A key with no handler in [`CONDITION_HANDLERS`] is §6.1.1 situation 1.
+    /// A key with no handler in [`CONDITION_HANDLERS`] is §6.1.1 case 1.
     /// Note that the async registry is deliberately NOT consulted: §6.1.3 makes
     /// an async-only key unevaluable on the sync path by design.
     ///
@@ -378,7 +357,7 @@ impl ACL {
         let mut outcome = ConditionOutcome::Satisfied;
         for (key, handler, value) in to_evaluate {
             let Some(handler) = handler else {
-                // §6.1.1 situation 1: no registered handler.
+                // §6.1.1 case 1: no resolvable handler.
                 tracing::warn!(
                     condition = %key,
                     "Unknown ACL condition — unevaluable (PROTOCOL_SPEC §6.1.1)"
@@ -402,7 +381,7 @@ impl ACL {
             let child = match poll_result {
                 Ok(std::task::Poll::Ready(val)) => val,
                 Ok(std::task::Poll::Pending) => {
-                    // §6.1.1 situation 3. Through spec v1.21.0 this was
+                    // §6.1.1 case 3. Through spec v1.21.0 this was
                     // "treated as unsatisfied", which made a `deny` rule
                     // guarded by an async-only handler inert on the sync path
                     // — the same failure mode as a misspelled key, reached by
@@ -478,12 +457,19 @@ impl ACL {
     /// this is the same warn-never-fail contract [`ACL::load`] has, for the
     /// same reason.
     pub fn add_rule(&mut self, rule: ACLRule) {
-        Self::warn_unresolved_conditions(std::slice::from_ref(&rule), 0);
+        Self::warn_rule_faults(std::slice::from_ref(&rule), 0);
         self.rules.insert(0, rule);
     }
 
-    /// Report every rule that references a condition key with no registered
-    /// handler (PROTOCOL_SPEC §6.1.2 rule 3, §6.1.3).
+    /// Report every rule that fails PROTOCOL_SPEC §6.1.4's precheck
+    /// (§6.1.2 rule 3, §6.1.3).
+    ///
+    /// Named `validate_rules` rather than `validate_conditions` because it
+    /// reports structural faults in the rule as a whole, not only unresolvable
+    /// condition keys: a `$or` whose value is not a list, a `$not` whose value
+    /// is not an object, and a `conditions` that is not a mapping are all
+    /// findings. (§6.1.4.1's malformed `callers` / `targets` cannot arise here
+    /// — see the note below.)
     ///
     /// Condition handlers are registered at runtime into a process-wide
     /// registry, and an ACL may legitimately be loaded before a deployment
@@ -492,8 +478,8 @@ impl ACL {
     /// intended shape is to call it once bootstrap has finished and to treat
     /// any finding on a `deny` rule as a startup error.
     ///
-    /// A finding is emitted whenever `sync_registered` is false — **including**
-    /// when `async_registered` is true. §6.1.3: `check()` consults only the
+    /// A finding is emitted whenever `sync_resolvable` is false — **including**
+    /// when `async_resolvable` is true. §6.1.3: `check()` consults only the
     /// sync registry, so an async-only key is a working condition under
     /// `async_check()` and an unevaluable one under `check()`. A caller that
     /// only ever uses `async_check()` may ignore such a finding; that choice
@@ -501,30 +487,43 @@ impl ACL {
     ///
     /// Pure read — never mutates the ACL, never registers a handler, never
     /// emits an audit event. Findings are ordered by rule index, then
-    /// ascending by condition key. An empty result is not a guarantee about the
-    /// future: a later [`Self::add_rule`] can introduce a new key.
+    /// ascending by condition **path**. An empty result is not a guarantee
+    /// about the future: a later [`Self::add_rule`] can introduce a new fault.
     ///
     /// This is diagnostics, not enforcement. The guarantee that a broken `deny`
     /// rule cannot silently pass traffic is §6.1.1's, and holds whether or not
     /// anyone calls this.
+    ///
+    /// # `callers` / `targets` are checked by the type system
+    ///
+    /// §6.1.4.1 requires the precheck to classify a non-list `callers` /
+    /// `targets` as unevaluable, because a bare string is iterable in several
+    /// host languages: `callers: "admin.*"` iterates character by character,
+    /// and the `*` character matches everything, so the typo grants access to
+    /// every caller. [`ACLRule::callers`] and [`ACLRule::targets`] are
+    /// `Vec<String>`, so the malformed value is unrepresentable — serde rejects
+    /// a bare string at deserialization and the compiler rejects one in a
+    /// struct literal. §6.1.4.1 states explicitly that such an implementation
+    /// "satisfies this clause by construction and needs no runtime check", so
+    /// there is deliberately no check here for a state that cannot exist.
     #[must_use]
-    pub fn validate_conditions(&self) -> Vec<ConditionValidationFinding> {
+    pub fn validate_rules(&self) -> Vec<RuleValidationFinding> {
         let mut findings = Vec::new();
         for (idx, rule) in self.rules.iter().enumerate() {
             let Some(conditions) = rule.conditions.as_ref() else {
                 continue;
             };
-            for key in Self::condition_keys(conditions) {
-                let sync_registered = is_sync_registered(&key);
-                if sync_registered {
-                    continue;
-                }
-                findings.push(ConditionValidationFinding::new(
+            // `precheck_conditions` already returns faults ordered by path, and
+            // rules are walked in definition order, so the result is ordered by
+            // (rule_index, condition_path) as §6.1.2 rule 3 requires.
+            for fault in precheck_conditions(conditions, PrecheckPath::Sync) {
+                findings.push(RuleValidationFinding::new(
                     idx,
-                    key.clone(),
+                    fault.path,
+                    fault.key,
                     rule.effect.clone(),
-                    sync_registered,
-                    is_async_registered(&key),
+                    fault.sync_resolvable,
+                    fault.async_resolvable,
                 ));
             }
         }
@@ -614,13 +613,13 @@ impl ACL {
         }
 
         for (idx, rule) in rules.iter().enumerate() {
-            let keys_before = crate::acl_handlers::reported_condition_keys();
+            let paths_before = crate::acl_handlers::reported_condition_paths();
             match self.matches_rule(rule, caller, target_id, ctx) {
                 RuleMatch::Match => {
                     return self.finalize_rule_match(idx, rule, caller, target_id, ctx)
                 }
                 RuleMatch::Unevaluable => {
-                    if Self::resolve_unevaluable_rule(idx, rule, &keys_before) {
+                    if Self::resolve_unevaluable_rule(idx, rule, &paths_before) {
                         return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
                     }
                 }
@@ -892,29 +891,30 @@ impl ACL {
     /// it as a rule match — a `deny` rule denies), `false` when evaluation must
     /// continue with the next rule (an `allow` rule MUST NOT grant).
     ///
-    /// Also emits §6.1.1 rule 3's warning, which must name the condition key,
-    /// the rule's index and the rule's `effect`. The `effect` is in the message
-    /// because a misconfigured `deny` rule is the consequential case. The keys
-    /// are recovered by diffing the per-call handler-error scope, which is the
-    /// only place a key nested inside `$or` / `$not` surfaces.
-    fn resolve_unevaluable_rule(idx: usize, rule: &ACLRule, keys_before: &[String]) -> bool {
-        let keys_after = crate::acl_handlers::reported_condition_keys();
-        let new_keys: Vec<String> = keys_after
+    /// Also emits §6.1.1 rule 3's warning, which must name the condition
+    /// **path**, the rule's index and the rule's `effect`. The `effect` is in
+    /// the message because a misconfigured `deny` rule is the consequential
+    /// case. The paths are recovered by diffing the per-call handler-error
+    /// scope, which is where both precheck-origin and execution-origin faults
+    /// land — including one nested inside `$or` / `$not`.
+    fn resolve_unevaluable_rule(idx: usize, rule: &ACLRule, paths_before: &[String]) -> bool {
+        let paths_after = crate::acl_handlers::reported_condition_paths();
+        let new_paths: Vec<String> = paths_after
             .into_iter()
-            .filter(|k| !keys_before.contains(k))
+            .filter(|p| !paths_before.contains(p))
             .collect();
-        let conditions = if new_keys.is_empty() {
+        let conditions = if new_paths.is_empty() {
             // Already reported by an earlier rule in this same check().
             "(see AuditEntry.handler_error)".to_string()
         } else {
-            new_keys.join(", ")
+            new_paths.join(", ")
         };
 
         let takes_effect = rule.effect == "deny";
         tracing::warn!(
             rule_index = idx,
             effect = %rule.effect,
-            conditions = %conditions,
+            condition_paths = %conditions,
             "ACL rule has unevaluable conditions — {} (PROTOCOL_SPEC §6.1.1)",
             if takes_effect {
                 "the deny rule TAKES EFFECT and the call is denied"
@@ -955,6 +955,27 @@ impl ACL {
         }
 
         RuleMatch::Match
+    }
+
+    /// Run PROTOCOL_SPEC §6.1.4's precheck and report any faults into the
+    /// per-call handler-error scope. Returns `true` when the rule is
+    /// unevaluable on structural or registry grounds alone.
+    ///
+    /// This runs **before** §6.5's no-context check (§6.1.4 rule 1), which is
+    /// what closes the bypass where `conditions: {mispelled: true}` on a `deny`
+    /// rule passed traffic simply because the caller carried no identity. A
+    /// rule that *passes* here and then finds no context still takes §6.5's
+    /// path and does not match: `roles` is answerable in principle, and this
+    /// caller merely supplied no input for it (§6.1.4 rule 2).
+    fn precheck_failed(conditions: &serde_json::Value, path: PrecheckPath) -> bool {
+        let faults: Vec<RuleFault> = precheck_conditions(conditions, path);
+        if faults.is_empty() {
+            return false;
+        }
+        for fault in &faults {
+            crate::acl_handlers::report_condition_unevaluable_at(&fault.path, &fault.reason);
+        }
+        true
     }
 
     /// Match a list of patterns against a value.
@@ -1027,12 +1048,18 @@ impl ACL {
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> ConditionOutcome {
+        // §6.1.4 rule 1: the precheck is context-independent and runs FIRST.
+        if Self::precheck_failed(conditions, PrecheckPath::Sync) {
+            return ConditionOutcome::Unevaluable;
+        }
+
         let Some(ctx) = ctx else {
             return ConditionOutcome::Unsatisfied; // §6.5: conditions require context
         };
 
+        // The precheck already established that `conditions` is a mapping.
         let Some(obj) = conditions.as_object() else {
-            return ConditionOutcome::Unsatisfied;
+            return ConditionOutcome::Unevaluable;
         };
 
         let map: HashMap<String, serde_json::Value> =
@@ -1050,12 +1077,18 @@ impl ACL {
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> ConditionOutcome {
+        // §6.1.4 rule 1, on the async path's registries (§6.1.3).
+        if Self::precheck_failed(conditions, PrecheckPath::Async) {
+            return ConditionOutcome::Unevaluable;
+        }
+
         let Some(ctx) = ctx else {
             return ConditionOutcome::Unsatisfied; // §6.5
         };
 
+        // The precheck already established that `conditions` is a mapping.
         let Some(obj) = conditions.as_object() else {
-            return ConditionOutcome::Unsatisfied;
+            return ConditionOutcome::Unevaluable;
         };
 
         let map: HashMap<String, serde_json::Value> =
@@ -1222,13 +1255,13 @@ impl ACL {
         }
 
         for (idx, rule) in rules.iter().enumerate() {
-            let keys_before = crate::acl_handlers::reported_condition_keys();
+            let paths_before = crate::acl_handlers::reported_condition_paths();
             match self.matches_rule_async(rule, caller, target_id, ctx).await {
                 RuleMatch::Match => {
                     return self.finalize_rule_match(idx, rule, caller, target_id, ctx)
                 }
                 RuleMatch::Unevaluable => {
-                    if Self::resolve_unevaluable_rule(idx, rule, &keys_before) {
+                    if Self::resolve_unevaluable_rule(idx, rule, &paths_before) {
                         return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
                     }
                 }

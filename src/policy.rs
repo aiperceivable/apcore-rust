@@ -29,6 +29,10 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::module::ModuleAnnotations;
 use crate::utils::{calculate_specificity, match_pattern};
 
+/// The framework-owned Phase B approval token key (PROTOCOL_SPEC §7.4).
+/// Stripped from `arguments` before policy resolution (§7.9.6 rule 5).
+const APPROVAL_TOKEN_KEY: &str = "_approval_token";
+
 /// A single pattern-based governance override.
 ///
 /// `requires_approval` / `destructive` are `Option<bool>`: `None` leaves the
@@ -255,16 +259,32 @@ impl ExecutionPolicy {
     /// wrong type, or missing required properties. Any code reading it MUST
     /// treat it as untrusted and MUST NOT assume it is well-formed.
     ///
+    /// # The framework-owned approval token is stripped
+    ///
+    /// §7.9.6 rule 5: `_approval_token` (§7.4) **MUST** be stripped from
+    /// `arguments` before policy resolution. §7.4 already requires it to be
+    /// removed "before passing to subsequent steps", which does not reach this
+    /// case — resolution happens *inside* Step 5, ahead of any subsequent step,
+    /// so an implementation can satisfy §7.4 literally and still hand the token
+    /// to the policy. It is a protocol-level key, not caller input; leaving it
+    /// in place puts a token into the audit trail and the
+    /// `apcore.policy.override` payload.
+    ///
+    /// The strip happens **here**, at the boundary of the policy API, rather
+    /// than at each call site. A caller cannot then forget it, and no future
+    /// call site can reintroduce the leak. It costs one shallow clone of the
+    /// arguments object, and only when the token is actually present — a Phase
+    /// B resume, not the common path.
+    ///
     /// # Why an added method rather than a wider `resolve`
     ///
-    /// §7.9.6 rule 5 explicitly permits an additional method "where extending
-    /// the existing signature would break its public API". `resolve` is `pub`
-    /// on a published crate and is the documented entry point in §7.9's status
-    /// line; widening it would break every external caller at compile time for
-    /// no behavioural gain, since rule 2 forbids the new inputs from changing
-    /// the verdict. Rust also has no default arguments and no overloading, so
-    /// the alternatives are a wider signature or an options struct — and an
-    /// options struct for two borrowed parameters buys nothing.
+    /// §7.9.6 rule 7 leaves the API shape to the language and then notes the
+    /// constraint explicitly: because rule 6 forbids the new inputs from
+    /// changing any verdict, widening a published signature buys nothing and
+    /// costs every external caller a compile error, so "a language without
+    /// default arguments or overloading **SHOULD** add a method rather than
+    /// widen". Rust is that language, and `resolve` is `pub` on a published
+    /// crate.
     #[must_use]
     pub fn resolve_with_call_site(
         &self,
@@ -273,16 +293,16 @@ impl ExecutionPolicy {
         arguments: Option<&serde_json::Value>,
         context: Option<&Context<serde_json::Value>>,
     ) -> PolicyDecision {
-        // §7.9.6 rule 3(a): carry the call site into the trace. Only the shape
-        // is recorded, never argument values — the gate runs before input
-        // validation and an argument may hold whatever the caller sent,
-        // including credentials a module would later redact.
+        let arguments = arguments.map(strip_approval_token);
+
+        // §7.9.6 rule 3: carry the call site into the trace. What is recorded
+        // MUST be the call site's *shape* — which keys were present, their
+        // types — and MUST NOT be argument values: the gate runs before input
+        // validation and an argument may hold anything, including a secret.
         tracing::trace!(
             module_id = %module_id,
             has_arguments = arguments.is_some(),
-            argument_count = arguments
-                .and_then(serde_json::Value::as_object)
-                .map_or(0, serde_json::Map::len),
+            argument_shape = ?arguments.as_deref().map(argument_shape),
             trace_id = context.map(|c| c.trace_id.as_str()),
             call_depth = context.map(|c| c.call_chain.len()),
             "policy resolution call site (§7.9.6; NOT consulted by the built-in pattern rules, \
@@ -362,6 +382,43 @@ impl ExecutionPolicy {
             strict: doc.strict,
         })
     }
+}
+
+/// Remove the framework-owned `_approval_token` (§7.4) from `arguments`
+/// (PROTOCOL_SPEC §7.9.6 rule 5).
+///
+/// Borrows unchanged in the common case; clones only when the token is
+/// actually present, which is a Phase B resume.
+fn strip_approval_token(arguments: &serde_json::Value) -> std::borrow::Cow<'_, serde_json::Value> {
+    let Some(obj) = arguments.as_object() else {
+        return std::borrow::Cow::Borrowed(arguments);
+    };
+    if !obj.contains_key(APPROVAL_TOKEN_KEY) {
+        return std::borrow::Cow::Borrowed(arguments);
+    }
+    let mut cleaned = obj.clone();
+    cleaned.remove(APPROVAL_TOKEN_KEY);
+    std::borrow::Cow::Owned(serde_json::Value::Object(cleaned))
+}
+
+/// The call site's **shape** — each top-level key paired with its JSON type
+/// name — and never a value (§7.9.6 rule 3).
+fn argument_shape(arguments: &serde_json::Value) -> Vec<(&str, &'static str)> {
+    arguments.as_object().map_or_else(Vec::new, |obj| {
+        obj.iter()
+            .map(|(key, value)| {
+                let type_name = match value {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                };
+                (key.as_str(), type_name)
+            })
+            .collect()
+    })
 }
 
 // --- Strict serde intermediates for from_value -----------------------------

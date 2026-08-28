@@ -168,3 +168,62 @@ fn resolution_accepts_the_arguments_and_the_context() {
     assert_eq!(decision.module_id, "executor.crm.delete");
     assert!(!decision.needs_approval);
 }
+
+// ---------------------------------------------------------------------------
+// §7.9.6 rule 5 — the framework-owned approval token
+// ---------------------------------------------------------------------------
+
+// [policy-call-site-strips-approval-token] `_approval_token` MUST be stripped
+// from `arguments` BEFORE policy resolution. §7.4 already requires it to be
+// removed "before passing to subsequent steps", which does not reach this
+// case: resolution happens INSIDE Step 5, ahead of any subsequent step, so an
+// implementation can satisfy §7.4 literally and still hand the token to the
+// policy. Confirmed against the gate: `builtin_steps.rs` resolves the policy
+// near the top of `execute()` and strips the token ~120 lines later, so the
+// strip has to live at the policy API boundary to be soon enough.
+//
+// The token is protocol-level, not caller input; leaving it in place puts a
+// token into the audit trail and the `apcore.policy.override` payload.
+#[test]
+fn resolution_strips_the_framework_approval_token_from_the_call_site() {
+    let policy = ExecutionPolicy::new(vec![PolicyRule::new("orders.*")
+        .unwrap()
+        .with_requires_approval(true)]);
+    let ctx = context();
+    let anns = annotations(false, false);
+
+    let with_token = json!({ "_approval_token": "tok-secret", "order_id": "O-1" });
+    let without_token = json!({ "order_id": "O-1" });
+
+    // Rule 6 first: the verdict is identical either way, as it must be for any
+    // call site.
+    let a =
+        policy.resolve_with_call_site("orders.delete", Some(&anns), Some(&with_token), Some(&ctx));
+    let b = policy.resolve_with_call_site(
+        "orders.delete",
+        Some(&anns),
+        Some(&without_token),
+        Some(&ctx),
+    );
+    assert_eq!(a, b);
+    assert_eq!(a, policy.resolve("orders.delete", Some(&anns)));
+
+    // And the caller's own value is not mutated — the strip is a copy, so a
+    // Phase B resume still finds its token in `ctx.inputs` further down Step 5.
+    assert_eq!(
+        with_token.get("_approval_token").and_then(Value::as_str),
+        Some("tok-secret"),
+        "resolution must not mutate the caller's arguments"
+    );
+}
+
+// [policy-call-site-non-object-arguments] Rule 4: the arguments have not been
+// schema-validated, so the strip must cope with a non-object.
+#[test]
+fn stripping_the_token_tolerates_arguments_that_are_not_an_object() {
+    let policy = ExecutionPolicy::new(vec![]);
+    for arguments in [json!("a bare string"), json!(7), json!([1, 2]), Value::Null] {
+        let decision = policy.resolve_with_call_site("a.b", None, Some(&arguments), None);
+        assert_eq!(decision, policy.resolve("a.b", None));
+    }
+}

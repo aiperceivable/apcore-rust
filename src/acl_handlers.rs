@@ -25,10 +25,14 @@ use crate::context::Context;
 /// | `allow` | rule does not match → continue | rule does not match → continue (MUST NOT grant) |
 /// | `deny`  | rule does not match → continue | rule **takes effect** → the call is denied |
 ///
-/// Exactly three situations produce [`ConditionOutcome::Unevaluable`]:
-/// the condition key has no registered handler; the handler panicked; or the
-/// handler was asynchronous and could not be resolved on the synchronous
-/// [`ACL::check`](crate::ACL::check) path.
+/// [`ConditionOutcome::Unevaluable`] means the implementation cannot answer the
+/// condition **as written**. That is a principle, not a closed list; the cases
+/// every implementation meets are: the condition key has no resolvable handler;
+/// the handler panicked; the handler was asynchronous and could not be resolved
+/// on the synchronous [`ACL::check`](crate::ACL::check) path; the value is
+/// malformed for its key (`$or` that is not a list, `$not` that is not an
+/// object); or `conditions` itself is not a mapping. A case outside the list is
+/// classified by the principle, never defaulted to `Unsatisfied`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConditionOutcome {
     /// A registered handler ran to completion and returned `true`.
@@ -106,21 +110,51 @@ impl ConditionOutcome {
 ///
 /// A `BTreeMap` rather than a `HashMap` on purpose: §6.1.1 rule 2 requires
 /// `handler_error` to list every unevaluable condition **ordered
-/// lexicographically by condition key**, not in evaluation order, because
-/// evaluation order is not portable across SDKs. `BTreeMap` iterates in
+/// lexicographically by condition path**, not in evaluation order, because
+/// evaluation order is not portable across SDKs — and by *path* rather than by
+/// *key* because a key may occur at several positions in a nested `$or` /
+/// `$not` tree, which leaves ordering by key undefined. `BTreeMap` iterates in
 /// ascending key order, so the required ordering is a property of the
 /// container we chose and not an accident of whatever map `serde_json`
 /// happens to use. See [`join_handler_errors`].
 type HandlerErrors = BTreeMap<String, String>;
 
+/// Per-`check()` capture scope: the accumulated diagnostics, plus the
+/// **condition path prefix** of the sub-tree currently being evaluated.
+///
+/// The prefix exists because paths (§6.1.4) are positional and the compound
+/// operators recurse through the public [`ACLConditionHandler`] trait, whose
+/// `evaluate_outcome(value, ctx)` has nowhere to carry one. `$or` / `$not`
+/// push a segment around their recursion, so a handler that panics two levels
+/// down still reports `$or[1].$not.k` rather than a bare `k`.
+///
+/// It lives in the *capture* scope rather than in a thread-local of its own so
+/// that it inherits the scope's correctness on the async path: a tokio task
+/// may migrate threads across an `.await`, so a save/restore pair around one
+/// would be unsound, while the task-local travels with the task.
+#[derive(Debug, Default)]
+struct CaptureState {
+    errors: HandlerErrors,
+    path_prefix: String,
+}
+
+impl CaptureState {
+    const fn new() -> Self {
+        Self {
+            errors: BTreeMap::new(),
+            path_prefix: String::new(),
+        }
+    }
+}
+
 /// Join accumulated diagnostics into the single `AuditEntry.handler_error`
-/// string, ordered lexicographically by condition key and separated by `"; "`
+/// string, ordered lexicographically by condition path and separated by `"; "`
 /// (PROTOCOL_SPEC §6.1.1 rule 2). Returns `None` when nothing was reported.
 fn join_handler_errors(errors: &HandlerErrors) -> Option<String> {
     if errors.is_empty() {
         return None;
     }
-    // Explicit: collect the values in ascending-key order, then join. The sort
+    // Explicit: collect the values in ascending-path order, then join. The sort
     // is `BTreeMap`'s ordering invariant, restated here so the rule is visible
     // at the point it is applied.
     let mut ordered: Vec<(&String, &String)> = errors.iter().collect();
@@ -156,37 +190,110 @@ fn join_handler_errors(errors: &HandlerErrors) -> Option<String> {
 // `with_handler_error_capture_sync`, so a stray report outside any check is a
 // no-op (matching the async task-local's behavior).
 tokio::task_local! {
-    pub(crate) static HANDLER_ERROR: RefCell<HandlerErrors>;
+    pub(crate) static HANDLER_ERROR: RefCell<CaptureState>;
 }
 
 thread_local! {
-    // `(active_depth, slot)`. The depth guards against a stray
+    // `(active_depth, state)`. The depth guards against a stray
     // `report_handler_error` leaking into an unrelated later read: writes and
     // reads only apply while a `with_handler_error_capture_sync` scope is open.
-    static HANDLER_ERROR_SYNC: RefCell<(u32, HandlerErrors)> =
-        const { RefCell::new((0, BTreeMap::new())) };
+    static HANDLER_ERROR_SYNC: RefCell<(u32, CaptureState)> =
+        const { RefCell::new((0, CaptureState::new())) };
 }
 
-/// Record that condition `key` was **unevaluable** (PROTOCOL_SPEC §6.1.1).
+/// Compose a condition path from the active capture scope's prefix and a local
+/// segment (PROTOCOL_SPEC §6.1.4). At the root of `conditions` the prefix is
+/// empty and the path is the bare key.
+pub(crate) fn condition_path(local: &str) -> String {
+    let prefix = current_path_prefix();
+    if prefix.is_empty() {
+        local.to_string()
+    } else {
+        format!("{prefix}.{local}")
+    }
+}
+
+/// The path prefix of the sub-tree currently being evaluated.
+fn current_path_prefix() -> String {
+    if let Ok(prefix) = HANDLER_ERROR.try_with(|cell| cell.borrow().path_prefix.clone()) {
+        return prefix;
+    }
+    HANDLER_ERROR_SYNC.with(|cell| cell.borrow().1.path_prefix.clone())
+}
+
+/// Replace the active path prefix, returning the previous value so a caller
+/// can restore it. Used only through [`PathPrefixGuard`].
+fn swap_path_prefix(next: String) -> String {
+    let next_for_sync = next.clone();
+    if let Ok(previous) = HANDLER_ERROR.try_with(move |cell| {
+        let mut state = cell.borrow_mut();
+        std::mem::replace(&mut state.path_prefix, next)
+    }) {
+        return previous;
+    }
+    HANDLER_ERROR_SYNC.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.0 == 0 {
+            return String::new();
+        }
+        std::mem::replace(&mut state.1.path_prefix, next_for_sync)
+    })
+}
+
+/// Scope guard that extends the condition path prefix by one segment and
+/// restores the previous prefix on drop.
 ///
-/// Unlike [`report_handler_error`], the condition key is supplied separately so
-/// the §6.1.1 rule 2 ordering ("lexicographically by condition key") is applied
-/// to the key itself rather than to a formatted message. The stored message is
-/// `"{key}: {reason}"`, matching the format all three SDKs emit.
-pub(crate) fn report_condition_unevaluable(key: &str, reason: impl std::fmt::Display) {
-    record_handler_error(key.to_string(), format!("{key}: {reason}"));
+/// A guard rather than a closure because `$or` / `$not` recurse across an
+/// `.await`, and a `Drop` impl restores correctly on every exit path —
+/// including a `?`, a `return`, and an unwind out of a panicking handler.
+pub(crate) struct PathPrefixGuard {
+    previous: String,
 }
 
-/// Insert one `(sort key, message)` pair into whichever capture scope is
+impl PathPrefixGuard {
+    /// Enter `segment` relative to the current prefix. `$or[0]` under the
+    /// prefix `$not` becomes `$not.$or[0]`.
+    pub(crate) fn enter(segment: &str) -> Self {
+        let previous = swap_path_prefix(condition_path(segment));
+        Self { previous }
+    }
+}
+
+impl Drop for PathPrefixGuard {
+    fn drop(&mut self) {
+        swap_path_prefix(std::mem::take(&mut self.previous));
+    }
+}
+
+/// Record that the condition at `local` (relative to the active path prefix)
+/// was **unevaluable** (PROTOCOL_SPEC §6.1.1).
+///
+/// Unlike [`report_handler_error`], the condition's position is supplied
+/// separately so the §6.1.1 rule 2 ordering ("lexicographically by condition
+/// path") is applied to the path itself rather than to a formatted message.
+/// The stored message is `"{path}: {reason}"`, matching the format all three
+/// SDKs emit.
+pub(crate) fn report_condition_unevaluable(local: &str, reason: impl std::fmt::Display) {
+    report_condition_unevaluable_at(&condition_path(local), reason);
+}
+
+/// [`report_condition_unevaluable`] for a caller that already holds the full
+/// path — the §6.1.4 precheck, which walks the tree itself and never relies on
+/// the evaluator's prefix.
+pub(crate) fn report_condition_unevaluable_at(path: &str, reason: impl std::fmt::Display) {
+    record_handler_error(path.to_string(), format!("{path}: {reason}"));
+}
+
+/// Insert one `(condition path, message)` pair into whichever capture scope is
 /// active. Shared by [`report_handler_error`] and
-/// [`report_condition_unevaluable`].
-fn record_handler_error(key: String, message: String) {
+/// [`report_condition_unevaluable_at`].
+fn record_handler_error(path: String, message: String) {
     // Prefer the async task-local scope when present.
-    let key_for_sync = key.clone();
+    let path_for_sync = path.clone();
     let message_for_sync = message.clone();
     if HANDLER_ERROR
         .try_with(move |cell| {
-            cell.borrow_mut().insert(key, message);
+            cell.borrow_mut().errors.insert(path, message);
         })
         .is_ok()
     {
@@ -196,26 +303,26 @@ fn record_handler_error(key: String, message: String) {
     HANDLER_ERROR_SYNC.with(|cell| {
         let mut state = cell.borrow_mut();
         if state.0 > 0 {
-            state.1.insert(key_for_sync, message_for_sync);
+            state.1.errors.insert(path_for_sync, message_for_sync);
         }
     });
 }
 
-/// The condition keys reported as unevaluable in the active capture scope,
-/// in ascending key order. Empty outside any scope.
+/// The condition paths reported as unevaluable in the active capture scope, in
+/// ascending path order. Empty outside any scope.
 ///
-/// Used by the ACL rule loop to name the offending keys in the §6.1.1 rule 3
+/// Used by the ACL rule loop to name the offending paths in the §6.1.1 rule 3
 /// warning, which must also carry the rule index and the rule's `effect` —
 /// neither of which is known this far down the call stack.
-pub(crate) fn reported_condition_keys() -> Vec<String> {
-    if let Ok(keys) =
-        HANDLER_ERROR.try_with(|cell| cell.borrow().keys().cloned().collect::<Vec<_>>())
+pub(crate) fn reported_condition_paths() -> Vec<String> {
+    if let Ok(paths) =
+        HANDLER_ERROR.try_with(|cell| cell.borrow().errors.keys().cloned().collect::<Vec<_>>())
     {
-        if !keys.is_empty() {
-            return keys;
+        if !paths.is_empty() {
+            return paths;
         }
     }
-    HANDLER_ERROR_SYNC.with(|cell| cell.borrow().1.keys().cloned().collect())
+    HANDLER_ERROR_SYNC.with(|cell| cell.borrow().1.errors.keys().cloned().collect())
 }
 
 /// Record a handler-evaluation error for the current ACL check.
@@ -228,18 +335,18 @@ pub(crate) fn reported_condition_keys() -> Vec<String> {
 /// on a missing scope.
 /// Messages are accumulated, not overwritten: §6.1.1 rule 2 requires
 /// `handler_error` to report **every** unevaluable condition in one `check()`,
-/// ordered lexicographically by condition key. This free-form entry point has
-/// no separate key argument, so the sort key is taken from the conventional
-/// `"{key}: {reason}"` message prefix (everything before the first `':'`),
-/// falling back to the whole message when it carries no colon. SDK-internal
-/// call sites use [`report_condition_unevaluable`], which passes the key
-/// explicitly.
+/// ordered lexicographically by condition **path**. This free-form entry point
+/// has no separate path argument, so the sort key is taken from the
+/// conventional `"{path}: {reason}"` message prefix (everything before the
+/// first `':'`), falling back to the whole message when it carries no colon.
+/// SDK-internal call sites use [`report_condition_unevaluable`], which knows
+/// the condition's position in the tree.
 pub fn report_handler_error(message: impl Into<String>) {
     let msg = message.into();
-    let key = msg
+    let path = msg
         .split_once(':')
         .map_or_else(|| msg.clone(), |(prefix, _)| prefix.trim().to_string());
-    record_handler_error(key, msg);
+    record_handler_error(path, msg);
 }
 
 /// Read the handler error recorded for the current ACL check, if any.
@@ -249,12 +356,12 @@ pub fn report_handler_error(message: impl Into<String>) {
 /// `ACL::build_audit_entry` so a handler error populates the audit entry on
 /// both the sync and async paths (A-D-002).
 pub(crate) fn current_handler_error() -> Option<String> {
-    if let Ok(v) = HANDLER_ERROR.try_with(|cell| join_handler_errors(&cell.borrow())) {
+    if let Ok(v) = HANDLER_ERROR.try_with(|cell| join_handler_errors(&cell.borrow().errors)) {
         if v.is_some() {
             return v;
         }
     }
-    HANDLER_ERROR_SYNC.with(|cell| join_handler_errors(&cell.borrow().1))
+    HANDLER_ERROR_SYNC.with(|cell| join_handler_errors(&cell.borrow().1.errors))
 }
 
 /// Run an async evaluation under a fresh handler-error capture scope.
@@ -266,10 +373,10 @@ pub async fn with_handler_error_capture<F, T>(fut: F) -> (T, Option<String>)
 where
     F: std::future::Future<Output = T>,
 {
-    let cell = RefCell::new(HandlerErrors::new());
+    let cell = RefCell::new(CaptureState::new());
     let result = HANDLER_ERROR.scope(cell, async move {
         let value = fut.await;
-        let captured = HANDLER_ERROR.with(|c| join_handler_errors(&c.borrow()));
+        let captured = HANDLER_ERROR.with(|c| join_handler_errors(&c.borrow().errors));
         (value, captured)
     });
     result.await
@@ -296,9 +403,9 @@ where
 
     let captured = HANDLER_ERROR_SYNC.with(|cell| {
         let mut state = cell.borrow_mut();
-        let captured = join_handler_errors(&state.1);
+        let captured = join_handler_errors(&state.1.errors);
         state.0 -= 1;
-        // Restore the enclosing scope's slot (empty at the outermost level).
+        // Restore the enclosing scope's state (empty at the outermost level).
         state.1 = previous;
         captured
     });
@@ -386,26 +493,31 @@ pub fn register_async_condition(key: impl Into<String>, handler: Arc<dyn ACLCond
     map.insert(key.into(), handler);
 }
 
-/// Whether `key` resolves on the **synchronous** [`ACL::check`](crate::ACL::check)
-/// path — i.e. whether it is present in [`CONDITION_HANDLERS`].
+/// Whether `key` is **resolvable on the synchronous**
+/// [`ACL::check`](crate::ACL::check) path — i.e. whether it is present in
+/// [`CONDITION_HANDLERS`].
 ///
 /// PROTOCOL_SPEC §6.1.3 keeps the two registries deliberately separate: a key
 /// registered only through [`register_async_condition`] is a working condition
 /// under `async_check()` and an **unevaluable** one under `check()`.
 #[must_use]
-pub fn is_sync_registered(key: &str) -> bool {
+pub fn is_sync_resolvable(key: &str) -> bool {
     CONDITION_HANDLERS.read().contains_key(key)
 }
 
-/// Whether `key` resolves on the **asynchronous**
+/// Whether `key` is **resolvable on the asynchronous**
 /// [`ACL::async_check`](crate::ACL::async_check) path.
 ///
 /// `async_check()` consults [`ASYNC_CONDITION_HANDLERS`] first and falls back
-/// to [`CONDITION_HANDLERS`], so a sync-only registration resolves here too
-/// (PROTOCOL_SPEC §6.1.3).
+/// to [`CONDITION_HANDLERS`], so this is the **union** of the two registries
+/// and a sync-only registration is `async_resolvable` (PROTOCOL_SPEC §6.1.3
+/// rule 2). The name says *resolvable* rather than *registered* for exactly
+/// that reason: `async_registered` would read as a lookup in the async
+/// registry and be false for every built-in leaf handler, all of which resolve
+/// on both paths.
 #[must_use]
-pub fn is_async_registered(key: &str) -> bool {
-    ASYNC_CONDITION_HANDLERS.read().contains_key(key) || is_sync_registered(key)
+pub fn is_async_resolvable(key: &str) -> bool {
+    ASYNC_CONDITION_HANDLERS.read().contains_key(key) || is_sync_resolvable(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +526,7 @@ pub fn is_async_registered(key: &str) -> bool {
 
 /// One condition key paired with the handler it resolved to (if any) and its
 /// configured value. `None` in the middle slot is PROTOCOL_SPEC §6.1.1
-/// situation 1 — no registered handler, i.e. an unevaluable condition.
+/// case 1 — no resolvable handler, i.e. an unevaluable condition.
 type ResolvedCondition = (String, Option<Arc<dyn ACLConditionHandler>>, Value);
 
 /// Evaluate all conditions with AND logic using the handler registry.
@@ -456,7 +568,7 @@ pub async fn evaluate_conditions_async_outcome<S: ::std::hash::BuildHasher>(
     use futures_util::FutureExt;
 
     // Resolve handlers first; an unresolved key is a leaf outcome of its own.
-    // `None` in the middle slot is PROTOCOL_SPEC §6.1.1 situation 1.
+    // `None` in the middle slot is PROTOCOL_SPEC §6.1.1 case 1.
     let mut to_evaluate: Vec<ResolvedCondition> = Vec::with_capacity(conditions.len());
     {
         let async_handlers = ASYNC_CONDITION_HANDLERS.read();
@@ -475,7 +587,7 @@ pub async fn evaluate_conditions_async_outcome<S: ::std::hash::BuildHasher>(
     let mut outcome = ConditionOutcome::Satisfied;
     for (key, handler, value) in &to_evaluate {
         let Some(handler) = handler else {
-            // §6.1.1 situation 1: no registered handler.
+            // §6.1.1 case 1: no resolvable handler.
             tracing::warn!(
                 condition = %key,
                 "Unknown ACL condition — unevaluable (PROTOCOL_SPEC §6.1.1)"
@@ -484,7 +596,7 @@ pub async fn evaluate_conditions_async_outcome<S: ::std::hash::BuildHasher>(
             outcome = outcome.and(ConditionOutcome::Unevaluable);
             continue;
         };
-        // §6.1.1 situation 2 (SECURITY, A-D-011): a panicking custom handler
+        // §6.1.1 case 2 (SECURITY, A-D-011): a panicking custom handler
         // must NOT unwind out of the ACL gate. Catch the panic, record it, and
         // report the condition unevaluable. Mirrors Python `try/except` and
         // TypeScript `try/catch` around handler.evaluate.
@@ -661,17 +773,37 @@ impl ACLConditionHandler for OrHandler {
     /// unevaluable. Every child is evaluated (no short-circuit on the first
     /// `Satisfied`) so that `handler_error` reports every unevaluable sibling
     /// deterministically — the decision is unchanged either way.
+    ///
+    /// A `$or` whose value is **not a list** is §6.1.1 case 4: the operand is
+    /// malformed for its key, so there is no question to answer and the result
+    /// is `Unevaluable`, not `Unsatisfied`. Reporting it as a plain non-match
+    /// would put a `deny` rule carrying `$or: "typo"` right back into the inert
+    /// state §6.1.1 exists to end. §6.1.4's precheck normally catches this
+    /// before any handler runs; this branch covers a direct call to
+    /// [`ACL::evaluate_conditions`](crate::ACL::evaluate_conditions), which has
+    /// no precheck in front of it.
     async fn evaluate_outcome(&self, value: &Value, ctx: &Context<Value>) -> ConditionOutcome {
         let Some(arr) = value.as_array() else {
-            return ConditionOutcome::Unsatisfied;
+            report_condition_unevaluable("$or", "value must be a list of condition objects");
+            return ConditionOutcome::Unevaluable;
         };
         // OR over three-valued children, starting from the identity of an
         // empty `$or: []` (which stays a non-match, as before).
         let mut outcome = ConditionOutcome::Unsatisfied;
-        for sub in arr {
-            let child = match sub.as_object() {
-                Some(obj) => evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx).await,
-                None => ConditionOutcome::Unsatisfied,
+        for (index, sub) in arr.iter().enumerate() {
+            // §6.1.4 paths are positional: a key `k` in the i-th branch is
+            // `$or[i].k`. The guard restores the enclosing prefix on every exit
+            // path, including an unwind out of a panicking handler.
+            let _guard = PathPrefixGuard::enter(&format!("$or[{index}]"));
+            let child = if let Some(obj) = sub.as_object() {
+                evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx).await
+            } else {
+                // A branch that is not an object is malformed for `$or`.
+                report_condition_unevaluable_at(
+                    &current_path_prefix(),
+                    "$or branch must be a condition object",
+                );
+                ConditionOutcome::Unevaluable
             };
             outcome = outcome.or(child);
         }
@@ -700,12 +832,169 @@ impl ACLConditionHandler for NotHandler {
     /// satisfied. Negating "no answer" into "yes" would let a misspelled key
     /// inside a `$not` satisfy the very rule it was meant to gate — the bypass
     /// this section exists to close, reintroduced one nesting level down.
+    ///
+    /// A `$not` whose value is **not an object** is §6.1.1 case 4 — malformed
+    /// for its key, hence `Unevaluable`. See [`OrHandler::evaluate_outcome`].
     async fn evaluate_outcome(&self, value: &Value, ctx: &Context<Value>) -> ConditionOutcome {
-        match value.as_object() {
-            Some(obj) => evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx)
+        if let Some(obj) = value.as_object() {
+            let _guard = PathPrefixGuard::enter("$not");
+            evaluate_sub_conditions(self.mode, &sub_condition_map(obj), ctx)
                 .await
-                .negate(),
-            None => ConditionOutcome::Unsatisfied,
+                .negate()
+        } else {
+            report_condition_unevaluable("$not", "value must be a condition object");
+            ConditionOutcome::Unevaluable
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §6.1.4 — structural and registry precheck
+// ---------------------------------------------------------------------------
+
+/// Which evaluation path a precheck is being run for. Resolvability differs
+/// between the two (§6.1.3), so the precheck's answer does too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrecheckPath {
+    /// `ACL::check` — consults the sync registry only.
+    Sync,
+    /// `ACL::async_check` — consults the async registry, falling back to sync.
+    Async,
+}
+
+/// One structural or registry fault found by the §6.1.4 precheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleFault {
+    /// Position of the fault in the rule (§6.1.4 condition paths).
+    pub path: String,
+    /// The offending key, where one exists. `None` for a `conditions` value
+    /// that is not a mapping at all — there is no key to name.
+    pub key: Option<String>,
+    /// Human-readable reason, used verbatim in `handler_error`.
+    pub reason: String,
+    /// Whether the condition resolves for `check()`.
+    pub sync_resolvable: bool,
+    /// Whether it resolves for `async_check()`.
+    pub async_resolvable: bool,
+}
+
+/// Run the §6.1.4 precheck over one rule's `conditions` tree.
+///
+/// **Context-independent and handler-free**, by requirement: it examines
+/// structure and the handler registries only, and never invokes a handler. It
+/// therefore runs *before* §6.5's "conditions present but no context provided"
+/// check, which is what closes the bypass where `conditions: {mispelled: true}`
+/// on a `deny` rule passed traffic simply because the caller carried no
+/// identity.
+///
+/// It **does not short-circuit** (§6.1.4 rule 3): it has no decisive outcome to
+/// short-circuit on, and its completeness is what makes §6.1.1 rule 2's
+/// deterministic `handler_error` achievable. Because the walk is exhaustive and
+/// depends only on the rule and the registries, every conforming implementation
+/// produces the same set of precheck-origin findings for the same rule.
+///
+/// Faults come back ordered lexicographically by path.
+pub(crate) fn precheck_conditions(conditions: &Value, path: PrecheckPath) -> Vec<RuleFault> {
+    let mut faults = Vec::new();
+    collect_condition_faults(conditions, "", path, &mut faults);
+    faults.sort_by(|a, b| a.path.cmp(&b.path));
+    faults
+}
+
+/// Structural fault with no resolvable handler on either path — a malformed
+/// operand or a non-mapping `conditions`. Both flags are false because the
+/// condition as written cannot be answered on either evaluation path, which is
+/// what the flags describe (§6.1.3 rule 2).
+fn structural_fault(path: String, key: Option<&str>, reason: &str) -> RuleFault {
+    RuleFault {
+        path,
+        key: key.map(str::to_string),
+        reason: reason.to_string(),
+        sync_resolvable: false,
+        async_resolvable: false,
+    }
+}
+
+fn join_path(prefix: &str, local: &str) -> String {
+    if prefix.is_empty() {
+        local.to_string()
+    } else {
+        format!("{prefix}.{local}")
+    }
+}
+
+fn collect_condition_faults(
+    conditions: &Value,
+    prefix: &str,
+    path: PrecheckPath,
+    out: &mut Vec<RuleFault>,
+) {
+    let Some(obj) = conditions.as_object() else {
+        // §6.1.1 case 5: `conditions` itself is not a mapping. At the root this
+        // is path `$`; nested, it is the branch's own path (a `$or` element or
+        // a `$not` operand that is not an object).
+        let (path_str, reason) = if prefix.is_empty() {
+            ("$".to_string(), "conditions must be a mapping")
+        } else {
+            (prefix.to_string(), "condition branch must be an object")
+        };
+        out.push(structural_fault(path_str, None, reason));
+        return;
+    };
+
+    for (key, value) in obj {
+        let key_path = join_path(prefix, key);
+
+        // Every key, compound operators included, must resolve to a handler on
+        // the path in use (§6.1.1 case 1).
+        let sync_resolvable = is_sync_resolvable(key);
+        let async_resolvable = is_async_resolvable(key);
+        let resolvable = match path {
+            PrecheckPath::Sync => sync_resolvable,
+            PrecheckPath::Async => async_resolvable,
+        };
+        if !resolvable {
+            out.push(RuleFault {
+                path: key_path.clone(),
+                key: Some(key.clone()),
+                reason: "unknown ACL condition".to_string(),
+                sync_resolvable,
+                async_resolvable,
+            });
+            // An unresolvable key cannot have its operand shape checked against
+            // a handler that does not exist. Nothing further to say about it.
+            continue;
+        }
+
+        // §6.1.1 case 4: the operand must have the shape its key requires.
+        match key.as_str() {
+            "$or" => match value.as_array() {
+                Some(arr) => {
+                    for (index, sub) in arr.iter().enumerate() {
+                        collect_condition_faults(sub, &format!("{key_path}[{index}]"), path, out);
+                    }
+                }
+                None => out.push(structural_fault(
+                    key_path,
+                    Some(key),
+                    "$or value must be a list of condition objects",
+                )),
+            },
+            "$not" => {
+                if value.is_object() {
+                    collect_condition_faults(value, &key_path, path, out);
+                } else {
+                    out.push(structural_fault(
+                        key_path,
+                        Some(key),
+                        "$not value must be a condition object",
+                    ));
+                }
+            }
+            // A leaf handler is the authority on its own value, and asking it
+            // would mean running it — which the precheck must not do. Leaf
+            // value faults surface at execution instead.
+            _ => {}
         }
     }
 }
