@@ -1,6 +1,6 @@
 [package]
 name = "apcore"
-version = "0.29.0"
+version = "0.28.0"
 edition = "2021"
 # Minimum supported Rust version. Verified with `cargo +1.86 check --all-features`.
 # The binding language constraint is `std::task::Waker::noop()` (used by the
