@@ -64,8 +64,10 @@ const FIXTURE: &str = "acl_argument_scoped_approval.json";
 /// `acl_handler_error.json` driver, and reconciled against the fixture after
 /// the loop so a case that stops being unrepresentable starts being asserted
 /// instead of silently staying skipped.
-const SKIPPED_UNREPRESENTABLE: &[&str] =
-    &["malformed_pattern_field_raises_the_pending_requirement"];
+const SKIPPED_UNREPRESENTABLE: &[&str] = &[
+    "malformed_pattern_field_raises_the_pending_requirement",
+    "malformed_targets_field_raises_the_pending_requirement",
+];
 
 /// The fixture lands in the spec repo one push after this driver, so that
 /// `check_driver_coverage.py --strict` has a driver to find for it. Until then
