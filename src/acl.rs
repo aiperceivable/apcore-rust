@@ -157,11 +157,13 @@ impl ACLRule {
     /// Whether this rule requires a human decision for the calls it matches
     /// (PROTOCOL_SPEC §6.1.6).
     ///
-    /// Always `false` for a `deny` rule. The combination is rejected at load
-    /// and by [`ACL::try_new`], so it is unrepresentable in a loaded ACL; the
-    /// guard is restated here because [`ACL::add_rule`] is infallible by
-    /// contract and can only warn, and because a governance requirement read
-    /// off a rule that refuses the call would be a state with no meaning.
+    /// Always `false` for a `deny` rule. All three entry points that accept a
+    /// rule — [`ACL::load`], [`ACL::try_new`] and [`ACL::try_add_rule`] —
+    /// refuse the combination, so it is unrepresentable in a live ACL. The
+    /// guard is restated here because a governance requirement read off a rule
+    /// that refuses the call would be a state with no meaning, and because
+    /// `rules` is `pub`-readable and a future entry point must not be able to
+    /// reintroduce it.
     #[must_use]
     pub fn approval_required(&self) -> bool {
         self.effect == "allow" && self.approval.is_some_and(ApprovalRequirement::is_required)
@@ -242,6 +244,22 @@ impl JsonType {
 /// protocol-level key, not caller input. Excluding it also keeps Step 4's
 /// verdict identical across the approval suspend/resume boundary, which §7.4
 /// re-enters from Step 1 with the token present in `arguments`.
+///
+/// # It cannot be forged
+///
+/// §6.1.8 rule 3: the projection **MUST** be computed by the framework and
+/// **MUST NOT** be accepted from caller-supplied input. A caller that could
+/// supply its own would satisfy `has_none_of` for a call whose arguments say
+/// otherwise, turning the condition into a caller-controlled switch.
+///
+/// apcore-rust satisfies this **structurally**, not with a runtime check.
+/// This type derives no serde traits, so there is no way to build one from a
+/// wire payload at all; it is carried on `PipelineContext`, which is
+/// framework-internal and never deserialized; and [`Context`] — the object
+/// that *is* deserialized from the wire — does not carry it, which is one of
+/// the reasons the projection did not go there. `projection_forgery_tests`
+/// below pins all three, so a later change that adds `Deserialize` or moves
+/// the field onto `Context` fails a test rather than opening the hole quietly.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GovernanceProjection {
     /// Key -> JSON type. `BTreeMap` so iteration order is the document order a
@@ -824,24 +842,46 @@ impl ACL {
     /// is emitted for each that does not resolve. Insertion still succeeds;
     /// this is the same warn-never-fail contract [`ACL::load`] has, for the
     /// same reason.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rule carries `approval: required` on a `deny` effect
+    /// (PROTOCOL_SPEC §6.1.6 rule 2). Use [`ACL::try_add_rule`] for fallible
+    /// insertion — the pairing [`ACL::new`] and [`ACL::try_new`] already use.
+    ///
+    /// This cannot break a caller written before spec v1.28.0: the `approval`
+    /// field did not exist, so the rejected state was not constructible. A
+    /// rule built in code is as meaningless as one parsed from YAML, which is
+    /// why all three entry points refuse it rather than two refusing and one
+    /// warning.
     pub fn add_rule(&mut self, rule: ACLRule) {
+        self.try_add_rule(rule)
+            .expect("invalid ACL rule — use ACL::try_add_rule for fallible insertion");
+    }
+
+    /// [`ACL::add_rule`], returning the §6.1.6 rejection instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ModuleError` with `ErrorCode::ACLRuleError` when the rule
+    /// carries `approval: required` on a `deny` effect. "Denied **and** needs
+    /// approval" is not a state that means anything (§6.1.6), and accepting
+    /// half of a governance rule is the failure mode §6.1.5 was written to end.
+    pub fn try_add_rule(&mut self, rule: ACLRule) -> Result<(), ModuleError> {
         Self::warn_rule_faults(std::slice::from_ref(&rule), 0);
-        // §6.1.6 rule 2 rejects `approval: required` on a `deny` rule at load.
-        // This entry point is infallible by contract
-        // (`acl-system.md` §Contract.ACL.add_rule declares `On success: None`),
-        // so it warns instead — and [`ACLRule::approval_required`] refuses to
-        // report a requirement off a `deny` rule regardless, so the meaningless
-        // state cannot reach a decision even when a caller ignores the warning.
         if rule.effect == "deny" && rule.approval.is_some_and(ApprovalRequirement::is_required) {
-            tracing::warn!(
-                effect = %rule.effect,
-                "ACL rule carries 'approval: required' on a 'deny' rule; the approval \
-                 requirement is IGNORED. Authorization and approval are two independent \
-                 results (PROTOCOL_SPEC §6.1.6) and a refusal is not a question. \
-                 ACL::load and ACL::try_new reject this combination outright."
-            );
+            return Err(ModuleError::new(
+                ErrorCode::ACLRuleError,
+                "ACL rule carries 'approval: required' on a 'deny' rule. Authorization and \
+                 approval are two independent results (PROTOCOL_SPEC §6.1.6): a refusal is \
+                 not a question, so the combination has no meaning. Use 'effect: allow' with \
+                 'approval: required' to ask a human, or drop the 'approval' key to refuse \
+                 outright."
+                    .to_string(),
+            ));
         }
         self.rules.insert(0, rule);
+        Ok(())
     }
 
     /// Report every rule that fails PROTOCOL_SPEC §6.1.4's precheck
@@ -1809,6 +1849,65 @@ mod reload_tests {
         assert_eq!(
             acl.yaml_path, before,
             "reload must not change the stored yaml_path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod projection_forgery_tests {
+    //! PROTOCOL_SPEC §6.1.8 rule 3 — the governance projection MUST NOT be
+    //! accepted from caller-supplied input.
+    //!
+    //! Source guards rather than `trybuild` compile-fail fixtures: a `.stderr`
+    //! for an unsatisfied serde trait bound is rustc-version sensitive, and CI
+    //! runs a newer toolchain than the local default. These assert the same
+    //! property and cannot go stale on a compiler upgrade.
+
+    /// The `#[...]` attribute lines immediately preceding `decl` in `src`.
+    ///
+    /// Attribute lines only — doc comments are skipped, because this very
+    /// type's own documentation discusses `Deserialize` at length and a naive
+    /// text scan would match the prose instead of the derive.
+    fn derives_before(src: &str, decl: &str) -> String {
+        let at = src
+            .find(decl)
+            .unwrap_or_else(|| panic!("{decl} still exists"));
+        src[..at]
+            .lines()
+            .rev()
+            .take_while(|line| line.trim_start().starts_with("#["))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_projection_derives_no_serde_traits() {
+        let attrs = derives_before(include_str!("acl.rs"), "pub struct GovernanceProjection {");
+        assert!(
+            !attrs.contains("Serialize") && !attrs.contains("Deserialize"),
+            "GovernanceProjection must not be constructible from a wire payload \
+             (PROTOCOL_SPEC §6.1.8 rule 3) — a caller that could supply its own \
+             projection would satisfy `has_none_of` for a call whose arguments say \
+             otherwise:\n{attrs}"
+        );
+    }
+
+    #[test]
+    fn the_wire_context_carries_no_projection() {
+        // `Context` is deserialized from untrusted input (§4). The projection
+        // lives on `PipelineContext`, which is framework-internal, precisely so
+        // that no wire payload can name it.
+        let src = include_str!("context.rs");
+        let start = src
+            .find("pub struct Context<T> {")
+            .expect("Context still exists");
+        let body_end = src[start..].find("\n}").expect("brace-terminated") + start;
+        let body = &src[start..body_end];
+        assert!(
+            !body.contains("projection"),
+            "the governance projection must not sit on the deserialized Context \
+             (PROTOCOL_SPEC §6.1.8 rule 3); if it ever moves there the field MUST be \
+             transient — `#[serde(skip)]`:\n{body}"
         );
     }
 }

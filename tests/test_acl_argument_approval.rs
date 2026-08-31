@@ -179,6 +179,42 @@ fn approval_required_on_a_deny_rule_is_rejected_by_try_new() {
 }
 
 #[test]
+fn approval_required_on_a_deny_rule_is_rejected_by_add_rule() {
+    // The third entry point. A rule built in code is as meaningless as one
+    // parsed from YAML, so all three refuse it rather than two refusing and
+    // one warning. `try_add_rule` is the fallible form, mirroring the
+    // `new` / `try_new` pairing the crate already uses.
+    let mut acl = ACL::try_new(vec![], "deny", None).expect("construct");
+    let err = acl
+        .try_add_rule(with_approval(
+            rule(&["*"], &["cli.git_push"], "deny"),
+            ApprovalRequirement::Required,
+        ))
+        .expect_err("runtime insertion must refuse the meaningless combination too");
+    assert_eq!(err.code, ErrorCode::ACLRuleError);
+    assert!(acl.rules().is_empty(), "the rejected rule is not inserted");
+
+    // A valid rule still goes in, at position 0 as before.
+    acl.try_add_rule(with_approval(
+        rule(&["*"], &["cli.git_push"], "allow"),
+        ApprovalRequirement::Required,
+    ))
+    .expect("allow + approval is valid");
+    assert_eq!(acl.rules().len(), 1);
+    assert!(acl.rules()[0].approval_required());
+}
+
+#[test]
+#[should_panic(expected = "use ACL::try_add_rule")]
+fn the_infallible_add_rule_panics_rather_than_accepting_it() {
+    let mut acl = ACL::try_new(vec![], "deny", None).expect("construct");
+    acl.add_rule(with_approval(
+        rule(&["*"], &["cli.git_push"], "deny"),
+        ApprovalRequirement::Required,
+    ));
+}
+
+#[test]
 fn approval_not_required_on_a_deny_rule_still_loads() {
     // Only `required` is meaningless on a `deny` rule. Writing the default out
     // explicitly is redundant, not wrong.
@@ -770,6 +806,40 @@ async fn module_lookup_populates_the_projection_before_step_4() {
     assert!(
         lookup < acl,
         "the projection is computed at Step 3 and read at Step 4: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_projection_never_reaches_the_wire_context() {
+    // §6.1.8 rule 3: the projection MUST be computed by the framework and MUST
+    // NOT be accepted from caller-supplied input. A caller that could supply
+    // its own would satisfy `has_none_of` for a call whose arguments say
+    // otherwise, which turns the condition into a caller-controlled switch.
+    //
+    // apcore-rust carries it on `PipelineContext`, which is framework-internal
+    // and never deserialized, so there is no field for a wire payload to name.
+    // `src/acl.rs`'s `projection_forgery_tests` pin the structural half (no
+    // serde derives, nothing on `Context`); this pins the observable half.
+    let registry = make_registry();
+    let mut pipe = PipelineContext::new(
+        "cli.git_push",
+        json!({"force": true}),
+        Context::<Value>::anonymous(),
+        "standard",
+    );
+    pipe.registry = Some(Arc::clone(&registry));
+    pipe.config = Some(Arc::new(apcore::config::Config::default()));
+    BuiltinModuleLookup::default()
+        .execute(&mut pipe)
+        .await
+        .expect("module lookup");
+    assert!(pipe.governance_projection.is_some());
+
+    let wire = serde_json::to_value(&pipe.context).expect("Context serializes");
+    let rendered = wire.to_string();
+    assert!(
+        !rendered.contains("projection"),
+        "nothing a caller can send names the projection: {rendered}"
     );
 }
 

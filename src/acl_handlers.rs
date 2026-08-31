@@ -808,17 +808,23 @@ const ARGUMENT_PREDICATES: &[&str] = &["has_key", "has_all_keys", "has_none_of"]
 /// [`GovernanceProjection`](crate::acl::GovernanceProjection), which has no
 /// field that can hold a value.
 ///
-/// # There is no registration point for it
+/// # It requires no registration
 ///
 /// It is seeded like every other built-in, through `seed_condition`, and there
-/// is no separate extension hook for argument predicates:
-/// `register_condition` writes runtime code into a process-wide registry, and
-/// a deployment-registered *argument* handler would be exactly the unauditable
-/// host code §7.9.6 rule 2 exists to keep out of a governance verdict. A fixed
-/// vocabulary keeps the decision reproducible from the ACL document. Being
-/// built-in also means §6.1.4's precheck covers the key for free: `argument:`
-/// written for `arguments:` is an unregistered condition key, so the rule is
-/// unevaluable rather than silently inert.
+/// is no separate extension hook for argument predicates: a *dedicated*
+/// registration point for them would invite exactly the unauditable host code
+/// §7.9.6 rule 2 exists to keep out of a governance verdict, and a fixed
+/// vocabulary keeps the decision reproducible from the ACL document.
+///
+/// §6.1.7 means the condition *requires* no registration — **not** that
+/// `register_condition` is forbidden from replacing it. That call can already
+/// replace `roles`, which is equally consequential, and special-casing one
+/// built-in would be arbitrary; `seed_condition` therefore treats `arguments`
+/// exactly as it treats the others and never overwrites a claimed key.
+///
+/// Being built-in also means §6.1.4's precheck covers the key for free:
+/// `argument:` written for `arguments:` is an unregistered condition key, so
+/// the rule is unevaluable rather than silently inert.
 pub struct ArgumentsHandler;
 
 impl ArgumentsHandler {
