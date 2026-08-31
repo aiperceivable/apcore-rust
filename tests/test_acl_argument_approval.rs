@@ -1174,3 +1174,322 @@ async fn preflight_keeps_reporting_the_requirement_under_a_clearing_policy() {
         "preflight reports the union, so it agrees with the gate (§7.9.5, §6.9 row 6)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §6.1.1 rule 5 — an unevaluable `allow` rule's approval requirement is
+// PENDING, not discarded (spec v1.29.0, apcore#109)
+// ---------------------------------------------------------------------------
+//
+// v1.22.0 wrote "an `allow` rule MUST NOT grant" when a rule carried one axis,
+// and stepping aside was then harmless because whatever granted next also said
+// `allow`. v1.28.0 gave rules a second axis and "does not grant" began
+// discarding it: on the very shape §6.1.7 exists for — `force_needs_approval()`
+// — the gate stepped aside, the broad rule granted, and the result was `allow`
+// with `approval_required: false` on exactly the call the operator gated.
+//
+// The fixture driver exercises this on the sync path over 24 cases. What is
+// pinned here is the async twin (a separate scan loop), the audit entry, and
+// the containment clause, none of which the driver reaches.
+
+/// Both scan loops, for one call against one ACL: `(sync, async)` decisions.
+///
+/// `check_inner` and `async_check_inner` are separate loops carrying separate
+/// pending-approval accumulators; a rule-5 behaviour verified on one says
+/// nothing about the other.
+fn both_decisions(
+    acl: &ACL,
+    target: &str,
+    projection: Option<&GovernanceProjection>,
+) -> (AccessDecision, AccessDecision) {
+    let sync = acl.check_access(Some("agent.planner"), target, Some(&ctx()), projection);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let asynchronous = rt.block_on(async {
+        acl.async_check_access(Some("agent.planner"), target, Some(&ctx()), projection)
+            .await
+    });
+    (sync, asynchronous)
+}
+
+#[test]
+fn a_stepped_aside_approval_rule_still_gates_the_rule_that_grants() {
+    // THE DEFECT. No projection, so the `arguments` gate is unevaluable
+    // (§6.1.8 rule 1) and rule 0 must not grant — but rule 1 does, and it
+    // inherits the requirement rule 0 carried.
+    let acl = force_needs_approval();
+    let (sync, asynchronous) = both_decisions(&acl, "cli.git_push", None);
+
+    for (label, decision) in [("sync", &sync), ("async", &asynchronous)] {
+        assert!(decision.is_allowed(), "[{label}] rule 1 grants");
+        assert!(
+            decision.approval_required,
+            "[{label}] the requirement rule 0 carried is PENDING, not discarded (§6.1.1 rule 5)"
+        );
+        assert_eq!(
+            decision.matched_rule_index,
+            Some(1),
+            "[{label}] `matched_rule_index` still names the rule that decided ACCESS"
+        );
+    }
+}
+
+#[test]
+fn the_legacy_boolean_fails_closed_on_a_pending_requirement() {
+    // §6.8.1 as amended: fail-closed is a property of the DECISION, so it
+    // holds for a requirement that originated in a rule which did not match.
+    // Without rule 5 this returns `true` and a legacy caller runs the gated
+    // call.
+    let acl = force_needs_approval();
+    assert!(!acl.check(Some("agent.planner"), "cli.git_push", Some(&ctx())));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    assert!(!rt.block_on(async {
+        acl.async_check(Some("agent.planner"), "cli.git_push", Some(&ctx()))
+            .await
+    }));
+}
+
+#[test]
+fn a_pending_requirement_rides_through_default_effect_allow() {
+    // The boundary a "a later rule grants" reading misses: there IS no later
+    // rule. `approval_required: true` with `matched_rule_index: None` is a
+    // legal combination since v1.29.0 (§6.9 row 2).
+    let acl = ACL::try_new(
+        vec![with_approval(
+            with_conditions(
+                rule(&["*"], &["cli.git_push"], "allow"),
+                json!({"arguments": {"has_key": ["force"]}}),
+            ),
+            ApprovalRequirement::Required,
+        )],
+        // Against the house rule deliberately: the fall-through is not
+        // observable against a `deny` default, because not-granting and
+        // denying produce the same answer.
+        "allow",
+        None,
+    )
+    .expect("construct");
+
+    let (sync, asynchronous) = both_decisions(&acl, "cli.git_push", None);
+    for (label, decision) in [("sync", &sync), ("async", &asynchronous)] {
+        assert!(decision.is_allowed(), "[{label}] the default grants");
+        assert!(
+            decision.approval_required,
+            "[{label}] the default MUST carry the pending requirement (§6.1.1 rule 5)"
+        );
+        assert_eq!(
+            decision.matched_rule_index, None,
+            "[{label}] no rule matched"
+        );
+        assert_eq!(decision.reason, "default_effect", "[{label}]");
+    }
+}
+
+#[test]
+fn a_denial_clears_the_pending_requirement() {
+    // "Denied and needs approval" is not a state that means anything (§6.1.6):
+    // the call is not going to run, so there is nothing to put to a human.
+    // Rule 0 raises a pending requirement, rule 1 denies.
+    let acl = ACL::try_new(
+        vec![
+            with_approval(
+                with_conditions(
+                    rule(&["*"], &["cli.git_push"], "allow"),
+                    json!({"arguments": {"has_key": ["force"]}}),
+                ),
+                ApprovalRequirement::Required,
+            ),
+            rule(&["*"], &["cli.git_push"], "deny"),
+        ],
+        "allow",
+        None,
+    )
+    .expect("construct");
+
+    let (sync, asynchronous) = both_decisions(&acl, "cli.git_push", None);
+    for (label, decision) in [("sync", &sync), ("async", &asynchronous)] {
+        assert!(!decision.is_allowed(), "[{label}] rule 1 denies");
+        assert!(
+            !decision.approval_required,
+            "[{label}] a denial clears the pending requirement (§6.1.1 rule 5)"
+        );
+        assert_eq!(
+            decision.matched_rule_index,
+            Some(1),
+            "[{label}] `matched_rule_index` names the rule that actually decided"
+        );
+    }
+}
+
+#[test]
+fn an_out_of_scope_approval_rule_raises_nothing() {
+    // The containment clause, and what keeps the fix from over-reaching: rule
+    // 0 is written about `cli.deploy`, so its conditions are never consulted
+    // (§6.1.4 rule 4) and it must not attach a human to a call it was never
+    // written about. An implementation that sets `pending` before matching
+    // patterns passes every other test in this section and fails this one.
+    let acl = ACL::try_new(
+        vec![
+            with_approval(
+                with_conditions(
+                    rule(&["*"], &["cli.deploy"], "allow"),
+                    json!({"arguments": {"has_key": ["force"]}}),
+                ),
+                ApprovalRequirement::Required,
+            ),
+            rule(&["*"], &["cli.git_push"], "allow"),
+        ],
+        "deny",
+        None,
+    )
+    .expect("construct");
+
+    let (sync, asynchronous) = both_decisions(&acl, "cli.git_push", None);
+    for (label, decision) in [("sync", &sync), ("async", &asynchronous)] {
+        assert!(decision.is_allowed(), "[{label}]");
+        assert!(
+            !decision.approval_required,
+            "[{label}] a rule whose patterns do not match raises no pending requirement"
+        );
+        assert_eq!(decision.matched_rule_index, Some(1), "[{label}]");
+    }
+    assert!(
+        acl.check(Some("agent.planner"), "cli.git_push", Some(&ctx())),
+        "and the legacy boolean is not dragged closed by an unrelated rule"
+    );
+}
+
+#[test]
+fn the_audit_entry_carries_the_final_approval_value_and_still_reports_the_fault() {
+    // §6.1.1 rule 5's closing sentence: a pending requirement neither
+    // suppresses nor substitutes for `handler_error`. The entry must show BOTH
+    // — the gate could not be evaluated, and a human is required anyway — or
+    // the audit trail says the call ran unapproved.
+    let audit: Arc<Mutex<Vec<AuditEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&audit);
+    let acl = ACL::try_new(
+        vec![
+            with_approval(
+                with_conditions(
+                    rule(&["*"], &["cli.git_push"], "allow"),
+                    json!({"arguments": {"has_key": ["force"]}}),
+                ),
+                ApprovalRequirement::Required,
+            ),
+            rule(&["*"], &["cli.git_push"], "allow"),
+        ],
+        "deny",
+        Some(Arc::new(move |entry: &AuditEntry| {
+            sink.lock().push(entry.clone());
+        })),
+    )
+    .expect("construct");
+
+    let decision = acl.check_access(Some("agent.planner"), "cli.git_push", Some(&ctx()), None);
+    let entries = audit.lock();
+    assert_eq!(entries.len(), 1, "one decision, one entry");
+    assert_eq!(
+        entries[0].approval_required, decision.approval_required,
+        "the entry reports the FINAL value, not the matched rule's own"
+    );
+    assert!(entries[0].approval_required);
+    assert_eq!(entries[0].matched_rule_index, Some(1));
+    let handler_error = entries[0]
+        .handler_error
+        .as_deref()
+        .expect("the unevaluable gate is still reported (§6.3.1)");
+    assert!(
+        handler_error.contains("arguments"),
+        "handler_error must name the condition path: {handler_error}"
+    );
+}
+
+#[test]
+fn a_misspelled_predicate_does_not_drop_the_requirement_on_the_executor_path() {
+    // Not confined to the projection-less legacy boolean. `has_keys` written
+    // for `has_all_keys` is a precheck fault (§6.1.8 case 3), so the rule is
+    // unevaluable WITH a projection present, on the ordinary Executor path.
+    // One typo turned "ask a human" into "do not ask".
+    let acl = ACL::try_new(
+        vec![
+            with_approval(
+                with_conditions(
+                    rule(&["*"], &["cli.git_push"], "allow"),
+                    json!({"arguments": {"has_keys": ["force"]}}),
+                ),
+                ApprovalRequirement::Required,
+            ),
+            rule(&["*"], &["cli.git_push"], "allow"),
+        ],
+        "deny",
+        None,
+    )
+    .expect("construct");
+
+    let args = projection(&json!({"remote": "origin", "force": true}));
+    let (sync, asynchronous) = both_decisions(&acl, "cli.git_push", Some(&args));
+    for (label, decision) in [("sync", &sync), ("async", &asynchronous)] {
+        assert!(decision.is_allowed(), "[{label}]");
+        assert!(
+            decision.approval_required,
+            "[{label}] a typo MUST NOT silently disarm the gate (§6.1.1 rule 5)"
+        );
+        assert_eq!(decision.matched_rule_index, Some(1), "[{label}]");
+    }
+    // §6.1.2 makes an unregistered key a warning rather than a load failure, so
+    // deploy-time validation is not a mitigation that can be assumed — but it
+    // does name the fault.
+    assert!(
+        acl.validate_rules()
+            .iter()
+            .any(|f| f.condition_path == "arguments.has_keys"),
+        "validate_rules() surfaces the misspelling at deploy time"
+    );
+}
+
+#[tokio::test]
+async fn a_typo_in_the_gate_still_reaches_the_step_5_approval_gate() {
+    // End to end, on the ordinary Executor pipeline with a projection present:
+    // the gate rule is unevaluable because `has_keys` is not a predicate name,
+    // and the broad rule grants. Before §6.1.1 rule 5 this ran `git push
+    // --force` with the handler never consulted — no denial, no error, no
+    // audit record of an approval, just a call the operator gated going
+    // through. Asserted at the gate rather than at the ACL because that is
+    // where the consequence lands.
+    let (handler, requests) = RecordingHandler::new();
+    let mut exec = Executor::new(make_registry(), apcore::config::Config::default());
+    exec.set_acl(
+        ACL::try_new(
+            vec![
+                with_approval(
+                    with_conditions(
+                        rule(&["*"], &["cli.git_push"], "allow"),
+                        json!({"arguments": {"has_keys": ["force"]}}),
+                    ),
+                    ApprovalRequirement::Required,
+                ),
+                rule(&["*"], &["cli.git_push"], "allow"),
+            ],
+            "deny",
+            None,
+        )
+        .expect("construct"),
+    );
+    exec.set_approval_handler(Box::new(handler));
+
+    let out = exec
+        .call("cli.git_push", json!({"force": true}), None, None)
+        .await
+        .expect("approved");
+    assert_eq!(out["status"], "pushed");
+    assert_eq!(
+        requests.lock().len(),
+        1,
+        "the pending requirement reaches the Step-5 gate (§6.1.1 rule 5, §7.4)"
+    );
+}

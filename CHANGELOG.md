@@ -16,6 +16,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.29.0] - Unreleased
+
+### Fixed
+
+- **SECURITY: an unevaluable approval rule stepped aside and the call was granted without approval (spec v1.29.0 §6.1.1 rule 5, §6.8.1, §6.9 rows 1-2, [apcore#109](https://github.com/aiperceivable/apcore/issues/109)).** The shape §6.1.7 was written for is a narrow approval rule ahead of a broad allow — `git push --force` needs a human, `git push` does not. When the narrow rule's condition could not be *evaluated*, §6.1.1 resolved it to "does not match, MUST NOT grant" and scanning continued; the broad rule then granted, carrying no requirement of its own. The result was `access: "allow"` with `approval_required: false` on exactly the call the operator gated, and `matched_rule_index` naming a rule that never mentioned approval — while `resolve_unevaluable_rule` logged *"the allow rule does not match and MUST NOT grant"* on the very call it was granting. Reproduced in all three SDKs.
+
+  **The root cause is a section that outlived its assumptions.** §6.1.1 was written in spec v1.22.0, when a rule carried one axis, and "an `allow` rule MUST NOT grant" was a complete instruction then: the rule steps aside, and stepping aside was harmless because whatever granted next also said `allow`. Spec v1.28.0 gave rules a second axis (`approval`) and did not revisit it, so "does not grant" began silently discarding the requirement the rule carried.
+
+  **It is not confined to the legacy boolean or to a missing projection.** The trigger is an unevaluable `allow` rule, and §6.1.1 is the path that misconfiguration, §6.1.2's warn-don't-fail registration ordering and handler failure all take. A misspelled predicate (`has_keys` for `has_all_keys`) or an unregistered condition key reaches it **with a governance projection present**, on the ordinary Executor pipeline; `default_effect: allow` reaches it with no second rule at all. `validate_rules()` is not a mitigation — §6.1.2 makes an unregistered condition key a warning rather than a load failure, so nothing stops such a rule reaching production.
+
+  **The requirement is now pending rather than discarded.** An unevaluable `allow` rule carrying `approval: required` records a pending requirement and scanning continues; the rule itself still does not grant. Whatever grants next composes it by **disjunction** — a later `allow` rule *or* `default_effect: allow`, which makes `approval_required: true` with `matched_rule_index: None` a legal combination for the first time. A final decision of `deny` clears it, and `matched_rule_index` keeps naming the rule that actually decided rather than the unevaluable one. `handler_error` is untouched: a pending requirement neither suppresses nor substitutes for it, and `AuditEntry.approval_required` carries the **final** value. The §6.1.1 warning gained a `pending_approval` field and now names the surviving requirement, because the old wording was logged on the call the next rule then granted.
+
+  **Scope is what keeps it from over-reaching.** `matches_rule` returns `Unevaluable` only *after* both pattern lists have matched, so a rule whose well-formed `callers` / `targets` do not cover this call has already left as `NoMatch` with its conditions never consulted (§6.1.4 rule 4) and raises nothing — a rule written about one target must not attach a human to calls it was never written about. Rule 5's other half, where a rule whose own pattern field is *malformed* (§6.1.4.1) **does** raise the requirement because its scope cannot be read, is satisfied structurally here: `callers` and `targets` are `Vec<String>`, so serde rejects a bare string at deserialization and the compiler rejects one in a struct literal, exactly as §6.1.4.1 anticipates. The fixture case marked `skip_if_unrepresentable` is skipped for that reason and named in the driver's skip list rather than passed over in silence.
+
+  **Requiring a human rather than denying is deliberate.** The condition that could not be evaluated is the one that decides whether *this* call is the dangerous one, so refusing would turn every ordinary `git push` into the hard failure §6.1.7 exists to eliminate. "Ask" is the answer that is wrong in neither direction.
+
+  Applied at **every** entry point — `check_access`, `async_check_access` and both legacy booleans. A requirement that survives on one and is lost on another is the same fail-open, reachable by choosing a different call; `check_inner` and `async_check_inner` are separate scan loops, so each carries its own accumulator and both compose it through the shared `finalize_rule_match` / `finalize_default_effect` helpers, which is what keeps the two paths from drifting. §6.8.1's fail-closed rule for `check()` is now a property of the **decision** rather than of the matched rule, and the booleans inherit it for free because they read `AccessDecision::approval_required` instead of re-deriving it.
+
+  **Backward compatible for correct configurations:** across all 20 pre-existing cases of `conformance/fixtures/acl_argument_scoped_approval.json` **with a projection**, no decision changes. Without a projection, two change, both `approval_required: false` -> `true`.
+
+### Changed
+
+- **`tests/test_acl_argument_scoped_approval_conformance.rs` runs every case twice.** The fixture grew a second column (24 cases, up from 20): run 1 supplies a governance projection derived from `arguments`, run 2 supplies none at all, and both are contracts — §6.1.8 case 1 makes `check()` a public entry point that may be called without one. Both **structured** columns are asserted here via `check_access(.., Some(&projection))` and `check_access(.., None)`; `ACL::check` takes no projection in this SDK and so answers run 2's question, which is now asserted on all 24 cases against `expected_legacy_check_no_projection`. This replaces the driver-side skip that had left 17 of 20 cases unverified — the column the drivers were skipping is exactly where apcore#109 was sitting. `expected_legacy_check` (run 1's boolean, for an SDK whose `check()` does take a projection) is the one key this driver cannot assert, and says so where the assertion would have been.
+
+---
+
 ## [0.28.0] - Unreleased
 
 ### Added

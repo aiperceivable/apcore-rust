@@ -341,9 +341,20 @@ pub struct AccessDecision {
     ///
     /// Only ever `true` alongside `access == "allow"`: "denied and needs
     /// approval" is not a state that means anything (§6.1.6).
+    ///
+    /// The requirement does not have to come from the rule
+    /// [`Self::matched_rule_index`] names. An `allow` rule carrying
+    /// `approval: required` whose conditions turned out UNEVALUABLE does not
+    /// grant, but leaves its requirement **pending**, and whatever grants next
+    /// inherits it (§6.1.1 rule 5, spec v1.29.0) — including
+    /// `default_effect: allow`, where `matched_rule_index` is `None`.
     pub approval_required: bool,
     /// Index of the rule that decided, in definition order, or `None` when the
     /// decision came from `default_effect` or from an empty rule list.
+    ///
+    /// It names the rule that decided **`access`**, which since spec v1.29.0
+    /// need not be the rule the approval requirement came from: `None`
+    /// alongside `approval_required: true` is a legal combination (§6.9 row 2).
     pub matched_rule_index: Option<usize>,
     /// Which branch of §6.3 produced the decision: `"rule_match"`,
     /// `"default_effect"` or `"no_rules"`.
@@ -415,9 +426,14 @@ pub struct AuditEntry {
     /// (sync finding A-D-024).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handler_error: Option<String>,
-    /// Whether the matched rule required this call to be put to a human
-    /// (PROTOCOL_SPEC §6.1.6, §6.3.1). `false` when no rule matched or the
-    /// matched rule required none.
+    /// Whether the **decision** required this call to be put to a human
+    /// (PROTOCOL_SPEC §6.1.6, §6.3.1) — the final value, matching the
+    /// [`AccessDecision`] emitted alongside it.
+    ///
+    /// Usually the matched rule's own requirement, but since spec v1.29.0 it
+    /// may also be one raised by an unevaluable `allow` rule that did not
+    /// itself match (§6.1.1 rule 5), including on the `default_effect: allow`
+    /// path where `matched_rule_index` is `None`. `false` on any `deny`.
     ///
     /// A field **beside** `decision` rather than a third `decision` value:
     /// `decision` is a string downstream consumers parse, and a third value
@@ -513,6 +529,29 @@ enum RuleMatch {
     Match,
     /// Patterns matched but the conditions were UNEVALUABLE (§6.1.1).
     Unevaluable,
+}
+
+/// What PROTOCOL_SPEC §6.1.1 says to do with a rule whose conditions were
+/// UNEVALUABLE.
+///
+/// A `bool` was enough while §6.1.1 said one thing about such a rule ("a `deny`
+/// rule takes effect, an `allow` rule does not grant"). Rule 5 (spec v1.29.0,
+/// apcore#109) added a second thing an `allow` rule can leave behind on its way
+/// out, so the resolution now carries both answers rather than returning one
+/// and leaving the caller to re-derive the other — sync and async both consume
+/// this, and a value re-derived at two call sites is a value that can drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnevaluableResolution {
+    /// The rule **takes effect** — a `deny` rule denies the call (§6.1.1 rule
+    /// 1). Scanning stops here.
+    TakesEffect,
+    /// The rule **steps aside**: an `allow` rule MUST NOT grant on a condition
+    /// nobody could answer, so scanning continues with the next rule.
+    ///
+    /// `pending_approval` is `true` when the rule carried `approval: required`.
+    /// The rule does not grant, but the requirement it carried is **pending**,
+    /// not discarded (§6.1.1 rule 5).
+    StepsAside { pending_approval: bool },
 }
 
 /// Access control list manager.
@@ -996,9 +1035,16 @@ impl ACL {
     ///
     /// # This boolean fails closed on an approval requirement
     ///
-    /// A rule resolving to `allow` with `approval: required` (§6.1.6) makes
-    /// this method return **`false`** — see [`Self::check_access`] for the
-    /// result that distinguishes the two axes.
+    /// A **decision** resolving to `allow` with an approval requirement
+    /// (§6.1.6) makes this method return **`false`** — see
+    /// [`Self::check_access`] for the result that distinguishes the two axes.
+    ///
+    /// §6.8.1 states this of the decision rather than of the matched rule on
+    /// purpose: since spec v1.29.0 the requirement may be a pending one raised
+    /// by an unevaluable `allow` rule that did not itself match, or carried
+    /// through `default_effect: allow` (§6.1.1 rule 5), and the boolean fails
+    /// closed on those identically. It does so here for free, because it reads
+    /// [`AccessDecision::approval_required`] rather than re-deriving it.
     ///
     /// `check()` is public API consumed by callers that are not the Executor —
     /// tooling, preflight helpers, third-party integrations — and such a caller
@@ -1032,7 +1078,9 @@ impl ACL {
     /// arguments?" — and any `arguments` condition is then **unevaluable**
     /// (§6.1.1): the question cannot be answered as written, so a `deny` rule
     /// carrying one takes effect and an `allow` rule carrying one does not
-    /// grant.
+    /// grant. It does, however, leave any `approval: required` it carried
+    /// **pending** for whatever grants next (§6.1.1 rule 5) — not granting is
+    /// not the same as having asked for nothing.
     pub fn check_access(
         &self,
         caller_id: Option<&str>,
@@ -1076,15 +1124,44 @@ impl ACL {
             return self.finalize_no_rules(&default_effect, caller, target_id, ctx);
         }
 
+        // §6.1.1 rule 5: an `allow` rule that carried `approval: required` and
+        // turned out UNEVALUABLE steps aside without granting, but the
+        // requirement it carried survives the scan and attaches to whatever
+        // grants next — a later `allow` rule or `default_effect: allow`. A
+        // denial clears it; the `finalize_*` helpers own that composition so
+        // this loop and its async twin cannot disagree about it.
+        let mut pending_approval = false;
+
         for (idx, rule) in rules.iter().enumerate() {
             let paths_before = crate::acl_handlers::reported_condition_paths();
             match self.matches_rule(rule, caller, target_id, ctx) {
                 RuleMatch::Match => {
-                    return self.finalize_rule_match(idx, rule, caller, target_id, ctx)
+                    return self.finalize_rule_match(
+                        idx,
+                        rule,
+                        caller,
+                        target_id,
+                        ctx,
+                        pending_approval,
+                    )
                 }
                 RuleMatch::Unevaluable => {
-                    if Self::resolve_unevaluable_rule(idx, rule, &paths_before) {
-                        return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
+                    match Self::resolve_unevaluable_rule(idx, rule, &paths_before) {
+                        UnevaluableResolution::TakesEffect => {
+                            return self.finalize_rule_match(
+                                idx,
+                                rule,
+                                caller,
+                                target_id,
+                                ctx,
+                                pending_approval,
+                            )
+                        }
+                        UnevaluableResolution::StepsAside {
+                            pending_approval: p,
+                        } => {
+                            pending_approval |= p;
+                        }
                     }
                 }
                 RuleMatch::NoMatch => {}
@@ -1094,7 +1171,7 @@ impl ACL {
         // Use the snapshotted default_effect rather than re-reading
         // self.default_effect to maintain consistency with the snapshotted
         // rules (sync finding A-D-021 / A-D-301).
-        self.finalize_default_effect(&default_effect, caller, target_id, ctx)
+        self.finalize_default_effect(&default_effect, caller, target_id, ctx, pending_approval)
     }
 
     /// Load ACL rules from a YAML file.
@@ -1356,9 +1433,29 @@ impl ACL {
 
     /// Apply PROTOCOL_SPEC §6.1.1 to a rule whose conditions were UNEVALUABLE.
     ///
-    /// Returns `true` when the rule must take effect (so the caller finalizes
-    /// it as a rule match — a `deny` rule denies), `false` when evaluation must
+    /// Returns [`UnevaluableResolution::TakesEffect`] when the rule must take
+    /// effect (so the caller finalizes it as a rule match — a `deny` rule
+    /// denies), and [`UnevaluableResolution::StepsAside`] when evaluation must
     /// continue with the next rule (an `allow` rule MUST NOT grant).
+    ///
+    /// **Rule 5 (spec v1.29.0, apcore#109).** Stepping aside was a complete
+    /// instruction while a rule carried one axis; since §6.1.6 it carries two,
+    /// and the second one is not lost when the first resolves to unevaluable.
+    /// An `allow` rule carrying `approval: required` therefore reports
+    /// `pending_approval: true` on its way out — it still does not grant, but
+    /// whatever grants *later* inherits the requirement. Without this the
+    /// shape §6.1.7 exists for (a narrow approval rule ahead of a broad allow)
+    /// resolved to `allow` with `approval_required: false` on exactly the call
+    /// the operator gated.
+    ///
+    /// Scope is not re-checked here: `matches_rule` returns `Unevaluable` only
+    /// **after** both pattern lists matched, so a rule written about another
+    /// caller or target has already left as `NoMatch` with its conditions never
+    /// consulted (§6.1.4 rule 4). Rule 5's "unknowable scope counts as scope"
+    /// clause — a malformed `callers` / `targets` raising the requirement
+    /// because its scope cannot be read — is satisfied structurally in this
+    /// SDK: both fields are `Vec<String>`, so §6.1.4.1's malformed shape has no
+    /// value to construct (see the `validate_rules` note on the same clause).
     ///
     /// Also emits §6.1.1 rule 3's warning, which must name the condition
     /// **path**, the rule's index and the rule's `effect`. The `effect` is in
@@ -1366,7 +1463,11 @@ impl ACL {
     /// case. The paths are recovered by diffing the per-call handler-error
     /// scope, which is where both precheck-origin and execution-origin faults
     /// land — including one nested inside `$or` / `$not`.
-    fn resolve_unevaluable_rule(idx: usize, rule: &ACLRule, paths_before: &[String]) -> bool {
+    fn resolve_unevaluable_rule(
+        idx: usize,
+        rule: &ACLRule,
+        paths_before: &[String],
+    ) -> UnevaluableResolution {
         let paths_after = crate::acl_handlers::reported_condition_paths();
         let new_paths: Vec<String> = paths_after
             .into_iter()
@@ -1380,18 +1481,30 @@ impl ACL {
         };
 
         let takes_effect = rule.effect == "deny";
+        // `approval_required()` is already false for a `deny` rule, and a deny
+        // rule that takes effect returns before the pending value is read, so
+        // the two branches cannot both be live.
+        let pending_approval = rule.approval_required();
         tracing::warn!(
             rule_index = idx,
             effect = %rule.effect,
             condition_paths = %conditions,
+            pending_approval,
             "ACL rule has unevaluable conditions — {} (PROTOCOL_SPEC §6.1.1)",
             if takes_effect {
                 "the deny rule TAKES EFFECT and the call is denied"
+            } else if pending_approval {
+                "the allow rule does not match and MUST NOT grant, but the `approval: required` \
+                 it carried is PENDING and attaches to whatever grants next (rule 5)"
             } else {
                 "the allow rule does not match and MUST NOT grant"
             }
         );
-        takes_effect
+        if takes_effect {
+            UnevaluableResolution::TakesEffect
+        } else {
+            UnevaluableResolution::StepsAside { pending_approval }
+        }
     }
 
     /// Check if a rule matches the caller, target, and context.
@@ -1580,7 +1693,12 @@ impl ACL {
         ctx: Option<&Context<serde_json::Value>>,
     ) -> AccessDecision {
         // §6.9 row 2: `default_effect` is `allow` / `deny` only. There is no
-        // default approval requirement, and no match means `false`.
+        // default approval *source*, and no match means `false`.
+        //
+        // Unlike `finalize_default_effect`, this branch takes no pending
+        // requirement (§6.1.1 rule 5): it is reached only when the rule list is
+        // EMPTY, and a requirement can only be raised by a rule. There is
+        // nothing to carry, so no parameter to carry it.
         let entry = self.build_audit_entry(
             caller,
             target_id,
@@ -1596,6 +1714,12 @@ impl ACL {
     }
 
     /// Audit + return for a matched rule. Shared by `check` and `async_check`.
+    ///
+    /// `pending_approval` is the §6.1.1 rule 5 requirement accumulated from
+    /// `allow` rules that were unevaluable earlier in the same scan. Composing
+    /// it here rather than at the call sites is what keeps the sync and async
+    /// loops from drifting on it, exactly as they already share audit
+    /// construction.
     fn finalize_rule_match(
         &self,
         idx: usize,
@@ -1603,9 +1727,20 @@ impl ACL {
         caller: &str,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
+        pending_approval: bool,
     ) -> AccessDecision {
-        // §6.9 row 1: the matched rule determines BOTH results.
-        let approval_required = rule.approval_required();
+        // §6.9 row 1: the matched rule determines `access`; the approval
+        // requirement is that rule's own UNION any pending one (§6.1.1 rule 5),
+        // which may therefore originate in a rule that did not match.
+        //
+        // A denial clears it. `approval_required()` is already false on a
+        // `deny` rule, but the pending term is not, and "denied and needs
+        // approval" is not a state that means anything (§6.1.6) — the call is
+        // not going to run, so there is nothing to put to a human.
+        // `matched_rule_index` still names the rule that actually decided
+        // rather than the unevaluable one.
+        let approval_required =
+            rule.effect == "allow" && (rule.approval_required() || pending_approval);
         let entry = self.build_audit_entry(
             caller,
             target_id,
@@ -1636,7 +1771,17 @@ impl ACL {
         caller: &str,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
+        pending_approval: bool,
     ) -> AccessDecision {
+        // §6.9 row 2 as amended in v1.29.0: there is still no default approval
+        // *source*, but `default_effect: allow` MUST carry a pending
+        // requirement (§6.1.1 rule 5) through to the result. This is the
+        // boundary a "a later rule grants" reading misses — there may BE no
+        // later rule, and the requirement would then be lost with nothing to
+        // carry it. The result is `approval_required: true` with
+        // `matched_rule_index: None`, which is a legal combination since
+        // v1.29.0. A `deny` default clears it, per `finalize_rule_match`.
+        let approval_required = default_effect == "allow" && pending_approval;
         let entry = self.build_audit_entry(
             caller,
             target_id,
@@ -1644,11 +1789,11 @@ impl ACL {
             "default_effect",
             None,
             None,
-            false,
+            approval_required,
             ctx,
         );
         self.emit_audit(&entry);
-        AccessDecision::new(default_effect, false, None, "default_effect")
+        AccessDecision::new(default_effect, approval_required, None, "default_effect")
     }
 
     /// Build an audit entry from the check parameters and context.
@@ -1757,22 +1902,49 @@ impl ACL {
             return self.finalize_no_rules(&default_effect, caller, target_id, ctx);
         }
 
+        // §6.1.1 rule 5 — see the identical accumulator in `check_inner`. The
+        // async path resolves conditions from a different registry (§6.1.3),
+        // not by a different rule, so it must carry the pending requirement the
+        // same way or the two paths answer the same ACL differently.
+        let mut pending_approval = false;
+
         for (idx, rule) in rules.iter().enumerate() {
             let paths_before = crate::acl_handlers::reported_condition_paths();
             match self.matches_rule_async(rule, caller, target_id, ctx).await {
                 RuleMatch::Match => {
-                    return self.finalize_rule_match(idx, rule, caller, target_id, ctx)
+                    return self.finalize_rule_match(
+                        idx,
+                        rule,
+                        caller,
+                        target_id,
+                        ctx,
+                        pending_approval,
+                    )
                 }
                 RuleMatch::Unevaluable => {
-                    if Self::resolve_unevaluable_rule(idx, rule, &paths_before) {
-                        return self.finalize_rule_match(idx, rule, caller, target_id, ctx);
+                    match Self::resolve_unevaluable_rule(idx, rule, &paths_before) {
+                        UnevaluableResolution::TakesEffect => {
+                            return self.finalize_rule_match(
+                                idx,
+                                rule,
+                                caller,
+                                target_id,
+                                ctx,
+                                pending_approval,
+                            )
+                        }
+                        UnevaluableResolution::StepsAside {
+                            pending_approval: p,
+                        } => {
+                            pending_approval |= p;
+                        }
                     }
                 }
                 RuleMatch::NoMatch => {}
             }
         }
 
-        self.finalize_default_effect(&default_effect, caller, target_id, ctx)
+        self.finalize_default_effect(&default_effect, caller, target_id, ctx, pending_approval)
     }
 
     /// Async version of `matches_rule` that awaits async condition handlers.
