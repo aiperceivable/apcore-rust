@@ -127,6 +127,7 @@ fn acl_argument_scoped_approval_conformance() {
     };
     let cases = fixture["test_cases"].as_array().expect("test_cases array");
     assert!(!cases.is_empty(), "fixture carries no cases");
+    let mut skipped: Vec<String> = Vec::new();
 
     for case in cases {
         let id = case["id"].as_str().unwrap();
@@ -181,15 +182,20 @@ fn acl_argument_scoped_approval_conformance() {
         );
 
         // §6.8.1: the legacy boolean fails closed on an approval requirement,
-        // so allow + required reads as false. It takes no projection, so only
-        // the cases whose rules carry no `arguments` condition are comparable
-        // through it — the rest would be unevaluable for want of one, which is
-        // a different question from the one the fixture is asking.
-        if !case["rules"].as_array().unwrap().iter().any(|r| {
-            r.get("conditions")
-                .map(|c| c.to_string().contains("arguments"))
-                .unwrap_or(false)
-        }) {
+        // so allow + required reads as false.
+        //
+        // `ACL::check` takes no projection in this SDK — its signature is
+        // `(caller_id, target_id, ctx)` — so a rule carrying an `arguments`
+        // condition is unevaluable through it for want of one (§6.1.8 rule 1),
+        // whatever `expected_legacy_check` says about the same call made WITH
+        // a projection. Those cases are skipped rather than asserted against
+        // the answer to a different question, and the skip is reconciled
+        // against the fixture after the loop so a case that stops carrying an
+        // `arguments` condition starts being asserted instead of silently
+        // staying skipped.
+        if takes_arguments(case) {
+            skipped.push(id.to_string());
+        } else {
             assert_eq!(
                 acl.check(Some(caller), target, Some(&ctx)),
                 case["expected_legacy_check"].as_bool().unwrap(),
@@ -201,6 +207,18 @@ fn acl_argument_scoped_approval_conformance() {
         // with no context and no handler, so validate_rules() must surface
         // them at deploy time rather than at the first call that trips them.
         let findings = acl.validate_rules();
+        // §6.1.8 rule 3: every faulty predicate is reported, so a case may pin
+        // the exact finding set rather than the presence of one.
+        if let Some(paths) = case["expected_validation_finding_paths"].as_array() {
+            let want: Vec<&str> = paths.iter().map(|p| p.as_str().unwrap()).collect();
+            let got: Vec<&str> = findings.iter().map(|f| f.condition_path.as_str()).collect();
+            assert_eq!(got, want, "[{id}] {note}");
+            for finding in &findings {
+                assert!(!finding.sync_resolvable, "[{id}] {note}");
+                assert!(!finding.async_resolvable, "[{id}] {note}");
+            }
+            continue;
+        }
         match case["expected_validation_finding_path"].as_str() {
             Some(path) => {
                 let at: Vec<_> = findings
@@ -220,6 +238,38 @@ fn acl_argument_scoped_approval_conformance() {
             ),
         }
     }
+
+    // Reconciled against the fixture rather than trusted.
+    let expected_skips: Vec<String> = cases
+        .iter()
+        .filter(|c| takes_arguments(c))
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        skipped, expected_skips,
+        "the legacy-boolean skip list drifted from the fixture"
+    );
+    assert!(
+        skipped.len() < cases.len(),
+        "every case skipped the legacy assertion — §6.8.1 would go unexercised"
+    );
+    eprintln!(
+        "{}/{} case(s) skip the legacy `check()` assertion: ACL::check takes no projection in this SDK",
+        skipped.len(),
+        cases.len()
+    );
+}
+
+/// Whether any of a case's rules carries an `arguments` condition, and so is
+/// unevaluable through the projection-less legacy [`ACL::check`].
+fn takes_arguments(case: &Value) -> bool {
+    case["rules"].as_array().is_some_and(|rules| {
+        rules.iter().any(|r| {
+            r.get("conditions")
+                .and_then(Value::as_object)
+                .is_some_and(|c| c.contains_key("arguments"))
+        })
+    })
 }
 
 /// §6.1.6 rule 3 — the meaningless combination cannot get in by any door.
