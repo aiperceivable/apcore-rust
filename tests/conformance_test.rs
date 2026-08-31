@@ -23,7 +23,7 @@ use apcore::version::negotiate_version;
 #[path = "conformance_env.rs"]
 mod conformance_env;
 
-use crate::conformance_env::find_fixtures_root;
+use crate::conformance_env::{find_fixtures_root, find_schemas_root};
 
 fn load_fixture(name: &str) -> Value {
     let path = find_fixtures_root().join(format!("{name}.json"));
@@ -1325,14 +1325,9 @@ fn conformance_context_trace_parent() {
 // ---------------------------------------------------------------------------
 
 fn load_schema(name: &str) -> Value {
-    let fixtures_root = find_fixtures_root();
-    let path = fixtures_root
-        .parent()
-        .unwrap() // conformance/
-        .parent()
-        .unwrap() // apcore/
-        .join("schemas")
-        .join(format!("{name}.schema.json"));
+    // §8.2.1 rule 4: resolve `schemas/` on its own rather than climbing out of
+    // the fixtures root — under CONFORMANCE_FIXTURES there is no repo above it.
+    let path = find_schemas_root().join(format!("{name}.schema.json"));
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("Failed to read schema: {}", path.display()));
     serde_json::from_str(&content).unwrap_or_else(|e| panic!("Invalid JSON in schema {name}: {e}"))

@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use crate::conformance_env::find_fixtures_root;
+use crate::conformance_env::{find_fixtures_root, find_schemas_root};
 
 fn fixture() -> serde_json::Value {
     let path = find_fixtures_root().join("config_key_governance.json");
@@ -397,12 +397,10 @@ fn governance_fixture_is_derived_not_authored() {
 // Default tiers mirror the canonical schemas (sync finding A-D-021)
 // ---------------------------------------------------------------------------
 
+// §8.2.1 rule 4: resolve `schemas/` on its own rather than climbing out of the
+// fixtures root. Under `CONFORMANCE_FIXTURES` there is no repo above it.
 fn schemas_root() -> std::path::PathBuf {
-    find_fixtures_root()
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("fixtures live under <spec repo>/conformance/fixtures")
-        .join("schemas")
+    find_schemas_root()
 }
 
 fn read_schema_file(name: &str) -> serde_json::Value {

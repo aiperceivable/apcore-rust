@@ -20,7 +20,7 @@ use apcore::{UsageCollector, UsageModule, UsageSummaryModule};
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 
-use crate::conformance_env::find_fixtures_root;
+use crate::conformance_env::{find_fixtures_root, find_schemas_root};
 
 /// driver_contract.output_validates_against_the_canonical_schema: the same file
 /// the spec repo ships, not a copy. `additionalProperties: false` is the point —
@@ -36,12 +36,9 @@ fn validate_against_canonical_schema(module: &str, output: &Value) {
         "system.usage.module" => "sys-usage-module.schema.json",
         other => panic!("fixture names an unknown module {other:?}"),
     };
-    let path = find_fixtures_root()
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("fixtures root has a repo root")
-        .join("schemas")
-        .join(file);
+    // §8.2.1 rule 4: resolve `schemas/` on its own rather than climbing out of
+    // the fixtures root. Under `CONFORMANCE_FIXTURES` there is no repo above it.
+    let path = find_schemas_root().join(file);
     let schema: Value = serde_json::from_str(
         &std::fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("failed to read {}", path.display())),
