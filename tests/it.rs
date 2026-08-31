@@ -84,6 +84,8 @@ mod system_modules_spec;
 mod test_acl;
 #[path = "test_acl_argument_approval.rs"]
 mod test_acl_argument_approval;
+#[path = "test_acl_argument_scoped_approval_conformance.rs"]
+mod test_acl_argument_scoped_approval_conformance;
 #[path = "test_acl_conditions.rs"]
 mod test_acl_conditions;
 #[path = "test_acl_handler_error_conformance.rs"]
