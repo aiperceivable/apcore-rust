@@ -30,6 +30,17 @@ const RULE_KEYS: &[&str] = &[
     "conditions",
 ];
 
+/// The complete set of values a rule's `effect` may carry (PROTOCOL_SPEC §6.1).
+///
+/// Closed at **every** entry point since spec v1.30.0 (#111), not only at file
+/// loading: an unrecognised `effect` must never be resolved to a decision.
+/// Reading it as `deny` looks safe and is not — under `default_effect: allow` a
+/// rule the operator wrote to permit becomes one that denies everything it
+/// matches, with no error and no warning, and on a `deny` rule the fallback is
+/// only ever *accidentally* right. `default_effect` is the same two values one
+/// field up and is validated against this set too.
+const EFFECTS: &[&str] = &["allow", "deny"];
+
 /// Reserved in earlier revisions of §6.1 and evaluated by no implementation.
 ///
 /// Rejected like any other unknown key, but named as reserved in the message:
@@ -593,52 +604,26 @@ impl ACL {
     ///
     /// # Errors
     ///
-    /// Returns `ModuleError` with `ErrorCode::ACLRuleError` if `default_effect` is
-    /// not `"allow"` or `"deny"`, matching the constructor validation in
-    /// apcore-typescript (sync finding A-D-025).
+    /// Returns `ModuleError` with `ErrorCode::ACLRuleError` if `default_effect`
+    /// is not `"allow"` or `"deny"` (matching the constructor validation in
+    /// apcore-typescript — sync finding A-D-025), or if any rule fails
+    /// [`ACL::validate_rule`]: an `effect` outside the same closed set
+    /// (§6.1.5, spec v1.30.0, #111) or `approval: required` on a `deny` effect
+    /// (§6.1.6 rule 2).
     pub fn try_new(
         rules: Vec<ACLRule>,
         default_effect: impl Into<String>,
         audit_logger: Option<Arc<AuditLoggerFn>>,
     ) -> Result<Self, ModuleError> {
         let default_effect = default_effect.into();
-        if default_effect != "allow" && default_effect != "deny" {
+        if !EFFECTS.contains(&default_effect.as_str()) {
             return Err(ModuleError::new(
                 ErrorCode::ACLRuleError,
                 format!("Invalid default_effect '{default_effect}': must be 'allow' or 'deny'"),
             ));
         }
-        // Validate each rule's effect at load, matching apcore-python
-        // `acl.py` and apcore-typescript `acl.ts` (both raise ACLRuleError
-        // on a rule effect that is not 'allow' or 'deny').
         for (index, rule) in rules.iter().enumerate() {
-            if rule.effect != "allow" && rule.effect != "deny" {
-                return Err(ModuleError::new(
-                    ErrorCode::ACLRuleError,
-                    format!(
-                        "Rule {index} has invalid effect '{}', must be 'allow' or 'deny'",
-                        rule.effect
-                    ),
-                ));
-            }
-            // PROTOCOL_SPEC §6.1.6 rule 2: `approval: required` on a `deny`
-            // rule is rejected at load. "Denied AND needs approval" is not a
-            // state that means anything, and silently ignoring one half of a
-            // governance rule is the failure mode §6.1.5 was written to end.
-            if rule.effect == "deny" && rule.approval.is_some_and(ApprovalRequirement::is_required)
-            {
-                return Err(ModuleError::new(
-                    ErrorCode::ACLRuleError,
-                    format!(
-                        "Rule {index} carries 'approval: required' on a 'deny' rule. \
-                         Authorization and approval are two independent results \
-                         (PROTOCOL_SPEC §6.1.6): a refusal is not a question, so the \
-                         combination has no meaning. Use 'effect: allow' with \
-                         'approval: required' to ask a human, or drop the 'approval' key \
-                         to refuse outright."
-                    ),
-                ));
-            }
+            Self::validate_rule(index, rule)?;
         }
         Ok(Self::new_unchecked(rules, default_effect, audit_logger))
     }
@@ -646,23 +631,34 @@ impl ACL {
     /// Create a new ACL with the given rules, default effect, and optional
     /// audit logger.
     ///
-    /// **Validates** `default_effect` and panics on invalid input. This
-    /// matches apcore-python and apcore-typescript constructor behaviour
-    /// (both throw on invalid `default_effect`) — sync finding A-D-302.
+    /// **Validates** and panics on invalid input, which matches apcore-python
+    /// and apcore-typescript constructor behaviour (both throw) — sync finding
+    /// A-D-302.
     ///
-    /// For fallible construction (e.g., when `default_effect` originates
-    /// from user input or a YAML file), prefer [`ACL::try_new`].
+    /// For fallible construction (e.g., when `default_effect` or a rule
+    /// originates from user input or a YAML file), prefer [`ACL::try_new`].
     ///
     /// # Panics
     ///
-    /// Panics if `default_effect` is not `"allow"` or `"deny"`.
+    /// Panics on everything [`ACL::try_new`] returns an error for: a
+    /// `default_effect` outside `allow` / `deny`, a rule `effect` outside the
+    /// same closed set (§6.1.5), or `approval: required` on a `deny` rule
+    /// (§6.1.6 rule 2). Construction is one of the three doors §6.1.6 rule 3
+    /// closes, so an invalid rule cannot enter here merely because the
+    /// signature is infallible.
     pub fn new(
         rules: Vec<ACLRule>,
         default_effect: impl Into<String>,
         audit_logger: Option<Arc<AuditLoggerFn>>,
     ) -> Self {
-        Self::try_new(rules, default_effect, audit_logger)
-            .expect("invalid default_effect — use ACL::try_new for fallible construction")
+        // Carry `try_new`'s own message into the panic rather than replacing
+        // it: §6.1.5 wants the refusal to name the offending value, and an
+        // `.expect()` string cannot — it named `default_effect` for every
+        // rejection, including the rule-level ones that have nothing to do
+        // with that field.
+        Self::try_new(rules, default_effect, audit_logger).unwrap_or_else(|e| {
+            panic!("{} — use ACL::try_new for fallible construction", e.message)
+        })
     }
 
     fn new_unchecked(
@@ -690,6 +686,57 @@ impl ACL {
             yaml_path: None,
             audit_logger,
         }
+    }
+
+    /// Reject a rule that cannot mean anything, whichever door it arrived at.
+    ///
+    /// The single check behind `load`, `try_new` and `try_add_rule`, so the
+    /// three entry points PROTOCOL_SPEC §6.1.6 rule 3 names cannot drift apart
+    /// — which they had: the `effect` enum was checked in `try_new`'s body and
+    /// nowhere else, so a rule `ACL::load` refused was accepted by
+    /// `try_add_rule` (spec v1.30.0, #111).
+    ///
+    /// `index` is the position the rule occupies in the rule list: its index in
+    /// the loaded document, or `0` for a runtime insertion, which is where
+    /// `add_rule` puts it.
+    ///
+    /// # Errors
+    ///
+    /// * `effect` outside [`EFFECTS`] (§6.1.5). The value set is closed and an
+    ///   unrecognised value MUST NOT be resolved to a decision — leaving it to
+    ///   the rule loop would hand `AccessDecision::access` a string no consumer
+    ///   knows, having silently changed what the operator wrote.
+    /// * `approval: required` on a `deny` effect (§6.1.6 rule 2). "Denied AND
+    ///   needs approval" is not a state that means anything, and silently
+    ///   ignoring one half of a governance rule is the failure mode §6.1.5 was
+    ///   written to end.
+    ///
+    /// Both name the rule index and the offending value, because an operator
+    /// reading the refusal needs to find the rule in their file.
+    fn validate_rule(index: usize, rule: &ACLRule) -> Result<(), ModuleError> {
+        if !EFFECTS.contains(&rule.effect.as_str()) {
+            return Err(ModuleError::new(
+                ErrorCode::ACLRuleError,
+                format!(
+                    "Rule {index} has invalid effect '{}', must be 'allow' or 'deny'",
+                    rule.effect
+                ),
+            ));
+        }
+        if rule.effect == "deny" && rule.approval.is_some_and(ApprovalRequirement::is_required) {
+            return Err(ModuleError::new(
+                ErrorCode::ACLRuleError,
+                format!(
+                    "Rule {index} carries 'approval: required' on a 'deny' rule. \
+                     Authorization and approval are two independent results \
+                     (PROTOCOL_SPEC §6.1.6): a refusal is not a question, so the \
+                     combination has no meaning. Use 'effect: allow' with \
+                     'approval: required' to ask a human, or drop the 'approval' key \
+                     to refuse outright."
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Emit PROTOCOL_SPEC §6.1.2 rule 2's load-time warning for every rule that
@@ -884,18 +931,27 @@ impl ACL {
     ///
     /// # Panics
     ///
-    /// Panics when the rule carries `approval: required` on a `deny` effect
-    /// (PROTOCOL_SPEC §6.1.6 rule 2). Use [`ACL::try_add_rule`] for fallible
+    /// Panics when the rule carries an `effect` outside `allow` / `deny`
+    /// (PROTOCOL_SPEC §6.1.5, spec v1.30.0, #111) or `approval: required` on a
+    /// `deny` effect (§6.1.6 rule 2). Use [`ACL::try_add_rule`] for fallible
     /// insertion — the pairing [`ACL::new`] and [`ACL::try_new`] already use.
     ///
-    /// This cannot break a caller written before spec v1.28.0: the `approval`
-    /// field did not exist, so the rejected state was not constructible. A
+    /// Neither can break a caller written before the release that added it.
+    /// The `approval` field did not exist before v1.28.0, so that state was not
+    /// constructible; an out-of-enum `effect` was never a *working* rule, only
+    /// one whose value travelled uninspected into `AccessDecision::access`. A
     /// rule built in code is as meaningless as one parsed from YAML, which is
     /// why all three entry points refuse it rather than two refusing and one
-    /// warning.
+    /// letting it through (§6.1.6 rule 3).
     pub fn add_rule(&mut self, rule: ACLRule) {
-        self.try_add_rule(rule)
-            .expect("invalid ACL rule — use ACL::try_add_rule for fallible insertion");
+        // Same reasoning as [`ACL::new`]: the panic carries `try_add_rule`'s
+        // message, which names the rule index and the offending value.
+        self.try_add_rule(rule).unwrap_or_else(|e| {
+            panic!(
+                "{} — use ACL::try_add_rule for fallible insertion",
+                e.message
+            )
+        });
     }
 
     /// [`ACL::add_rule`], returning the §6.1.6 rejection instead of panicking.
@@ -903,22 +959,19 @@ impl ACL {
     /// # Errors
     ///
     /// Returns `ModuleError` with `ErrorCode::ACLRuleError` when the rule
-    /// carries `approval: required` on a `deny` effect. "Denied **and** needs
-    /// approval" is not a state that means anything (§6.1.6), and accepting
-    /// half of a governance rule is the failure mode §6.1.5 was written to end.
+    /// carries an `effect` outside `allow` / `deny` (§6.1.5, spec v1.30.0,
+    /// #111), or `approval: required` on a `deny` effect (§6.1.6 rule 2).
+    /// "Denied **and** needs approval" is not a state that means anything, and
+    /// accepting half of a governance rule is the failure mode §6.1.5 was
+    /// written to end.
     pub fn try_add_rule(&mut self, rule: ACLRule) -> Result<(), ModuleError> {
+        // Index 0 — the position the rule is about to occupy, so the refusal
+        // names the rule the caller will find at the head of `rules()`.
+        // Validated BEFORE the precheck warning and before insertion: a rule
+        // that cannot be accepted should not leave a warning behind about a
+        // condition nobody will ever evaluate.
+        Self::validate_rule(0, &rule)?;
         Self::warn_rule_faults(std::slice::from_ref(&rule), 0);
-        if rule.effect == "deny" && rule.approval.is_some_and(ApprovalRequirement::is_required) {
-            return Err(ModuleError::new(
-                ErrorCode::ACLRuleError,
-                "ACL rule carries 'approval: required' on a 'deny' rule. Authorization and \
-                 approval are two independent results (PROTOCOL_SPEC §6.1.6): a refusal is \
-                 not a question, so the combination has no meaning. Use 'effect: allow' with \
-                 'approval: required' to ask a human, or drop the 'approval' key to refuse \
-                 outright."
-                    .to_string(),
-            ));
-        }
         self.rules.insert(0, rule);
         Ok(())
     }

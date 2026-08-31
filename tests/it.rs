@@ -88,6 +88,8 @@ mod test_acl_argument_approval;
 mod test_acl_argument_scoped_approval_conformance;
 #[path = "test_acl_conditions.rs"]
 mod test_acl_conditions;
+#[path = "test_acl_effect_value_closure_conformance.rs"]
+mod test_acl_effect_value_closure_conformance;
 #[path = "test_acl_handler_error_conformance.rs"]
 mod test_acl_handler_error_conformance;
 #[path = "test_acl_panic_boundary.rs"]

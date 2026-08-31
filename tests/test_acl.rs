@@ -394,7 +394,10 @@ fn test_check_add_rule_inserts_at_front() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic(expected = "invalid default_effect")]
+// The panic now carries `try_new`'s own message, which names the offending
+// value (§6.1.5): an `.expect()` string could not, and said "default_effect"
+// for rule-level rejections too.
+#[should_panic(expected = "Invalid default_effect 'wrong_value'")]
 fn test_acl_new_panics_on_invalid_default_effect() {
     // ACL::new must validate default_effect — bogus value should panic,
     // matching apcore-python and apcore-typescript constructor-throws
