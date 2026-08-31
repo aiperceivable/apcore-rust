@@ -21,7 +21,14 @@ use crate::utils::match_pattern;
 ///
 /// Closed on purpose: a key nothing evaluates is otherwise dropped in silence,
 /// which widens an `allow` rule with no warning (#107).
-const RULE_KEYS: &[&str] = &["callers", "targets", "effect", "description", "conditions"];
+const RULE_KEYS: &[&str] = &[
+    "callers",
+    "targets",
+    "effect",
+    "approval",
+    "description",
+    "conditions",
+];
 
 /// Reserved in earlier revisions of §6.1 and evaluated by no implementation.
 ///
@@ -75,6 +82,49 @@ fn reject_unknown_rule_keys(
     ))
 }
 
+/// Whether a rule requires the calls it matches to be put to a human before
+/// they run (PROTOCOL_SPEC §6.1.6).
+///
+/// Orthogonal to [`ACLRule::effect`], which answers a different question. An
+/// ACL rule resolves **two** results, and folding them into one enumeration
+/// makes a meaningless state ("denied *and* needs approval") representable
+/// while forcing a real one ("allowed, but ask first") to be spelled as a kind
+/// of denial:
+///
+/// * **Authorization** — may this caller reach this target at all? `effect`.
+/// * **Approval requirement** — must *this particular call* be put to a human?
+///   This type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRequirement {
+    /// The call runs without an approval gate on the ACL's account. The
+    /// module's own `annotations.requires_approval` and any `ExecutionPolicy`
+    /// still apply — §6.9 row 3 composes the sources by **union**, and this
+    /// value cancels neither.
+    NotRequired,
+    /// A call matching this rule must be put to a human before it runs.
+    ///
+    /// Only meaningful on an `allow` rule. `approval: required` on a `deny`
+    /// rule is rejected at load with `ACLRuleError` (§6.1.6 rule 2).
+    Required,
+}
+
+impl ApprovalRequirement {
+    /// `true` only for [`ApprovalRequirement::Required`].
+    #[must_use]
+    pub fn is_required(self) -> bool {
+        self == Self::Required
+    }
+}
+
+impl Default for ApprovalRequirement {
+    /// `not_required` — the meaning every rule written before spec v1.28.0
+    /// already had (§6.1.6 rule 1).
+    fn default() -> Self {
+        Self::NotRequired
+    }
+}
+
 /// Defines an access control rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ACLRule {
@@ -83,14 +133,246 @@ pub struct ACLRule {
     #[serde(default)]
     pub targets: Vec<String>,
     pub effect: String,
+    /// Whether a call matching this rule must be put to a human before it runs
+    /// (PROTOCOL_SPEC §6.1.6, spec v1.28.0, apcore#108).
+    ///
+    /// `None` is the absent key and means [`ApprovalRequirement::NotRequired`],
+    /// so every rule written before v1.28.0 keeps its meaning exactly. The
+    /// absent and the explicitly-written forms are kept distinguishable rather
+    /// than normalised, so `rules()` reports the document as authored.
+    ///
+    /// Adding this field was only safe once §6.1.5 closed the rule key set
+    /// (v1.27.0): an SDK that still dropped unknown keys would read a
+    /// `deny`-with-`approval` rule as a bare rule and act on half of what the
+    /// operator wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalRequirement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conditions: Option<serde_json::Value>,
 }
 
-/// Audit log entry produced by ACL checks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl ACLRule {
+    /// Whether this rule requires a human decision for the calls it matches
+    /// (PROTOCOL_SPEC §6.1.6).
+    ///
+    /// Always `false` for a `deny` rule. The combination is rejected at load
+    /// and by [`ACL::try_new`], so it is unrepresentable in a loaded ACL; the
+    /// guard is restated here because [`ACL::add_rule`] is infallible by
+    /// contract and can only warn, and because a governance requirement read
+    /// off a rule that refuses the call would be a state with no meaning.
+    #[must_use]
+    pub fn approval_required(&self) -> bool {
+        self.effect == "allow" && self.approval.is_some_and(ApprovalRequirement::is_required)
+    }
+}
+
+/// The JSON type of one argument, as carried by a [`GovernanceProjection`].
+///
+/// A type name, never a value — see the type-level note on
+/// [`GovernanceProjection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JsonType {
+    /// `null`
+    Null,
+    /// `true` / `false`
+    Boolean,
+    /// Any JSON number, integral or not.
+    Number,
+    /// A JSON string.
+    String,
+    /// A JSON array.
+    Array,
+    /// A JSON object.
+    Object,
+}
+
+impl JsonType {
+    /// The canonical lowercase name, matching `ExecutionPolicy`'s call-site
+    /// shape vocabulary (§7.9.6 rule 3) and JSON Schema's `type` keyword.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Object => "object",
+        }
+    }
+
+    fn of(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(_) => Self::Boolean,
+            serde_json::Value::Number(_) => Self::Number,
+            serde_json::Value::String(_) => Self::String,
+            serde_json::Value::Array(_) => Self::Array,
+            serde_json::Value::Object(_) => Self::Object,
+        }
+    }
+}
+
+/// The **governance projection** of a call's arguments — the only view of them
+/// the ACL ever sees (PROTOCOL_SPEC §6.1.8).
+///
+/// It carries the argument **key set** and each key's JSON type, and it
+/// **cannot carry a value**: there is no field for one. A projection that
+/// structurally cannot hold a value cannot leak one, whatever a future
+/// predicate does with it — which is the whole reason the type exists rather
+/// than a `&serde_json::Value` being passed down.
+///
+/// # Why not `context.redacted_inputs`
+///
+/// §6.1.8 rule 3 is a MUST NOT, for two independent reasons. Its documented
+/// contract is safe *logging*, not "input to a security decision", and one
+/// field serving both will eventually break one of them in a change made for
+/// the other. And it is not even safe here: redaction is driven by
+/// `x-sensitive` markers in the module's input schema, so a module with no
+/// input schema gets no field redaction at all and `redacted_inputs` is a raw
+/// copy of the arguments.
+///
+/// # `_approval_token` is not an argument
+///
+/// The framework-owned Phase B resume token (§7.4) is excluded, on the same
+/// grounds §7.9.6 rule 5 excludes it from policy resolution: it is a
+/// protocol-level key, not caller input. Excluding it also keeps Step 4's
+/// verdict identical across the approval suspend/resume boundary, which §7.4
+/// re-enters from Step 1 with the token present in `arguments`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GovernanceProjection {
+    /// Key -> JSON type. `BTreeMap` so iteration order is the document order a
+    /// diagnostic reader expects, and identical across runs.
+    keys: std::collections::BTreeMap<String, JsonType>,
+}
+
+impl GovernanceProjection {
+    /// Project a call's arguments (PROTOCOL_SPEC §6.1.8 rule 2).
+    ///
+    /// Top-level keys only: §6.1.7's three predicates are defined over the
+    /// call's argument keys, and descending into nested objects would widen
+    /// the projection without widening what can be asked of it.
+    ///
+    /// Arguments that are not a JSON object project to the empty key set — the
+    /// ACL check is Step 4 and input validation is Step 7, so the value here is
+    /// whatever the caller passed and may be a scalar, an array, or `null`.
+    #[must_use]
+    pub fn from_arguments(arguments: &serde_json::Value) -> Self {
+        let keys = arguments
+            .as_object()
+            .map_or_else(std::collections::BTreeMap::new, |obj| {
+                obj.iter()
+                    .filter(|(key, _)| key.as_str() != crate::policy::APPROVAL_TOKEN_KEY)
+                    .map(|(key, value)| (key.clone(), JsonType::of(value)))
+                    .collect()
+            });
+        Self { keys }
+    }
+
+    /// Whether the call carried an argument named `key`.
+    #[must_use]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.keys.contains_key(key)
+    }
+
+    /// The projected key set, in ascending lexicographic order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.keys.keys().map(String::as_str)
+    }
+
+    /// The JSON type of one argument, or `None` when the call did not carry it.
+    #[must_use]
+    pub fn type_of(&self, key: &str) -> Option<JsonType> {
+        self.keys.get(key).copied()
+    }
+
+    /// Number of projected keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the call carried no arguments at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// The structured result of an ACL check (PROTOCOL_SPEC §6.8.1).
+///
+/// [`ACL::check`] returns a `bool`, which can carry authorization but not the
+/// second axis of §6.1.6. This type carries both, and is what the Executor
+/// consults — the boolean entry points are kept for existing callers and
+/// **fail closed** on an approval requirement.
+///
+/// Marked `#[non_exhaustive]`: it is a spec-derived record that a future
+/// revision may widen, and the attribute is the mechanism by which that stays
+/// non-breaking. Build one with [`AccessDecision::new`]; the fields are public
+/// to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AccessDecision {
+    /// `"allow"` or `"deny"` — the authorization result, with exactly the
+    /// semantics [`ACL::check`]'s boolean has always had.
+    pub access: String,
+    /// Whether **this call** must be put to a human before it runs.
+    ///
+    /// Only ever `true` alongside `access == "allow"`: "denied and needs
+    /// approval" is not a state that means anything (§6.1.6).
+    pub approval_required: bool,
+    /// Index of the rule that decided, in definition order, or `None` when the
+    /// decision came from `default_effect` or from an empty rule list.
+    pub matched_rule_index: Option<usize>,
+    /// Which branch of §6.3 produced the decision: `"rule_match"`,
+    /// `"default_effect"` or `"no_rules"`.
+    pub reason: String,
+}
+
+impl AccessDecision {
+    /// Build a decision. Provided because `#[non_exhaustive]` removes
+    /// struct-literal construction for downstream crates
+    /// (`api-surface-conventions.md` §9.2 rule 2).
+    #[must_use]
+    pub fn new(
+        access: impl Into<String>,
+        approval_required: bool,
+        matched_rule_index: Option<usize>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            access: access.into(),
+            approval_required,
+            matched_rule_index,
+            reason: reason.into(),
+        }
+    }
+
+    /// Whether the ACL authorized the call, **ignoring** the approval
+    /// requirement.
+    ///
+    /// This is the authorization axis alone. A caller that is not the approval
+    /// gate wants [`ACL::check`], which folds the two axes together and fails
+    /// closed.
+    #[must_use]
+    pub fn is_allowed(&self) -> bool {
+        self.access == "allow"
+    }
+}
+
+/// Audit log entry produced by ACL checks (PROTOCOL_SPEC §6.3.1).
+///
+/// Marked `#[non_exhaustive]` in the same change that added
+/// [`Self::approval_required`] (spec v1.28.0): the field is a breaking
+/// addition for downstream struct-literal construction either way, and the
+/// attribute is what makes the *next* spec-driven field non-breaking. Build
+/// one with `AuditEntry::default()` and mutate, per the migration note the
+/// crate uses for every other spec-derived record (apcore#24).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AuditEntry {
     pub timestamp: String,
     pub caller_id: String,
@@ -115,6 +397,16 @@ pub struct AuditEntry {
     /// (sync finding A-D-024).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handler_error: Option<String>,
+    /// Whether the matched rule required this call to be put to a human
+    /// (PROTOCOL_SPEC §6.1.6, §6.3.1). `false` when no rule matched or the
+    /// matched rule required none.
+    ///
+    /// A field **beside** `decision` rather than a third `decision` value:
+    /// `decision` is a string downstream consumers parse, and a third value
+    /// would break every existing parser (§6.9 row 7). `#[serde(default)]` so
+    /// an audit record written before v1.28.0 still deserializes.
+    #[serde(default)]
+    pub approval_required: bool,
 }
 
 /// Type alias for the audit logger callback.
@@ -269,6 +561,24 @@ impl ACL {
                     format!(
                         "Rule {index} has invalid effect '{}', must be 'allow' or 'deny'",
                         rule.effect
+                    ),
+                ));
+            }
+            // PROTOCOL_SPEC §6.1.6 rule 2: `approval: required` on a `deny`
+            // rule is rejected at load. "Denied AND needs approval" is not a
+            // state that means anything, and silently ignoring one half of a
+            // governance rule is the failure mode §6.1.5 was written to end.
+            if rule.effect == "deny" && rule.approval.is_some_and(ApprovalRequirement::is_required)
+            {
+                return Err(ModuleError::new(
+                    ErrorCode::ACLRuleError,
+                    format!(
+                        "Rule {index} carries 'approval: required' on a 'deny' rule. \
+                         Authorization and approval are two independent results \
+                         (PROTOCOL_SPEC §6.1.6): a refusal is not a question, so the \
+                         combination has no meaning. Use 'effect: allow' with \
+                         'approval: required' to ask a human, or drop the 'approval' key \
+                         to refuse outright."
                     ),
                 ));
             }
@@ -516,6 +826,21 @@ impl ACL {
     /// same reason.
     pub fn add_rule(&mut self, rule: ACLRule) {
         Self::warn_rule_faults(std::slice::from_ref(&rule), 0);
+        // §6.1.6 rule 2 rejects `approval: required` on a `deny` rule at load.
+        // This entry point is infallible by contract
+        // (`acl-system.md` §Contract.ACL.add_rule declares `On success: None`),
+        // so it warns instead — and [`ACLRule::approval_required`] refuses to
+        // report a requirement off a `deny` rule regardless, so the meaningless
+        // state cannot reach a decision even when a caller ignores the warning.
+        if rule.effect == "deny" && rule.approval.is_some_and(ApprovalRequirement::is_required) {
+            tracing::warn!(
+                effect = %rule.effect,
+                "ACL rule carries 'approval: required' on a 'deny' rule; the approval \
+                 requirement is IGNORED. Authorization and approval are two independent \
+                 results (PROTOCOL_SPEC §6.1.6) and a refusal is not a question. \
+                 ACL::load and ACL::try_new reject this combination outright."
+            );
+        }
         self.rules.insert(0, rule);
     }
 
@@ -629,6 +954,21 @@ impl ACL {
     /// Returns `true` for allow, `false` for deny. Never errors — deny is
     /// signalled via the return value, not an `Err`, per the protocol spec.
     ///
+    /// # This boolean fails closed on an approval requirement
+    ///
+    /// A rule resolving to `allow` with `approval: required` (§6.1.6) makes
+    /// this method return **`false`** — see [`Self::check_access`] for the
+    /// result that distinguishes the two axes.
+    ///
+    /// `check()` is public API consumed by callers that are not the Executor —
+    /// tooling, preflight helpers, third-party integrations — and such a caller
+    /// can only read a boolean as "let it through / do not". Returning `true`
+    /// would let it execute a call the ACL said needed a human. `false` is
+    /// wrong in the benign direction: the caller sees a refusal where the truth
+    /// was "ask first" (PROTOCOL_SPEC §6.8.1). The Executor uses
+    /// [`Self::check_access`] and is unaffected, and a legacy caller only meets
+    /// this at all once an operator has authored a rule carrying `approval`.
+    ///
     /// Sync entry point. The shared post-decision audit logic lives in
     /// `finalize_*` helpers so this method and `async_check` cannot drift.
     pub fn check(
@@ -637,16 +977,42 @@ impl ACL {
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
+        let decision = self.check_access(caller_id, target_id, ctx, None);
+        decision.is_allowed() && !decision.approval_required
+    }
+
+    /// The structured result of a check — authorization **and** approval
+    /// requirement (PROTOCOL_SPEC §6.8.1).
+    ///
+    /// `projection` is the §6.1.8 governance projection of the call's
+    /// arguments, which the built-in `arguments` condition (§6.1.7) reads. The
+    /// execution pipeline computes it during module lookup (Step 3) and hands
+    /// it to this method at Step 4. `None` means the caller has no call site —
+    /// tooling asking "may X reach Y?" rather than "may X reach Y with these
+    /// arguments?" — and any `arguments` condition is then **unevaluable**
+    /// (§6.1.1): the question cannot be answered as written, so a `deny` rule
+    /// carrying one takes effect and an `allow` rule carrying one does not
+    /// grant.
+    pub fn check_access(
+        &self,
+        caller_id: Option<&str>,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+        projection: Option<&GovernanceProjection>,
+    ) -> AccessDecision {
         // Wrap the entire evaluation in a synchronous handler-error capture
         // scope (A-D-002) so any condition handler that calls
         // `report_handler_error(...)` lands its message in this call's audit
         // entry — mirroring `async_check`'s task-local scope and Python's
         // sync `_handler_error_var.set(None)` / `reset(token)` pairing.
         // Without this, `build_audit_entry` always read `None` on the sync
-        // path because the only scope was tokio-task-local.
-        let (decision, _captured) = crate::acl_handlers::with_handler_error_capture_sync(|| {
-            self.check_inner(caller_id, target_id, ctx)
-        });
+        // path because the only scope was tokio-task-local. The same scope
+        // carries the governance projection down to the `arguments` handler,
+        // whose `evaluate(value, ctx)` signature has nowhere else to take it.
+        let (decision, _captured) = crate::acl_handlers::with_acl_evaluation_scope_sync(
+            projection.cloned().map(Arc::new),
+            || self.check_inner(caller_id, target_id, ctx),
+        );
         decision
     }
 
@@ -655,7 +1021,7 @@ impl ACL {
         caller_id: Option<&str>,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> AccessDecision {
         let caller = caller_id.unwrap_or("@external");
 
         // Snapshot rules + default_effect before evaluation so any concurrent
@@ -1172,7 +1538,9 @@ impl ACL {
         caller: &str,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> AccessDecision {
+        // §6.9 row 2: `default_effect` is `allow` / `deny` only. There is no
+        // default approval requirement, and no match means `false`.
         let entry = self.build_audit_entry(
             caller,
             target_id,
@@ -1180,10 +1548,11 @@ impl ACL {
             "no_rules",
             None,
             None,
+            false,
             ctx,
         );
         self.emit_audit(&entry);
-        default_effect == "allow"
+        AccessDecision::new(default_effect, false, None, "no_rules")
     }
 
     /// Audit + return for a matched rule. Shared by `check` and `async_check`.
@@ -1194,7 +1563,9 @@ impl ACL {
         caller: &str,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> AccessDecision {
+        // §6.9 row 1: the matched rule determines BOTH results.
+        let approval_required = rule.approval_required();
         let entry = self.build_audit_entry(
             caller,
             target_id,
@@ -1202,10 +1573,16 @@ impl ACL {
             "rule_match",
             rule.description.as_deref(),
             Some(idx),
+            approval_required,
             ctx,
         );
         self.emit_audit(&entry);
-        rule.effect == "allow"
+        AccessDecision::new(
+            rule.effect.clone(),
+            approval_required,
+            Some(idx),
+            "rule_match",
+        )
     }
 
     /// Audit + return for the no-rule-matched path. Shared by `check` and
@@ -1219,7 +1596,7 @@ impl ACL {
         caller: &str,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> AccessDecision {
         let entry = self.build_audit_entry(
             caller,
             target_id,
@@ -1227,10 +1604,11 @@ impl ACL {
             "default_effect",
             None,
             None,
+            false,
             ctx,
         );
         self.emit_audit(&entry);
-        default_effect == "allow"
+        AccessDecision::new(default_effect, false, None, "default_effect")
     }
 
     /// Build an audit entry from the check parameters and context.
@@ -1244,9 +1622,11 @@ impl ACL {
         reason: &str,
         matched_rule_desc: Option<&str>,
         matched_rule_index: Option<usize>,
+        approval_required: bool,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> AuditEntry {
         AuditEntry {
+            approval_required,
             timestamp: Utc::now().to_rfc3339(),
             caller_id: caller_id.to_string(),
             target_id: target_id.to_string(),
@@ -1285,12 +1665,32 @@ impl ACL {
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> bool {
+        let decision = self
+            .async_check_access(caller_id, target_id, ctx, None)
+            .await;
+        decision.is_allowed() && !decision.approval_required
+    }
+
+    /// Async counterpart to [`Self::check_access`] (PROTOCOL_SPEC §6.8.1).
+    ///
+    /// §6.8.1 requires the structured accessor on **both** paths: `check()`
+    /// and `async_check()` resolve conditions from different registries
+    /// (§6.1.3), so an implementation that offered it on one path only would
+    /// leave the other unable to see an approval requirement at all.
+    pub async fn async_check_access(
+        &self,
+        caller_id: Option<&str>,
+        target_id: &str,
+        ctx: Option<&Context<serde_json::Value>>,
+        projection: Option<&GovernanceProjection>,
+    ) -> AccessDecision {
         // Wrap the entire evaluation in a per-call handler-error capture
         // scope so any handler that calls `report_handler_error(...)` lands
         // its message in this call's audit entry. The captured value is
         // read by `build_audit_entry` via the `HANDLER_ERROR` task-local
-        // (closes A-D-ACL-001).
-        let (decision, _captured) = crate::acl_handlers::with_handler_error_capture(
+        // (closes A-D-ACL-001). The same scope carries the §6.1.8 projection.
+        let (decision, _captured) = crate::acl_handlers::with_acl_evaluation_scope(
+            projection.cloned().map(Arc::new),
             self.async_check_inner(caller_id, target_id, ctx),
         )
         .await;
@@ -1302,7 +1702,7 @@ impl ACL {
         caller_id: Option<&str>,
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
-    ) -> bool {
+    ) -> AccessDecision {
         let caller = caller_id.unwrap_or("@external");
 
         // Snapshot rules + default_effect at entry so any concurrent mutator

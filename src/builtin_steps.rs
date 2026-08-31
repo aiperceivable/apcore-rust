@@ -335,6 +335,23 @@ impl Step for BuiltinModuleLookup {
         }
         ctx.module = Some(module.clone());
 
+        // PROTOCOL_SPEC §6.1.8 rule 1: compute the governance projection of the
+        // call's arguments HERE, at Step 3, so it is available to the ACL check
+        // at Step 4. The ordering is normative, not incidental — the `arguments`
+        // condition (§6.1.7) has nothing to read otherwise, and a rule carrying
+        // it would load, match, and go unevaluable on every call.
+        //
+        // Deliberately NOT `context.redacted_inputs`, which is computed just
+        // below for a different purpose (§6.1.8 rule 3): that field's contract
+        // is safe *logging*, it is a raw copy when the module declares no input
+        // schema, and one field serving both "safe to log" and "input to a
+        // security decision" will eventually break one of them in a change made
+        // for the other. The projection carries the key set and each key's JSON
+        // type and has no field that can hold a value.
+        ctx.governance_projection = Some(crate::acl::GovernanceProjection::from_arguments(
+            &ctx.inputs,
+        ));
+
         // Early input redaction: set context.redacted_inputs BEFORE
         // middleware runs (step 6), so logging sees redacted data.
         let input_schema = module.input_schema().clone();
@@ -381,8 +398,22 @@ impl Step for BuiltinACLCheck {
     async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
         if let Some(acl) = ctx.acl.clone() {
             let caller_id = ctx.context.caller_id.clone();
-            let allowed = acl.check(caller_id.as_deref(), &ctx.module_id, Some(&ctx.context));
-            if !allowed {
+            // The structured accessor (PROTOCOL_SPEC §6.8.1), never the boolean:
+            // Step 4 now produces TWO results (§6.1.6) and `check()` folds them
+            // together by failing closed, which would turn "allowed, ask a
+            // human" into a denial here. The Executor is the one caller that
+            // must see them apart.
+            let decision = acl.check_access(
+                caller_id.as_deref(),
+                &ctx.module_id,
+                Some(&ctx.context),
+                ctx.governance_projection.as_ref(),
+            );
+            // Carried to Step 5 and to `Executor::validate`'s preflight, which
+            // union it with the module annotation and the policy (§6.9 rows
+            // 3-6). Recorded even on a denial, where it is always false.
+            ctx.acl_approval_required = decision.approval_required;
+            if !decision.is_allowed() {
                 // Publish a governance event on denial (canonical name proposed
                 // in apcore#77). Guarded by dry_run so a validate() preflight
                 // probe never emits a spurious denial event; fires only on deny
@@ -630,7 +661,7 @@ impl Step for BuiltinApprovalGate {
             )
         });
 
-        let (needs_approval, effective_destructive) = match &decision {
+        let (policy_effective_approval, effective_destructive) = match &decision {
             Some(d) => (d.needs_approval, d.destructive),
             None => (
                 desc_annotations
@@ -639,6 +670,25 @@ impl Step for BuiltinApprovalGate {
                 desc_annotations.as_ref().is_some_and(|a| a.destructive),
             ),
         };
+
+        // PROTOCOL_SPEC §7.4 / §6.9 rows 3-5: the gate fires on the UNION of
+        // the module's `annotations.requires_approval`, the Step-4 ACL
+        // decision, and `gate_destructive`. `policy_effective_approval` already
+        // folds the annotation and `gate_destructive` together; the ACL's
+        // requirement joins them here.
+        //
+        // The union is what makes §6.9 row 4 hold: an `ExecutionPolicy`
+        // override may ADD a requirement and MUST NOT remove one the ACL set.
+        // The ACL is a caller-scoped authorization layer and `ExecutionPolicy`
+        // is a module-scoped platform override, so letting the module-scoped
+        // one cancel the caller-scoped one is a privilege escalation — a policy
+        // rule written for `orders.*` would silently strip a requirement an ACL
+        // author attached to one untrusted caller. `policy_effective_approval`
+        // is ORed, never assigned over, which is the whole guard: a policy
+        // `requires_approval: false` overrides the module's *annotation* and
+        // never the ACL's decision.
+        let acl_requires_approval = ctx.acl_approval_required;
+        let needs_approval = policy_effective_approval || acl_requires_approval;
 
         // Audit a policy-driven override: log, span, and bus event (apcore#77).
         if let Some(d) = &decision {
@@ -758,10 +808,13 @@ impl Step for BuiltinApprovalGate {
             // guaranteed true", PROTOCOL_SPEC §7) under policy overrides: the
             // handler sees the effective governance values, not the module's
             // raw declaration. Reaching this point means the call needs
-            // approval, so requires_approval is true by definition (covers both
-            // rule overrides and gate_destructive). (apcore#76)
+            // approval, so requires_approval is true by definition (covers a
+            // rule override, gate_destructive, and — since v1.28.0 — an ACL
+            // rule carrying `approval`). §7.4 rule 3 makes it explicit: an
+            // ACL-sourced requirement makes `requires_approval` effectively
+            // true for that call. (apcore#76, apcore#108)
+            annotations.requires_approval = true;
             if let Some(d) = &decision {
-                annotations.requires_approval = true;
                 annotations.destructive = d.destructive;
             }
             let module_description = module.description();

@@ -1108,7 +1108,7 @@ impl Executor {
             .ok()
             .flatten()
             .and_then(|desc| desc.annotations);
-        let requires_approval = if let Some(policy) = self.policy.as_ref() {
+        let policy_effective_approval = if let Some(policy) = self.policy.as_ref() {
             // §7.9.6: preflight resolves through the same call-site-aware entry
             // point the Step-5 gate uses, so the two cannot report different
             // verdicts. The built-in rules ignore the call site (§7.9.6 rule 2),
@@ -1121,6 +1121,14 @@ impl Executor {
                 .as_ref()
                 .is_some_and(|a| a.requires_approval)
         };
+        // PROTOCOL_SPEC §7.9.5: report the GOVERNANCE-effective requirement —
+        // the union of §6.9 rows 3-5 for this call site — not merely the
+        // policy-effective one. Since v1.28.0 that union includes an ACL rule
+        // carrying `approval` (§6.1.6), recorded on the pipeline context by the
+        // Step-4 `acl_check` that just ran (it is `pure`, so a dry run executes
+        // it). Reporting only the policy-effective value would tell a caller no
+        // approval is needed for a call the Step-5 gate will stop.
+        let requires_approval = policy_effective_approval || pipe_ctx.acl_approval_required;
 
         // Module-level introspection is gated on TWO conditions, not one.
         //

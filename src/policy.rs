@@ -30,8 +30,9 @@ use crate::module::ModuleAnnotations;
 use crate::utils::{calculate_specificity, match_pattern};
 
 /// The framework-owned Phase B approval token key (PROTOCOL_SPEC §7.4).
-/// Stripped from `arguments` before policy resolution (§7.9.6 rule 5).
-const APPROVAL_TOKEN_KEY: &str = "_approval_token";
+/// Stripped from `arguments` before policy resolution (§7.9.6 rule 5) and
+/// excluded from the §6.1.8 governance projection on the same grounds.
+pub(crate) const APPROVAL_TOKEN_KEY: &str = "_approval_token";
 
 /// A single pattern-based governance override.
 ///

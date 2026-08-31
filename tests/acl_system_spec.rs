@@ -31,6 +31,7 @@ use apcore::errors::ErrorCode;
 /// Build an ACLRule with no description / conditions.
 fn rule(callers: &[&str], targets: &[&str], effect: &str) -> ACLRule {
     ACLRule {
+        approval: None,
         callers: callers.iter().map(|s| (*s).to_string()).collect(),
         targets: targets.iter().map(|s| (*s).to_string()).collect(),
         effect: effect.to_string(),

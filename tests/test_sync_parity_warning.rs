@@ -284,6 +284,7 @@ mod w4 {
         conditions.insert("$or".to_string(), json!([{ "_w4_mode_probe": true }]));
         ACL::new(
             vec![ACLRule {
+                approval: None,
                 callers: vec!["*".to_string()],
                 targets: vec!["*".to_string()],
                 effect: "allow".to_string(),
@@ -372,6 +373,7 @@ mod w6 {
         conditions.insert("_w6_never_registered".to_string(), json!(true));
         let mut acl = ACL::new(
             vec![ACLRule {
+                approval: None,
                 callers: vec!["*".to_string()],
                 targets: vec!["*".to_string()],
                 effect: "allow".to_string(),

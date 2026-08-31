@@ -35,6 +35,7 @@ fn make_acl_with_condition(condition_key: &str, condition_value: Value) -> ACL {
     let mut conditions = serde_json::Map::new();
     conditions.insert(condition_key.to_string(), condition_value);
     let rule = ACLRule {
+        approval: None,
         callers: vec!["*".to_string()],
         targets: vec!["*".to_string()],
         effect: "allow".to_string(),
@@ -264,6 +265,7 @@ async fn test_unknown_condition_fails_closed() {
 #[test]
 fn test_empty_callers_matches_nothing() {
     let rule = ACLRule {
+        approval: None,
         callers: vec![],
         targets: vec!["*".to_string()],
         effect: "allow".to_string(),
@@ -277,6 +279,7 @@ fn test_empty_callers_matches_nothing() {
 #[test]
 fn test_empty_targets_matches_nothing() {
     let rule = ACLRule {
+        approval: None,
         callers: vec!["*".to_string()],
         targets: vec![],
         effect: "allow".to_string(),
@@ -300,6 +303,7 @@ fn test_audit_logger_via_constructor() {
     };
     let acl = ACL::new(
         vec![ACLRule {
+            approval: None,
             callers: vec!["*".to_string()],
             targets: vec!["*".to_string()],
             effect: "allow".to_string(),

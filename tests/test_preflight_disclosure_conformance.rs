@@ -148,6 +148,7 @@ async fn conformance_preflight_disclosure() {
             .expect("acl_rules")
             .iter()
             .map(|r| ACLRule {
+                approval: None,
                 callers: string_list(&r["callers"]),
                 targets: string_list(&r["targets"]),
                 effect: r["effect"].as_str().expect("effect").to_string(),

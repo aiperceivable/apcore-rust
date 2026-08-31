@@ -592,6 +592,7 @@ fn conformance_acl_evaluation() {
             .unwrap()
             .iter()
             .map(|r| ACLRule {
+                approval: None,
                 callers: r["callers"]
                     .as_array()
                     .unwrap()
@@ -3312,6 +3313,7 @@ fn conformance_acl_agent_scoping() {
         .unwrap()
         .iter()
         .map(|r| ACLRule {
+            approval: None,
             callers: r["callers"]
                 .as_array()
                 .unwrap()

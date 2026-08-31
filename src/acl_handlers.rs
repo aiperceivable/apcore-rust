@@ -136,6 +136,19 @@ type HandlerErrors = BTreeMap<String, String>;
 struct CaptureState {
     errors: HandlerErrors,
     path_prefix: String,
+    /// The §6.1.8 governance projection of the call's arguments, when the
+    /// check was entered through [`ACL::check_access`](crate::ACL::check_access)
+    /// or [`ACL::async_check_access`](crate::ACL::async_check_access).
+    ///
+    /// It rides the capture scope rather than a pair of locals of its own for
+    /// the reason the path prefix does: the scope is already correct on both
+    /// evaluation paths — task-local for `async_check`, thread-local for
+    /// `check` — and duplicating that machinery is how the two would drift.
+    /// The [`ACLConditionHandler`] trait's `evaluate(value, ctx)` has nowhere
+    /// to carry it, and widening the trait would make the projection reachable
+    /// by every deployment-registered handler, which is precisely the
+    /// unauditable host code §6.1.7 keeps out of a governance verdict.
+    projection: Option<Arc<crate::acl::GovernanceProjection>>,
 }
 
 impl CaptureState {
@@ -143,6 +156,7 @@ impl CaptureState {
         Self {
             errors: BTreeMap::new(),
             path_prefix: String::new(),
+            projection: None,
         }
     }
 }
@@ -325,6 +339,27 @@ pub(crate) fn reported_condition_paths() -> Vec<String> {
     HANDLER_ERROR_SYNC.with(|cell| cell.borrow().1.errors.keys().cloned().collect())
 }
 
+/// The governance projection (PROTOCOL_SPEC §6.1.8) of the call being checked,
+/// or `None` when the check was entered without one.
+///
+/// Consults the async task-local scope first and the synchronous thread-local
+/// scope second, in the same order as every other read on this scope. `None`
+/// is a real answer, not a missing one: a caller with no call site (tooling
+/// asking "may X reach Y?") supplies no projection, and the `arguments`
+/// condition is then unevaluable rather than vacuously false.
+pub(crate) fn current_governance_projection() -> Option<Arc<crate::acl::GovernanceProjection>> {
+    if let Ok(projection) = HANDLER_ERROR.try_with(|cell| cell.borrow().projection.clone()) {
+        return projection;
+    }
+    HANDLER_ERROR_SYNC.with(|cell| {
+        let state = cell.borrow();
+        if state.0 == 0 {
+            return None;
+        }
+        state.1.projection.clone()
+    })
+}
+
 /// Record a handler-evaluation error for the current ACL check.
 ///
 /// Cross-language parity with apcore-python `_handler_error_var.set(...)` and
@@ -373,7 +408,22 @@ pub async fn with_handler_error_capture<F, T>(fut: F) -> (T, Option<String>)
 where
     F: std::future::Future<Output = T>,
 {
-    let cell = RefCell::new(CaptureState::new());
+    with_acl_evaluation_scope(None, fut).await
+}
+
+/// [`with_handler_error_capture`], additionally carrying the §6.1.8 governance
+/// projection for the built-in `arguments` condition to read.
+pub(crate) async fn with_acl_evaluation_scope<F, T>(
+    projection: Option<Arc<crate::acl::GovernanceProjection>>,
+    fut: F,
+) -> (T, Option<String>)
+where
+    F: std::future::Future<Output = T>,
+{
+    let cell = RefCell::new(CaptureState {
+        projection,
+        ..CaptureState::new()
+    });
     let result = HANDLER_ERROR.scope(cell, async move {
         let value = fut.await;
         let captured = HANDLER_ERROR.with(|c| join_handler_errors(&c.borrow().errors));
@@ -392,11 +442,25 @@ pub fn with_handler_error_capture_sync<F, T>(f: F) -> (T, Option<String>)
 where
     F: FnOnce() -> T,
 {
+    with_acl_evaluation_scope_sync(None, f)
+}
+
+/// [`with_handler_error_capture_sync`], additionally carrying the §6.1.8
+/// governance projection for the built-in `arguments` condition to read.
+pub(crate) fn with_acl_evaluation_scope_sync<F, T>(
+    projection: Option<Arc<crate::acl::GovernanceProjection>>,
+    f: F,
+) -> (T, Option<String>)
+where
+    F: FnOnce() -> T,
+{
     // Open a fresh slot, saving the previous one so a nested check restores it.
     let previous = HANDLER_ERROR_SYNC.with(|cell| {
         let mut state = cell.borrow_mut();
         state.0 += 1;
-        std::mem::take(&mut state.1)
+        let previous = std::mem::take(&mut state.1);
+        state.1.projection = projection;
+        previous
     });
 
     let value = f();
@@ -710,6 +774,163 @@ impl ACLConditionHandler for MaxCallDepthHandler {
     }
 }
 
+/// The three structure-only predicates of the built-in `arguments` condition
+/// (PROTOCOL_SPEC §6.1.7). A key outside this set is unevaluable, not false.
+const ARGUMENT_PREDICATES: &[&str] = &["has_key", "has_all_keys", "has_none_of"];
+
+/// The built-in `arguments` condition (PROTOCOL_SPEC §6.1.7, spec v1.28.0,
+/// apcore#108).
+///
+/// | Predicate | Passes when |
+/// |---|---|
+/// | `has_key` | **any** of the named keys is present in the call's arguments |
+/// | `has_all_keys` | **every** named key is present |
+/// | `has_none_of` | **none** of the named keys is present |
+///
+/// Several predicates in one `arguments` object are ANDed, like any other
+/// sibling conditions, and an empty object is vacuously satisfied — the same
+/// vacuous truth that keeps `$not: {}` fail-closed.
+///
+/// # No predicate reads a value
+///
+/// That is a design constraint, not a first cut. The argument view here is not
+/// reliably redacted (redaction is driven by `x-sensitive` markers in the
+/// module's input schema, so a module without one gets none), and the
+/// arguments are unvalidated — the ACL check is Step 4 and input schema
+/// validation is Step 7, so a value may be absent, of the wrong type, or
+/// malformed. Key presence is the one question well-defined on what is
+/// available, and it answers the driving requirement: "did this call carry
+/// `--force`?" is a presence question. Value-level predicates are deliberately
+/// unspecified; if they are ever added they carry a precondition that the
+/// module declares an `input_schema`.
+///
+/// The type makes this structural: it reads a
+/// [`GovernanceProjection`](crate::acl::GovernanceProjection), which has no
+/// field that can hold a value.
+///
+/// # There is no registration point for it
+///
+/// It is seeded like every other built-in, through `seed_condition`, and there
+/// is no separate extension hook for argument predicates:
+/// `register_condition` writes runtime code into a process-wide registry, and
+/// a deployment-registered *argument* handler would be exactly the unauditable
+/// host code §7.9.6 rule 2 exists to keep out of a governance verdict. A fixed
+/// vocabulary keeps the decision reproducible from the ACL document. Being
+/// built-in also means §6.1.4's precheck covers the key for free: `argument:`
+/// written for `arguments:` is an unregistered condition key, so the rule is
+/// unevaluable rather than silently inert.
+pub struct ArgumentsHandler;
+
+impl ArgumentsHandler {
+    /// Read one predicate operand as a list of argument key names.
+    ///
+    /// `None` means the operand is malformed — §6.1.1 case 4 — and the caller
+    /// reports the condition **unevaluable**, never unsatisfied. A malformed
+    /// operand is the failure mode v1.25.0 widened §6.1.1 to cover: a `deny`
+    /// rule carrying `has_key: "force"` (a bare string rather than a list)
+    /// would otherwise go inert, which is the defect the section exists to
+    /// prevent, reached through the operand rather than the key.
+    fn key_names(value: &Value) -> Option<Vec<&str>> {
+        value
+            .as_array()?
+            .iter()
+            .map(serde_json::Value::as_str)
+            .collect()
+    }
+
+    fn decide(value: &Value) -> ConditionOutcome {
+        let Some(predicates) = value.as_object() else {
+            report_condition_unevaluable(
+                "arguments",
+                "value must be an object of predicates (has_key / has_all_keys / has_none_of)",
+            );
+            return ConditionOutcome::Unevaluable;
+        };
+
+        // An empty predicate object is UNEVALUABLE, not vacuously satisfied
+        // (§6.1.7). The reason §6.1 gives for `$not: {}` being fail-closed
+        // applies unchanged: an operator who wrote `arguments: {}` asked
+        // nothing, and reading "asked nothing" as "passes" turns the rule they
+        // meant to restrict into an unconditional one.
+        if predicates.is_empty() {
+            report_condition_unevaluable(
+                "arguments",
+                format!(
+                    "no predicate given; name at least one of {}",
+                    ARGUMENT_PREDICATES.join(", ")
+                ),
+            );
+            return ConditionOutcome::Unevaluable;
+        }
+
+        // `serde_json::Map` is a `BTreeMap` here (the `preserve_order` feature
+        // is off), so predicates are visited in ascending key order and the
+        // diagnostics are identical on every run. Every predicate is visited —
+        // no short-circuit — so `handler_error` names all of the malformed
+        // ones, matching the evaluator above.
+        let mut outcome = ConditionOutcome::Satisfied;
+        for (predicate, operand) in predicates {
+            outcome = outcome.and(Self::decide_one(predicate, operand));
+        }
+        outcome
+    }
+
+    fn decide_one(predicate: &str, operand: &Value) -> ConditionOutcome {
+        if !ARGUMENT_PREDICATES.contains(&predicate) {
+            report_condition_unevaluable(
+                &format!("arguments.{predicate}"),
+                format!(
+                    "unknown argument predicate; the vocabulary is closed ({})",
+                    ARGUMENT_PREDICATES.join(", ")
+                ),
+            );
+            return ConditionOutcome::Unevaluable;
+        }
+        let Some(names) = Self::key_names(operand) else {
+            report_condition_unevaluable(
+                &format!("arguments.{predicate}"),
+                "predicate value must be a list of argument key names",
+            );
+            return ConditionOutcome::Unevaluable;
+        };
+        // The projection is resolved AFTER the operand is checked, so a
+        // malformed rule is reported as malformed even on a check that carries
+        // no call site at all.
+        let Some(projection) = current_governance_projection() else {
+            report_condition_unevaluable(
+                &format!("arguments.{predicate}"),
+                "no governance projection for this check (PROTOCOL_SPEC §6.1.8); \
+                 the arguments condition is only answerable from a call site — \
+                 use ACL::check_access / ACL::async_check_access",
+            );
+            return ConditionOutcome::Unevaluable;
+        };
+        let present = |key: &&str| projection.contains_key(key);
+        ConditionOutcome::from_bool(match predicate {
+            "has_key" => names.iter().any(present),
+            "has_all_keys" => names.iter().all(present),
+            "has_none_of" => !names.iter().any(present),
+            // Unreachable: the vocabulary was checked above. Fail closed
+            // rather than panic inside the governance gate.
+            _ => return ConditionOutcome::Unevaluable,
+        })
+    }
+}
+
+#[async_trait]
+impl ACLConditionHandler for ArgumentsHandler {
+    async fn evaluate(&self, value: &Value, _ctx: &Context<Value>) -> bool {
+        Self::decide(value).is_satisfied()
+    }
+
+    /// Overridden so a malformed predicate or a missing projection reaches the
+    /// rule loop as `Unevaluable` rather than collapsing to "does not match" —
+    /// the distinction that decides what a `deny` rule does (§6.1.1).
+    async fn evaluate_outcome(&self, value: &Value, _ctx: &Context<Value>) -> ConditionOutcome {
+        Self::decide(value)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compound handlers
 // ---------------------------------------------------------------------------
@@ -991,10 +1212,73 @@ fn collect_condition_faults(
                     ));
                 }
             }
-            // A leaf handler is the authority on its own value, and asking it
-            // would mean running it — which the precheck must not do. Leaf
-            // value faults surface at execution instead.
+            // §6.1.7's `arguments` is the one leaf whose operand the precheck
+            // CAN judge. Its predicate vocabulary is closed by the spec and
+            // there is no registration point for it, so the shape of a
+            // well-formed operand is knowable without running anything —
+            // which is what makes it structural rather than a handler's own
+            // business. Being in the precheck also means `validate_rules()`
+            // reports a broken predicate, and that a structurally broken
+            // `deny` rule is unevaluable even for a context-less call, which
+            // is §6.1.4's whole point.
+            "arguments" => collect_argument_faults(value, &key_path, out),
+            // Every other leaf handler is the authority on its own value, and
+            // asking it would mean running it — which the precheck must not
+            // do. Those value faults surface at execution instead.
             _ => {}
+        }
+    }
+}
+
+/// Structural faults in an `arguments` operand (PROTOCOL_SPEC §6.1.7).
+///
+/// Three shapes are decidable here, all without a context and without running
+/// a handler: the operand is not an object of predicates; it is an empty
+/// object; or a predicate is unrecognised or carries something other than a
+/// list of key names. Every one of them is UNEVALUABLE rather than
+/// UNSATISFIED — the direction only shows on a `deny` rule, where "does not
+/// match" means the call proceeds.
+///
+/// Does not short-circuit: every predicate is examined, so `handler_error` and
+/// `validate_rules()` name all of them (§6.1.4 rule 3).
+fn collect_argument_faults(value: &Value, key_path: &str, out: &mut Vec<RuleFault>) {
+    let Some(predicates) = value.as_object() else {
+        out.push(structural_fault(
+            key_path.to_string(),
+            Some("arguments"),
+            "arguments value must be an object of predicates \
+             (has_key / has_all_keys / has_none_of)",
+        ));
+        return;
+    };
+    if predicates.is_empty() {
+        out.push(structural_fault(
+            key_path.to_string(),
+            Some("arguments"),
+            "arguments carries no predicate; name at least one of \
+             has_key, has_all_keys, has_none_of",
+        ));
+        return;
+    }
+    for (predicate, operand) in predicates {
+        let path = format!("{key_path}.{predicate}");
+        if !ARGUMENT_PREDICATES.contains(&predicate.as_str()) {
+            out.push(structural_fault(
+                path,
+                Some("arguments"),
+                &format!(
+                    "unknown argument predicate '{predicate}'; the vocabulary is closed ({})",
+                    ARGUMENT_PREDICATES.join(", ")
+                ),
+            ));
+            continue;
+        }
+        if ArgumentsHandler::key_names(operand).is_none() {
+            out.push(structural_fault(
+                path,
+                Some("arguments"),
+                &format!("'{predicate}' value must be a list of argument key names"),
+            ));
         }
     }
 }
@@ -1004,6 +1288,10 @@ pub fn register_builtin_handlers() {
     seed_condition("identity_types", || Arc::new(IdentityTypesHandler));
     seed_condition("roles", || Arc::new(RolesHandler));
     seed_condition("max_call_depth", || Arc::new(MaxCallDepthHandler));
+    // §6.1.7: `arguments` is part of the language §6.1 already defines, not a
+    // mechanism beside it, so it is seeded here with the other built-ins and
+    // has no registration point of its own.
+    seed_condition("arguments", || Arc::new(ArgumentsHandler));
     // Mode-matched pairs — see `CompoundMode`.
     seed_condition("$or", || Arc::new(OrHandler::new(CompoundMode::Sync)));
     seed_condition("$not", || Arc::new(NotHandler::new(CompoundMode::Sync)));
@@ -1275,8 +1563,8 @@ mod tests {
         );
         assert_eq!(
             body.matches("seed_condition(").count() + body.matches("seed_async_condition(").count(),
-            7,
-            "expected all seven built-in registrations to be seeded — three \
+            8,
+            "expected all eight built-in registrations to be seeded — four \
              sync-only handlers plus the two mode-matched compound pairs:\n{body}"
         );
     }

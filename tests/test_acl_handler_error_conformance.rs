@@ -162,6 +162,7 @@ fn build_rule(rule: &Value) -> ACLRule {
     // quietly turn the case under test into a rule with no conditions at all.
     let conditions = rule.get("conditions").cloned();
     ACLRule {
+        approval: None,
         callers,
         targets,
         effect,
@@ -439,6 +440,7 @@ fn unknown_condition_key_resolves_toward_refusing_access() {
         let mut conditions = Map::new();
         conditions.insert(unknown_key.to_string(), Value::Bool(true));
         let rule = ACLRule {
+            approval: None,
             callers: vec!["*".to_string()],
             targets: vec!["*".to_string()],
             effect: effect.to_string(),

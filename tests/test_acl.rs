@@ -28,6 +28,7 @@ fn test_acl_default_is_empty() {
 #[test]
 fn test_acl_rule_fields() {
     let rule = ACLRule {
+        approval: None,
         callers: vec!["admin".to_string()],
         targets: vec!["admin.*".to_string()],
         effect: "allow".to_string(),
@@ -42,6 +43,7 @@ fn test_acl_rule_fields() {
 #[test]
 fn test_acl_rule_deny() {
     let rule = ACLRule {
+        approval: None,
         callers: vec!["guest".to_string()],
         targets: vec!["*".to_string()],
         effect: "deny".to_string(),
@@ -55,6 +57,7 @@ fn test_acl_rule_deny() {
 #[test]
 fn test_acl_rule_with_conditions() {
     let rule = ACLRule {
+        approval: None,
         callers: vec!["user".to_string()],
         targets: vec!["data.*".to_string()],
         effect: "allow".to_string(),
@@ -67,6 +70,7 @@ fn test_acl_rule_with_conditions() {
 #[test]
 fn test_acl_rule_serialization_round_trip() {
     let rule = ACLRule {
+        approval: None,
         callers: vec!["user".to_string(), "admin".to_string()],
         targets: vec!["user.*".to_string()],
         effect: "allow".to_string(),
@@ -83,6 +87,7 @@ fn test_acl_rule_serialization_round_trip() {
 #[test]
 fn test_acl_new_with_rules() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["admin".to_string()],
         targets: vec!["*".to_string()],
         effect: "allow".to_string(),
@@ -109,6 +114,7 @@ fn make_ctx(id: &str, id_type: &str, roles: Vec<String>) -> Context<Value> {
 #[test]
 fn test_check_allow_rule_matches() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["admin".to_string()],
         targets: vec!["secrets.*".to_string()],
         effect: "allow".to_string(),
@@ -124,6 +130,7 @@ fn test_check_allow_rule_matches() {
 #[test]
 fn test_check_allow_without_context() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["bot".to_string()],
         targets: vec!["public.*".to_string()],
         effect: "allow".to_string(),
@@ -143,6 +150,7 @@ fn test_check_allow_without_context() {
 #[test]
 fn test_check_deny_rule_matches() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["guest".to_string()],
         targets: vec!["admin.*".to_string()],
         effect: "deny".to_string(),
@@ -162,6 +170,7 @@ fn test_check_deny_rule_matches() {
 #[test]
 fn test_check_default_deny_when_no_rules_match() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["admin".to_string()],
         targets: vec!["admin.*".to_string()],
         effect: "allow".to_string(),
@@ -177,6 +186,7 @@ fn test_check_default_deny_when_no_rules_match() {
 #[test]
 fn test_check_default_allow_when_no_rules_match() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["blocked".to_string()],
         targets: vec!["*".to_string()],
         effect: "deny".to_string(),
@@ -205,6 +215,7 @@ fn test_check_default_effect_with_empty_rules() {
 #[test]
 fn test_check_wildcard_target_matches_all() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["superadmin".to_string()],
         targets: vec!["*".to_string()],
         effect: "allow".to_string(),
@@ -219,6 +230,7 @@ fn test_check_wildcard_target_matches_all() {
 #[test]
 fn test_check_wildcard_caller_matches_all() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["*".to_string()],
         targets: vec!["public.health".to_string()],
         effect: "allow".to_string(),
@@ -233,6 +245,7 @@ fn test_check_wildcard_caller_matches_all() {
 #[test]
 fn test_check_glob_pattern_in_target() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["svc".to_string()],
         targets: vec!["data.*".to_string()],
         effect: "allow".to_string(),
@@ -251,6 +264,7 @@ fn test_check_glob_pattern_in_target() {
 #[test]
 fn test_check_none_caller_maps_to_external() {
     let rules = vec![ACLRule {
+        approval: None,
         callers: vec!["@external".to_string()],
         targets: vec!["public.*".to_string()],
         effect: "allow".to_string(),
@@ -272,6 +286,7 @@ fn test_check_none_caller_maps_to_external() {
 fn test_check_first_match_wins_allow_before_deny() {
     let rules = vec![
         ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "allow".to_string(),
@@ -279,6 +294,7 @@ fn test_check_first_match_wins_allow_before_deny() {
             conditions: None,
         },
         ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "deny".to_string(),
@@ -295,6 +311,7 @@ fn test_check_first_match_wins_allow_before_deny() {
 fn test_check_first_match_wins_deny_before_allow() {
     let rules = vec![
         ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "deny".to_string(),
@@ -302,6 +319,7 @@ fn test_check_first_match_wins_deny_before_allow() {
             conditions: None,
         },
         ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "allow".to_string(),
@@ -318,6 +336,7 @@ fn test_check_first_match_wins_deny_before_allow() {
 fn test_check_first_match_skips_non_matching_rules() {
     let rules = vec![
         ACLRule {
+            approval: None,
             callers: vec!["other".to_string()],
             targets: vec!["resource".to_string()],
             effect: "deny".to_string(),
@@ -325,6 +344,7 @@ fn test_check_first_match_skips_non_matching_rules() {
             conditions: None,
         },
         ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "allow".to_string(),
@@ -344,6 +364,7 @@ fn test_check_first_match_skips_non_matching_rules() {
 fn test_check_add_rule_inserts_at_front() {
     let mut acl = ACL::new(
         vec![ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "allow".to_string(),
@@ -356,6 +377,7 @@ fn test_check_add_rule_inserts_at_front() {
 
     // add_rule inserts at position 0 — this deny rule should now be first
     acl.add_rule(ACLRule {
+        approval: None,
         callers: vec!["user".to_string()],
         targets: vec!["resource".to_string()],
         effect: "deny".to_string(),
@@ -500,6 +522,7 @@ fn test_acl_add_rule_returns_unit_no_result_wrapper() {
     // should not need `?`/`.unwrap()` to use it.
     let mut acl = ACL::new(vec![], "deny", None);
     let rule = ACLRule {
+        approval: None,
         callers: vec!["caller".to_string()],
         targets: vec!["target".to_string()],
         effect: "allow".to_string(),
@@ -547,6 +570,7 @@ async fn test_async_check_uses_snapshot_consistent_with_sync() {
     // snapshot path produces the same decisions.
     let rules = vec![
         ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "deny".to_string(),
@@ -554,6 +578,7 @@ async fn test_async_check_uses_snapshot_consistent_with_sync() {
             conditions: None,
         },
         ACLRule {
+            approval: None,
             callers: vec!["user".to_string()],
             targets: vec!["resource".to_string()],
             effect: "allow".to_string(),

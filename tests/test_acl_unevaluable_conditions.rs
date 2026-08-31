@@ -50,6 +50,7 @@ fn make_context(roles: Vec<&str>) -> Context<Value> {
 
 fn rule(effect: &str, conditions: Value) -> ACLRule {
     ACLRule {
+        approval: None,
         callers: vec!["*".to_string()],
         targets: vec!["*".to_string()],
         effect: effect.to_string(),
@@ -1065,6 +1066,7 @@ fn an_unevaluable_rule_warns_with_the_key_index_and_effect() {
         // Rule 0 never matches, so rule 1 is the one that goes unevaluable —
         // proving the index is the rule's real position, not a constant.
         let non_matching = ACLRule {
+            approval: None,
             callers: vec!["nobody.*".to_string()],
             targets: vec!["nothing.*".to_string()],
             effect: "allow".to_string(),
@@ -1575,6 +1577,7 @@ fn an_execution_fault_does_not_gate_when_an_or_sibling_is_satisfied() {
 fn a_condition_fault_in_a_non_matching_rule_does_not_affect_the_call() {
     init();
     let scoped = ACLRule {
+        approval: None,
         callers: vec!["api.*".to_string()],
         targets: vec!["*".to_string()],
         effect: "deny".to_string(),
@@ -1604,6 +1607,7 @@ fn a_condition_fault_in_a_non_matching_rule_does_not_affect_the_call() {
 fn a_condition_fault_in_a_target_mismatched_rule_does_not_affect_the_call() {
     init();
     let scoped = ACLRule {
+        approval: None,
         callers: vec!["*".to_string()],
         targets: vec!["executor.payment.*".to_string()],
         effect: "deny".to_string(),
@@ -1627,6 +1631,7 @@ fn a_condition_fault_in_a_target_mismatched_rule_does_not_affect_the_call() {
 fn validate_rules_reports_a_fault_in_a_rule_no_call_would_match() {
     init();
     let scoped = ACLRule {
+        approval: None,
         callers: vec!["never.matches.anything".to_string()],
         targets: vec!["also.never".to_string()],
         effect: "deny".to_string(),
@@ -1646,6 +1651,7 @@ fn validate_rules_reports_a_fault_in_a_rule_no_call_would_match() {
 async fn async_check_also_ignores_a_condition_fault_in_a_non_matching_rule() {
     init();
     let scoped = ACLRule {
+        approval: None,
         callers: vec!["api.*".to_string()],
         targets: vec!["*".to_string()],
         effect: "deny".to_string(),

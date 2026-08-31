@@ -43,7 +43,10 @@ pub mod utils;
 pub mod version;
 
 // Re-export primary types at crate root for convenience.
-pub use acl::{ACLRule, AuditEntry, RuleValidationFinding, ACL};
+pub use acl::{
+    ACLRule, AccessDecision, ApprovalRequirement, AuditEntry, GovernanceProjection, JsonType,
+    RuleValidationFinding, ACL,
+};
 pub use acl_handlers::{ACLConditionHandler, ConditionOutcome};
 pub use approval::{
     AlwaysDenyHandler, ApprovalHandler, ApprovalRequest, ApprovalResult, AutoApproveHandler,

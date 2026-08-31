@@ -90,6 +90,7 @@ fn build_policy() -> Vec<ACLRule> {
     vec![
         // External / unauthenticated callers (no caller_id) — read-only.
         ACLRule {
+            approval: None,
             callers: vec!["@external".to_string()],
             targets: vec!["executor.*.read".to_string()],
             effect: "allow".to_string(),
@@ -98,6 +99,7 @@ fn build_policy() -> Vec<ACLRule> {
         },
         // Reader-role agents — read + query, depth-capped to fuse runaway chains.
         ACLRule {
+            approval: None,
             callers: vec!["agent.*".to_string()],
             targets: vec![
                 "executor.*.read".to_string(),
@@ -109,6 +111,7 @@ fn build_policy() -> Vec<ACLRule> {
         },
         // Data-admin agents — exports and sensitive deletes (no depth cap).
         ACLRule {
+            approval: None,
             callers: vec!["agent.*".to_string()],
             targets: vec!["data.export".to_string(), "executor.*.delete".to_string()],
             effect: "allow".to_string(),

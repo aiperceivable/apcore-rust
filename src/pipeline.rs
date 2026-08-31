@@ -272,6 +272,25 @@ pub struct PipelineContext {
     // -- Resolved during pipeline (None until the responsible step runs) --
     /// Set by `module_lookup` step.
     pub module: Option<Arc<dyn Module>>,
+    /// The §6.1.8 governance projection of `inputs` — the argument key set and
+    /// each key's JSON type, and **never** a value.
+    ///
+    /// Computed by `module_lookup` (Step 3) and read by `acl_check` (Step 4);
+    /// PROTOCOL_SPEC §6.1.8 rule 1 makes that ordering normative rather than an
+    /// implementation detail that happens to hold. It is deliberately NOT
+    /// `context.redacted_inputs`: that field's contract is safe *logging*, and
+    /// it is a raw copy of the arguments when the module declares no input
+    /// schema (§6.1.8 rule 3).
+    pub governance_projection: Option<crate::acl::GovernanceProjection>,
+    /// Whether the Step-4 ACL decision required this call to be put to a human
+    /// (PROTOCOL_SPEC §6.1.6).
+    ///
+    /// Set by `acl_check`; read by `approval_gate` (Step 5) and by
+    /// `Executor::validate`'s preflight, both of which take the **union** of
+    /// this with the module annotation and the policy (§6.9 rows 3-6). Stays
+    /// `false` when no ACL is configured or the `acl_check` step was removed
+    /// from the strategy — absence of the gate is not a requirement.
+    pub acl_approval_required: bool,
     /// Set by `input_validation` step.
     pub validated_inputs: Option<serde_json::Value>,
     /// Set by `execute` step (non-streaming).
@@ -332,6 +351,8 @@ impl PipelineContext {
             inputs,
             context,
             module: None,
+            governance_projection: None,
+            acl_approval_required: false,
             validated_inputs: None,
             output: None,
             validated_output: None,
