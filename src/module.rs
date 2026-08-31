@@ -224,6 +224,21 @@ pub struct ModuleAnnotations {
     pub readonly: bool,
     pub destructive: bool,
     pub idempotent: bool,
+    /// Whether **this module** requires human approval before execution.
+    ///
+    /// A module-level declaration, **not** the governance-effective value.
+    /// `false` means this module asks for none; it does **not** mean none will
+    /// be required. An ACL rule (PROTOCOL_SPEC §6.1.6), an `ExecutionPolicy`
+    /// override or `gate_destructive` may each require one for a particular
+    /// call (§6.9 rows 3-5), and §6.9 rule 3 unions them — neither source can
+    /// cancel the other.
+    ///
+    /// The effective value is call-site dependent, because the ACL condition
+    /// that decides it reads what the call carries (§6.1.7). Read it from
+    /// [`Executor::validate`](crate::executor::Executor::validate) (§7.9.5),
+    /// which reports the same verdict the approval gate will enforce. This
+    /// annotation describes the **module**; the preflight describes the
+    /// **call**.
     pub requires_approval: bool,
     pub open_world: bool,
     pub streaming: bool,
@@ -474,7 +489,17 @@ pub struct PreflightResult {
     pub valid: bool,
     /// Ordered list of check results.
     pub checks: Vec<PreflightCheckResult>,
-    /// True if the module has `requires_approval` annotation.
+    /// The **governance-effective** approval requirement for this call
+    /// (PROTOCOL_SPEC §7.9.5) — the union of the module annotation, an ACL rule
+    /// carrying `approval`, an `ExecutionPolicy` override and
+    /// `gate_destructive` (§6.9 rows 3-5).
+    ///
+    /// **Not the annotation alone.** Since spec v1.28.0 a module declaring
+    /// `requires_approval: false` still reports `true` here when the ACL
+    /// requires a human for the arguments *this* call carries. Reporting only
+    /// the module's own declaration would tell a caller no approval is needed
+    /// for a call the gate will stop; this union is by construction the same
+    /// verdict the gate enforces.
     #[serde(default)]
     pub requires_approval: bool,
     /// Optional structured prediction of changes from the module's
