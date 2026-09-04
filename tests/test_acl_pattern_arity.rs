@@ -1031,3 +1031,100 @@ fn the_lowest_indexed_bad_rule_is_the_one_reported() {
         "a fault in a later rule is still reported, named by its own index: {second_rule}"
     );
 }
+
+/// `default_effect` is judged **first**, and "first" reaches past the
+/// individual rules to the file-level checks on the `rules` collection itself.
+///
+/// A document missing `rules`, or carrying a `rules` that is not a list, is
+/// malformed at the file level rather than at any rule — there is no index to
+/// name. §6.2.1 point 2 places `default_effect` ahead of those too, so a
+/// document wrong in both is refused for the `default_effect`. No fixture case
+/// covers the combination, deliberately: a doubly malformed document is
+/// refused either way and only the message differs, which is exactly the class
+/// of divergence that goes unnoticed until two SDKs are compared.
+///
+/// This SDK failed the missing-`rules` half. `ACL::load` looked the `rules`
+/// key up before it had even read `default_effect`, so a file with both faults
+/// was refused for the absent `rules` here while `ACL::try_new` — which cannot
+/// see that fault at all — named the `default_effect`. The non-list half was
+/// already correct, being caught by the deserialization further down.
+#[test]
+fn default_effect_is_judged_before_the_rules_collection_itself() {
+    let dir = std::env::temp_dir().join("apcore_acl_pattern_arity");
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    // The refusal quotes the file path, and these file names contain the word
+    // `rules`. Strip it, or the negative assertions below read the file name
+    // rather than the diagnosis.
+    let load = |name: &str, doc: &str| -> String {
+        let file = dir.join(format!("{name}.yaml"));
+        std::fs::write(&file, doc).expect("write yaml");
+        let path = file.to_str().expect("utf8").to_string();
+        ACL::load(&path)
+            .expect_err("the document is malformed twice over")
+            .message
+            .replace(&path, "<file>")
+    };
+
+    for (name, doc) in [
+        // `rules` absent entirely.
+        (
+            "default_effect_before_missing_rules",
+            r#"{"default_effect":"Allow"}"#,
+        ),
+        // `rules` present and not a list.
+        (
+            "default_effect_before_non_list_rules",
+            r#"{"default_effect":"Allow","rules":{"callers":["*"]}}"#,
+        ),
+        // ...and not a list, in the shape an operator is likeliest to write:
+        // a single rule mapping where a list of one belongs.
+        (
+            "default_effect_before_scalar_rules",
+            r#"{"default_effect":"Allow","rules":"everything"}"#,
+        ),
+    ] {
+        let message = load(name, doc);
+        assert!(
+            message.contains("'Allow'"),
+            "[{name}] `default_effect` is judged ahead of the file-level checks on the \
+             `rules` collection, not merely ahead of the individual rules (§6.2.1 \
+             point 2): {message}"
+        );
+        assert!(
+            !message.contains("rules"),
+            "[{name}] and only one refusal is raised: {message}"
+        );
+    }
+
+    // The controls. Each fault alone still produces its own refusal — without
+    // these, an implementation that reports `default_effect` for every
+    // malformed document passes the loop above.
+    let missing_rules = load(
+        "missing_rules_alone",
+        r#"{"default_effect":"deny","not_rules":[]}"#,
+    );
+    assert!(
+        missing_rules.contains("missing 'rules' key"),
+        "a document missing `rules` and otherwise clean is still refused for `rules`: \
+         {missing_rules}"
+    );
+    let non_list_rules = load(
+        "non_list_rules_alone",
+        r#"{"default_effect":"deny","rules":"everything"}"#,
+    );
+    assert!(
+        non_list_rules.contains("rules"),
+        "and so is a `rules` that is not a list: {non_list_rules}"
+    );
+
+    // The doors agree, which is the point of placing it at all: `try_new`
+    // cannot see either `rules` fault, so if `load` named one of them the two
+    // would answer differently for one document.
+    let constructed = ACL::try_new(Vec::new(), "Allow", None)
+        .expect_err("an out-of-enum default_effect is refused")
+        .message;
+    assert!(
+        constructed.contains("'Allow'"),
+        "ACL::try_new names the same axis ACL::load does: {constructed}"
+    );
+}

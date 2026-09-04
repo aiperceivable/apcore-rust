@@ -1600,14 +1600,15 @@ impl ACL {
             )
         })?;
 
-        // Expect top-level "rules" key.
-        let rules_val = raw.get("rules").ok_or_else(|| {
-            ModuleError::new(
-                ErrorCode::ACLRuleError,
-                format!("ACL file '{path}' missing 'rules' key"),
-            )
-        })?;
-
+        // §6.2.1 point 2: `default_effect` is judged FIRST — ahead of the
+        // individual rules AND ahead of the file-level checks on the `rules`
+        // collection itself. It used to sit behind the missing-`rules` check
+        // below, so a document wrong in both was refused for the absent
+        // `rules` key at this door while `ACL::try_new`, which cannot see that
+        // fault at all, named the `default_effect`. A non-list `rules` is
+        // caught further down still, by the deserialization, and was already
+        // behind this.
+        //
         // Distinguish "key absent" (→ canonical default `deny`) from "key
         // present but not a string". The previous
         // `.and_then(as_str).unwrap_or("deny")` silently coerced a non-string
@@ -1649,6 +1650,15 @@ impl ACL {
                 ),
             ));
         }
+
+        // Expect top-level "rules" key — the first file-level check on the
+        // collection, and behind `default_effect` on §6.2.1 point 2.
+        let rules_val = raw.get("rules").ok_or_else(|| {
+            ModuleError::new(
+                ErrorCode::ACLRuleError,
+                format!("ACL file '{path}' missing 'rules' key"),
+            )
+        })?;
 
         // A12-ACL: every rule MUST explicitly declare `callers` and `targets`.
         // `#[serde(default)]` on those fields would otherwise let an omitted
