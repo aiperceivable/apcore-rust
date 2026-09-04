@@ -96,6 +96,8 @@ mod test_acl_effect_value_closure_conformance;
 mod test_acl_handler_error_conformance;
 #[path = "test_acl_panic_boundary.rs"]
 mod test_acl_panic_boundary;
+#[path = "test_acl_pattern_arity.rs"]
+mod test_acl_pattern_arity;
 #[path = "test_acl_root_discovery.rs"]
 mod test_acl_root_discovery;
 #[path = "test_acl_root_discovery_conformance.rs"]

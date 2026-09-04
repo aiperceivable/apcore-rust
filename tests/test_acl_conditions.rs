@@ -254,21 +254,44 @@ async fn test_unknown_condition_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// Empty callers fix (AC-033)
+// Empty callers / targets (AC-033, superseded by PROTOCOL_SPEC §6.2.1)
 // ---------------------------------------------------------------------------
+//
+// These two tests used to assert that an empty pattern array "matches
+// nothing", which §6.5's edge-case table required as a **MUST** through spec
+// v1.30.0. That reading is what #112 reversed: a rule that can never match is
+// not a narrow rule but no rule at all, and under `default_effect: allow` an
+// inert `deny` rule permits the very call it was written to block. The
+// construction is now refused at every door (spec v1.31.0), so the assertion
+// is the rejection rather than the non-match.
+//
+// The runtime half — a field assigned onto an already-constructed rule, which
+// no door intercepts — is pinned by `pattern_arity_backstop_tests` in
+// `src/acl.rs`; it is unreachable from outside the crate, since `ACL::rules`
+// hands back an immutable slice.
 
 #[test]
-fn test_empty_callers_matches_nothing() {
+fn test_empty_callers_is_rejected_at_construction() {
     let rule = ACLRule::new(vec![], vec!["*".to_string()], "allow");
-    let acl = ACL::new(vec![rule], "deny", None);
-    assert!(!acl.check(Some("anyone"), "target", None));
+    let error = ACL::try_new(vec![rule], "deny", None)
+        .expect_err("an empty `callers` is outside §6.2.1's table and MUST be refused");
+    assert!(
+        error.message.contains("callers"),
+        "the refusal must name the field so an operator can find the rule: {}",
+        error.message
+    );
 }
 
 #[test]
-fn test_empty_targets_matches_nothing() {
+fn test_empty_targets_is_rejected_at_construction() {
     let rule = ACLRule::new(vec!["*".to_string()], vec![], "allow");
-    let acl = ACL::new(vec![rule], "deny", None);
-    assert!(!acl.check(Some("anyone"), "target", None));
+    let error = ACL::try_new(vec![rule], "deny", None)
+        .expect_err("an empty `targets` is outside §6.2.1's table and MUST be refused");
+    assert!(
+        error.message.contains("targets"),
+        "the refusal must name the field so an operator can find the rule: {}",
+        error.message
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -576,6 +576,69 @@ fn conformance_error_codes() {
 // 7. ACL Evaluation
 // ---------------------------------------------------------------------------
 
+/// Build one `acl_evaluation` case's rules as this SDK's in-memory type.
+fn acl_rules_of(tc: &Value) -> Vec<ACLRule> {
+    let patterns = |r: &Value, key: &str| -> Vec<String> {
+        r[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    tc["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let mut rule = ACLRule::new(
+                patterns(r, "callers"),
+                patterns(r, "targets"),
+                r["effect"].as_str().unwrap().to_string(),
+            );
+            rule.description = r
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            rule.conditions = r.get("conditions").cloned();
+            rule
+        })
+        .collect()
+}
+
+/// Pin what this SDK answers for the two `acl_evaluation` cases PROTOCOL_SPEC
+/// §6.2.1 supersedes (spec v1.31.0, apcore#112), and report whether the case
+/// was one of them.
+///
+/// `empty_callers_matches_none` and `empty_targets_matches_none` assert the
+/// pre-v1.31.0 reading in which an empty pattern array is a rule that simply
+/// never matches. §6.2.1 replaced that: an array which can never match is not
+/// a narrow rule but no rule at all, and it is now refused at every entry
+/// point. The cases are deleted from the fixture in the same coordinated pass
+/// that lands `acl_pattern_arity.json` — after all three SDKs ship the change
+/// — so until then this pins what the SDK answers INSTEAD rather than skipping
+/// them, because "skipped" and "agrees" are not the same result.
+///
+/// DELETE this function and its call when the fixture drops the two cases.
+fn assert_superseded_empty_pattern_case(id: &str, rules: &[ACLRule], default_effect: &str) -> bool {
+    if !matches!(
+        id,
+        "empty_callers_matches_none" | "empty_targets_matches_none"
+    ) {
+        return false;
+    }
+    let error = ACL::try_new(rules.to_vec(), default_effect, None).expect_err(
+        "an empty pattern array is outside §6.2.1's table and MUST be refused at every \
+         entry point (spec v1.31.0, #112)",
+    );
+    assert!(
+        error.message.contains("callers") || error.message.contains("targets"),
+        "FAIL [{id}]: the refusal must name the offending field: {}",
+        error.message
+    );
+    true
+}
+
 #[test]
 fn conformance_acl_evaluation() {
     ACL::init_builtin_handlers();
@@ -587,34 +650,11 @@ fn conformance_acl_evaluation() {
         let expected = tc["expected"].as_bool().unwrap();
         let default_effect = tc["default_effect"].as_str().unwrap();
 
-        let rules: Vec<ACLRule> = tc["rules"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| {
-                let mut rule = ACLRule::new(
-                    r["callers"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|v| v.as_str().unwrap().to_string())
-                        .collect(),
-                    r["targets"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|v| v.as_str().unwrap().to_string())
-                        .collect(),
-                    r["effect"].as_str().unwrap().to_string(),
-                );
-                rule.description = r
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                rule.conditions = r.get("conditions").cloned();
-                rule
-            })
-            .collect();
+        let rules: Vec<ACLRule> = acl_rules_of(tc);
+
+        if assert_superseded_empty_pattern_case(id, &rules, default_effect) {
+            continue;
+        }
 
         let acl = ACL::new(rules, default_effect, None);
 

@@ -110,6 +110,177 @@ fn reject_unknown_rule_keys(
     ))
 }
 
+/// The tokens a `callers` / `targets` array reserves for its compound
+/// operators (PROTOCOL_SPEC §6.2.1).
+///
+/// Detected by **equality**, never by a `$` prefix or a substring: `$orders.*`
+/// is an ordinary pattern that happens to begin with the same character, and a
+/// prefix test would refuse a rule the specification permits.
+const PATTERN_OPERATORS: &[&str] = &["$or", "$not"];
+
+/// TIER 1 — why a `callers` / `targets` array is **structurally** illegal, or
+/// `None` when its shape is legal (PROTOCOL_SPEC §6.2.1, spec v1.31.0, #112).
+///
+/// A pattern array is **FLAT**: the operators do not nest, there is no
+/// precedence, an operand is always a plain pattern string, and there is
+/// exactly one operator position — index 0. The predicate below reads only the
+/// array's length, its elements' emptiness and the position of a reserved
+/// token; it is finite, total, context-free and handler-free, which is what
+/// makes it safe at a door rather than only in a validator (§6.1.4's
+/// determinism guarantee).
+///
+/// Every clause applies to `callers` and `targets` **identically**. An
+/// implementation that checks one field and infers the other passes almost
+/// every rejection case in `acl_pattern_arity.json` and still ships the defect.
+///
+/// The order of the checks decides which fault an operator is told about
+/// first, and runs from the most basic outward: empty array, then an empty
+/// element, then a reserved token outside index 0, then the leading operator's
+/// arity. It is deliberately **not** the same question as
+/// [`pattern_never_matches`], which reasons about the match relation and is a
+/// validator finding rather than a rejection.
+///
+/// **No message may contain the two characters `"; "`.** §6.1.1 rule 2 joins
+/// several `handler_error` entries with that separator, and a reader recovers
+/// the reported paths by splitting on it, so a message carrying it splits into
+/// two paths that name nothing — a failure that reads as a short-circuit bug
+/// rather than as the wording bug it is.
+/// `no_fault_message_contains_the_handler_error_separator` pins this.
+fn pattern_shape_fault(field: &str, patterns: &[String]) -> Option<String> {
+    if patterns.is_empty() {
+        return Some(format!(
+            "'{field}' is empty. A pattern array MUST carry at least one operand \
+             (PROTOCOL_SPEC §6.2.1): an array that can never match makes the rule inert, \
+             and under 'default_effect: allow' an inert 'deny' rule permits the very call \
+             it was written to block. Write ['*'] if the rule was meant to cover \
+             everything, or delete the rule if it was meant to cover nothing."
+        ));
+    }
+    if let Some(index) = patterns.iter().position(String::is_empty) {
+        return Some(format!(
+            "'{field}[{index}]' is the empty string, which matches no legal module ID. \
+             Every element of a pattern array MUST be a non-empty pattern \
+             (PROTOCOL_SPEC §6.2.1)."
+        ));
+    }
+    if let Some(index) = patterns
+        .iter()
+        .skip(1)
+        .position(|p| PATTERN_OPERATORS.contains(&p.as_str()))
+    {
+        let index = index + 1;
+        return Some(format!(
+            "'{field}[{index}]' is the reserved token '{}'. A pattern array is FLAT — the \
+             operators do not nest and there is no precedence — so a reserved token is an \
+             operator at index 0 and nothing anywhere else (PROTOCOL_SPEC §6.2.1). \
+             ['$or', '$not', p] is not \"or of not\" and [p, '$not', q] is not \"p but not \
+             q\" — no such form exists. Use first-match-wins with two rules (§6.3).",
+            patterns[index]
+        ));
+    }
+    match patterns[0].as_str() {
+        "$or" if patterns.len() < 2 => Some(format!(
+            "'{field}' is ['$or'] — an OR over nothing, which matches no module ID. \
+             '$or' at index 0 MUST be followed by at least one pattern \
+             (PROTOCOL_SPEC §6.2.1)."
+        )),
+        "$not" if patterns.len() != 2 => Some(format!(
+            "'{field}' gives '$not' {} operands. '$not' at index 0 MUST be followed by \
+             EXACTLY one pattern (PROTOCOL_SPEC §6.2.1). Through spec v1.30.0 a \
+             multi-operand '$not' was implementation-defined — every SDK consulted the \
+             first operand and dropped the rest — so an 'allow' rule excluding two \
+             targets GRANTED the second one. There is no single-array form for \
+             \"neither p nor q\": use first-match-wins with two rules (§6.3).",
+            patterns.len() - 1
+        )),
+        _ => None,
+    }
+}
+
+/// TIER 2 — why a **well-formed** `callers` / `targets` array still matches no
+/// legal module ID, or `None` (PROTOCOL_SPEC §6.2.1, spec v1.31.0, #112).
+///
+/// Reached only from [`ACL::validate_rules`], and deliberately so: this is
+/// diagnostics, not enforcement (§6.1.3). Such an array **MUST NOT** be
+/// rejected and **MUST NOT** change any access decision — a `deny` rule reading
+/// `["$not", "*"]` keeps falling through to the next rule exactly as it did
+/// before v1.31.0, and only the finding is new. Wiring this into
+/// [`ACL::precheck_pattern_faults`] would turn a well-formed rule into one that
+/// denies every call, which is the failure the tier split exists to prevent.
+///
+/// The criterion — "matches no legal module ID for any input" — is normative
+/// and the detected set is a **minimum**, not a closed one: it reasons about
+/// the glob language, which §6.2 defines but does not freeze, so divergence
+/// between implementations is expected and harmless here in a way it would
+/// never be at a door.
+///
+/// The criterion is over the array **as a whole**, never over one element. The
+/// array's own combinator is OR, so a flat or `$or` form is reported only when
+/// *every* operand is unmatchable: `["@external"]` in `targets` is reported and
+/// `["api.*", "@external"]` is not, because `api.*` still matches and the rule
+/// still protects something. Implement the criterion, not the MUST-detect
+/// list — the list's entries happen to be whole arrays and read as though the
+/// token alone were the fault.
+///
+/// Assumes [`pattern_shape_fault`] already returned `None` for this array.
+fn pattern_never_matches(field: &str, patterns: &[String]) -> Option<String> {
+    let first = patterns.first()?.as_str();
+    if first == "$not" {
+        let operand = patterns.get(1)?;
+        if is_universal_pattern(operand) {
+            return Some(format!(
+                "'{field}' negates '{operand}', which matches every module ID, so the rule \
+                 fires for none of them (PROTOCOL_SPEC §6.2.1 tier 2). The rule is \
+                 well-formed and still protects nothing."
+            ));
+        }
+        return None;
+    }
+    // The remaining forms are an OR over their operands, explicit or implicit.
+    let operands = if first == "$or" {
+        &patterns[1..]
+    } else {
+        patterns
+    };
+    if field == "targets" && operands.iter().all(|p| p == EXTERNAL_CALLER) {
+        return Some(format!(
+            "'{field}' matches only '{EXTERNAL_CALLER}', which is the caller-side sentinel \
+             §6.5 substitutes for an absent 'caller_id' and is never a module ID, so this \
+             rule names no target (PROTOCOL_SPEC §6.2.1 tier 2). The same token in \
+             'callers' is entirely legal and is what it exists for."
+        ));
+    }
+    None
+}
+
+/// Whether a pattern matches every module ID because it is nothing but
+/// wildcards.
+///
+/// `*` and `**` both reach [`match_pattern`] as "match anything", and so does
+/// any longer run — the MUST-detect minimum is "any pattern consisting only of
+/// wildcards", not the single literal `*`.
+fn is_universal_pattern(pattern: &str) -> bool {
+    !pattern.is_empty() && pattern.chars().all(|c| c == '*')
+}
+
+/// Wrap a pattern-field fault in §6.1.3 rule 3's **keyless structural** shape.
+///
+/// The path is the field name (`callers` / `targets`), the key is `None` —
+/// there is no key to name, exactly as for a `conditions` value that is not a
+/// mapping — and both resolvability flags are `false`, because the field as
+/// written cannot be read on either evaluation path (§6.1.3 rule 2). Nothing
+/// about a pattern array is registry-dependent, so the two flags could never
+/// differ here.
+fn pattern_rule_fault(field: &str, reason: String) -> RuleFault {
+    RuleFault {
+        path: field.to_string(),
+        key: None,
+        reason,
+        sync_resolvable: false,
+        async_resolvable: false,
+    }
+}
+
 /// Whether a rule requires the calls it matches to be put to a human before
 /// they run (PROTOCOL_SPEC §6.1.6).
 ///
@@ -214,11 +385,14 @@ impl ACLRule {
     /// `conditions` are left unset and assigned on the returned value — the
     /// form §9.3 names as the one that compiles from outside this crate.
     ///
-    /// `effect` is **not** validated here. The closed `allow` / `deny` set is
-    /// enforced at the three doors that accept a rule — [`ACL::load`],
-    /// [`ACL::try_new`] and [`ACL::try_add_rule`] (apcore#111) — so a rule
-    /// carrying an effect outside the set cannot reach a live ACL by any route,
-    /// and a rule under construction is not yet a governance decision.
+    /// `effect` is **not** validated here, and neither is the shape of
+    /// `callers` / `targets`. Both are enforced at the three doors that accept
+    /// a rule — [`ACL::load`], [`ACL::try_new`] and [`ACL::try_add_rule`]
+    /// (apcore#111 and apcore#112) — so a rule carrying an effect outside the
+    /// closed set, or a pattern array outside §6.2.1's table, cannot reach a
+    /// live ACL by any route, and a rule under construction is not yet a
+    /// governance decision. The refusal names the rule's index, which a rule
+    /// under construction does not have; §6.2.1 forbids inventing one.
     ///
     /// ```
     /// use apcore::ACLRule;
@@ -689,8 +863,9 @@ impl ACL {
     /// is not `"allow"` or `"deny"` (matching the constructor validation in
     /// apcore-typescript — sync finding A-D-025), or if any rule fails
     /// [`ACL::validate_rule`]: an `effect` outside the same closed set
-    /// (§6.1.5, spec v1.30.0, #111) or `approval: required` on a `deny` effect
-    /// (§6.1.6 rule 2).
+    /// (§6.1.5, spec v1.30.0, #111), `approval: required` on a `deny` effect
+    /// (§6.1.6 rule 2), or a `callers` / `targets` array whose shape is outside
+    /// §6.2.1's table (spec v1.31.0, #112).
     pub fn try_new(
         rules: Vec<ACLRule>,
         default_effect: impl Into<String>,
@@ -723,10 +898,11 @@ impl ACL {
     ///
     /// Panics on everything [`ACL::try_new`] returns an error for: a
     /// `default_effect` outside `allow` / `deny`, a rule `effect` outside the
-    /// same closed set (§6.1.5), or `approval: required` on a `deny` rule
-    /// (§6.1.6 rule 2). Construction is one of the three doors §6.1.6 rule 3
-    /// closes, so an invalid rule cannot enter here merely because the
-    /// signature is infallible.
+    /// same closed set (§6.1.5), `approval: required` on a `deny` rule
+    /// (§6.1.6 rule 2), or a `callers` / `targets` array whose shape is outside
+    /// §6.2.1's table (spec v1.31.0, #112). Construction is one of the three
+    /// doors §6.1.6 rule 3 closes, so an invalid rule cannot enter here merely
+    /// because the signature is infallible.
     pub fn new(
         rules: Vec<ACLRule>,
         default_effect: impl Into<String>,
@@ -791,10 +967,27 @@ impl ACL {
     ///   needs approval" is not a state that means anything, and silently
     ///   ignoring one half of a governance rule is the failure mode §6.1.5 was
     ///   written to end.
+    /// * A `callers` or `targets` array whose **shape** is outside §6.2.1's
+    ///   table (spec v1.31.0, #112) — empty, an empty element, `$or` with no
+    ///   operand, `$not` with none or more than one, or a reserved token
+    ///   outside index 0. `schemas/acl-config.schema.json` has declared
+    ///   `minItems: 1` and `minLength: 1` on both fields since the file
+    ///   existed and no door enforced either, because no implementation
+    ///   validates an ACL file against the schema at load time. An array that
+    ///   can never match leaves the rule inert, and an inert `deny` rule under
+    ///   `default_effect: allow` permits the call it was written to block.
     ///
-    /// Both name the rule index and the offending value, because an operator
-    /// reading the refusal needs to find the rule in their file.
+    /// All three name the rule index and the offending field or value, because
+    /// an operator reading the refusal needs to find the rule in their file.
     fn validate_rule(index: usize, rule: &ACLRule) -> Result<(), ModuleError> {
+        for (field, patterns) in [("callers", &rule.callers), ("targets", &rule.targets)] {
+            if let Some(reason) = pattern_shape_fault(field, patterns) {
+                return Err(ModuleError::new(
+                    ErrorCode::ACLRuleError,
+                    format!("Rule {index}: {reason}"),
+                ));
+            }
+        }
         if !EFFECTS.contains(&rule.effect.as_str()) {
             return Err(ModuleError::new(
                 ErrorCode::ACLRuleError,
@@ -1016,14 +1209,24 @@ impl ACL {
     /// (PROTOCOL_SPEC §6.1.5, spec v1.30.0, #111) or `approval: required` on a
     /// `deny` effect (§6.1.6 rule 2). Use [`ACL::try_add_rule`] for fallible
     /// insertion — the pairing [`ACL::new`] and [`ACL::try_new`] already use.
+    /// It panics on a `callers` / `targets` array whose shape is outside
+    /// §6.2.1's table too (spec v1.31.0, #112) — runtime insertion is the third
+    /// of the doors that rule closes, and the panic is what this method's
+    /// infallible signature makes of a refusal, not an exemption from one.
     ///
-    /// Neither can break a caller written before the release that added it.
-    /// The `approval` field did not exist before v1.28.0, so that state was not
-    /// constructible; an out-of-enum `effect` was never a *working* rule, only
-    /// one whose value travelled uninspected into `AccessDecision::access`. A
-    /// rule built in code is as meaningless as one parsed from YAML, which is
-    /// why all three entry points refuse it rather than two refusing and one
-    /// letting it through (§6.1.6 rule 3).
+    /// Neither of the first two can break a caller written before the release
+    /// that added it. The `approval` field did not exist before v1.28.0, so
+    /// that state was not constructible; an out-of-enum `effect` was never a
+    /// *working* rule, only one whose value travelled uninspected into
+    /// `AccessDecision::access`. A rule built in code is as meaningless as one
+    /// parsed from YAML, which is why all three entry points refuse it rather
+    /// than two refusing and one letting it through (§6.1.6 rule 3).
+    ///
+    /// The shape rejection **is** a break, deliberately: a caller inserting
+    /// `targets: []` used to succeed and get a rule that decided nothing. The
+    /// affected population is exactly the callers who believe they inserted a
+    /// rule and did not, and the migration is `["*"]` for "everything" or
+    /// deleting the call for "nothing".
     pub fn add_rule(&mut self, rule: ACLRule) {
         // Same reasoning as [`ACL::new`]: the panic carries `try_add_rule`'s
         // message, which names the rule index and the offending value.
@@ -1041,10 +1244,12 @@ impl ACL {
     ///
     /// Returns `ModuleError` with `ErrorCode::ACLRuleError` when the rule
     /// carries an `effect` outside `allow` / `deny` (§6.1.5, spec v1.30.0,
-    /// #111), or `approval: required` on a `deny` effect (§6.1.6 rule 2).
-    /// "Denied **and** needs approval" is not a state that means anything, and
-    /// accepting half of a governance rule is the failure mode §6.1.5 was
-    /// written to end.
+    /// #111), `approval: required` on a `deny` effect (§6.1.6 rule 2), or a
+    /// `callers` / `targets` array whose shape is outside §6.2.1's table (spec
+    /// v1.31.0, #112). "Denied **and** needs approval" is not a state that
+    /// means anything, an array that can never match is not a narrow rule but
+    /// no rule at all, and accepting half of a governance rule is the failure
+    /// mode §6.1.5 was written to end.
     pub fn try_add_rule(&mut self, rule: ACLRule) -> Result<(), ModuleError> {
         // Index 0 — the position the rule is about to occupy, so the refusal
         // names the rule the caller will find at the head of `rules()`.
@@ -1063,9 +1268,10 @@ impl ACL {
     /// Named `validate_rules` rather than `validate_conditions` because it
     /// reports structural faults in the rule as a whole, not only unresolvable
     /// condition keys: a `$or` whose value is not a list, a `$not` whose value
-    /// is not an object, and a `conditions` that is not a mapping are all
-    /// findings. (§6.1.4.1's malformed `callers` / `targets` cannot arise here
-    /// — see the note below.)
+    /// is not an object, a `conditions` that is not a mapping, and a `callers`
+    /// / `targets` array whose **shape** is outside §6.2.1's table are all
+    /// findings. (§6.1.4.1's malformed `callers` / `targets` *type* cannot
+    /// arise here — see the note below.)
     ///
     /// Condition handlers are registered at runtime into a process-wide
     /// registry, and an ACL may legitimately be loaded before a deployment
@@ -1090,29 +1296,54 @@ impl ACL {
     /// rule cannot silently pass traffic is §6.1.1's, and holds whether or not
     /// anyone calls this.
     ///
-    /// # `callers` / `targets` are checked by the type system
+    /// # `callers` / `targets`: the **type** is checked by the type system, the
+    /// **shape** is not
     ///
     /// §6.1.4.1 requires the precheck to classify a non-list `callers` /
     /// `targets` as unevaluable, because a bare string is iterable in several
     /// host languages: `callers: "admin.*"` iterates character by character,
     /// and the `*` character matches everything, so the typo grants access to
     /// every caller. [`ACLRule::callers`] and [`ACLRule::targets`] are
-    /// `Vec<String>`, so the malformed value is unrepresentable — serde rejects
-    /// a bare string at deserialization and the compiler rejects one in a
-    /// struct literal. §6.1.4.1 states explicitly that such an implementation
+    /// `Vec<String>`, so that malformed *value* is unrepresentable — serde
+    /// rejects a bare string at deserialization and the compiler rejects one in
+    /// a struct literal. §6.1.4.1 states explicitly that such an implementation
     /// "satisfies this clause by construction and needs no runtime check", so
-    /// there is deliberately no check here for a state that cannot exist.
+    /// there is deliberately no type check here for a state that cannot exist.
+    ///
+    /// That argument reaches the element type and **stops there**: a
+    /// `Vec<String>` places no constraint on its length and none on what its
+    /// elements say, so `targets: vec![]`, `vec!["$or".into()]` and
+    /// `vec!["$not".into(), a, b]` are all perfectly constructible (spec
+    /// v1.31.0, #112). §6.2.1 closes those at every door, and this method
+    /// reports whatever arrives around one — see
+    /// [`ACL::precheck_pattern_faults`].
     #[must_use]
     pub fn validate_rules(&self) -> Vec<RuleValidationFinding> {
         let mut findings = Vec::new();
         for (idx, rule) in self.rules.iter().enumerate() {
-            let Some(conditions) = rule.conditions.as_ref() else {
-                continue;
-            };
-            // `precheck_conditions` already returns faults ordered by path, and
-            // rules are walked in definition order, so the result is ordered by
-            // (rule_index, condition_path) as §6.1.2 rule 3 requires.
-            for fault in precheck_conditions(conditions, PrecheckPath::Sync) {
+            // §6.2.1's two tiers, per field and in that order: a structural
+            // fault is reported instead of a semantic one, never alongside it,
+            // because tier 2's predicate assumes a well-formed array. Tier 2
+            // is reachable from HERE ONLY — it must never feed the per-call
+            // handler-error scope or a decision.
+            let mut faults: Vec<RuleFault> = Vec::new();
+            for (field, patterns) in [("callers", &rule.callers), ("targets", &rule.targets)] {
+                if let Some(reason) = pattern_shape_fault(field, patterns)
+                    .or_else(|| pattern_never_matches(field, patterns))
+                {
+                    faults.push(pattern_rule_fault(field, reason));
+                }
+            }
+            if let Some(conditions) = rule.conditions.as_ref() {
+                faults.extend(precheck_conditions(conditions, PrecheckPath::Sync));
+            }
+            // `precheck_conditions` already returns faults ordered by path, but
+            // the pattern faults are appended from a separate walk, so the
+            // merged list is re-sorted: rules are visited in definition order,
+            // so the result is ordered by (rule_index, path) as §6.1.2 rule 3
+            // requires.
+            faults.sort_by(|a, b| a.path.cmp(&b.path));
+            for fault in faults {
                 findings.push(RuleValidationFinding::new(
                     idx,
                     fault.path,
@@ -1582,21 +1813,25 @@ impl ACL {
     /// resolved to `allow` with `approval_required: false` on exactly the call
     /// the operator gated.
     ///
-    /// Scope is not re-checked here: `matches_rule` returns `Unevaluable` only
-    /// **after** both pattern lists matched, so a rule written about another
-    /// caller or target has already left as `NoMatch` with its conditions never
-    /// consulted (§6.1.4 rule 4). Rule 5's "unknowable scope counts as scope"
-    /// clause — a malformed `callers` / `targets` raising the requirement
-    /// because its scope cannot be read — is satisfied structurally in this
-    /// SDK: both fields are `Vec<String>`, so §6.1.4.1's malformed shape has no
-    /// value to construct (see the `validate_rules` note on the same clause).
+    /// A rule written about another caller or target has already left as
+    /// `NoMatch` with its conditions never consulted (§6.1.4 rule 4), so a
+    /// *readable* scope is not re-checked here. Rule 5's "unknowable scope
+    /// counts as scope" clause is a different matter and does reach this
+    /// function: `matches_rule` runs §6.1.4.1's pattern precheck first, so a
+    /// rule whose `callers` / `targets` **shape** is outside §6.2.1's table
+    /// arrives as `Unevaluable` before either list is matched, and an `allow`
+    /// rule carrying `approval: required` raises the pending requirement from
+    /// here (spec v1.31.0, #112). Only the field's *type* is satisfied
+    /// structurally in this SDK — `Vec<String>` constrains the element type and
+    /// nothing about the array's length (see the `validate_rules` note).
     ///
-    /// Also emits §6.1.1 rule 3's warning, which must name the condition
+    /// Also emits §6.1.1 rule 3's warning, which must name the fault's
     /// **path**, the rule's index and the rule's `effect`. The `effect` is in
     /// the message because a misconfigured `deny` rule is the consequential
     /// case. The paths are recovered by diffing the per-call handler-error
     /// scope, which is where both precheck-origin and execution-origin faults
-    /// land — including one nested inside `$or` / `$not`.
+    /// land — including one nested inside `$or` / `$not`, and including the
+    /// bare `callers` / `targets` path a pattern-shape fault reports at.
     fn resolve_unevaluable_rule(
         idx: usize,
         rule: &ACLRule,
@@ -1624,7 +1859,7 @@ impl ACL {
             effect = %rule.effect,
             condition_paths = %conditions,
             pending_approval,
-            "ACL rule has unevaluable conditions — {} (PROTOCOL_SPEC §6.1.1)",
+            "ACL rule is UNEVALUABLE — {} (PROTOCOL_SPEC §6.1.1)",
             if takes_effect {
                 "the deny rule TAKES EFFECT and the call is denied"
             } else if pending_approval {
@@ -1653,6 +1888,13 @@ impl ACL {
         target: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> RuleMatch {
+        // §6.1.4.1 runs BEFORE the matcher: a rule whose scope cannot be read
+        // is unevaluable, not unmatched, and reading "does not match" off a
+        // malformed field is the fail-open #112 was opened about.
+        if Self::pattern_precheck_failed(rule) {
+            return RuleMatch::Unevaluable;
+        }
+
         if !Self::match_patterns(&rule.callers, caller, ctx) {
             return RuleMatch::NoMatch;
         }
@@ -1694,8 +1936,64 @@ impl ACL {
         true
     }
 
+    /// Run PROTOCOL_SPEC §6.1.4.1's precheck over a rule's **pattern fields**
+    /// (spec v1.31.0, #112).
+    ///
+    /// The backstop for the one route §6.2.1's door-closing cannot reach.
+    /// [`ACLRule`]'s fields are `pub`, so `rule.targets = vec![]` on an
+    /// already-constructed rule bypasses [`ACL::try_new`], [`ACL::try_add_rule`]
+    /// and [`ACL::load`] alike. Unlike an unrecognised `effect` — which, once
+    /// the doors are closed, is never read again — a mutated pattern array
+    /// **is** read: the matcher would consult it on the next `check()`.
+    ///
+    /// **Both fields are always examined** (§6.1.4 rule 3): the walk does not
+    /// short-circuit on the first fault, which is what makes the reported set a
+    /// pure function of the rule. Faults come back in field order, which is
+    /// already the lexicographic path order §6.1.1 rule 2 requires
+    /// (`callers` < `targets`).
+    ///
+    /// Tier 1 only. [`pattern_never_matches`] is deliberately **not** consulted
+    /// here: a well-formed array that happens to match nothing is a finding,
+    /// and routing it through this function would make it deny.
+    fn precheck_pattern_faults(rule: &ACLRule) -> Vec<RuleFault> {
+        let mut faults = Vec::new();
+        for (field, patterns) in [("callers", &rule.callers), ("targets", &rule.targets)] {
+            if let Some(reason) = pattern_shape_fault(field, patterns) {
+                faults.push(pattern_rule_fault(field, reason));
+            }
+        }
+        faults
+    }
+
+    /// [`Self::precheck_pattern_faults`], reporting each fault into the
+    /// per-call handler-error scope and answering whether the rule is
+    /// UNEVALUABLE on its scope alone.
+    ///
+    /// Shaped exactly like [`Self::precheck_failed`], and reporting through the
+    /// same sink, so a malformed pattern field reaches `AuditEntry.handler_error`
+    /// by the route a malformed condition already did.
+    fn pattern_precheck_failed(rule: &ACLRule) -> bool {
+        let faults = Self::precheck_pattern_faults(rule);
+        if faults.is_empty() {
+            return false;
+        }
+        for fault in &faults {
+            crate::acl_handlers::report_condition_unevaluable_at(&fault.path, &fault.reason);
+        }
+        true
+    }
+
     /// Match a list of patterns against a value.
     /// Supports compound operators: `$or` (any match) and `$not` (negate).
+    ///
+    /// The `false` returns for an empty list and for a `$not` with nothing to
+    /// negate are **defence in depth only** (PROTOCOL_SPEC §6.2.1, spec
+    /// v1.31.0, #112). Those shapes are refused at every entry point and
+    /// classified UNEVALUABLE by [`Self::pattern_precheck_failed`], which runs
+    /// first, so a malformed array never reaches this function — and reading
+    /// an arity fault as a non-match here is exactly the fail-open #112 was
+    /// opened about. They are kept rather than replaced with a panic because a
+    /// matcher is not the right place to decide a rule's fate.
     fn match_patterns(
         patterns: &[String],
         value: &str,
@@ -2092,6 +2390,14 @@ impl ACL {
         target: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> RuleMatch {
+        // §6.1.4.1, exactly as in the sync twin. The pattern precheck is
+        // context-free and registry-free, so the two paths cannot legitimately
+        // disagree about it — but they are separate code paths (#100), so the
+        // call has to be written in both.
+        if Self::pattern_precheck_failed(rule) {
+            return RuleMatch::Unevaluable;
+        }
+
         if !Self::match_patterns(&rule.callers, caller, ctx) {
             return RuleMatch::NoMatch;
         }
@@ -2215,5 +2521,320 @@ mod projection_forgery_tests {
              (PROTOCOL_SPEC §6.1.8 rule 3); if it ever moves there the field MUST be \
              transient — `#[serde(skip)]`:\n{body}"
         );
+    }
+}
+
+/// PROTOCOL_SPEC §6.1.4.1's **backstop** for a pattern field assigned onto an
+/// already-constructed rule (§6.2.1, spec v1.31.0, apcore#112).
+///
+/// # Why these live in the crate and not in `tests/`
+///
+/// §6.2.1 closes every entry point that accepts a rule, and in this SDK that
+/// leaves the backstop with no route in from outside: [`ACL::rules`] hands back
+/// `&[ACLRule]`, and there is no `rules_mut`, no public field and no
+/// `Deserialize` on [`ACL`], so a downstream crate cannot install a rule it
+/// mutated after construction. In apcore-python and apcore-typescript
+/// `acl.rules[0].targets = []` reaches the matcher directly, which is why the
+/// conformance fixture carries the route as nine `kind: "backstop"` cases.
+///
+/// That asymmetry is a reason to test the backstop from inside the crate, not a
+/// reason to leave it untested: `self.rules` is reachable from here, a future
+/// `rules_mut` or in-place editing API would open the same route from outside,
+/// and §6.1.4.1's classification has to already be correct when it does. These
+/// mirror the fixture's backstop cases by name.
+#[cfg(test)]
+mod pattern_arity_backstop_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A one-rule ACL plus the audit entries it emits.
+    ///
+    /// Built through `new_unchecked` so the rule can be planted in the state a
+    /// mutation would leave it in — every public door refuses it, which is the
+    /// point of the closure and the reason this helper is private.
+    fn planted(rule: ACLRule, default_effect: &str) -> (ACL, Arc<Mutex<Vec<AuditEntry>>>) {
+        ACL::init_builtin_handlers();
+        let captured: Arc<Mutex<Vec<AuditEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let logger: Arc<AuditLoggerFn> = Arc::new(move |entry: &AuditEntry| {
+            sink.lock().expect("audit sink").push(entry.clone());
+        });
+        let acl = ACL::new_unchecked(vec![rule], default_effect, Some(logger));
+        (acl, captured)
+    }
+
+    fn base_rule(effect: &str) -> ACLRule {
+        ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], effect)
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The `handler_error` paths on the single audit entry the check emitted.
+    ///
+    /// `handler_error` is the joined `"{path}: {reason}"` form (§6.1.1 rule 2),
+    /// already ordered lexicographically by path, so the paths are recovered by
+    /// splitting rather than re-sorted — the order under test is the one the
+    /// entry was written in.
+    fn handler_error_paths(captured: &Arc<Mutex<Vec<AuditEntry>>>) -> Vec<String> {
+        let entries = captured.lock().expect("audit sink");
+        assert_eq!(entries.len(), 1, "exactly one audit entry per check()");
+        let Some(joined) = entries[0].handler_error.as_ref() else {
+            return Vec::new();
+        };
+        joined
+            .split("; ")
+            .map(|part| part.split(':').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn finding_paths(acl: &ACL) -> Vec<String> {
+        acl.validate_rules()
+            .into_iter()
+            .map(|f| f.condition_path)
+            .collect()
+    }
+
+    #[test]
+    fn mutated_empty_targets_on_deny_rule_denies() {
+        let mut rule = base_rule("deny");
+        rule.targets = Vec::new();
+        let (acl, captured) = planted(rule, "allow");
+
+        let decision = acl.check_access(Some("api.gateway"), "cli.rm", None, None);
+        assert_eq!(
+            decision.access, "deny",
+            "a rule whose scope cannot be read is UNEVALUABLE, and §6.1.1's effect table \
+             makes a deny rule take effect — reading it as a non-match is #112's fail-open"
+        );
+        assert!(!decision.approval_required, "a denial carries no question");
+        assert_eq!(handler_error_paths(&captured), vec!["targets".to_string()]);
+        // The legacy boolean agrees, as it must whenever no approval is pending.
+        assert!(!acl.check(Some("api.gateway"), "cli.rm", None));
+        assert_eq!(finding_paths(&acl), vec!["targets".to_string()]);
+    }
+
+    #[test]
+    fn mutated_empty_targets_on_allow_rule_does_not_grant() {
+        let mut rule = base_rule("allow");
+        rule.targets = Vec::new();
+        let (acl, captured) = planted(rule, "deny");
+
+        assert!(
+            !acl.check(Some("api.gateway"), "cli.rm", None),
+            "an unevaluable allow rule does not match and MUST NOT grant (§6.1.1)"
+        );
+        // The decision is unchanged from v1.30.0 — an inert `allow` rule also
+        // failed to grant. The audit entry and the finding are what is new, and
+        // they are what tells the operator the rule is broken rather than
+        // merely unmatched.
+        assert_eq!(handler_error_paths(&captured), vec!["targets".to_string()]);
+        assert_eq!(finding_paths(&acl), vec!["targets".to_string()]);
+    }
+
+    #[test]
+    fn mutated_or_with_no_operands_on_deny_rule_denies() {
+        let mut rule = base_rule("deny");
+        rule.targets = strings(&["$or"]);
+        let (acl, captured) = planted(rule, "allow");
+
+        assert!(
+            !acl.check(Some("api.gateway"), "cli.rm", None),
+            "an implementation that special-cases only the empty array fails here"
+        );
+        assert_eq!(handler_error_paths(&captured), vec!["targets".to_string()]);
+        assert_eq!(finding_paths(&acl), vec!["targets".to_string()]);
+    }
+
+    #[test]
+    fn mutated_not_with_no_operands_on_deny_rule_denies() {
+        let mut rule = base_rule("deny");
+        rule.callers = strings(&["$not"]);
+        let (acl, captured) = planted(rule, "allow");
+
+        assert!(
+            !acl.check(Some("api.gateway"), "cli.rm", None),
+            "the fault is per field — an implementation that checks only `targets` fails here"
+        );
+        assert_eq!(handler_error_paths(&captured), vec!["callers".to_string()]);
+        assert_eq!(finding_paths(&acl), vec!["callers".to_string()]);
+    }
+
+    #[test]
+    fn mutated_not_with_two_operands_on_allow_rule_does_not_grant() {
+        let mut rule = base_rule("allow");
+        rule.targets = strings(&["$not", "secrets.a", "secrets.b"]);
+        let (acl, captured) = planted(rule, "deny");
+
+        assert!(
+            !acl.check(Some("api.gateway"), "secrets.b", None),
+            "the escalation case at runtime: through v1.30.0 the matcher read the first \
+             operand and dropped the rest, so the SECOND target the operator excluded was \
+             GRANTED. A `true` here is the pre-v1.31.0 matcher"
+        );
+        assert_eq!(handler_error_paths(&captured), vec!["targets".to_string()]);
+        assert_eq!(finding_paths(&acl), vec!["targets".to_string()]);
+    }
+
+    #[test]
+    fn mutated_both_fields_report_both_paths() {
+        let mut rule = base_rule("deny");
+        rule.callers = strings(&["$not"]);
+        rule.targets = Vec::new();
+        let (acl, captured) = planted(rule, "allow");
+
+        assert!(!acl.check(Some("api.gateway"), "cli.rm", None));
+        // §6.1.4 rule 3: the precheck MUST NOT short-circuit, so both fields
+        // are examined and both faults reported, ordered lexicographically by
+        // path (§6.1.1 rule 2).
+        assert_eq!(
+            handler_error_paths(&captured),
+            vec!["callers".to_string(), "targets".to_string()]
+        );
+        assert_eq!(
+            finding_paths(&acl),
+            vec!["callers".to_string(), "targets".to_string()]
+        );
+    }
+
+    #[test]
+    fn mutated_empty_targets_on_approval_rule_raises_pending_requirement() {
+        let mut rule = base_rule("allow");
+        rule.approval = Some(ApprovalRequirement::Required);
+        rule.targets = Vec::new();
+        let (acl, captured) = planted(rule, "allow");
+
+        let decision = acl.check_access(Some("api.gateway"), "cli.rm", None, None);
+        // §6.1.1 rule 5, "unknowable scope counts as scope": the rule's scope
+        // cannot be read, so it cannot be shown not to apply here. An arity
+        // fault is a malformed pattern field like any other — §6.1.4.1 has no
+        // partially-readable tier, and inventing one would put back the
+        // per-implementation judgement call that produced three answers in #100.
+        assert_eq!(
+            decision.access, "allow",
+            "the grant comes from default_effect: allow"
+        );
+        assert!(
+            decision.approval_required,
+            "the pending requirement composes onto whatever grants next (§6.1.1 rule 5)"
+        );
+        assert_eq!(
+            decision.matched_rule_index, None,
+            "approval_required with no matched rule is the legal combination rule 5 names"
+        );
+        assert_eq!(handler_error_paths(&captured), vec!["targets".to_string()]);
+        // §6.8.1: the legacy boolean `check()` folds the two axes into one and
+        // fails closed on an outstanding approval requirement, so it answers
+        // `false` here while `access` is `"allow"`. Asserted separately from
+        // the structured accessor, because the two are different questions and
+        // reading the boolean as the access decision would make this case look
+        // like a denial.
+        assert!(
+            !acl.check(Some("api.gateway"), "cli.rm", None),
+            "the boolean entry point fails closed while approval is pending (§6.8.1)"
+        );
+        assert_eq!(finding_paths(&acl), vec!["targets".to_string()]);
+    }
+
+    #[test]
+    fn mutated_pattern_field_is_unevaluable_on_the_async_path_too() {
+        // `matches_rule` and `matches_rule_async` are separate code paths, as
+        // they were in #100. The precheck is context-free and registry-free, so
+        // the two cannot legitimately disagree — which is exactly why a test
+        // has to say so rather than the reader assuming it.
+        let mut rule = base_rule("deny");
+        rule.targets = Vec::new();
+        let (acl, captured) = planted(rule, "allow");
+
+        let allowed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async { acl.async_check(Some("api.gateway"), "cli.rm", None).await });
+
+        assert!(
+            !allowed,
+            "the async twin must classify the fault identically"
+        );
+        assert_eq!(handler_error_paths(&captured), vec!["targets".to_string()]);
+    }
+
+    /// Every clause of §6.2.1, in the vocabulary the fault messages are built
+    /// from: the field, the array, and whether the array is legal.
+    fn every_illegal_shape() -> Vec<(&'static str, Vec<String>)> {
+        vec![
+            ("callers", Vec::new()),
+            ("targets", Vec::new()),
+            ("targets", strings(&[""])),
+            ("callers", strings(&["$or", ""])),
+            ("targets", strings(&["$or"])),
+            ("callers", strings(&["$not"])),
+            ("targets", strings(&["$not", "a", "b"])),
+            ("callers", strings(&["$or", "$not", "admin"])),
+            ("targets", strings(&["api.*", "$not", "cli.*"])),
+        ]
+    }
+
+    #[test]
+    fn no_fault_message_contains_the_handler_error_separator() {
+        // §6.1.1 rule 2 joins several `handler_error` entries with "; ", and a
+        // reader — a driver, or the test helper above — recovers the reported
+        // paths by splitting on it. A message carrying the separator splits
+        // into two bogus paths, and the resulting failure reads as a
+        // short-circuit bug rather than as the message-format bug it is.
+        for (field, patterns) in every_illegal_shape() {
+            let reason = pattern_shape_fault(field, &patterns)
+                .unwrap_or_else(|| panic!("{field}: {patterns:?} is illegal under §6.2.1"));
+            assert!(
+                !reason.contains("; "),
+                "the tier-1 message for {field}: {patterns:?} carries the handler_error \
+                 separator: {reason}"
+            );
+        }
+        for (field, patterns) in [
+            ("targets", strings(&["$not", "*"])),
+            ("targets", strings(&["$not", "**"])),
+            ("targets", strings(&["@external"])),
+        ] {
+            let reason = pattern_never_matches(field, &patterns)
+                .unwrap_or_else(|| panic!("{field}: {patterns:?} matches nothing"));
+            assert!(
+                !reason.contains("; "),
+                "the tier-2 message for {field}: {patterns:?} carries the handler_error \
+                 separator: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_illegal_shape_is_reported_on_both_fields() {
+        // §6.2.1 constrains `callers` and `targets` identically. The predicate
+        // takes the field name only to name it in the message, so a shape that
+        // is a fault on one field must be a fault on the other — asserted
+        // rather than assumed, because an implementation that checked one field
+        // and inferred the other is the defect the fixture's `*_in_callers_*`
+        // mirrors exist to catch.
+        for (_, patterns) in every_illegal_shape() {
+            for field in ["callers", "targets"] {
+                assert!(
+                    pattern_shape_fault(field, &patterns).is_some(),
+                    "{patterns:?} is illegal under §6.2.1 but was accepted on '{field}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_well_formed_planted_rule_raises_no_finding() {
+        // The control without which an implementation that flags every rule
+        // passes every other test in this module.
+        let mut rule = base_rule("deny");
+        rule.targets = strings(&["cli.*"]);
+        let (acl, captured) = planted(rule, "allow");
+
+        assert!(!acl.check(Some("api.gateway"), "cli.rm", None));
+        assert!(handler_error_paths(&captured).is_empty());
+        assert!(finding_paths(&acl).is_empty());
     }
 }
