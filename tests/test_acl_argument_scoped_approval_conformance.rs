@@ -102,26 +102,28 @@ fn build(case: &Value) -> (ACL, Arc<Mutex<Vec<AuditEntry>>>) {
         .as_array()
         .expect("rules array")
         .iter()
-        .map(|r| ACLRule {
-            callers: r["callers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|c| c.as_str().unwrap().to_string())
-                .collect(),
-            targets: r["targets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t.as_str().unwrap().to_string())
-                .collect(),
-            effect: r["effect"].as_str().unwrap().to_string(),
-            approval: r.get("approval").and_then(Value::as_str).map(|a| match a {
+        .map(|r| {
+            let mut rule = ACLRule::new(
+                r["callers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.as_str().unwrap().to_string())
+                    .collect(),
+                r["targets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.as_str().unwrap().to_string())
+                    .collect(),
+                r["effect"].as_str().unwrap().to_string(),
+            );
+            rule.approval = r.get("approval").and_then(Value::as_str).map(|a| match a {
                 "required" => ApprovalRequirement::Required,
                 _ => ApprovalRequirement::NotRequired,
-            }),
-            description: None,
-            conditions: r.get("conditions").cloned(),
+            });
+            rule.conditions = r.get("conditions").cloned();
+            rule
         })
         .collect();
     let acl = ACL::new(
@@ -374,14 +376,9 @@ fn acl_argument_scoped_approval_conformance() {
 /// §6.1.6 rule 3 — the meaningless combination cannot get in by any door.
 #[test]
 fn deny_plus_approval_is_rejected_at_every_entry_point() {
-    let rule = ACLRule {
-        callers: vec!["*".to_string()],
-        targets: vec!["x.y".to_string()],
-        effect: "deny".to_string(),
-        approval: Some(ApprovalRequirement::Required),
-        description: None,
-        conditions: None,
-    };
+    let mut rule = ACLRule::new(vec!["*".to_string()], vec!["x.y".to_string()], "deny");
+    rule.approval = Some(ApprovalRequirement::Required);
+
     assert!(
         ACL::try_new(vec![rule.clone()], "deny", None).is_err(),
         "try_new must reject"

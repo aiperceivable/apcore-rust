@@ -283,13 +283,10 @@ mod w4 {
         let mut conditions = serde_json::Map::new();
         conditions.insert("$or".to_string(), json!([{ "_w4_mode_probe": true }]));
         ACL::new(
-            vec![ACLRule {
-                approval: None,
-                callers: vec!["*".to_string()],
-                targets: vec!["*".to_string()],
-                effect: "allow".to_string(),
-                description: None,
-                conditions: Some(Value::Object(conditions)),
+            vec![{
+                let mut rule = ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow");
+                rule.conditions = Some(Value::Object(conditions));
+                rule
             }],
             "deny",
             None,
@@ -372,13 +369,10 @@ mod w6 {
         let mut conditions = serde_json::Map::new();
         conditions.insert("_w6_never_registered".to_string(), json!(true));
         let mut acl = ACL::new(
-            vec![ACLRule {
-                approval: None,
-                callers: vec!["*".to_string()],
-                targets: vec!["*".to_string()],
-                effect: "allow".to_string(),
-                description: None,
-                conditions: Some(Value::Object(conditions)),
+            vec![{
+                let mut rule = ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow");
+                rule.conditions = Some(Value::Object(conditions));
+                rule
             }],
             "deny",
             None,

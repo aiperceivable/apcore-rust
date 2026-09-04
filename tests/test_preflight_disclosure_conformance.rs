@@ -147,13 +147,14 @@ async fn conformance_preflight_disclosure() {
             .as_array()
             .expect("acl_rules")
             .iter()
-            .map(|r| ACLRule {
-                approval: None,
-                callers: string_list(&r["callers"]),
-                targets: string_list(&r["targets"]),
-                effect: r["effect"].as_str().expect("effect").to_string(),
-                description: Some("conformance rule".to_string()),
-                conditions: None,
+            .map(|r| {
+                let mut rule = ACLRule::new(
+                    string_list(&r["callers"]),
+                    string_list(&r["targets"]),
+                    r["effect"].as_str().expect("effect").to_string(),
+                );
+                rule.description = Some("conformance rule".to_string());
+                rule
             })
             .collect();
         let acl = ACL::new(

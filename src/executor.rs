@@ -881,7 +881,7 @@ impl Executor {
         let context = match ctx {
             Some(c) => c.clone(),
             None => Context::<serde_json::Value>::new(Identity::new(
-                "@external".to_string(),
+                crate::acl::EXTERNAL_CALLER.to_string(),
                 "external".to_string(),
                 vec![],
                 HashMap::new(),
@@ -1017,7 +1017,7 @@ impl Executor {
         }
         let context = ctx.cloned().unwrap_or_else(|| {
             Context::<serde_json::Value>::new(Identity::new(
-                "@external".to_string(),
+                crate::acl::EXTERNAL_CALLER.to_string(),
                 "external".to_string(),
                 vec![],
                 HashMap::new(),
@@ -1561,7 +1561,7 @@ impl Executor {
     ) -> Result<StreamPrep, ModuleError> {
         let context = ctx.unwrap_or_else(|| {
             Context::<Value>::new(Identity::new(
-                "@external".to_string(),
+                crate::acl::EXTERNAL_CALLER.to_string(),
                 "external".to_string(),
                 vec![],
                 HashMap::new(),
@@ -1868,7 +1868,7 @@ impl Executor {
         let context = match ctx {
             Some(c) => c.clone(),
             None => Context::<Value>::new(Identity::new(
-                "@external".to_string(),
+                crate::acl::EXTERNAL_CALLER.to_string(),
                 "external".to_string(),
                 vec![],
                 HashMap::new(),

@@ -87,38 +87,40 @@ fn build_registry() -> Registry {
 /// The canonical agent-tool-governance policy (default-deny).
 /// Mirrors examples/acl/agent-tool-governance.yaml in the apcore spec repo.
 fn build_policy() -> Vec<ACLRule> {
-    vec![
-        // External / unauthenticated callers (no caller_id) — read-only.
-        ACLRule {
-            approval: None,
-            callers: vec!["@external".to_string()],
-            targets: vec!["executor.*.read".to_string()],
-            effect: "allow".to_string(),
-            description: Some("External callers may only read.".to_string()),
-            conditions: None,
-        },
-        // Reader-role agents — read + query, depth-capped to fuse runaway chains.
-        ACLRule {
-            approval: None,
-            callers: vec!["agent.*".to_string()],
-            targets: vec![
-                "executor.*.read".to_string(),
-                "executor.*.query".to_string(),
-            ],
-            effect: "allow".to_string(),
-            description: Some("Reader agents may read/query, depth-capped.".to_string()),
-            conditions: Some(json!({"roles": ["reader"], "max_call_depth": 3})),
-        },
-        // Data-admin agents — exports and sensitive deletes (no depth cap).
-        ACLRule {
-            approval: None,
-            callers: vec!["agent.*".to_string()],
-            targets: vec!["data.export".to_string(), "executor.*.delete".to_string()],
-            effect: "allow".to_string(),
-            description: Some("Data-admin agents may export and delete.".to_string()),
-            conditions: Some(json!({"roles": ["data_admin"]})),
-        },
-    ]
+    // `ACLRule` is `#[non_exhaustive]`, so a rule is built through
+    // `ACLRule::new` and its optional fields assigned afterwards — the form
+    // that compiles from outside the crate (api-surface-conventions.md §9.3).
+
+    // External / unauthenticated callers (no caller_id) — read-only.
+    let mut external = ACLRule::new(
+        vec!["@external".to_string()],
+        vec!["executor.*.read".to_string()],
+        "allow",
+    );
+    external.description = Some("External callers may only read.".to_string());
+
+    // Reader-role agents — read + query, depth-capped to fuse runaway chains.
+    let mut reader = ACLRule::new(
+        vec!["agent.*".to_string()],
+        vec![
+            "executor.*.read".to_string(),
+            "executor.*.query".to_string(),
+        ],
+        "allow",
+    );
+    reader.description = Some("Reader agents may read/query, depth-capped.".to_string());
+    reader.conditions = Some(json!({"roles": ["reader"], "max_call_depth": 3}));
+
+    // Data-admin agents — exports and sensitive deletes (no depth cap).
+    let mut data_admin = ACLRule::new(
+        vec!["agent.*".to_string()],
+        vec!["data.export".to_string(), "executor.*.delete".to_string()],
+        "allow",
+    );
+    data_admin.description = Some("Data-admin agents may export and delete.".to_string());
+    data_admin.conditions = Some(json!({"roles": ["data_admin"]}));
+
+    vec![external, reader, data_admin]
 }
 
 /// Fixed inputs per tool (kept out of the scenario table for readability).

@@ -34,14 +34,9 @@ fn make_context(
 fn make_acl_with_condition(condition_key: &str, condition_value: Value) -> ACL {
     let mut conditions = serde_json::Map::new();
     conditions.insert(condition_key.to_string(), condition_value);
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["*".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: Some(Value::Object(conditions)),
-    };
+    let mut rule = ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow");
+    rule.conditions = Some(Value::Object(conditions));
+
     ACL::new(vec![rule], "deny", None)
 }
 
@@ -264,28 +259,14 @@ async fn test_unknown_condition_fails_closed() {
 
 #[test]
 fn test_empty_callers_matches_nothing() {
-    let rule = ACLRule {
-        approval: None,
-        callers: vec![],
-        targets: vec!["*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    };
+    let rule = ACLRule::new(vec![], vec!["*".to_string()], "allow");
     let acl = ACL::new(vec![rule], "deny", None);
     assert!(!acl.check(Some("anyone"), "target", None));
 }
 
 #[test]
 fn test_empty_targets_matches_nothing() {
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["*".to_string()],
-        targets: vec![],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    };
+    let rule = ACLRule::new(vec!["*".to_string()], vec![], "allow");
     let acl = ACL::new(vec![rule], "deny", None);
     assert!(!acl.check(Some("anyone"), "target", None));
 }
@@ -302,14 +283,11 @@ fn test_audit_logger_via_constructor() {
         logged_clone.lock().unwrap().push(entry.decision.clone());
     };
     let acl = ACL::new(
-        vec![ACLRule {
-            approval: None,
-            callers: vec!["*".to_string()],
-            targets: vec!["*".to_string()],
-            effect: "allow".to_string(),
-            description: None,
-            conditions: None,
-        }],
+        vec![ACLRule::new(
+            vec!["*".to_string()],
+            vec!["*".to_string()],
+            "allow",
+        )],
         "deny",
         Some(Arc::new(audit_fn)),
     );

@@ -194,8 +194,13 @@ pub(crate) async fn emit_event(
 
 /// Default `caller_id` when the `Context` has none (Issue #45.2 — contextual
 /// auditing). Cross-language parity: `apcore-python` and `apcore-typescript`
-/// both fall back to the literal `"@external"` string.
-pub(crate) const DEFAULT_EXTERNAL_CALLER: &str = "@external";
+/// both fall back to the same literal.
+///
+/// Aliases [`crate::acl::EXTERNAL_CALLER`] rather than restating it: the value
+/// an audit record shows for a context-less call and the value the ACL matched
+/// to produce that record are the same identity, and two independent literals
+/// are how they drift apart.
+pub(crate) const DEFAULT_EXTERNAL_CALLER: &str = crate::acl::EXTERNAL_CALLER;
 
 /// Identity attribute names whose values are replaced with `<redacted>` in
 /// audit-event payloads. Mirrors `apcore-python._IDENTITY_SENSITIVE_SUBSTRINGS`
@@ -739,7 +744,7 @@ pub fn register_sys_modules_with_options(
                         if is_ephemeral_module_id(&module_id_owned) {
                             let payload = json!({
                                 "namespace_class": "ephemeral",
-                                "caller_id": "@external",
+                                "caller_id": crate::acl::EXTERNAL_CALLER,
                             });
                             let canonical = ApCoreEvent::with_module(
                                 "apcore.registry.module_registered",
@@ -773,7 +778,7 @@ pub fn register_sys_modules_with_options(
                         if is_ephemeral_module_id(&module_id_owned) {
                             let payload = json!({
                                 "namespace_class": "ephemeral",
-                                "caller_id": "@external",
+                                "caller_id": crate::acl::EXTERNAL_CALLER,
                             });
                             let canonical = ApCoreEvent::with_module(
                                 "apcore.registry.module_unregistered",

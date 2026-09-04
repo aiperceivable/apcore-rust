@@ -187,10 +187,10 @@ impl Step for BuiltinContextCreation {
         // pipeline unmodified (otherwise D-21 cancel-token checks observe a
         // fresh, never-cancelled token).
         if ctx.context.caller_id.is_none() {
-            ctx.context.caller_id = Some("@external".to_string());
+            ctx.context.caller_id = Some(crate::acl::EXTERNAL_CALLER.to_string());
             if ctx.context.identity.is_none() {
                 ctx.context.identity = Some(Identity::new(
-                    "@external".to_string(),
+                    crate::acl::EXTERNAL_CALLER.to_string(),
                     "external".to_string(),
                     vec![],
                     HashMap::new(),
@@ -434,12 +434,9 @@ impl Step for BuiltinACLCheck {
                         emitter.emit(&event).await;
                     }
                 }
-                return Err(ModuleError::new(
-                    ErrorCode::ACLDenied,
-                    format!(
-                        "Access denied: caller '{:?}' cannot access module '{}'",
-                        caller_id, ctx.module_id
-                    ),
+                return Err(ModuleError::acl_denied(
+                    caller_id.as_deref(),
+                    &ctx.module_id,
                 ));
             }
         }

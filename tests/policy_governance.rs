@@ -536,6 +536,45 @@ async fn acl_denied_event() {
         .is_some_and(|s| !s.is_empty()));
 }
 
+/// apcore#37: the denial a real call raises must carry the same recovery
+/// metadata as apcore-python's and apcore-typescript's, not only the code.
+///
+/// Asserted on the error the pipeline actually produces rather than on
+/// `ModuleError::acl_denied` alone: `apcore-a2a` reads `ai_guidance` and the
+/// message off this value when `disclose_refusal_reason` is on, so a
+/// construction site that stopped calling the builder would put a bare denial
+/// back on the wire without failing a unit test.
+#[tokio::test]
+async fn acl_denial_carries_guidance_message_and_recovery_metadata() {
+    let (mut exec, _events, _emitter) = executor_with_emitter(make_registry());
+    exec.set_acl(ACL::new(vec![], "deny", None));
+    let err = exec
+        .call("orders.list_orders", json!({}), None, None)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::ACLDenied);
+    // No `Some("...")`, no `None`. An in-process call carries no caller id, and
+    // the ACL resolved that absence to `@external` before matching — so the
+    // message, the guidance and this denial's AuditEntry all name one identity,
+    // and it is one an operator can write a rule against.
+    assert_eq!(
+        err.message,
+        "Access denied: @external -> orders.list_orders"
+    );
+    assert_eq!(
+        err.ai_guidance.as_deref(),
+        Some(
+            "Access denied for '@external' calling 'orders.list_orders'. Verify the caller has the required role or permission, or try an alternative module with similar functionality."
+        )
+    );
+    // apcore#36: a refusal by policy is terminal, and not fixable by resending
+    // different input.
+    assert_eq!(err.retryable, Some(false));
+    assert_eq!(err.user_fixable, Some(false));
+    assert_eq!(err.details["target_id"], json!("orders.list_orders"));
+}
+
 #[tokio::test]
 async fn acl_denied_event_not_emitted_in_preflight() {
     // validate() runs the ACL step in dry_run — it must NOT emit a denial event.

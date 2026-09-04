@@ -71,17 +71,14 @@ fn rule_of(case: &Value) -> ACLRule {
             .map(|v| v.as_str().expect("pattern is a string").to_string())
             .collect()
     };
-    ACLRule {
-        callers: strings("callers"),
-        targets: strings("targets"),
-        effect: rule["effect"]
+    ACLRule::new(
+        strings("callers"),
+        strings("targets"),
+        rule["effect"]
             .as_str()
             .expect("rule.effect is a string")
             .to_string(),
-        approval: None,
-        description: None,
-        conditions: None,
-    }
+    )
 }
 
 /// Emit the case as a one-rule ACL document.

@@ -16,6 +16,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.29.0] - Unreleased
+
+### BREAKING
+
+- **`ACLRule` is now `#[non_exhaustive]` (apcore#38).** Downstream struct-literal construction no longer compiles — `..Default::default()` included, since that is a struct expression too (`api-surface-conventions.md` §9.1). Build a rule with the new `ACLRule::new` and assign the optional fields afterwards:
+
+  ```rust
+  // Before (0.28.0 and earlier)
+  let rule = ACLRule {
+      callers: vec!["agent.*".to_string()],
+      targets: vec!["data.export".to_string()],
+      effect: "allow".to_string(),
+      approval: None,
+      description: Some("Data-admin agents may export.".to_string()),
+      conditions: Some(json!({ "roles": ["data_admin"] })),
+  };
+
+  // After
+  let mut rule = ACLRule::new(
+      vec!["agent.*".to_string()],
+      vec!["data.export".to_string()],
+      "allow",
+  );
+  rule.description = Some("Data-admin agents may export.".to_string());
+  rule.conditions = Some(json!({ "roles": ["data_admin"] }));
+  ```
+
+  This is a **decision recorded on the type**, which is what apcore#38 asked for and what the three neighbouring spec-derived types in the same file already had. `AccessDecision`, `AuditEntry` and `RuleValidationFinding` carry the attribute; `ACLRule` — the type the spec extends most often and the type downstream constructs most often — was the one it was never applied to, and no record said whether that was a decision or an oversight. It was an oversight, and it has a measured cost: v1.28.0's `approval` field was a hard compile break for `apexe` (5 sites) and `apcore-mcp-rust` (2, recorded verbatim in its own 0.19.0 changelog: *"`ACLRule` is not `#[non_exhaustive]`, so these were compile breaks under the corrected dependency"*).
+
+  The attribute does not undo that break; it prevents the next one. §6.1.5 closed the rule key set in spec v1.27.0 and §6.1.6 added `approval` in v1.28.0, and the spec is still extending the type — so this is the last release in which adding a field to a rule costs downstream a compile error. The migration is the same work v1.28.0 already forced, done once more and for the last time, which is the trade this issue put plainly and which is settled here rather than left open.
+
+  Pinned by a compile-fail test (`tests/compile_fail/acl_rule_non_exhaustive.rs`) rather than by a doc comment alone: a later change that drops the attribute to "let downstream keep its literals" would reopen the hole silently, and a doc comment cannot fail CI.
+
+- **Framework errors now resolve a default `retryable` from their error code (apcore#36).** `ModuleError::new` left the field `None` for every code, so a `RetryMiddleware` installed by the host only ever retried errors that had called `.with_retryable(true)` explicitly. Three codes now default to `Some(true)`: `MODULE_TIMEOUT`, `APPROVAL_TIMEOUT` and `GENERAL_INTERNAL_ERROR`. This is the behaviour apcore-python and apcore-typescript have always had (both gate on `retryable === true` in the same place).
+
+  **Of those three, `RetryMiddleware` will now automatically retry `MODULE_TIMEOUT` and a module-raised `GENERAL_INTERNAL_ERROR`** — both are raised at pipeline step 8 (`BuiltinExecute`), after `BuiltinMiddlewareBefore` at step 6 has registered the middleware. A host that relies on a module timeout *not* being re-attempted — a non-idempotent module without its own guard — should set `max_retries: 0` or override the field with `with_retryable(false)`.
+
+  `APPROVAL_TIMEOUT` is **not** affected despite its new default, and neither is `ACL_DENIED`: the `on_error` chain runs only when `pipe_ctx.executed_middlewares` is non-empty, and the approval gate (step 5) and ACL check (step 4) both precede `BuiltinMiddlewareBefore` (step 6), so no middleware has run when they fail. The field value still matters to every consumer that reads it off the wire — an A2A caller deciding whether to re-request approval — it just does not reach this crate's retry middleware. See the `Fixed` entry below for why the defaults themselves are not optional.
+
+### Added
+
+- **`ACLRule::new(callers, targets, effect)`** — the semantic constructor `api-surface-conventions.md` §9.2 rule 4 requires for a type carrying required fields, and, with `#[non_exhaustive]`, the only construction path available to a downstream crate. `effect` is deliberately not validated here: the closed `allow` / `deny` set is enforced at the three doors that accept a rule — `ACL::load`, `ACL::try_new` and `ACL::try_add_rule` (apcore#111) — so a rule carrying an effect outside the set cannot reach a live ACL by any route, and a rule under construction is not yet a governance decision.
+
+- **`ModuleError::acl_denied(caller_id, target_id)`** — the builder that carries the default AI recovery guidance and the structured `caller_id` / `target_id` detail for an ACL denial, matching what apcore-python's and apcore-typescript's `ACLDeniedError` constructors have always attached. Overridable through `with_ai_guidance`, which is what `setdefault` and `??` buy in those two.
+
+- **`apcore::EXTERNAL_CALLER`** — the `@external` sentinel an absent `caller_id` resolves to (§6.5), previously a bare literal repeated at nine sites across `acl.rs`, `executor.rs`, `builtin_steps.rs` and `sys_modules/`, plus a second private constant holding the same value. It has to agree across four surfaces resolved in different modules — the ACL matcher, the `AuditEntry`, the `ACL_DENIED` message a refused caller reads, and the context `Executor` synthesizes for a context-less call — and a literal drifting apart at one of them is what the `ACL_DENIED` fix below had to correct. Exported so a downstream adapter can stop defining its own copy.
+
+### Fixed
+
+- **`retryable` was never resolved from the error code: 18 of the 19 `error_recovery_metadata` fixture cases diverged (apcore#36).** The fixture states that every language SDK MUST produce a default `retryable` and `user_fixable` per framework error code, and calls both part of the cross-language contract. This binding implemented `user_fixable` and not `retryable`, so every framework error the pipeline raised carried `retryable: None`. The new `retryable_for_code` resolves it in `ModuleError::new`, mirroring the existing `user_fixable_for_code`; `with_retryable` remains the explicit override and `circuit_breaker_open()`'s `.with_retryable(true)` is unchanged.
+
+  The peers resolve this per error *class* (`_default_retryable` in Python, `static DEFAULT_RETRYABLE` in TypeScript). This binding has no error-class hierarchy — one `ModuleError` keyed by `ErrorCode` — which is why the conformance driver previously deferred `retryable` to a class-level test "verified elsewhere": that reasoning transfers from Python, where such a test exists, and there was no elsewhere here. `conformance_error_recovery_metadata_defaults` now asserts **both** fields for all 19 cases, which is what makes the fixture binding rather than half-observed.
+
+  What this restores is the distinction the fixture encodes for governance refusals: `APPROVAL_DENIED` is `false` — a human said no, which is terminal — while `APPROVAL_TIMEOUT` is `true`, because nobody answered and a later attempt may succeed. With both `None`, every adapter above this crate had to re-derive that itself or drop it, and at least one got it wrong by assuming a blanket `false` was safe for all refusals (see aiperceivable/apcore-a2a#2).
+
+  Two tests asserted the divergent value and were corrected with the fix rather than treated as a regression: `test_module_error_not_retryable_by_default` (now `test_module_error_retryable_resolved_from_code`) and `test_module_error_creation` in the integration suite, which asserted the *correct* `user_fixable` on the line below.
+
+- **`ACL_DENIED` carried no default `ai_guidance`, and its message rendered an `Option` with `Debug` (apcore#37).** Two defects at one construction site. An authenticated caller was rendered as ``caller 'Some("api.gateway")'`` in a caller-facing message, and the denial carried none of the recovery guidance both peers attach word for word. Both reach an external caller since `apcore-a2a` 0.6, whose `failure_text` appends `ai_guidance` and discloses the message when `disclose_refusal_reason` is on — so with disclosure enabled a Rust-served refusal said less than a Python- or TypeScript-served one, and leaked a Rust-specific `Debug` rendering while doing it. The message is now `Access denied: api.gateway -> cli.rm`, the shape the peers produce, and the guidance is byte-identical to theirs.
+
+  An unauthenticated caller has no id to print, and the peers each print their own language's null spelling here (`None`, `null`), so there is no cross-language wording to match for that branch. The two surfaces now carry it differently, on purpose: `details.caller_id` stays `null` — the raw wire value, which is what the structured contract pins — while the message and guidance name `@external`, the sentinel `ACL::check_access` resolved that absence to before matching any rule and the one this denial's own `AuditEntry` records. That spelling is load-bearing rather than cosmetic: `@external` is matched as an exact literal, no wildcard reaches it, so guidance telling an agent to "verify the caller has the required role" has to name it for the resulting `callers:` rule to fire at all.
+
+  Scope is `ACL_DENIED` only. `ApprovalDeniedError` and `ApprovalTimeoutError` carry no default guidance in any of the three SDKs, so adding it there is a cross-SDK feature request rather than a parity fix.
+
+- **`retryable_for_code` and `user_fixable_for_code` disagreed about `INVALID_PARENT_ID`.** The `user_fixable` policy deliberately carries one code beyond the fixture; the new `retryable` policy now carries the same one, with the value apcore-python pins on the class. A malformed `parent_id` is fixed by sending a valid one, never by retrying the same call.
+
+- **The `retryable` policy covered 12 of PROTOCOL_SPEC §8.6's 38 classification rows.** The fix above was scoped to the codes `error_recovery_metadata.json` pins, on the reasoning that a value invented on one side of a three-SDK contract is the divergence the policy exists to prevent. That reasoning does not survive reading §8.6: the spec carries a normative table for 38 codes and says implementations **SHOULD** use it as the default, and §9.12.4 goes further with a categorical **MUST** — *"All config errors ... are non-retryable (`retryable = false`)"*. The table was already the authority; the fixture only pins an executable subset of it. Transcribing the remaining rows is not invention.
+
+  Now resolved: the 23 remaining §8.6 `No` rows, `RELOAD_FAILED` as §8.6 `Yes`, and the whole `CONFIG_*` family under §9.12.4 — including `CONFIG_KEY_RESTRICTED`, which is a config error the §9.12.4 table does not list, so a hand-kept list would have been short by one. 31 codes in total, every one of which agrees with both apcore-python and apcore-typescript where those pin a value; there are **no** codes where this crate now contradicts a peer.
+
+  The visible effect is on the wire rather than in the pipeline. `ModuleError.retryable` is `skip_serializing_if = "Option::is_none"`, so an unset code omitted the field entirely while the peers emitted `"retryable": false` — a consumer testing `err.retryable === false` got `undefined` from a Rust-served error and `false` from the other two. In-process, `RetryMiddleware` gates on `retryable == Some(true)`, so `None` and `Some(false)` were already indistinguishable to it and none of the 30 `false` codes changes any behaviour. `RELOAD_FAILED` is the one code that becomes retryable; `Config::reload` is not module execution, so it reaches the retry gate only if a module calls it during `execute` and propagates the error.
+
+  Two §8.6 rows are deliberately **not** carried, and both are pinned by a test so the omission reads as a decision. `MODULE_EXECUTE_ERROR` is §8.6 *"Depends"* — on the module's `annotations.idempotent` — which is exactly what `None` already means here. `EXECUTION_CANCELLED` is §8.6 *"Yes"*, and is the one row that would change behaviour rather than metadata: `CancelToken::check` raises it from **inside** module execution, so unlike `APPROVAL_TIMEOUT` it does reach `RetryMiddleware`, and `Some(true)` would auto-retry a call the caller had just explicitly cancelled. Neither peer implements the code at all, so there is no parity pressure and the question belongs upstream.
+
+  `CIRCUIT_BREAKER_OPEN` and `TASK_LIMIT_EXCEEDED` stay out for a different reason: §8.6 does not list them, and the two peers **disagree** about the first — apcore-python pins `True`, apcore-typescript pins `false` while its own `aiGuidance` on the same class tells the caller to *"wait for the recovery window to elapse before retrying"*. `ModuleError::circuit_breaker_open()` keeps its explicit `.with_retryable(true)`, siding with Python and with TypeScript's own guidance text.
+
+  `test_retryable_for_code_transcribes_the_spec_8_6_table` transcribes all 38 rows row for row — the table is prose in the spec repo, so nothing mechanical kept the map honest before. `test_every_config_error_code_is_non_retryable` sweeps `ErrorCode::ALL` rather than a list, so a config code added later fails until its value is pinned.
+
+---
+
 ## [0.28.0] - 2026-08-31
 
 ### Added

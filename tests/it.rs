@@ -16,6 +16,8 @@
 
 #![allow(clippy::pedantic, clippy::all)] // per-module allows live in each file
 
+#[path = "acl_rule_non_exhaustive_test.rs"]
+mod acl_rule_non_exhaustive_test;
 #[path = "acl_system_spec.rs"]
 mod acl_system_spec;
 #[path = "apcore_client_spec.rs"]

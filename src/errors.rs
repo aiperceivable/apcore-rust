@@ -365,9 +365,146 @@ pub static FRAMEWORK_CODES: std::sync::LazyLock<HashSet<String>> = std::sync::La
         .collect()
 });
 
+/// Declarative `retryable` policy, keyed by error code (single source of
+/// truth). The authority is PROTOCOL_SPEC §8.6's classification table, of which
+/// `apcore/conformance/fixtures/error_recovery_metadata.json` pins an
+/// executable subset; the fixture is what CI compares, the table is what the
+/// map is transcribed from.
+///
+/// - `Some(true)`  — retrying the same call later may succeed, the precondition
+///   being time rather than a corrected input (`APPROVAL_TIMEOUT`: nobody
+///   answered; `MODULE_TIMEOUT`; `GENERAL_INTERNAL_ERROR`).
+/// - `Some(false)` — governance / structural; retrying without changing the
+///   precondition is not useful (`APPROVAL_DENIED`: a human said no, which is
+///   terminal — the distinction from `APPROVAL_TIMEOUT` is the one an
+///   autonomous caller most needs, apcore#36).
+/// - `None`        — left for the module author to supply (business errors,
+///   e.g. `MODULE_EXECUTE_ERROR`); any code not listed here stays unset.
+///
+/// **Structural difference from the peers, deliberate.** apcore-python resolves
+/// this per error *class* (`_default_retryable`, via the `_UNSET` sentinel in
+/// `ModuleError.__init__`) and apcore-typescript per class as well
+/// (`static DEFAULT_RETRYABLE`, read off `this.constructor`). This binding has
+/// no error-class hierarchy — one `ModuleError` keyed by [`ErrorCode`] — so the
+/// policy is keyed by code instead, which is also why the fixture is the only
+/// place the two shapes can be compared and why
+/// `conformance_error_recovery_metadata_defaults` asserts every case rather
+/// than deferring to a class-level test that has nowhere to live here.
+///
+/// **Scope.** Every code PROTOCOL_SPEC §8.6's classification table pins, plus
+/// the `CONFIG_*` family §9.12.4 covers with a categorical **MUST** ("All
+/// config errors ... are non-retryable"), plus the extras
+/// [`user_fixable_for_code`] already carries so the two fields never disagree
+/// about a code one of them knows. Codes outside all three stay `None`: the
+/// peers default a further tail to `false` per class, but a value invented on
+/// one side of a three-SDK contract is the divergence this function exists to
+/// prevent, and §8.6 is the authority that makes the rest transcription rather
+/// than invention.
+///
+/// Two §8.6 rows are deliberately **not** carried:
+/// - `EXECUTION_CANCELLED` (§8.6 "Yes"). Neither peer implements it, and here
+///   it is the one row that would change behaviour rather than metadata:
+///   [`crate::CancelToken::check`] raises it from inside module execution, so
+///   it reaches [`crate::middleware::RetryMiddleware`]'s gate and `Some(true)`
+///   would auto-retry a call the caller had just explicitly cancelled.
+/// - `MODULE_EXECUTE_ERROR` (§8.6 "Depends" — on the module's
+///   `annotations.idempotent`), which is exactly what `None` means here.
+///
+/// Not part of the public crate API: `pub` only so integration tests in `tests/`
+/// can assert fixture↔source parity; hidden from rustdoc.
+#[doc(hidden)]
+#[must_use]
+pub fn retryable_for_code(code: ErrorCode) -> Option<bool> {
+    // One arm per value rather than one per semantic group: `clippy::match_same_arms`
+    // rejects the grouped form, so the grouping lives in the comments inside the
+    // chain, which is where `INVALID_PARENT_ID` already carried its rationale.
+    match code {
+        // §8.6 "Yes" — the missing precondition is time, so the same call sent
+        // later may succeed without the caller changing anything.
+        // `RELOAD_FAILED` is raised by `Config::reload`, never by module
+        // execution, so it carries the annotation without reaching the retry
+        // gate.
+        ErrorCode::ApprovalTimeout
+        | ErrorCode::ModuleTimeout
+        | ErrorCode::GeneralInternalError
+        | ErrorCode::ReloadFailed => Some(true),
+
+        // §8.6 "No", grouped by why retrying cannot help.
+        //
+        // Input faults: the caller fixes what it sends, not when it sends.
+        ErrorCode::SchemaValidationError
+        | ErrorCode::GeneralInvalidInput
+        | ErrorCode::SchemaUnionNoMatch
+        | ErrorCode::SchemaUnionAmbiguous
+        // Not in §8.6; carried because `user_fixable_for_code` carries it, and
+        // apcore-python pins the same value on the class
+        // (`InvalidParentIdError._default_retryable = False`). A caller that
+        // sent a malformed `parent_id` fixes it by sending a valid one, never
+        // by retrying the same call.
+        | ErrorCode::InvalidParentId
+        // Governance: a decision, not a transient condition. The distinction
+        // between `APPROVAL_DENIED` (a human said no — terminal) and
+        // `APPROVAL_TIMEOUT` (nobody answered — retryable) is the one an
+        // autonomous caller most needs (apcore#36). `APPROVAL_PENDING` is
+        // non-retryable because the caller should poll, not re-submit.
+        | ErrorCode::ACLDenied
+        | ErrorCode::ACLRuleError
+        | ErrorCode::ApprovalDenied
+        | ErrorCode::ApprovalPending
+        | ErrorCode::ModuleDisabled
+        // Call-chain structure: retrying reproduces the same chain.
+        | ErrorCode::CallDepthExceeded
+        | ErrorCode::CircularCall
+        | ErrorCode::CallFrequencyExceeded
+        // Resolution and wiring: needs a deployment or code change.
+        | ErrorCode::ModuleNotFound
+        | ErrorCode::ModuleLoadError
+        | ErrorCode::VersionConstraintInvalid
+        | ErrorCode::VersionIncompatible
+        | ErrorCode::DependencyNotFound
+        | ErrorCode::DependencyVersionMismatch
+        | ErrorCode::CircularDependency
+        | ErrorCode::ErrorCodeCollision
+        | ErrorCode::MiddlewareChainError
+        // Schema definition faults: the schema is wrong, not the moment.
+        | ErrorCode::SchemaNotFound
+        | ErrorCode::SchemaParseError
+        | ErrorCode::SchemaCircularRef
+        | ErrorCode::SchemaMaxDepthExceeded
+        // Binding faults: the binding declaration needs fixing.
+        | ErrorCode::BindingInvalidTarget
+        | ErrorCode::BindingModuleNotFound
+        | ErrorCode::BindingCallableNotFound
+        | ErrorCode::BindingNotCallable
+        | ErrorCode::BindingFileInvalid
+        | ErrorCode::BindingSchemaMissing
+        | ErrorCode::BindingSchemaInferenceFailed
+        | ErrorCode::BindingSchemaModeConflict
+        | ErrorCode::BindingStrictSchemaIncompatible
+        // Authoring faults: the module's own signature needs a developer.
+        | ErrorCode::FuncMissingTypeHint
+        | ErrorCode::FuncMissingReturnType
+        // §9.12.4: every config error is non-retryable. `CONFIG_KEY_RESTRICTED`
+        // is not a table row but is a config error, so the categorical MUST
+        // reaches it too.
+        | ErrorCode::ConfigNotFound
+        | ErrorCode::ConfigInvalid
+        | ErrorCode::ConfigNamespaceDuplicate
+        | ErrorCode::ConfigNamespaceReserved
+        | ErrorCode::ConfigEnvPrefixConflict
+        | ErrorCode::ConfigMountError
+        | ErrorCode::ConfigBindError
+        | ErrorCode::ConfigEnvMapConflict
+        | ErrorCode::ConfigKeyRestricted => Some(false),
+
+        // Unlisted codes (e.g. MODULE_EXECUTE_ERROR, EXECUTION_CANCELLED) stay
+        // unset — see the scope note above.
+        _ => None,
+    }
+}
+
 /// Declarative `user_fixable` policy, keyed by error code (single source of
-/// truth; kept in lock-step with `apcore/conformance/fixtures/error_recovery_metadata.json`
-/// so the language SDKs agree).
+/// truth; kept in lock-step with the same fixture as [`retryable_for_code`]).
 ///
 /// - `Some(true)`  — the caller can resolve it by changing the input or
 ///   configuration they sent.
@@ -376,12 +513,10 @@ pub static FRAMEWORK_CODES: std::sync::LazyLock<HashSet<String>> = std::sync::La
 /// - `None`        — left for the module author to supply (business errors,
 ///   e.g. `MODULE_EXECUTE_ERROR`); any code not listed here stays unset.
 ///
-/// Mirrors apcore-python `_USER_FIXABLE_BY_CODE` and the resolution performed in
-/// `ModuleError.__init__`.
-///
-/// Not part of the public crate API: `pub` only so integration tests in `tests/`
-/// can assert fixture↔source parity; hidden from rustdoc. Mirrors Python's private
-/// `_USER_FIXABLE_BY_CODE` and TypeScript's `@internal` `USER_FIXABLE_BY_CODE`.
+/// Mirrors apcore-python's private `_USER_FIXABLE_BY_CODE` and TypeScript's
+/// `@internal` `USER_FIXABLE_BY_CODE` — both of which are keyed by code, unlike
+/// `retryable`; see [`retryable_for_code`] for that asymmetry and for the
+/// visibility note that applies to this function too.
 #[doc(hidden)]
 #[must_use]
 pub fn user_fixable_for_code(code: ErrorCode) -> Option<bool> {
@@ -445,12 +580,14 @@ impl ModuleError {
             cause: None,
             trace_id: None,
             timestamp: Utc::now(),
-            retryable: None,
+            // Both recovery fields resolve their framework-deterministic
+            // default from the error code (single source of truth:
+            // `retryable_for_code` / `user_fixable_for_code`), and an explicit
+            // value still overrides via `with_retryable` / `with_user_fixable`.
+            // Mirrors apcore-python `ModuleError.__init__`, which resolves
+            // `user_fixable` from `code` and `retryable` from the error class.
+            retryable: retryable_for_code(code),
             ai_guidance: None,
-            // Resolve the framework-deterministic default from the error code
-            // (single source of truth: `user_fixable_for_code`). An explicit
-            // value still overrides via `with_user_fixable`. Mirrors apcore-python
-            // `ModuleError.__init__` resolving `user_fixable` from `code`.
             user_fixable: user_fixable_for_code(code),
             suggestion: None,
         }
@@ -520,6 +657,54 @@ impl ModuleError {
             "The input was malformed or missing required fields. Check the values against the \
              module's input_schema and retry with corrected input.",
         )
+    }
+
+    /// Builder for `ACL_DENIED` carrying the default AI recovery guidance and
+    /// the structured caller/target detail (apcore#37).
+    ///
+    /// Mirrors apcore-python `ACLDeniedError` and apcore-typescript
+    /// `ACLDeniedError`, which supply the same guidance text word for word (via
+    /// `setdefault` and `??` respectively) and the same
+    /// `Access denied: {caller} -> {target}` message shape. The guidance
+    /// remains overridable through [`Self::with_ai_guidance`], which is what
+    /// those two defaulting forms buy in a language with keyword arguments.
+    /// Both reach an external caller: `apcore-a2a` appends `ai_guidance` to the
+    /// failure text when `disclose_refusal_reason` is on, and discloses the
+    /// message itself.
+    ///
+    /// The two surfaces carry the absent caller differently, on purpose.
+    /// `details.caller_id` is the **raw wire value** — `null` for an
+    /// unauthenticated caller, which is what both peers put there and what the
+    /// cross-language contract pins. The message and guidance name the
+    /// **resolved sentinel** `@external`, which is the identity the ACL itself
+    /// matched: [`ACL::check_access`](crate::acl::ACL::check_access) resolves a
+    /// `None` caller to `@external` before evaluating any rule, and the
+    /// `AuditEntry` for this very denial records `@external` too.
+    ///
+    /// Naming it anything else makes the guidance actively wrong rather than
+    /// merely vague. `@external` is matched as an exact literal — no wildcard
+    /// reaches it — so an operator or agent acting on "verify the caller has
+    /// the required role" needs that exact spelling to write a rule that fires.
+    /// A prose-only word like "anonymous" would send them to a `callers:`
+    /// pattern the matcher can never produce.
+    #[must_use]
+    pub fn acl_denied(caller_id: Option<&str>, target_id: &str) -> Self {
+        // INVARIANT: the same sentinel `ACL::check_inner` resolves `None` to
+        // before matching, and the one `build_audit_entry` records. Keep the
+        // three surfaces (audit, message, guidance) naming one identity.
+        let caller = caller_id.unwrap_or(crate::acl::EXTERNAL_CALLER);
+        let mut details = HashMap::new();
+        details.insert("caller_id".to_string(), serde_json::json!(caller_id));
+        details.insert("target_id".to_string(), serde_json::json!(target_id));
+        Self::new(
+            ErrorCode::ACLDenied,
+            format!("Access denied: {caller} -> {target_id}"),
+        )
+        .with_details(details)
+        .with_ai_guidance(format!(
+            "Access denied for '{caller}' calling '{target_id}'. Verify the caller has the \
+             required role or permission, or try an alternative module with similar functionality."
+        ))
     }
 
     #[must_use]

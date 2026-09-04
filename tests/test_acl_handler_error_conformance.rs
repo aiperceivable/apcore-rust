@@ -161,14 +161,9 @@ fn build_rule(rule: &Value) -> ACLRule {
     // §6.1.1 case 5 is exactly that shape, and coercing it to `None` here would
     // quietly turn the case under test into a rule with no conditions at all.
     let conditions = rule.get("conditions").cloned();
-    ACLRule {
-        approval: None,
-        callers,
-        targets,
-        effect,
-        description: None,
-        conditions,
-    }
+    let mut built = ACLRule::new(callers, targets, effect);
+    built.conditions = conditions;
+    built
 }
 
 /// The condition paths named by a `handler_error` string.
@@ -439,14 +434,8 @@ fn unknown_condition_key_resolves_toward_refusing_access() {
     for (effect, default_effect, expected) in cases {
         let mut conditions = Map::new();
         conditions.insert(unknown_key.to_string(), Value::Bool(true));
-        let rule = ACLRule {
-            approval: None,
-            callers: vec!["*".to_string()],
-            targets: vec!["*".to_string()],
-            effect: effect.to_string(),
-            description: None,
-            conditions: Some(Value::Object(conditions)),
-        };
+        let mut rule = ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], effect);
+        rule.conditions = Some(Value::Object(conditions));
 
         let captured: Arc<Mutex<Vec<AuditEntry>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_logger = Arc::clone(&captured);

@@ -131,13 +131,29 @@ async fn test_retry_middleware_skips_non_retryable() {
         vec![],
         HashMap::default(),
     ));
-    let error = ModuleError::new(ErrorCode::ModuleExecuteError, "fail");
-    // error.retryable is None (not explicitly retryable)
+    // A code the policy resolves to Some(false) — a governance refusal, which
+    // is the shape this test exists to refuse. `MODULE_EXECUTE_ERROR` alone
+    // would only prove the `None` branch, and since apcore#36 that is no longer
+    // the only non-retryable shape.
+    let error = ModuleError::new(ErrorCode::ACLDenied, "denied");
+    assert_eq!(error.retryable, Some(false), "precondition");
     let result = mw
         .on_error("test.mod", json!({}), &error, &ctx)
         .await
         .unwrap();
     assert!(result.is_none(), "Should not retry non-retryable errors");
+
+    // The other non-retryable shape: left unset for the module author.
+    let unset = ModuleError::new(ErrorCode::ModuleExecuteError, "fail");
+    assert_eq!(unset.retryable, None, "precondition");
+    let result = mw
+        .on_error("test.mod", json!({}), &unset, &ctx)
+        .await
+        .unwrap();
+    assert!(
+        result.is_none(),
+        "Should not retry errors with retryable unset"
+    );
 }
 
 #[tokio::test]

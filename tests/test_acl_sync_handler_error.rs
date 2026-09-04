@@ -44,14 +44,8 @@ fn make_acl_capturing(captured: Arc<Mutex<Vec<AuditEntry>>>) -> ACL {
 
     let mut conditions = serde_json::Map::new();
     conditions.insert("_throwing_rs".to_string(), json!(true));
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["*".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: Some(Value::Object(conditions)),
-    };
+    let mut rule = ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow");
+    rule.conditions = Some(Value::Object(conditions));
 
     let mut acl = ACL::new(vec![rule], "deny", None);
     acl.set_audit_logger(move |entry: &AuditEntry| {

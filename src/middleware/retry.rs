@@ -318,6 +318,14 @@ mod tests {
         assert!(!RETRY_COUNT_BASE.scoped("mod.a").exists(&ctx));
     }
 
+    /// The gate is `retryable != Some(true)`, so BOTH non-retryable shapes must
+    /// be refused: a code the policy resolves to `Some(false)`, and a code it
+    /// leaves `None` for the module author.
+    ///
+    /// Before apcore#36 every `ModuleError::new` carried `None`, so a test that
+    /// used `MODULE_EXECUTE_ERROR` alone covered the whole space. It no longer
+    /// does — `Some(false)` is now reachable and is the shape a governance
+    /// refusal takes.
     #[tokio::test]
     async fn test_on_error_non_retryable_returns_none() {
         let mw = RetryMiddleware::new(RetryConfig {
@@ -328,9 +336,106 @@ mod tests {
             jitter: false,
         });
         let ctx = Context::<serde_json::Value>::anonymous();
-        let err = ModuleError::new(ErrorCode::ModuleExecuteError, "fail");
-        let result = mw.on_error("mod.a", json!({}), &err, &ctx).await.unwrap();
-        assert_eq!(result, None);
+
+        // Resolved to Some(false) from the code — a refusal, terminal by policy.
+        let denied = ModuleError::new(ErrorCode::ACLDenied, "denied");
+        assert_eq!(denied.retryable, Some(false), "precondition");
+        let result = mw
+            .on_error("mod.a", json!({}), &denied, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result, None, "a Some(false) code must not be retried");
+
+        // Left unset for the module author to supply.
+        let unset = ModuleError::new(ErrorCode::ModuleExecuteError, "fail");
+        assert_eq!(unset.retryable, None, "precondition");
+        let result = mw.on_error("mod.a", json!({}), &unset, &ctx).await.unwrap();
+        assert_eq!(result, None, "an unset code must not be retried");
+
+        assert_eq!(
+            RetryMiddleware::retry_count(&ctx, "mod.a"),
+            0,
+            "neither refusal may consume a retry budget"
+        );
+    }
+
+    /// apcore#36 declared this as a BREAKING behaviour change: a `MODULE_TIMEOUT`
+    /// now resolves to `retryable: Some(true)` from its code alone, so a host
+    /// with `RetryMiddleware` installed re-runs the pipeline for it without ever
+    /// calling `with_retryable`. Pinned here because the release note promises
+    /// it and nothing else asserts it.
+    ///
+    /// `GENERAL_INTERNAL_ERROR` is checked alongside it — the other of the two
+    /// newly-`true` codes that can actually reach this gate (both are raised at
+    /// step 8, after `BuiltinMiddlewareBefore` at step 6).
+    #[tokio::test]
+    async fn test_on_error_retries_codes_the_policy_now_defaults_to_retryable() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 3,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+        });
+        let inputs = json!({"key": "val"});
+
+        for code in [ErrorCode::ModuleTimeout, ErrorCode::GeneralInternalError] {
+            let ctx = Context::<serde_json::Value>::anonymous();
+            // No `.with_retryable(true)` anywhere — the code alone decides.
+            let err = ModuleError::new(code, "boom");
+            assert_eq!(err.retryable, Some(true), "precondition for {code:?}");
+
+            let result = mw
+                .on_error("mod.a", inputs.clone(), &err, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                Some(inputs.clone()),
+                "{code:?} must be retried on its code-derived default alone"
+            );
+            assert_eq!(RetryMiddleware::retry_count(&ctx, "mod.a"), 1);
+        }
+    }
+
+    /// `with_retryable` must beat the code-derived default in BOTH directions.
+    /// Every other override site in the suite uses `MODULE_EXECUTE_ERROR`, whose
+    /// default is `None` — that exercises "set from unset", not "override".
+    #[tokio::test]
+    async fn test_with_retryable_overrides_a_resolved_default() {
+        let mw = RetryMiddleware::new(RetryConfig {
+            max_retries: 3,
+            strategy: "fixed".to_string(),
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+        });
+
+        // Some(false) -> true: the host opts a refusal back in.
+        let ctx = Context::<serde_json::Value>::anonymous();
+        let forced_on = ModuleError::new(ErrorCode::ACLDenied, "denied").with_retryable(true);
+        assert_eq!(forced_on.retryable, Some(true));
+        let result = mw
+            .on_error("mod.a", json!({}), &forced_on, &ctx)
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "explicit true must beat a Some(false) code"
+        );
+
+        // Some(true) -> false: the documented opt-out for a non-idempotent module.
+        let ctx = Context::<serde_json::Value>::anonymous();
+        let forced_off = ModuleError::new(ErrorCode::ModuleTimeout, "slow").with_retryable(false);
+        assert_eq!(forced_off.retryable, Some(false));
+        let result = mw
+            .on_error("mod.a", json!({}), &forced_off, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            result, None,
+            "explicit false must beat a Some(true) code — the CHANGELOG's opt-out"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! Tests for ModuleError and ErrorCode.
 
-use apcore::errors::{ErrorCode, ModuleError};
+use apcore::errors::{retryable_for_code, user_fixable_for_code, ErrorCode, ModuleError};
 
 // ---------------------------------------------------------------------------
 // ErrorCode
@@ -92,9 +92,195 @@ fn test_module_error_basic_fields() {
 }
 
 #[test]
-fn test_module_error_not_retryable_by_default() {
+fn test_module_error_retryable_resolved_from_code() {
     let err = ModuleError::new(ErrorCode::GeneralInternalError, "oops");
-    assert_eq!(err.retryable, None);
+    assert_eq!(err.retryable, Some(true));
+
+    let acl_denied = ModuleError::new(ErrorCode::ACLDenied, "no");
+    assert_eq!(acl_denied.retryable, Some(false));
+
+    let unset = ModuleError::new(ErrorCode::ModuleExecuteError, "boom");
+    assert_eq!(unset.retryable, None);
+}
+
+#[test]
+fn test_retryable_for_code_matches_governance_timeout_semantics() {
+    // The distinction an autonomous caller most needs: a human said no
+    // (terminal) versus nobody answered (a later attempt may succeed).
+    assert_eq!(retryable_for_code(ErrorCode::ApprovalDenied), Some(false));
+    assert_eq!(retryable_for_code(ErrorCode::ApprovalTimeout), Some(true));
+}
+
+#[test]
+fn test_retryable_for_code_covers_the_same_extras_as_user_fixable() {
+    // `INVALID_PARENT_ID` is the one code carried beyond PROTOCOL_SPEC §8.6 and
+    // the §9.12.4 config family. The two policies must not disagree about a
+    // code either of them knows, and apcore-python pins the same value on the
+    // class.
+    assert_eq!(retryable_for_code(ErrorCode::InvalidParentId), Some(false));
+    assert_eq!(
+        user_fixable_for_code(ErrorCode::InvalidParentId),
+        Some(true)
+    );
+}
+
+/// PROTOCOL_SPEC §8.6's classification table, transcribed row for row.
+///
+/// The table is prose in the spec repo, so nothing mechanical keeps this map
+/// honest — this test is that mechanism. A row here that stops matching means
+/// either the spec moved (update both) or the map drifted (fix the map).
+#[test]
+fn test_retryable_for_code_transcribes_the_spec_8_6_table() {
+    // §8.6 "Yes" — the missing precondition is time.
+    for code in [
+        ErrorCode::ModuleTimeout,
+        ErrorCode::GeneralInternalError,
+        ErrorCode::ApprovalTimeout,
+        ErrorCode::ReloadFailed,
+    ] {
+        assert_eq!(
+            retryable_for_code(code),
+            Some(true),
+            "{code:?} is §8.6 \"Yes\""
+        );
+    }
+
+    // §8.6 "No" — retrying reproduces the same failure.
+    for code in [
+        ErrorCode::ConfigNotFound,
+        ErrorCode::ConfigInvalid,
+        ErrorCode::ACLRuleError,
+        ErrorCode::ACLDenied,
+        ErrorCode::ApprovalDenied,
+        ErrorCode::ApprovalPending,
+        ErrorCode::ModuleNotFound,
+        ErrorCode::ModuleDisabled,
+        ErrorCode::ModuleLoadError,
+        ErrorCode::SchemaValidationError,
+        ErrorCode::SchemaNotFound,
+        ErrorCode::SchemaParseError,
+        ErrorCode::SchemaCircularRef,
+        ErrorCode::SchemaMaxDepthExceeded,
+        ErrorCode::SchemaUnionNoMatch,
+        ErrorCode::SchemaUnionAmbiguous,
+        ErrorCode::CallDepthExceeded,
+        ErrorCode::CircularCall,
+        ErrorCode::CallFrequencyExceeded,
+        ErrorCode::GeneralInvalidInput,
+        ErrorCode::FuncMissingTypeHint,
+        ErrorCode::FuncMissingReturnType,
+        ErrorCode::BindingInvalidTarget,
+        ErrorCode::BindingModuleNotFound,
+        ErrorCode::BindingCallableNotFound,
+        ErrorCode::BindingNotCallable,
+        ErrorCode::BindingSchemaMissing,
+        ErrorCode::BindingFileInvalid,
+        ErrorCode::CircularDependency,
+        ErrorCode::MiddlewareChainError,
+        ErrorCode::VersionIncompatible,
+        ErrorCode::ErrorCodeCollision,
+    ] {
+        assert_eq!(
+            retryable_for_code(code),
+            Some(false),
+            "{code:?} is §8.6 \"No\""
+        );
+    }
+
+    // §8.6 "Depends" (on `annotations.idempotent`) is exactly what `None` means
+    // here: the framework declines to answer and the module author supplies it.
+    assert_eq!(retryable_for_code(ErrorCode::ModuleExecuteError), None);
+}
+
+/// PROTOCOL_SPEC §9.12.4: "All config errors ... are non-retryable
+/// (`retryable = false`)".
+///
+/// Swept over [`ErrorCode::ALL`] rather than listed, so a config code added
+/// later fails here until its `retryable` is pinned — the categorical MUST is
+/// what makes that the right default, and `CONFIG_KEY_RESTRICTED` (a config
+/// error the §9.12.4 table does not list) is why a hand-kept list would have
+/// already been short by one.
+#[test]
+fn test_every_config_error_code_is_non_retryable() {
+    let mut checked = 0_usize;
+    for &code in ErrorCode::ALL {
+        if !code.wire_str().starts_with("CONFIG_") {
+            continue;
+        }
+        checked += 1;
+        assert_eq!(
+            retryable_for_code(code),
+            Some(false),
+            "{} is a config error: §9.12.4 requires retryable = false",
+            code.wire_str()
+        );
+    }
+    assert!(
+        checked >= 9,
+        "expected the whole CONFIG_* family, saw {checked}"
+    );
+}
+
+/// `EXECUTION_CANCELLED` is §8.6 "Yes" and is nevertheless left unset.
+///
+/// Neither peer implements it, and here it is the one §8.6 row that would
+/// change behaviour rather than metadata: `CancelToken::check` raises it from
+/// inside module execution, so it reaches `RetryMiddleware`'s
+/// `retryable == Some(true)` gate and the annotation would auto-retry a call
+/// the caller had just explicitly cancelled. Pinned as a test so the omission
+/// reads as a decision rather than an oversight.
+#[test]
+fn test_execution_cancelled_retryable_is_deliberately_unset() {
+    assert_eq!(retryable_for_code(ErrorCode::ExecutionCancelled), None);
+}
+
+#[test]
+fn test_acl_denied_default_guidance_and_plain_caller_message() {
+    let err = ModuleError::acl_denied(Some("api.gateway"), "cli.rm");
+    assert_eq!(err.message, "Access denied: api.gateway -> cli.rm");
+    assert_eq!(
+        err.ai_guidance.as_deref(),
+        Some(
+            "Access denied for 'api.gateway' calling 'cli.rm'. Verify the caller has the required role or permission, or try an alternative module with similar functionality."
+        )
+    );
+    // Structured detail, as apcore-python and apcore-typescript both attach.
+    assert_eq!(err.details["caller_id"], serde_json::json!("api.gateway"));
+    assert_eq!(err.details["target_id"], serde_json::json!("cli.rm"));
+    assert_eq!(err.retryable, Some(false));
+    assert_eq!(err.user_fixable, Some(false));
+}
+
+#[test]
+fn test_acl_denied_absent_caller_names_the_sentinel_the_acl_matched() {
+    // An unauthenticated caller has no id, but it is not unidentified to the
+    // ACL: `check_access` resolves `None` to `@external` before matching, and
+    // the AuditEntry for this denial records `@external`. The prose names that
+    // same identity so the guidance points at a rule an operator can actually
+    // write (`@external` is matched as an exact literal — no wildcard reaches
+    // it). `details.caller_id` stays null: that is the raw wire value, and it
+    // is what both peers put there.
+    let err = ModuleError::acl_denied(None, "cli.rm");
+    assert_eq!(err.message, "Access denied: @external -> cli.rm");
+    assert_eq!(
+        err.ai_guidance.as_deref(),
+        Some(
+            "Access denied for '@external' calling 'cli.rm'. Verify the caller has the required role or permission, or try an alternative module with similar functionality."
+        )
+    );
+    assert_eq!(err.details["caller_id"], serde_json::Value::Null);
+    assert_eq!(err.details["target_id"], serde_json::json!("cli.rm"));
+
+    // The spelling is the crate's one sentinel, not a literal typed twice.
+    assert_eq!(apcore::EXTERNAL_CALLER, "@external");
+    assert!(err.message.contains(apcore::EXTERNAL_CALLER));
+}
+
+#[test]
+fn test_acl_denied_guidance_can_be_overridden() {
+    let err = ModuleError::acl_denied(Some("api.gateway"), "cli.rm")
+        .with_ai_guidance("use a safer module");
+    assert_eq!(err.ai_guidance.as_deref(), Some("use a safer module"));
 }
 
 #[test]
@@ -310,4 +496,36 @@ fn test_all_codes_retains_framework_after_module_register() {
     reg.register("m", &code_set(&["MY_CUSTOM_CODE"])).unwrap();
     assert!(reg.all_codes().contains("MY_CUSTOM_CODE"));
     assert!(reg.all_codes().contains("SCHEMA_VALIDATION_ERROR"));
+}
+
+/// apcore#36: `CIRCUIT_BREAKER_OPEN` is deliberately absent from
+/// `retryable_for_code` — the fixture does not pin it, and the policy stays
+/// fixture-scoped. Its `retryable: true` therefore rests entirely on the
+/// builder's explicit `.with_retryable(true)`, which is exactly the kind of
+/// value that disappears unnoticed when the builder is refactored.
+///
+/// The peers set it on the class (`CircuitBreakerOpenError._default_retryable
+/// = True`, `static DEFAULT_RETRYABLE = true`), so this is the one code whose
+/// cross-language agreement is carried by a call site rather than by a table.
+#[test]
+fn test_circuit_breaker_open_is_retryable_via_the_builder_not_the_code() {
+    // The code alone resolves to nothing — the builder is load-bearing here.
+    assert_eq!(retryable_for_code(ErrorCode::CircuitBreakerOpen), None);
+    assert_eq!(
+        ModuleError::new(ErrorCode::CircuitBreakerOpen, "open").retryable,
+        None
+    );
+
+    let err = ModuleError::circuit_breaker_open("billing.charge", "api.gateway");
+    assert_eq!(err.code, ErrorCode::CircuitBreakerOpen);
+    assert_eq!(
+        err.retryable,
+        Some(true),
+        "the circuit re-probes after the recovery window, so the call may succeed later"
+    );
+    assert_eq!(
+        err.details["module_id"],
+        serde_json::json!("billing.charge")
+    );
+    assert_eq!(err.details["caller_id"], serde_json::json!("api.gateway"));
 }

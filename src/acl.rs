@@ -48,6 +48,23 @@ const EFFECTS: &[&str] = &["allow", "deny"];
 /// is better served by "not implemented" than by "unknown key".
 const RESERVED_RULE_KEYS: &[&str] = &["id", "actions", "priority"];
 
+/// The caller identity an absent `caller_id` resolves to (PROTOCOL_SPEC §6.5).
+///
+/// A call that carries no caller — an inbound external request, or an
+/// in-process call made without a context — is not *unidentified* to the ACL:
+/// it is identified as external, and rules are written against that. The
+/// sentinel is matched as an **exact literal** by [`ACL::match_acl_pattern`];
+/// no wildcard reaches it, so an operator granting external access must write
+/// `callers: ["@external"]` verbatim.
+///
+/// Named rather than spelled inline because it has to agree across four
+/// surfaces that are resolved in different modules — the ACL matcher, the
+/// `AuditEntry` this crate writes, the `ACL_DENIED` error message a refused
+/// caller reads, and the synthesized context `Executor` builds for a
+/// context-less call. A literal drifting apart at one of them produced
+/// apcore#37's follow-up: guidance that named an identity no rule could match.
+pub const EXTERNAL_CALLER: &str = "@external";
+
 /// Reject any rule key outside [`RULE_KEYS`].
 fn reject_unknown_rule_keys(
     index: usize,
@@ -137,7 +154,31 @@ impl Default for ApprovalRequirement {
 }
 
 /// Defines an access control rule.
+///
+/// # Construction policy (apcore#38)
+///
+/// This type is `#[non_exhaustive]`, which is the decision this attribute
+/// records: **the spec may add a field to a rule in any minor release, and doing
+/// so must not break a downstream crate.** §6.1.5 closed the rule key set in
+/// spec v1.27.0 and §6.1.6 added `approval` in v1.28.0; more will follow, and
+/// the attribute is what makes the *next* one additive rather than a compile
+/// break for everyone who builds a rule in code.
+///
+/// The cost is paid once, here: `#[non_exhaustive]` removes struct-expression
+/// construction for every crate except this one, `..Default::default()`
+/// included (`api-surface-conventions.md` §9.1). Downstream builds a rule
+/// through [`ACLRule::new`] and assigns the optional fields afterwards, which
+/// is the same shape [`AccessDecision::new`], [`RuleValidationFinding::new`]
+/// and [`Change`](crate::Change) already use, and the form §9.3 names as the
+/// only one that compiles across a package boundary.
+///
+/// The three neighbours in this file — [`AccessDecision`], [`AuditEntry`] and
+/// [`RuleValidationFinding`] — carry the attribute for the same reason
+/// (apcore#24). `ACLRule` was the one spec-derived type it was never applied
+/// to, which is what made v1.28.0's `approval` a hard break for `apexe` and
+/// `apcore-mcp-rust`; that is now closed rather than left as an oversight.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ACLRule {
     #[serde(default)]
     pub callers: Vec<String>,
@@ -165,6 +206,46 @@ pub struct ACLRule {
 }
 
 impl ACLRule {
+    /// Build a rule from its three required fields
+    /// (`api-surface-conventions.md` §9.2 rule 4).
+    ///
+    /// The type is `#[non_exhaustive]`, so this is the only construction path
+    /// available to a downstream crate. `approval`, `description` and
+    /// `conditions` are left unset and assigned on the returned value — the
+    /// form §9.3 names as the one that compiles from outside this crate.
+    ///
+    /// `effect` is **not** validated here. The closed `allow` / `deny` set is
+    /// enforced at the three doors that accept a rule — [`ACL::load`],
+    /// [`ACL::try_new`] and [`ACL::try_add_rule`] (apcore#111) — so a rule
+    /// carrying an effect outside the set cannot reach a live ACL by any route,
+    /// and a rule under construction is not yet a governance decision.
+    ///
+    /// ```
+    /// use apcore::ACLRule;
+    ///
+    /// let mut rule = ACLRule::new(
+    ///     vec!["agent.*".to_string()],
+    ///     vec!["data.export".to_string()],
+    ///     "allow",
+    /// );
+    /// rule.description = Some("Data-admin agents may export.".to_string());
+    /// rule.conditions = Some(serde_json::json!({ "roles": ["data_admin"] }));
+    ///
+    /// assert_eq!(rule.effect, "allow");
+    /// assert!(!rule.approval_required());
+    /// ```
+    #[must_use]
+    pub fn new(callers: Vec<String>, targets: Vec<String>, effect: impl Into<String>) -> Self {
+        Self {
+            callers,
+            targets,
+            effect: effect.into(),
+            approval: None,
+            description: None,
+            conditions: None,
+        }
+    }
+
     /// Whether this rule requires a human decision for the calls it matches
     /// (PROTOCOL_SPEC §6.1.6).
     ///
@@ -1163,7 +1244,7 @@ impl ACL {
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> AccessDecision {
-        let caller = caller_id.unwrap_or("@external");
+        let caller = caller_id.unwrap_or(EXTERNAL_CALLER);
 
         // Snapshot rules + default_effect before evaluation so any concurrent
         // add_rule/reload caller (wrapped in Arc<RwLock<ACL>> by the user) does
@@ -1646,8 +1727,8 @@ impl ACL {
     /// Pattern matching for ACL patterns. Handles `@external`, `@system`, and
     /// delegates to `match_pattern()` for wildcard/glob matching.
     fn match_acl_pattern(pattern: &str, value: &str) -> bool {
-        if pattern == "@external" {
-            return value == "@external";
+        if pattern == EXTERNAL_CALLER {
+            return value == EXTERNAL_CALLER;
         }
         // @system is handled in match_acl_pattern_with_ctx (needs identity check)
         if pattern == "@system" {
@@ -1941,7 +2022,7 @@ impl ACL {
         target_id: &str,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> AccessDecision {
-        let caller = caller_id.unwrap_or("@external");
+        let caller = caller_id.unwrap_or(EXTERNAL_CALLER);
 
         // Snapshot rules + default_effect at entry so any concurrent mutator
         // (e.g., another task calling add_rule/reload through an

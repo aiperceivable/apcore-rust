@@ -591,26 +591,28 @@ fn conformance_acl_evaluation() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| ACLRule {
-                approval: None,
-                callers: r["callers"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.as_str().unwrap().to_string())
-                    .collect(),
-                targets: r["targets"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.as_str().unwrap().to_string())
-                    .collect(),
-                effect: r["effect"].as_str().unwrap().to_string(),
-                description: r
+            .map(|r| {
+                let mut rule = ACLRule::new(
+                    r["callers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect(),
+                    r["targets"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect(),
+                    r["effect"].as_str().unwrap().to_string(),
+                );
+                rule.description = r
                     .get("description")
                     .and_then(|v| v.as_str())
-                    .map(String::from),
-                conditions: r.get("conditions").cloned(),
+                    .map(String::from);
+                rule.conditions = r.get("conditions").cloned();
+                rule
             })
             .collect();
 
@@ -3245,24 +3247,22 @@ async fn conformance_context_create() {
 }
 
 // ---------------------------------------------------------------------------
-// Error-recovery metadata: default `user_fixable` resolved from error code.
+// Error-recovery metadata: defaults resolved from error code.
 //
-// Mirrors apcore-python `test_error_recovery_user_fixable`: for each fixture
-// case, a default error constructed with the given code must carry the
-// expected `user_fixable`. Only `user_fixable` is asserted here — `retryable`
-// is class-based (per error type) and verified elsewhere, matching the Python
-// test's scope.
+// For each fixture case, a default error constructed with the given code must
+// carry the expected `retryable` and `user_fixable` values.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn conformance_error_recovery_user_fixable() {
+fn conformance_error_recovery_metadata_defaults() {
     use apcore::errors::{ErrorCode, ModuleError};
 
     let fixture = load_fixture("error_recovery_metadata");
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
         let code_str = tc["code"].as_str().unwrap();
-        let expected = &tc["expected"]["user_fixable"];
+        let expected_retryable = &tc["expected"]["retryable"];
+        let expected_user_fixable = &tc["expected"]["user_fixable"];
 
         // Resolve the wire code string to the typed ErrorCode via serde.
         let code: ErrorCode = serde_json::from_value(Value::String(code_str.to_string()))
@@ -3270,16 +3270,29 @@ fn conformance_error_recovery_user_fixable() {
 
         let err = ModuleError::new(code, "conformance");
 
-        let expected_user_fixable = if expected.is_null() {
+        let expected_retryable = if expected_retryable.is_null() {
             None
         } else {
             Some(
-                expected
+                expected_retryable
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("FAIL [{id}]: retryable must be bool or null")),
+            )
+        };
+        let expected_user_fixable = if expected_user_fixable.is_null() {
+            None
+        } else {
+            Some(
+                expected_user_fixable
                     .as_bool()
                     .unwrap_or_else(|| panic!("FAIL [{id}]: user_fixable must be bool or null")),
             )
         };
 
+        assert_eq!(
+            err.retryable, expected_retryable,
+            "FAIL [{id}]: code '{code_str}' retryable mismatch"
+        );
         assert_eq!(
             err.user_fixable, expected_user_fixable,
             "FAIL [{id}]: code '{code_str}' user_fixable mismatch"
@@ -3307,26 +3320,28 @@ fn conformance_acl_agent_scoping() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| ACLRule {
-            approval: None,
-            callers: r["callers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect(),
-            targets: r["targets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect(),
-            effect: r["effect"].as_str().unwrap().to_string(),
-            description: r
+        .map(|r| {
+            let mut rule = ACLRule::new(
+                r["callers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect(),
+                r["targets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect(),
+                r["effect"].as_str().unwrap().to_string(),
+            );
+            rule.description = r
                 .get("description")
                 .and_then(|v| v.as_str())
-                .map(String::from),
-            conditions: r.get("conditions").cloned(),
+                .map(String::from);
+            rule.conditions = r.get("conditions").cloned();
+            rule
         })
         .collect();
 

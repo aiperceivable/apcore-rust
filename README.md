@@ -302,14 +302,25 @@ client.use_middleware(Box::new(ObsLoggingMiddleware::new(ContextLogger::new("app
 
 ### Access control
 
+`ACLRule` is `#[non_exhaustive]`, so a rule is built through `ACLRule::new` and
+its optional fields assigned afterwards — the form that compiles from outside
+the crate, and the one that stays source-compatible when the spec adds a field.
+
 ```rust
 use apcore::acl::{ACL, ACLRule};
 
-let acl = ACL::new(vec![
-    ACLRule { callers: vec!["admin.*".into()], targets: vec!["*".into()], effect: "allow".into(), description: Some("Admins can call anything".into()), conditions: None },
-    ACLRule { callers: vec!["*".into()], targets: vec!["admin.*".into()], effect: "deny".into(), description: Some("Others cannot call admin modules".into()), conditions: None },
-], "deny", None);
+let mut admins = ACLRule::new(vec!["admin.*".into()], vec!["*".into()], "allow");
+admins.description = Some("Admins can call anything".into());
+
+let mut others = ACLRule::new(vec!["*".into()], vec!["admin.*".into()], "deny");
+others.description = Some("Others cannot call admin modules".into());
+
+let acl = ACL::new(vec![admins, others], "deny", None);
 ```
+
+A call that arrives with no `caller_id` is matched as `apcore::EXTERNAL_CALLER`
+(`"@external"`), an exact literal that no wildcard reaches — grant it explicitly
+with `callers: ["@external"]`.
 
 ### Execution policy (external governance overrides)
 

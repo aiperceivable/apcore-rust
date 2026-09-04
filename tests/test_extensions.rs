@@ -221,13 +221,10 @@ fn test_apply_wires_acl_into_executor() {
 
     // Register an ACL with a permissive allow-all rule
     let acl = ACL::new(
-        vec![ACLRule {
-            approval: None,
-            callers: vec!["*".to_string()],
-            targets: vec!["*".to_string()],
-            effect: "allow".to_string(),
-            description: Some("allow all for test".to_string()),
-            conditions: None,
+        vec![{
+            let mut rule = ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow");
+            rule.description = Some("allow all for test".to_string());
+            rule
         }],
         "deny",
         None,

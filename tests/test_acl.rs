@@ -1,9 +1,32 @@
 //! Tests for ACL types, construction, and check() behavior.
 
-use apcore::acl::{ACLRule, ACL};
+use apcore::acl::{ACLRule, ApprovalRequirement, ACL};
 use apcore::context::{Context, Identity};
 use serde_json::Value;
 use std::collections::HashMap;
+
+// ---------------------------------------------------------------------------
+// Rule builders
+//
+// `ACLRule` is `#[non_exhaustive]` (apcore#38), so a test crate builds one
+// through `ACLRule::new` and assigns the optional fields afterwards. These two
+// helpers keep that one line long at the call sites below, which care about a
+// rule's three required fields and, occasionally, its description.
+// ---------------------------------------------------------------------------
+
+fn rule(callers: &[&str], targets: &[&str], effect: &str) -> ACLRule {
+    ACLRule::new(
+        callers.iter().map(|s| (*s).to_string()).collect(),
+        targets.iter().map(|s| (*s).to_string()).collect(),
+        effect,
+    )
+}
+
+fn described(callers: &[&str], targets: &[&str], effect: &str, description: &str) -> ACLRule {
+    let mut r = rule(callers, targets, effect);
+    r.description = Some(description.to_string());
+    r
+}
 
 // ---------------------------------------------------------------------------
 // ACL construction
@@ -27,56 +50,67 @@ fn test_acl_default_is_empty() {
 
 #[test]
 fn test_acl_rule_fields() {
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["admin".to_string()],
-        targets: vec!["admin.*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    };
+    // The construction form `#[non_exhaustive]` leaves available to every crate
+    // (api-surface-conventions.md §9.3): `new()` for the required fields, then
+    // assignment for the optional ones. A struct literal does not compile from
+    // outside apcore and is pinned as such in tests/compile_fail/.
+    let mut rule = ACLRule::new(
+        vec!["admin".to_string()],
+        vec!["admin.*".to_string()],
+        "allow",
+    );
+    rule.description = Some("Admins may administer".to_string());
+    rule.approval = Some(ApprovalRequirement::Required);
+
     assert_eq!(rule.callers, vec!["admin"]);
     assert_eq!(rule.targets, vec!["admin.*"]);
     assert_eq!(rule.effect, "allow");
+    assert_eq!(rule.description.as_deref(), Some("Admins may administer"));
+    assert!(rule.approval_required());
+}
+
+#[test]
+fn test_acl_rule_new_sets_required_fields_and_leaves_optional_fields_unset() {
+    let rule = ACLRule::new(
+        vec!["admin".to_string()],
+        vec!["admin.*".to_string()],
+        "allow",
+    );
+
+    assert_eq!(rule.callers, vec!["admin"]);
+    assert_eq!(rule.targets, vec!["admin.*"]);
+    assert_eq!(rule.effect, "allow");
+    assert_eq!(rule.approval, None);
+    assert_eq!(rule.description, None);
+    assert_eq!(rule.conditions, None);
 }
 
 #[test]
 fn test_acl_rule_deny() {
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["guest".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "deny".to_string(),
-        description: Some("Deny all guests".to_string()),
-        conditions: None,
-    };
+    let mut rule = ACLRule::new(vec!["guest".to_string()], vec!["*".to_string()], "deny");
+    rule.description = Some("Deny all guests".to_string());
     assert_eq!(rule.effect, "deny");
     assert_eq!(rule.description.as_deref(), Some("Deny all guests"));
 }
 
 #[test]
 fn test_acl_rule_with_conditions() {
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["user".to_string()],
-        targets: vec!["data.*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: Some(serde_json::json!({"ip_range": "10.0.0.0/8"})),
-    };
+    let mut rule = ACLRule::new(
+        vec!["user".to_string()],
+        vec!["data.*".to_string()],
+        "allow",
+    );
+    rule.conditions = Some(serde_json::json!({"ip_range": "10.0.0.0/8"}));
     assert!(rule.conditions.is_some());
 }
 
 #[test]
 fn test_acl_rule_serialization_round_trip() {
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["user".to_string(), "admin".to_string()],
-        targets: vec!["user.*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    };
+    let rule = ACLRule::new(
+        vec!["user".to_string(), "admin".to_string()],
+        vec!["user.*".to_string()],
+        "allow",
+    );
     let json = serde_json::to_string(&rule).unwrap();
     let restored: ACLRule = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.callers, rule.callers);
@@ -86,14 +120,7 @@ fn test_acl_rule_serialization_round_trip() {
 
 #[test]
 fn test_acl_new_with_rules() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["admin".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["admin"], &["*"], "allow")];
     let acl = ACL::new(rules, "deny", None);
     assert_eq!(acl.rules().len(), 1);
 }
@@ -113,14 +140,12 @@ fn make_ctx(id: &str, id_type: &str, roles: Vec<String>) -> Context<Value> {
 
 #[test]
 fn test_check_allow_rule_matches() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["admin".to_string()],
-        targets: vec!["secrets.*".to_string()],
-        effect: "allow".to_string(),
-        description: Some("Admin can access secrets".to_string()),
-        conditions: None,
-    }];
+    let rules = vec![described(
+        &["admin"],
+        &["secrets.*"],
+        "allow",
+        "Admin can access secrets",
+    )];
     let acl = ACL::new(rules, "deny", None);
     let ctx = make_ctx("admin", "user", vec![]);
     let result = acl.check(Some("admin"), "secrets.read", Some(&ctx));
@@ -129,14 +154,7 @@ fn test_check_allow_rule_matches() {
 
 #[test]
 fn test_check_allow_without_context() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["bot".to_string()],
-        targets: vec!["public.*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["bot"], &["public.*"], "allow")];
     let acl = ACL::new(rules, "deny", None);
     // check() with ctx=None should still match when there are no conditions
     let result = acl.check(Some("bot"), "public.info", None);
@@ -149,14 +167,12 @@ fn test_check_allow_without_context() {
 
 #[test]
 fn test_check_deny_rule_matches() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["guest".to_string()],
-        targets: vec!["admin.*".to_string()],
-        effect: "deny".to_string(),
-        description: Some("Guests cannot access admin".to_string()),
-        conditions: None,
-    }];
+    let rules = vec![described(
+        &["guest"],
+        &["admin.*"],
+        "deny",
+        "Guests cannot access admin",
+    )];
     let acl = ACL::new(rules, "allow", None);
     let ctx = make_ctx("guest", "user", vec![]);
     let result = acl.check(Some("guest"), "admin.panel", Some(&ctx));
@@ -169,14 +185,7 @@ fn test_check_deny_rule_matches() {
 
 #[test]
 fn test_check_default_deny_when_no_rules_match() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["admin".to_string()],
-        targets: vec!["admin.*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["admin"], &["admin.*"], "allow")];
     let acl = ACL::new(rules, "deny", None);
     // "user1" does not match the "admin" caller pattern
     let result = acl.check(Some("user1"), "admin.panel", None);
@@ -185,14 +194,7 @@ fn test_check_default_deny_when_no_rules_match() {
 
 #[test]
 fn test_check_default_allow_when_no_rules_match() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["blocked".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "deny".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["blocked"], &["*"], "deny")];
     let acl = ACL::new(rules, "allow", None);
     // "friendly" does not match "blocked"
     let result = acl.check(Some("friendly"), "anything", None);
@@ -214,14 +216,7 @@ fn test_check_default_effect_with_empty_rules() {
 
 #[test]
 fn test_check_wildcard_target_matches_all() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["superadmin".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["superadmin"], &["*"], "allow")];
     let acl = ACL::new(rules, "deny", None);
     assert!(acl.check(Some("superadmin"), "any.module.here", None));
     assert!(acl.check(Some("superadmin"), "another", None));
@@ -229,14 +224,7 @@ fn test_check_wildcard_target_matches_all() {
 
 #[test]
 fn test_check_wildcard_caller_matches_all() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["*".to_string()],
-        targets: vec!["public.health".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["*"], &["public.health"], "allow")];
     let acl = ACL::new(rules, "deny", None);
     assert!(acl.check(Some("anyone"), "public.health", None));
     assert!(acl.check(Some("someone_else"), "public.health", None));
@@ -244,14 +232,7 @@ fn test_check_wildcard_caller_matches_all() {
 
 #[test]
 fn test_check_glob_pattern_in_target() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["svc".to_string()],
-        targets: vec!["data.*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["svc"], &["data.*"], "allow")];
     let acl = ACL::new(rules, "deny", None);
     assert!(acl.check(Some("svc"), "data.read", None));
     assert!(acl.check(Some("svc"), "data.write", None));
@@ -263,14 +244,7 @@ fn test_check_glob_pattern_in_target() {
 
 #[test]
 fn test_check_none_caller_maps_to_external() {
-    let rules = vec![ACLRule {
-        approval: None,
-        callers: vec!["@external".to_string()],
-        targets: vec!["public.*".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    }];
+    let rules = vec![rule(&["@external"], &["public.*"], "allow")];
     let acl = ACL::new(rules, "deny", None);
     // None caller should be treated as @external
     assert!(acl.check(None, "public.api", None));
@@ -285,22 +259,8 @@ fn test_check_none_caller_maps_to_external() {
 #[test]
 fn test_check_first_match_wins_allow_before_deny() {
     let rules = vec![
-        ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "allow".to_string(),
-            description: Some("Allow first".to_string()),
-            conditions: None,
-        },
-        ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "deny".to_string(),
-            description: Some("Deny second".to_string()),
-            conditions: None,
-        },
+        described(&["user"], &["resource"], "allow", "Allow first"),
+        described(&["user"], &["resource"], "deny", "Deny second"),
     ];
     let acl = ACL::new(rules, "deny", None);
     let result = acl.check(Some("user"), "resource", None);
@@ -310,22 +270,8 @@ fn test_check_first_match_wins_allow_before_deny() {
 #[test]
 fn test_check_first_match_wins_deny_before_allow() {
     let rules = vec![
-        ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "deny".to_string(),
-            description: Some("Deny first".to_string()),
-            conditions: None,
-        },
-        ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "allow".to_string(),
-            description: Some("Allow second".to_string()),
-            conditions: None,
-        },
+        described(&["user"], &["resource"], "deny", "Deny first"),
+        described(&["user"], &["resource"], "allow", "Allow second"),
     ];
     let acl = ACL::new(rules, "allow", None);
     let result = acl.check(Some("user"), "resource", None);
@@ -335,22 +281,8 @@ fn test_check_first_match_wins_deny_before_allow() {
 #[test]
 fn test_check_first_match_skips_non_matching_rules() {
     let rules = vec![
-        ACLRule {
-            approval: None,
-            callers: vec!["other".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "deny".to_string(),
-            description: Some("Does not match caller".to_string()),
-            conditions: None,
-        },
-        ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "allow".to_string(),
-            description: Some("Matches".to_string()),
-            conditions: None,
-        },
+        described(&["other"], &["resource"], "deny", "Does not match caller"),
+        described(&["user"], &["resource"], "allow", "Matches"),
     ];
     let acl = ACL::new(rules, "deny", None);
     let result = acl.check(Some("user"), "resource", None);
@@ -363,27 +295,18 @@ fn test_check_first_match_skips_non_matching_rules() {
 #[test]
 fn test_check_add_rule_inserts_at_front() {
     let mut acl = ACL::new(
-        vec![ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "allow".to_string(),
-            description: Some("Original allow".to_string()),
-            conditions: None,
-        }],
+        vec![described(
+            &["user"],
+            &["resource"],
+            "allow",
+            "Original allow",
+        )],
         "deny",
         None,
     );
 
     // add_rule inserts at position 0 — this deny rule should now be first
-    acl.add_rule(ACLRule {
-        approval: None,
-        callers: vec!["user".to_string()],
-        targets: vec!["resource".to_string()],
-        effect: "deny".to_string(),
-        description: Some("Added deny".to_string()),
-        conditions: None,
-    });
+    acl.add_rule(described(&["user"], &["resource"], "deny", "Added deny"));
 
     let result = acl.check(Some("user"), "resource", None);
     assert!(!result, "Newly added deny rule at front should win");
@@ -524,14 +447,7 @@ fn test_acl_add_rule_returns_unit_no_result_wrapper() {
     // return type must be unit, not Result<(), ModuleError>. Callers
     // should not need `?`/`.unwrap()` to use it.
     let mut acl = ACL::new(vec![], "deny", None);
-    let rule = ACLRule {
-        approval: None,
-        callers: vec!["caller".to_string()],
-        targets: vec!["target".to_string()],
-        effect: "allow".to_string(),
-        description: None,
-        conditions: None,
-    };
+    let rule = rule(&["caller"], &["target"], "allow");
     // The next line would not compile if add_rule returned Result<(), _>
     // because that requires `?` or explicit handling — the bare statement
     // form proves the type is unit.
@@ -572,22 +488,8 @@ async fn test_async_check_uses_snapshot_consistent_with_sync() {
     // first-match-wins behaviour through async_check to verify the
     // snapshot path produces the same decisions.
     let rules = vec![
-        ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "deny".to_string(),
-            description: Some("first deny".to_string()),
-            conditions: None,
-        },
-        ACLRule {
-            approval: None,
-            callers: vec!["user".to_string()],
-            targets: vec!["resource".to_string()],
-            effect: "allow".to_string(),
-            description: Some("second allow".to_string()),
-            conditions: None,
-        },
+        described(&["user"], &["resource"], "deny", "first deny"),
+        described(&["user"], &["resource"], "allow", "second allow"),
     ];
     let acl = ACL::new(rules, "deny", None);
     let r = acl.async_check(Some("user"), "resource", None).await;

@@ -46,14 +46,11 @@ use apcore::{
 // ---------------------------------------------------------------------------
 
 fn rule(callers: &[&str], targets: &[&str], effect: &str) -> ACLRule {
-    ACLRule {
-        callers: callers.iter().map(|s| (*s).to_string()).collect(),
-        targets: targets.iter().map(|s| (*s).to_string()).collect(),
-        effect: effect.to_string(),
-        approval: None,
-        description: None,
-        conditions: None,
-    }
+    ACLRule::new(
+        callers.iter().map(|s| (*s).to_string()).collect(),
+        targets.iter().map(|s| (*s).to_string()).collect(),
+        effect,
+    )
 }
 
 fn with_conditions(mut r: ACLRule, conditions: Value) -> ACLRule {

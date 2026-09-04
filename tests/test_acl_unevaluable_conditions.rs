@@ -49,14 +49,10 @@ fn make_context(roles: Vec<&str>) -> Context<Value> {
 }
 
 fn rule(effect: &str, conditions: Value) -> ACLRule {
-    ACLRule {
-        approval: None,
-        callers: vec!["*".to_string()],
-        targets: vec!["*".to_string()],
-        effect: effect.to_string(),
-        description: Some(format!("{effect} rule under test")),
-        conditions: Some(conditions),
-    }
+    let mut rule = ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], effect);
+    rule.description = Some(format!("{effect} rule under test"));
+    rule.conditions = Some(conditions);
+    rule
 }
 
 /// Build an ACL over one rule with an audit sink attached.
@@ -1065,14 +1061,11 @@ fn an_unevaluable_rule_warns_with_the_key_index_and_effect() {
     let (decision, warnings) = warn_capture::capture(|| {
         // Rule 0 never matches, so rule 1 is the one that goes unevaluable —
         // proving the index is the rule's real position, not a constant.
-        let non_matching = ACLRule {
-            approval: None,
-            callers: vec!["nobody.*".to_string()],
-            targets: vec!["nothing.*".to_string()],
-            effect: "allow".to_string(),
-            description: None,
-            conditions: None,
-        };
+        let non_matching = ACLRule::new(
+            vec!["nobody.*".to_string()],
+            vec!["nothing.*".to_string()],
+            "allow",
+        );
         let acl = ACL::new(
             vec![
                 non_matching,
@@ -1576,14 +1569,10 @@ fn an_execution_fault_does_not_gate_when_an_or_sibling_is_satisfied() {
 #[test]
 fn a_condition_fault_in_a_non_matching_rule_does_not_affect_the_call() {
     init();
-    let scoped = ACLRule {
-        approval: None,
-        callers: vec!["api.*".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "deny".to_string(),
-        description: Some("narrowly scoped deny with a typo".to_string()),
-        conditions: Some(json!({ "__uc_never_registered__": true })),
-    };
+    let mut scoped = ACLRule::new(vec!["api.*".to_string()], vec!["*".to_string()], "deny");
+    scoped.description = Some("narrowly scoped deny with a typo".to_string());
+    scoped.conditions = Some(json!({ "__uc_never_registered__": true }));
+
     let (acl, captured) = acl_with_sink(scoped, "allow");
 
     assert!(
@@ -1606,14 +1595,13 @@ fn a_condition_fault_in_a_non_matching_rule_does_not_affect_the_call() {
 #[test]
 fn a_condition_fault_in_a_target_mismatched_rule_does_not_affect_the_call() {
     init();
-    let scoped = ACLRule {
-        approval: None,
-        callers: vec!["*".to_string()],
-        targets: vec!["executor.payment.*".to_string()],
-        effect: "deny".to_string(),
-        description: None,
-        conditions: Some(json!({ "__uc_never_registered__": true })),
-    };
+    let mut scoped = ACLRule::new(
+        vec!["*".to_string()],
+        vec!["executor.payment.*".to_string()],
+        "deny",
+    );
+    scoped.conditions = Some(json!({ "__uc_never_registered__": true }));
+
     let (acl, captured) = acl_with_sink(scoped, "allow");
 
     assert!(acl.check(
@@ -1630,14 +1618,13 @@ fn a_condition_fault_in_a_target_mismatched_rule_does_not_affect_the_call() {
 #[test]
 fn validate_rules_reports_a_fault_in_a_rule_no_call_would_match() {
     init();
-    let scoped = ACLRule {
-        approval: None,
-        callers: vec!["never.matches.anything".to_string()],
-        targets: vec!["also.never".to_string()],
-        effect: "deny".to_string(),
-        description: None,
-        conditions: Some(json!({ "__uc_scoped_missing__": true })),
-    };
+    let mut scoped = ACLRule::new(
+        vec!["never.matches.anything".to_string()],
+        vec!["also.never".to_string()],
+        "deny",
+    );
+    scoped.conditions = Some(json!({ "__uc_scoped_missing__": true }));
+
     let acl = ACL::new(vec![scoped], "deny", None);
 
     let findings = acl.validate_rules();
@@ -1650,14 +1637,9 @@ fn validate_rules_reports_a_fault_in_a_rule_no_call_would_match() {
 #[tokio::test]
 async fn async_check_also_ignores_a_condition_fault_in_a_non_matching_rule() {
     init();
-    let scoped = ACLRule {
-        approval: None,
-        callers: vec!["api.*".to_string()],
-        targets: vec!["*".to_string()],
-        effect: "deny".to_string(),
-        description: None,
-        conditions: Some(json!({ "__uc_never_registered__": true })),
-    };
+    let mut scoped = ACLRule::new(vec!["api.*".to_string()], vec!["*".to_string()], "deny");
+    scoped.conditions = Some(json!({ "__uc_never_registered__": true }));
+
     let (acl, captured) = acl_with_sink(scoped, "allow");
 
     assert!(
