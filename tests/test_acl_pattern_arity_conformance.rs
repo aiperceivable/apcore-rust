@@ -22,10 +22,15 @@
 //! A case carries either `rule` (one) or `rules` (an ordered list); the list
 //! form is offered at `load` and `construct` only, since `add_rule` takes one
 //! rule at a time. `expected_refused_axis` and `expected_refused_rule_index`
-//! pin §6.2.1 point 2's two halves — the index chooses the rule, the axis
-//! order chooses the fault inside it — neither of which `expected_load` can
-//! see, since every one of those cases reads `reject` whichever fault is
-//! named.
+//! pin §6.2.1 point 2 — `default_effect` first, having no index for the rule
+//! ordering to reach; then the lowest-indexed bad rule; then the axis order
+//! inside it — none of which `expected_load` can see, since every one of
+//! those cases reads `reject` whichever fault is named. "Axis" there covers
+//! EVERY per-rule check a door performs, not only `effect` / `approval` /
+//! patterns: `ACL::load` has three the other doors cannot have (#107's rule
+//! key set, the missing-field check, the value types), and sweeping one of
+//! those across the whole file ahead of the next axis is what
+//! `lowest_indexed_bad_rule_wins_over_a_loader_only_axis` catches.
 //!
 //! `kind: "backstop"` is the one route no door covers: assigning a field on an
 //! already-constructed rule, which the matcher still reads. Two of the nine
@@ -267,19 +272,34 @@ fn case_yaml_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
 /// Assert that a refusal names the axis `expected_refused_axis` gives, and
 /// **only** that axis.
 ///
-/// §6.2.1 point 2 fixes the order as `effect` -> `approval` -> `callers` /
-/// `targets`. The key mixes two levels deliberately: `effect` and `approval`
-/// name axes, while `callers` / `targets` name a FIELD inside the single
-/// pattern axis — so `callers` asserts both that the pattern axis fired and
-/// that it fired on `callers`. An unrecognised value is a fixture this driver
-/// does not understand, and is failed rather than skipped.
+/// §6.2.1 point 2 judges `default_effect` first — it is not a rule and has no
+/// index, so the rule ordering cannot reach it — then each rule on `effect` ->
+/// `approval` -> `callers` / `targets`. The key mixes levels deliberately:
+/// `default_effect`, `effect` and `approval` name axes, while `callers` /
+/// `targets` name a FIELD inside the single pattern axis, so `callers` asserts
+/// both that the pattern axis fired and that it fired on `callers`. The
+/// vocabulary is open — §6.2.1 says "axis" covers every per-rule check a door
+/// performs, not only the names it happens to use — so an unrecognised value
+/// is a fixture this driver does not understand, and is failed rather than
+/// skipped.
 /// `expected_load` cannot see which of a rule's faults was named — every one
 /// of these cases is a `reject` either way — so a driver that read
 /// `expected_load` alone would pass an implementation running any order at
 /// all. The negative half carries the weight: naming the right axis is easy
 /// for an implementation that names several.
-fn assert_names_axis(id: &str, api: &str, axis: &str, rule: &Value, message: &str) {
+fn assert_names_axis(id: &str, api: &str, axis: &str, case: &Value, rule: &Value, message: &str) {
     let (needle, forbidden): (String, &[&str]) = match axis {
+        // Not a rule and carrying no index, so the rule ordering cannot reach
+        // it — judged FIRST, ahead of every rule, at every door. A refusal
+        // that names a rule here has judged the rules first and found this
+        // second, or not at all.
+        "default_effect" => (
+            format!(
+                "'{}'",
+                case["default_effect"].as_str().expect("default_effect")
+            ),
+            &["callers", "targets", "approval", "Rule ", "rule "],
+        ),
         // The offending value, quoted — §6.1.5 requires the refusal to carry
         // it so an operator can find the rule in their file.
         "effect" => (
@@ -293,9 +313,9 @@ fn assert_names_axis(id: &str, api: &str, axis: &str, rule: &Value, message: &st
     };
     assert!(
         message.contains(&needle),
-        "[{id}] {api} refused, but not for the '{axis}' axis — §6.2.1 point 2 fixes the \
-         order as effect -> approval -> callers -> targets, and this rule is bad on more \
-         than one of them: {message}"
+        "[{id}] {api} refused, but not for the '{axis}' axis — §6.2.1 point 2 judges \
+         default_effect first and then each rule on effect -> approval -> callers -> \
+         targets, and this document is bad on more than one of them: {message}"
     );
     for other in forbidden {
         assert!(
@@ -489,25 +509,42 @@ fn run_closure_case(case: &Value, dir: &std::path::Path) -> usize {
                 // pattern field. The heuristic below is for the cases faulty
                 // on the pattern axis alone.
                 // The index is asserted first: it chooses the rule, and only
-                // then does the axis order choose the fault inside it.
+                // then does the axis order choose the fault inside it. Both
+                // spellings are accepted because a loader-only axis words it
+                // differently — `ACL rule 1 in '<file>' carries 'priority'
+                // unrecognised` beside `Rule 0 has invalid effect 'Allow'` —
+                // and §6.2.1's sweep prohibition binds those axes too, so an
+                // assertion that only knew one spelling would read a refusal
+                // on the other as naming no rule at all.
                 if let Some(index) = refused_index {
+                    let names = |i: usize| {
+                        message.contains(&format!("Rule {i}"))
+                            || message.contains(&format!("rule {i}"))
+                    };
                     assert!(
-                        message.contains(&format!("Rule {index}")),
+                        names(index),
                         "[{id}] {api} refused, but not for rule {index} — §6.2.1 point 2 \
                          makes the LOWEST-INDEXED bad rule the one reported, and an axis \
-                         MUST NOT be swept across every rule ahead of the next axis: \
-                         {message}"
+                         MUST NOT be swept across every rule ahead of the next axis, \
+                         including a per-rule axis only this door has: {message}"
                     );
                     for other in 0..rules.len() {
                         assert!(
-                            other == index || !message.contains(&format!("Rule {other}")),
+                            other == index || !names(other),
                             "[{id}] {api} named rule {other} as well as rule {index}. \
                              One rule set, one refusal: {message}"
                         );
                     }
                 }
                 if let Some(axis) = axis {
-                    assert_names_axis(id, api, axis, rules[refused_index.unwrap_or(0)], message);
+                    assert_names_axis(
+                        id,
+                        api,
+                        axis,
+                        case,
+                        rules[refused_index.unwrap_or(0)],
+                        message,
+                    );
                 } else {
                     match field {
                         Some(field) => assert!(
