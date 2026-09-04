@@ -27,10 +27,16 @@
 //!
 //! # Scope of this file
 //!
-//! These are **SDK-local** tests mirroring the staged conformance fixture
-//! `acl_pattern_arity.json`, which lands in `conformance/fixtures/` only once
-//! all three SDKs have. There is deliberately no driver for it yet, so the
-//! cases are transcribed here by their fixture IDs.
+//! These are **SDK-local** tests mirroring `acl_pattern_arity.json` by fixture
+//! ID. The fixture itself is driven from
+//! `tests/test_acl_pattern_arity_conformance.rs`; these are kept because they
+//! run without a spec-repo checkout and because they say in Rust what the
+//! driver says in JSON, which is what a reader of this crate looks for first.
+//!
+//! Two things live here that the fixture cannot express, both of them §6.2.1's
+//! "two points of order": that the three checks run in the order `effect` ->
+//! `approval` -> `callers` / `targets`, and that `add_rule` re-validates the
+//! rule it is handed whatever its history.
 //!
 //! The fixture's nine `kind: "backstop"` cases that mutate a field on an
 //! already-constructed rule are **not** here: [`ACL::rules`] hands back
@@ -758,4 +764,270 @@ fn well_formed_rule_raises_no_finding() {
     assert!(!acl.check(Some("api.gateway"), "cli.rm", None));
     assert_eq!(only_handler_error(&captured), None);
     assert!(acl.validate_rules().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// §6.2.1's two points of order (spec v1.31.0, #112)
+// ---------------------------------------------------------------------------
+
+/// Point 2 — validation order within a rule is `effect` -> `approval` ->
+/// `callers` / `targets`.
+///
+/// A rule bad on more than one axis is refused for the FIRST of these it
+/// fails, so the same rule produces the same error in every implementation.
+/// This SDK checked the patterns first, so the fixture case below was refused
+/// here for its patterns and in apcore-python for its `effect` — both
+/// conformant while nothing said otherwise, which is what the ordering ends.
+/// §6.2.1 states the order for the first time; §6.1.6 rule 2 only *implies*
+/// `effect` before `approval` and is not the citation for it.
+///
+/// Asserted at every door, not only at `try_new`: an ordering that held in one
+/// entry point and not another would be the same class of defect #111 was
+/// opened about, one level down.
+#[test]
+fn validation_order_is_effect_then_approval_then_patterns() {
+    // Bad on two axes: an out-of-enum `effect` AND two empty pattern arrays.
+    // §6.2.1 point 2 says the `effect` wins.
+    for (api, verdict) in run_all_doors(
+        "validation_order_effect_before_patterns",
+        &[],
+        &[],
+        "Allow",
+        "deny",
+    ) {
+        let message = verdict.expect_err(&format!(
+            "[validation_order] {api} accepted a rule bad on two axes"
+        ));
+        assert!(
+            message.contains("'Allow'"),
+            "[validation_order] {api} must refuse for the EFFECT first (§6.2.1 point 2), \
+             naming the offending value: {message}"
+        );
+        assert!(
+            !message.contains("callers") && !message.contains("targets"),
+            "[validation_order] {api} refused for the patterns; the `effect` is checked \
+             first and only one refusal is raised: {message}"
+        );
+    }
+
+    // Bad on the other two axes: `approval: required` on a `deny` rule AND an
+    // empty `targets`. The `approval` check is second, so it wins over the
+    // patterns. Built by hand because `run_all_doors` takes no `approval`, and
+    // `ACL::load` is exercised through the same YAML the loader would see.
+    let mut rule = rule_of(&["*"], &[], "deny");
+    rule.approval = Some(apcore::acl::ApprovalRequirement::Required);
+    let message = ACL::try_new(vec![rule.clone()], "allow", None)
+        .expect_err("a rule bad on two axes is still refused")
+        .message;
+    assert!(
+        message.contains("approval"),
+        "the `approval` check precedes the pattern check (§6.2.1 point 2): {message}"
+    );
+    assert!(
+        !message.contains("targets"),
+        "and only one refusal is raised: {message}"
+    );
+
+    let dir = std::env::temp_dir().join("apcore_acl_pattern_arity");
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let file = dir.join("validation_order_approval_before_patterns.yaml");
+    std::fs::write(
+        &file,
+        "default_effect: allow\nrules:\n  - callers: [\"*\"]\n    targets: []\n    \
+         effect: \"deny\"\n    approval: required\n",
+    )
+    .expect("write yaml");
+    let loaded = ACL::load(file.to_str().expect("utf8"))
+        .expect_err("the loader shares `validate_rule`, so it shares the order")
+        .message;
+    assert!(
+        loaded.contains("approval") && !loaded.contains("targets"),
+        "ACL::load must apply the same order as the constructors: {loaded}"
+    );
+
+    // The control: with the `effect` and `approval` axes clean, the pattern
+    // fault is what is left to report. Without this, an implementation that
+    // never reports a pattern fault at all passes both assertions above.
+    let only_patterns = ACL::try_new(vec![rule_of(&[], &[], "allow")], "deny", None)
+        .expect_err("empty pattern arrays are still refused")
+        .message;
+    assert!(
+        only_patterns.contains("callers"),
+        "an ordering is not an exemption — the pattern check still runs: {only_patterns}"
+    );
+}
+
+/// Point 1 — `add_rule` re-validates the rule it is handed, whatever its
+/// history.
+///
+/// Including a rule that was well-formed when constructed and has since had
+/// `callers` or `targets` assigned: [`ACLRule`]'s fields are public, so
+/// `ACLRule::new` cannot be the only check. This SDK routes all three doors
+/// through one `ACL::validate_rule` and so satisfies it by construction —
+/// which is a reason to pin it, not to assume it, because the funnel is one
+/// refactor away from being bypassed and apcore-python is being changed to
+/// match this behaviour.
+///
+/// This is also the assertion that closes the fixture's `backstop` route from
+/// outside the crate: the mutated rule exists, and the door refuses it.
+#[test]
+fn add_rule_revalidates_a_rule_mutated_after_construction() {
+    // Every mutation the fixture's backstop cases apply, plus the field each
+    // one lands on.
+    let mutations: &[(&str, &[&str])] = &[
+        ("targets", &[]),
+        ("targets", &["$or"]),
+        ("callers", &["$not"]),
+        ("targets", &["$not", "secrets.a", "secrets.b"]),
+        ("callers", &[""]),
+        ("targets", &["api.*", "$not", "cli.*"]),
+    ];
+
+    for (field, value) in mutations {
+        // Well-formed at construction — `ACLRule::new` has nothing to object
+        // to and `try_add_rule` would accept it as it stands.
+        let mut rule = rule_of(&["*"], &["*"], "deny");
+        assert!(
+            ACL::try_new(vec![], "allow", None)
+                .expect("host ACL is valid")
+                .try_add_rule(rule.clone())
+                .is_ok(),
+            "the unmutated rule is accepted, so the refusal below is the mutation's"
+        );
+
+        // ...and mutated afterwards, which no constructor can intercept.
+        match *field {
+            "callers" => rule.callers = strings(value),
+            "targets" => rule.targets = strings(value),
+            other => panic!("unknown field {other}"),
+        }
+
+        let message = ACL::try_new(vec![], "allow", None)
+            .expect("host ACL is valid")
+            .try_add_rule(rule.clone())
+            .expect_err(&format!(
+                "try_add_rule MUST re-validate the rule it is handed, whatever its history \
+                 (§6.2.1 point 1) — {field} = {value:?}"
+            ))
+            .message;
+        assert!(
+            message.contains(field),
+            "the refusal names the offending field: {message}"
+        );
+
+        // The infallible half signals the same refusal the way Rust does.
+        let panicked = verdict_of_panicking(|| {
+            let mut acl = ACL::try_new(vec![], "allow", None).expect("host ACL is valid");
+            acl.add_rule(rule.clone());
+        });
+        assert!(
+            panicked.is_err(),
+            "ACL::add_rule inherits the refusal as a panic — an infallible signature is \
+             not an exemption from the door ({field} = {value:?})"
+        );
+    }
+}
+
+/// The rule accessor hands back an **immutable view**, and there is no mutable
+/// counterpart — which is what makes the fixture's `mutation_route:
+/// "installed_rule"` unreachable from outside this crate.
+///
+/// The signature is pinned as a value rather than described in prose: this
+/// coerces `ACL::rules` to `fn(&ACL) -> &[ACLRule]` and stops compiling the
+/// day it returns anything a caller could write through. The absence of a
+/// mutable counterpart is pinned by `tests/compile_fail/acl_rules_immutable.rs`
+/// — assigning through `rules()` does not compile — and by the conformance
+/// driver, which reads `src/acl.rs` for a `fn rules_mut`.
+#[test]
+fn rules_accessor_hands_back_an_immutable_view() {
+    let accessor: for<'a> fn(&'a ACL) -> &'a [ACLRule] = ACL::rules;
+    let acl = ACL::try_new(vec![rule_of(&["*"], &["*"], "deny")], "allow", None)
+        .expect("rule is well-formed");
+    assert_eq!(accessor(&acl).len(), 1);
+}
+
+/// Point 2's other half — **rule index dominates every axis**.
+///
+/// A rule set with more than one bad rule is refused for the LOWEST-INDEXED
+/// bad rule, and an implementation MUST NOT sweep one axis across every rule
+/// before looking at the next. apcore-typescript's `ACL.load` validated rule
+/// by rule while its constructor swept check by check across the list, so the
+/// same file produced different errors through different doors — both
+/// conformant under the pre-v1.31.0 wording.
+///
+/// `ACL::load` is the door with the most to get wrong here, because it carries
+/// a fourth axis the others do not: #107's rule-KEY closure, which needs the
+/// raw document and so cannot live in `validate_rule`. It used to run that
+/// axis across the whole list before `try_new` looked at any rule's `effect`,
+/// which is the forbidden sweep — a file whose rule 0 carried `effect:
+/// "Allow"` and whose rule 1 carried an unknown key was refused for rule 1.
+#[test]
+fn the_lowest_indexed_bad_rule_is_the_one_reported() {
+    let dir = std::env::temp_dir().join("apcore_acl_pattern_arity");
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let load = |name: &str, doc: &str| -> String {
+        let file = dir.join(format!("{name}.yaml"));
+        std::fs::write(&file, doc).expect("write yaml");
+        ACL::load(file.to_str().expect("utf8"))
+            .expect_err("the document carries two bad rules")
+            .message
+    };
+
+    // Rule 0 is bad on the PATTERN axis, rule 1 on the EFFECT axis. The axis
+    // order would put rule 1's effect first; the rule index outranks it.
+    let across_axes = load(
+        "lowest_index_across_axes",
+        r#"{"default_effect":"deny","rules":[
+             {"callers":[],"targets":["*"],"effect":"allow"},
+             {"callers":["*"],"targets":["*"],"effect":"Allow"}]}"#,
+    );
+    assert!(
+        across_axes.contains("Rule 0") && !across_axes.contains("'Allow'"),
+        "the lowest-indexed bad rule is the one reported (§6.2.1 point 2): {across_axes}"
+    );
+
+    // And the same file through the constructor, which is the comparison that
+    // caught apcore-typescript: one door validating rule by rule while the
+    // other sweeps axis by axis reports two different rules for one file.
+    let constructed = ACL::try_new(
+        vec![
+            rule_of(&[], &["*"], "allow"),
+            rule_of(&["*"], &["*"], "Allow"),
+        ],
+        "deny",
+        None,
+    )
+    .expect_err("the rule set carries two bad rules")
+    .message;
+    assert!(
+        constructed.contains("Rule 0") && !constructed.contains("'Allow'"),
+        "ACL::try_new must name the same rule ACL::load does: {constructed}"
+    );
+
+    // `ACL::load`'s fourth axis, #107's rule-key closure, is subject to the
+    // same rule: rule 0's bad `effect` outranks rule 1's unknown key, which
+    // the pre-v1.31.0 two-pass shape got backwards.
+    let against_key_axis = load(
+        "lowest_index_against_key_axis",
+        r#"{"default_effect":"deny","rules":[
+             {"callers":["*"],"targets":["*"],"effect":"Allow"},
+             {"callers":["*"],"targets":["*"],"effect":"deny","bogus":1}]}"#,
+    );
+    assert!(
+        against_key_axis.contains("Rule 0") && !against_key_axis.contains("bogus"),
+        "an axis MUST NOT be swept across every rule ahead of the next axis: {against_key_axis}"
+    );
+
+    // The control: with rule 0 clean, rule 1's fault is what is reported —
+    // otherwise an implementation that always names rule 0 passes the above.
+    let second_rule = load(
+        "lowest_index_control",
+        r#"{"default_effect":"deny","rules":[
+             {"callers":["*"],"targets":["*"],"effect":"allow"},
+             {"callers":["*"],"targets":[],"effect":"deny"}]}"#,
+    );
+    assert!(
+        second_rule.contains("Rule 1") && second_rule.contains("targets"),
+        "a fault in a later rule is still reported, named by its own index: {second_rule}"
+    );
 }

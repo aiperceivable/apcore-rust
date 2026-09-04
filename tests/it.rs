@@ -18,6 +18,8 @@
 
 #[path = "acl_rule_non_exhaustive_test.rs"]
 mod acl_rule_non_exhaustive_test;
+#[path = "acl_rules_immutable_test.rs"]
+mod acl_rules_immutable_test;
 #[path = "acl_system_spec.rs"]
 mod acl_system_spec;
 #[path = "apcore_client_spec.rs"]
@@ -98,6 +100,8 @@ mod test_acl_handler_error_conformance;
 mod test_acl_panic_boundary;
 #[path = "test_acl_pattern_arity.rs"]
 mod test_acl_pattern_arity;
+#[path = "test_acl_pattern_arity_conformance.rs"]
+mod test_acl_pattern_arity_conformance;
 #[path = "test_acl_root_discovery.rs"]
 mod test_acl_root_discovery;
 #[path = "test_acl_root_discovery_conformance.rs"]

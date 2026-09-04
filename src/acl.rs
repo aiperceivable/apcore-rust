@@ -979,15 +979,47 @@ impl ACL {
     ///
     /// All three name the rule index and the offending field or value, because
     /// an operator reading the refusal needs to find the rule in their file.
+    ///
+    /// # The order of the three checks is normative
+    ///
+    /// §6.2.1 point 2 (spec v1.31.0, #112) fixes it as **`effect` ->
+    /// `approval` -> `callers` / `targets`**: a rule bad on more than one axis
+    /// is refused for the first of these it fails, so the same rule produces
+    /// the same error in every implementation. `callers` precedes `targets`
+    /// within the pattern axis, which is the whole of that axis here —
+    /// §6.1.4.1's *type* fault is unrepresentable in a `Vec<String>`, leaving
+    /// only the shape closure.
+    ///
+    /// §6.2.1 states this ordering **for the first time**. §6.1.6 rule 2 only
+    /// *implies* `effect` before `approval` — judging "`deny` plus
+    /// `approval: required`" requires knowing the effect — and states no
+    /// order, so it is not the citation for this and was never a second
+    /// scheme to extend.
+    ///
+    /// This SDK checked the **patterns first** until v1.31.0 landed, so
+    /// `{callers: [], targets: [], effect: "Allow"}` was refused here for its
+    /// patterns and in apcore-python for its `effect`. Both were conformant
+    /// while nothing said otherwise, which is what the ordering ends. Pinned by
+    /// `validation_order_is_effect_then_approval_then_patterns` in
+    /// `tests/test_acl_pattern_arity.rs`.
+    ///
+    /// **Rule index dominates all three.** A rule set with more than one bad
+    /// rule is refused for the lowest-indexed bad rule, and no implementation
+    /// may sweep one axis across every rule before looking at the next. Every
+    /// door here loops rule by rule through this one function, so the property
+    /// holds by construction at `try_new` and `try_add_rule`; [`ACL::load`]
+    /// carries a fourth axis of its own — #107's rule-key closure, which needs
+    /// the raw document — and interleaves it into the same per-rule loop for
+    /// exactly this reason. Pinned by
+    /// `the_lowest_indexed_bad_rule_is_the_one_reported`.
+    ///
+    /// Reporting order is a different question and is unchanged:
+    /// [`ACL::validate_rules`] still orders findings by rule index then
+    /// lexicographically by path (§6.1.2 rule 3), so a pattern fault
+    /// interleaves with condition faults rather than being grouped ahead of
+    /// them. This ordering governs which single refusal a *rejecting* door
+    /// raises, not what a *reporting* validator returns.
     fn validate_rule(index: usize, rule: &ACLRule) -> Result<(), ModuleError> {
-        for (field, patterns) in [("callers", &rule.callers), ("targets", &rule.targets)] {
-            if let Some(reason) = pattern_shape_fault(field, patterns) {
-                return Err(ModuleError::new(
-                    ErrorCode::ACLRuleError,
-                    format!("Rule {index}: {reason}"),
-                ));
-            }
-        }
         if !EFFECTS.contains(&rule.effect.as_str()) {
             return Err(ModuleError::new(
                 ErrorCode::ACLRuleError,
@@ -1009,6 +1041,14 @@ impl ACL {
                      to refuse outright."
                 ),
             ));
+        }
+        for (field, patterns) in [("callers", &rule.callers), ("targets", &rule.targets)] {
+            if let Some(reason) = pattern_shape_fault(field, patterns) {
+                return Err(ModuleError::new(
+                    ErrorCode::ACLRuleError,
+                    format!("Rule {index}: {reason}"),
+                ));
+            }
         }
         Ok(())
     }
@@ -1568,12 +1608,61 @@ impl ACL {
             )
         })?;
 
+        // Distinguish "key absent" (→ canonical default `deny`) from "key
+        // present but not a string". The previous
+        // `.and_then(as_str).unwrap_or("deny")` silently coerced a non-string
+        // such as `default_effect: true` into a valid value, so `try_new`'s
+        // validation never fired and an operator typo went unreported.
+        // apcore-python and apcore-typescript both raise `ACLRuleError` here.
+        // The outcome was fail-closed either way, so this is a diagnostics fix,
+        // not a bypass.
+        let default_effect = match raw.get("default_effect") {
+            None | Some(serde_json::Value::Null) => "deny".to_string(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(ModuleError::new(
+                    ErrorCode::ACLRuleError,
+                    format!(
+                        "ACL file '{path}': default_effect must be the string 'allow' or 'deny' (got {other})"
+                    ),
+                ))
+            }
+        };
+
+        // PROTOCOL_SPEC §6.2.1 point 2 (spec v1.31.0, #112): the RULE INDEX
+        // dominates every axis, so a file with more than one bad rule is
+        // refused for the LOWEST-INDEXED one. The `default_effect` is not a
+        // rule and has no index, so it is judged first — which is also the
+        // order `try_new` uses, and this door and that one have to agree.
+        //
+        // Checked here rather than left to `try_new` below because the rule
+        // loop that follows now raises the rule-level refusals itself: leaving
+        // `default_effect` to `try_new` would put every rule fault ahead of it
+        // at THIS door and behind it at the constructor, which is precisely
+        // the cross-door disagreement §6.2.1 point 2 exists to end.
+        if !EFFECTS.contains(&default_effect.as_str()) {
+            return Err(ModuleError::new(
+                ErrorCode::ACLRuleError,
+                format!(
+                    "Invalid ACL config in '{path}': Invalid default_effect \
+                     '{default_effect}': must be 'allow' or 'deny'"
+                ),
+            ));
+        }
+
         // A12-ACL: every rule MUST explicitly declare `callers` and `targets`.
         // `#[serde(default)]` on those fields would otherwise let an omitted
         // key load as an empty Vec, silently turning a deny rule inert. Reject
         // a missing key here (the key may be an empty list — only OMISSION is
         // rejected), matching apcore-python acl.py:270 and apcore-typescript
         // acl.ts:74 which raise ACLRuleError at load (sync finding A-D-09).
+        //
+        // Every axis for rule `i` is judged before rule `i + 1` is looked at.
+        // The loop used to run the key checks across the WHOLE list and leave
+        // the rest to `try_new`, so a file whose rule 0 carried an unrecognised
+        // `effect` and whose rule 1 carried an unknown key was refused for
+        // rule 1 — an axis swept across every rule ahead of the next axis,
+        // which §6.2.1 point 2 forbids by name.
         if let Some(rules_arr) = rules_val.as_array() {
             for (i, raw_rule) in rules_arr.iter().enumerate() {
                 let Some(obj) = raw_rule.as_object() else {
@@ -1595,6 +1684,24 @@ impl ACL {
                 // render a rule inert; an unknown key is the same hazard pointing
                 // the other way, and was dropped in silence until #107.
                 reject_unknown_rule_keys(i, path, obj)?;
+
+                // ...and this rule's `effect` / `approval` / patterns, in
+                // §6.2.1 point 2's order, through the same `validate_rule`
+                // every other door uses. `try_new` re-runs it below; that is
+                // deliberate — the funnel stays the single place the three
+                // axes are defined, and this loop only decides WHEN it runs.
+                let rule: ACLRule = serde_json::from_value(raw_rule.clone()).map_err(|e| {
+                    ModuleError::new(
+                        ErrorCode::ACLRuleError,
+                        format!("Invalid ACL rules in '{path}': {e}"),
+                    )
+                })?;
+                Self::validate_rule(i, &rule).map_err(|e| {
+                    ModuleError::new(
+                        ErrorCode::ACLRuleError,
+                        format!("Invalid ACL config in '{path}': {}", e.message),
+                    )
+                })?;
             }
         }
 
@@ -1604,27 +1711,6 @@ impl ACL {
                 format!("Invalid ACL rules in '{path}': {e}"),
             )
         })?;
-
-        // Distinguish "key absent" (→ canonical default `deny`) from "key
-        // present but not a string". The previous
-        // `.and_then(as_str).unwrap_or("deny")` silently coerced a non-string
-        // such as `default_effect: true` into a valid value, so `try_new`'s
-        // validation never fired and an operator typo went unreported.
-        // apcore-python and apcore-typescript both raise `ACLRuleError` here.
-        // The outcome was fail-closed either way, so this is a diagnostics fix,
-        // not a bypass.
-        let default_effect = match raw.get("default_effect") {
-            None | Some(serde_json::Value::Null) => "deny".to_string(),
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(other) => {
-                return Err(ModuleError::new(
-                    ErrorCode::ACLRuleError,
-                    format!(
-                        "ACL file '{path}': default_effect must be the string 'allow' or 'deny' (got {other})"
-                    ),
-                ))
-            }
-        };
 
         // Propagate try_new validation errors as Result rather than panicking
         // — YAML errors must not crash the host process (sync finding A-D-302).
@@ -2541,7 +2627,10 @@ mod projection_forgery_tests {
 /// reason to leave it untested: `self.rules` is reachable from here, a future
 /// `rules_mut` or in-place editing API would open the same route from outside,
 /// and §6.1.4.1's classification has to already be correct when it does. These
-/// mirror the fixture's backstop cases by name.
+/// mirror the fixture's backstop cases **by name**, and that is load-bearing:
+/// `tests/test_acl_pattern_arity_conformance.rs` reports those seven cases as
+/// satisfied by construction rather than skipped, and reads this file to check
+/// that a test of the same name exists. Renaming one here fails the driver.
 #[cfg(test)]
 mod pattern_arity_backstop_tests {
     use super::*;
