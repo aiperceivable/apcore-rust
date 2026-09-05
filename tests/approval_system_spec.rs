@@ -104,10 +104,22 @@ fn approval_system_request_approval_input_request_module_id_required() {
 }
 
 // clause: approval_system.request_approval.input.request.caller_id_action_required
-#[ignore = "approval_system.request_approval.input.request.caller_id_action_required: missing symbol ApprovalRequest.caller_id / ApprovalRequest.action (contract gap) — the Rust ApprovalRequest exposes module_id/arguments/context/annotations/description/tags but no caller_id or action field; caller identity lives on request.context"]
 #[test]
 fn approval_system_request_approval_input_request_caller_id_action_required() {
-    panic!("unreachable: skipped contract gap");
+    // Decision D-03 (docs/spec/2026-05-decision-log.md, spec v1.32.0 §7.3.1):
+    // `ApprovalRequest` carries `caller_id` and `action` directly, so a
+    // handler can read them without traversing `request.context`. `caller_id`
+    // is `None` for a top-level call (there is no caller to name) and
+    // `action` is always populated — it is not conditioned on `caller_id`.
+    let req = make_request("test.mod", json!({}));
+    assert_eq!(req.caller_id, None);
+    assert_eq!(req.action, String::new());
+
+    let mut nested = make_request("test.mod", json!({}));
+    nested.caller_id = Some("test.caller".to_string());
+    nested.action = "test.mod".to_string();
+    assert_eq!(nested.caller_id.as_deref(), Some("test.caller"));
+    assert_eq!(nested.action, "test.mod");
 }
 
 // ---------------------------------------------------------------------------

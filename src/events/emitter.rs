@@ -237,7 +237,7 @@ impl EventEmitter {
         let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
         for subscriber in &all_subscribers {
-            if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+            if Self::subscriber_matches(subscriber.as_ref(), &event.event_type) {
                 let sub = Arc::clone(subscriber);
                 let evt = event.clone();
                 let dlq_subs = all_subscribers.clone();
@@ -268,7 +268,7 @@ impl EventEmitter {
         // Snapshot under a short read-lock; never hold the lock across `.await`.
         let subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
         for subscriber in &subscribers {
-            if Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+            if Self::subscriber_matches(subscriber.as_ref(), &event.event_type) {
                 if let Err(e) = subscriber.on_event(event).await {
                     tracing::warn!(
                         subscriber_id = %subscriber.subscriber_id(),
@@ -299,7 +299,7 @@ impl EventEmitter {
         let all_subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
         for subscriber in &all_subscribers {
             if Self::matches_pattern(pattern, &event.event_type)
-                && Self::matches_pattern(subscriber.event_pattern(), &event.event_type)
+                && Self::subscriber_matches(subscriber.as_ref(), &event.event_type)
             {
                 Self::deliver_with_dlq(
                     Arc::clone(subscriber),
@@ -407,7 +407,7 @@ impl EventEmitter {
         }
         let subscribers: Vec<Arc<dyn EventSubscriber>> = self.subscribers.read().clone();
         for subscriber in &subscribers {
-            if !Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+            if !Self::subscriber_matches(subscriber.as_ref(), &event.event_type) {
                 continue;
             }
             let sub = Arc::clone(subscriber);
@@ -473,7 +473,7 @@ impl EventEmitter {
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
         for subscriber in &all_subscribers {
-            if !Self::matches_pattern(subscriber.event_pattern(), &event.event_type) {
+            if !Self::subscriber_matches(subscriber.as_ref(), &event.event_type) {
                 continue;
             }
             let sub = Arc::clone(subscriber);
@@ -554,7 +554,7 @@ impl EventEmitter {
             if dlq_sub.event_pattern() == "*" {
                 continue;
             }
-            if Self::matches_pattern(dlq_sub.event_pattern(), DLQ_EVENT_TYPE) {
+            if Self::subscriber_matches(dlq_sub.as_ref(), DLQ_EVENT_TYPE) {
                 // DLQ delivery is single-attempt (no retry, no second-order DLQ).
                 if let Err(e) = dlq_sub.on_event(&dlq_event).await {
                     tracing::error!(
@@ -569,6 +569,38 @@ impl EventEmitter {
         subscriber
             .on_failure(&event, &err, retry.max_attempts)
             .await;
+    }
+
+    /// Whether `subscriber` should receive an event of type `event_type`.
+    ///
+    /// This is the single decision point every dispatch loop in this file
+    /// funnels through, so `on()`'s exact-match contract and every other
+    /// subscriber's glob semantics cannot drift apart the way they had.
+    ///
+    /// A subscriber created through `APCore::on()` / `on_subscriber()` is
+    /// wrapped in `EventTypeSubscriber`, which is the only implementor that
+    /// overrides `event_type_filter()` to `Some(event_type)`. Per the spec
+    /// Contract (`docs/features/apcore-client.md` "## Contract: APCore.on"),
+    /// `event_type` there is "filtered by exact equality match inside the
+    /// subscriber" — apcore-python's `on()`-created subscriber does
+    /// `if event.event_type != self.event_type:` and apcore-typescript's does
+    /// `if (event.eventType === eventType)`, neither a glob. So
+    /// `client.on("apcore.acl.*", handler)` subscribes to the literal event
+    /// type `"apcore.acl.*"`, not a prefix — routing it through
+    /// `matches_pattern` here would have it also fire on
+    /// `apcore.acl.rule_matched`.
+    ///
+    /// Every other subscriber (`WebhookSubscriber`, `A2ASubscriber`, a bare
+    /// `EventSubscriber` impl, the DLQ's own `"*"` catch-all) reports `None`
+    /// from `event_type_filter()` and keeps this crate's `*`-wildcard glob
+    /// semantics via `event_pattern()` + [`Self::matches_pattern`] — those
+    /// subscribers legitimately rely on glob matching (A-D-026) and are
+    /// unaffected.
+    fn subscriber_matches(subscriber: &dyn EventSubscriber, event_type: &str) -> bool {
+        match subscriber.event_type_filter() {
+            Some(exact) => exact == event_type,
+            None => Self::matches_pattern(subscriber.event_pattern(), event_type),
+        }
     }
 
     /// Simple glob-style pattern matching with `*` wildcard.

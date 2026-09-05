@@ -826,6 +826,13 @@ impl Step for BuiltinApprovalGate {
                 arguments: ctx.inputs.clone(),
                 context: Some(ctx.context.clone()),
                 annotations,
+                // Decision D-03 (spec v1.32.0 §7.3.1): populated from the same
+                // Context and module_id already in scope at this call site —
+                // caller_id is None/null for a top-level call (§5.7), with no
+                // "@external" substitution; action is a flat duplicate of
+                // module_id so a handler can read it without cross-referencing.
+                caller_id: ctx.context.caller_id.clone(),
+                action: ctx.module_id.clone(),
                 description,
                 tags,
             };

@@ -477,6 +477,53 @@ async fn on_returns_subscriber() {
     assert!(client.off(&id), "off() removes the subscriber by id");
 }
 
+// Regression: `on()`'s `event_type` is filtered by EXACT equality, per the
+// spec Contract (docs/features/apcore-client.md "## Contract: APCore.on") —
+// apcore-python's on()-created subscriber does `if event.event_type !=
+// self.event_type:` and apcore-typescript's does `if (event.eventType ===
+// eventType)`, neither a glob. Subscribing with a literal `*` character must
+// NOT behave like `EventEmitter::matches_pattern`'s glob: a different event
+// type that would glob-match the subscribed string must not fire the
+// handler, and the literal string itself still must.
+#[tokio::test]
+async fn on_event_type_is_exact_match_not_glob() {
+    let mut client = APCore::with_config(sys_config());
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = Arc::clone(&counter);
+    // Subscribes to the literal event type "apcore.acl.*" — not a prefix glob.
+    client.on("apcore.acl.*", move |_e| {
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let emitter = client.events().expect("local emitter exists after on()");
+
+    // A DIFFERENT event type that would glob-match "apcore.acl.*" must NOT
+    // fire the subscriber.
+    emitter
+        .emit_sequential(&apcore::events::emitter::ApCoreEvent::new(
+            "apcore.acl.rule_matched",
+            json!({}),
+        ))
+        .await;
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "on() must use exact equality, not glob — a differing event type must not fire"
+    );
+
+    // The literal subscribed string, emitted verbatim, still fires.
+    emitter
+        .emit_sequential(&apcore::events::emitter::ApCoreEvent::new(
+            "apcore.acl.*",
+            json!({}),
+        ))
+        .await;
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the exact subscribed event_type string must still fire"
+    );
+}
+
 // ===========================================================================
 // Contract: APCoreClient.off
 // ===========================================================================

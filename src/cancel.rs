@@ -101,6 +101,19 @@ impl CancelToken {
         }
     }
 
+    /// Check if cancelled and return [`ExecutionCancelledError`] if so.
+    ///
+    /// The spec's canonical name for this check (`docs/features/cancellation.md`
+    /// "## Contract: CancelToken.raise_if_cancelled") — identical behavior to
+    /// [`Self::check`], which this crate added first and keeps: `check()` and
+    /// `check_for()` are used internally throughout this crate and documented
+    /// elsewhere in this file, so neither is deprecated or removed. Prefer this
+    /// name when writing spec-traced or cross-language code; either name is
+    /// equally correct.
+    pub fn raise_if_cancelled(&self) -> Result<(), ExecutionCancelledError> {
+        self.check()
+    }
+
     /// Check with an explicit `module_id`. Returns the typed error so
     /// callers can match on cancellation specifically before widening.
     pub fn check_for(&self, module_id: &str) -> Result<(), ExecutionCancelledError> {

@@ -350,6 +350,32 @@ fn test_acl_load_propagates_invalid_default_effect_as_result() {
     );
 }
 
+// `schemas/acl-config.schema.json` declares `default_effect` as a plain
+// `allow` / `deny` string enum, not nullable — an explicit `default_effect:
+// null` is a type violation, not a synonym for an omitted key. Only omission
+// may default to `deny`; a written `null` must be refused like any other
+// non-string value.
+#[test]
+fn test_acl_load_rejects_explicit_null_default_effect() {
+    use apcore::errors::ErrorCode;
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    writeln!(tmp, "default_effect: null\nrules: []\n").expect("write tempfile");
+    let path = tmp.path().to_str().expect("utf8 path").to_string();
+    let err = ACL::load(&path).expect_err("load must reject an explicit null default_effect");
+    assert_eq!(
+        err.code,
+        ErrorCode::ACLRuleError,
+        "explicit null default_effect must be ACLRuleError, got {:?}",
+        err.code
+    );
+    assert!(
+        err.message.contains("default_effect"),
+        "error must name default_effect: {}",
+        err.message
+    );
+}
+
 // Regression: sync finding A-D-022 — structural ACL parse/validation
 // errors carry `ErrorCode::ACLRuleError` per spec contract (apcore-python
 // and apcore-typescript both raise `ACLRuleError`). Previously Rust used

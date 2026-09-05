@@ -12,15 +12,10 @@
 //! `cancellation.<method>.<kind>.<detail>` in a leading `// clause:` comment so
 //! cross-language diffs line up.
 //!
-//! Cross-language gap: the contract block names the second method
-//! `CancelToken.raise_if_cancelled`, but the Rust SDK (`src/cancel.rs`)
-//! implements the cancellation check as `check()` (returning
-//! `Result<(), ExecutionCancelledError>`). There is no `raise_if_cancelled`
-//! symbol — identical to the Python SDK, which implements it as `check()`. Per
-//! the missing-symbol rule, every clause that targets `raise_if_cancelled` by
-//! name is emitted as `#[ignore]` documenting the gap. A separate error-type
-//! guard asserts the real `check()` path emits the spec'd code so the gap is
-//! purely a method-naming mismatch.
+//! `CancelToken::raise_if_cancelled` now exists (`src/cancel.rs`) as the
+//! spec's canonical name for the same behavior `check()` already had —
+//! `check()` and `check_for()` are unchanged and still used internally
+//! throughout this crate.
 
 use apcore::cancel::{CancelToken, ExecutionCancelledError};
 use apcore::errors::{ErrorCode, ModuleError};
@@ -99,47 +94,92 @@ fn cancellation_cancel_property_idempotent() {
 
 // ---------------------------------------------------------------------------
 // Contract: CancelToken.raise_if_cancelled
-//
-// MISSING SYMBOL: the Rust SDK has no `raise_if_cancelled` method on
-// CancelToken (the equivalent behavior is `check()`). These clauses are
-// recorded as ignored so the cross-language naming gap is documented as a skip
-// rather than a coarse compile failure — identical to the Python suite.
 // ---------------------------------------------------------------------------
 
 // clause: cancellation.raise_if_cancelled.error.EXECUTION_CANCELLED
 #[test]
-#[ignore = "cancellation.raise_if_cancelled.error.EXECUTION_CANCELLED: missing symbol CancelToken::raise_if_cancelled (contract gap) — Rust SDK implements this as CancelToken::check()"]
 fn cancellation_raise_if_cancelled_error_execution_cancelled() {
-    unreachable!("missing symbol: CancelToken::raise_if_cancelled");
+    // Not cancelled: Ok(()).
+    let token = CancelToken::new();
+    assert!(token.raise_if_cancelled().is_ok());
+
+    // Cancelled: Err(ExecutionCancelledError(code=EXECUTION_CANCELLED)).
+    token.cancel();
+    let err: ExecutionCancelledError = token
+        .raise_if_cancelled()
+        .expect_err("expected cancel error");
+    assert!(!err.message.is_empty());
+
+    let module_err: ModuleError = err.into();
+    assert_eq!(module_err.code, ErrorCode::ExecutionCancelled);
+    let code_str = serde_json::to_value(module_err.code).expect("serialize code");
+    assert_eq!(
+        code_str,
+        serde_json::Value::String("EXECUTION_CANCELLED".to_string())
+    );
 }
 
 // clause: cancellation.raise_if_cancelled.property.thread_safe
-#[test]
-#[ignore = "cancellation.raise_if_cancelled.property.thread_safe: missing symbol CancelToken::raise_if_cancelled (contract gap) — Rust SDK implements this as CancelToken::check()"]
-fn cancellation_raise_if_cancelled_property_thread_safe() {
-    unreachable!("missing symbol: CancelToken::raise_if_cancelled");
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_raise_if_cancelled_property_thread_safe() {
+    // Concurrent raise_if_cancelled() calls on a shared token must not panic
+    // and must all observe the same cancelled state once cancel() has been
+    // observed, mirroring cancellation_cancel_property_thread_safe_shared_token.
+    let shared = CancelToken::new();
+    shared.cancel();
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let tok = shared.clone();
+        handles.push(tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            tok.raise_if_cancelled()
+        }));
+    }
+
+    for h in handles {
+        let result = h.await.expect("raise_if_cancelled task must not panic");
+        assert!(
+            result.is_err(),
+            "every call must observe the cancelled state"
+        );
+    }
 }
 
 // clause: cancellation.raise_if_cancelled.property.pure
 #[test]
-#[ignore = "cancellation.raise_if_cancelled.property.pure: missing symbol CancelToken::raise_if_cancelled (contract gap) — Rust SDK implements this as CancelToken::check()"]
 fn cancellation_raise_if_cancelled_property_pure() {
-    unreachable!("missing symbol: CancelToken::raise_if_cancelled");
+    // Calling raise_if_cancelled() repeatedly must not itself mutate state —
+    // only checks internal cancelled state (spec: "no side effects").
+    let token = CancelToken::new();
+    assert!(token.raise_if_cancelled().is_ok());
+    assert!(
+        token.raise_if_cancelled().is_ok(),
+        "no side effects: repeated calls are stable"
+    );
+    assert!(!token.is_cancelled());
+
+    token.cancel();
+    assert!(token.raise_if_cancelled().is_err());
+    assert!(
+        token.raise_if_cancelled().is_err(),
+        "no side effects: repeated calls after cancel are stable"
+    );
+    assert!(token.is_cancelled());
 }
 
 // ---------------------------------------------------------------------------
-// Error-type guard: ensure the declared error type/code referenced by the
-// raise_if_cancelled contract actually exists with the spec'd code, so the gap
-// above is purely a method-name mismatch (not a missing error type). The live
-// check() path is the Rust equivalent of raise_if_cancelled.
+// Regression: check() — raise_if_cancelled's original name in this crate —
+// must keep emitting the spec'd error type/code too, since it is unchanged
+// and still used internally throughout this crate.
 // ---------------------------------------------------------------------------
 
 // clause: cancellation.raise_if_cancelled.error.EXECUTION_CANCELLED
 #[test]
 fn cancellation_execution_cancelled_error_code_matches_spec() {
     // The contract requires ExecutionCancelledError(code=EXECUTION_CANCELLED).
-    // Verify the error TYPE and CODE field match exactly via the live check()
-    // path, confirming the gap is method-naming only.
+    // Verify the error TYPE and CODE field match exactly via the check()
+    // path, which raise_if_cancelled delegates to.
     let token = CancelToken::new();
     token.cancel();
 

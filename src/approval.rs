@@ -12,7 +12,8 @@ use crate::errors::ModuleError;
 use crate::module::ModuleAnnotations;
 
 /// Approval request sent before a sensitive operation.
-/// Spec §7.3.1: required fields are `module_id`, arguments, context, annotations.
+/// Spec §7.3.1: required fields are `module_id`, `arguments`, `context`,
+/// `annotations`, `caller_id`, `action`.
 ///
 /// Marked `#[non_exhaustive]` (issue #24) so a future spec revision can add a
 /// field without a major version bump. That works by **removing struct-literal
@@ -37,6 +38,19 @@ pub struct ApprovalRequest {
     /// Module behavior annotations (`requires_approval` is guaranteed true).
     #[serde(default)]
     pub annotations: ModuleAnnotations,
+    /// The invoking module's canonical ID, read straight off
+    /// `context.caller_id` with no substitution — `None` for a top-level /
+    /// external call, exactly as `Context::caller_id` is (§5.7), NOT the
+    /// `"@external"` sentinel ACL evaluation substitutes internally.
+    /// (Decision D-03, spec v1.32.0 §7.3.1.)
+    #[serde(default)]
+    pub caller_id: Option<String>,
+    /// The target module's canonical ID being requested — a flat duplicate of
+    /// `module_id`, not a separate free-text label, so a handler can read
+    /// `request.action` without cross-referencing `request.module_id` under a
+    /// second name. (Decision D-03, spec v1.32.0 §7.3.1.)
+    #[serde(default)]
+    pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]

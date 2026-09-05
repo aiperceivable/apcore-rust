@@ -1617,8 +1617,15 @@ impl ACL {
         // apcore-python and apcore-typescript both raise `ACLRuleError` here.
         // The outcome was fail-closed either way, so this is a diagnostics fix,
         // not a bypass.
+        //
+        // An explicit `default_effect: null` is NOT the same as an absent key:
+        // `schemas/acl-config.schema.json` declares `default_effect` as a plain
+        // `allow` / `deny` string enum, not nullable, so a written `null` is a
+        // type violation the operator asked for, not a request for the
+        // canonical default. Only OMISSION defaults to `deny`; `Value::Null`
+        // falls through to the same rejection as any other non-string value.
         let default_effect = match raw.get("default_effect") {
-            None | Some(serde_json::Value::Null) => "deny".to_string(),
+            None => "deny".to_string(),
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(other) => {
                 return Err(ModuleError::new(
