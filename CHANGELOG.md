@@ -16,9 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.29.0] - Unreleased
+## [0.29.0] - 2026-09-05
 
 ### BREAKING
+
+- **`APCore::on` / `on_subscriber` / `on_fn` / `off` / `off_by_type` now return `Result`, and error with `SYS_MODULES_DISABLED` when the client has no event bus.** They previously could not fail: `on()` called `get_or_insert_with` on `event_emitter`, so subscribing on a client built without `sys_modules` silently created a *standalone* bus — the subscription reported success, and no framework event ever reached it, because the sys-modules and registry emitters are a different bus. `off()` mirrored the gap from the other side, returning a plain `false` that read as "no such subscriber" when the real answer was "there is no bus at all". apcore-python and apcore-typescript both raise `SysModulesDisabledError` here, and `docs/features/apcore-client.md`'s Error Behavior table has required it all along; this SDK's own conformance tests `on_error_sys_modules_disabled` and `off_error_sys_modules_disabled` were carrying `#[ignore]` attributes naming the gap, and are now enabled.
+
+  The guard is the one `disable()` / `enable()` already use, so the whole governance-adjacent surface answers consistently. `off()` keeps its `bool` payload inside the `Ok` (Python and TypeScript return void): "no such subscriber" and "events are off" are genuinely different answers, and collapsing the first into the second is what made the original defect invisible. `off_by_type` is guarded for the same reason, so no entry point on the subscription surface is left silently returning a zero value.
+
+  **Migration** — add `?` or `.expect(...)` at the call site; a client built with `sys_modules.enabled=true` (and `sys_modules.events.enabled=true`) always returns `Ok`:
+
+  ```rust
+  // Before (0.28.0 and earlier)
+  let id = client.on("apcore.module.toggled", |e| println!("{}", e.event_type));
+  client.off(&id);
+
+  // After
+  let id = client.on("apcore.module.toggled", |e| println!("{}", e.event_type))?;
+  client.off(&id)?;
+  ```
 
 - **SECURITY: a pattern list with no operands made an ACL rule inert, and under `default_effect: allow` that permitted the call the rule named (spec v1.31.0 §6.2.1, [apcore#112](https://github.com/aiperceivable/apcore/issues/112)).** `callers` / `targets` of `[]`, `["$or"]` or `["$not"]` can never match; the matcher returned `false` and `validate_rules()` reported nothing, so a `deny` rule an operator wrote, loaded and validated contributed nothing to the decision — the outcome tracked `default_effect` exactly across all twelve combinations of the three shapes, both effects and both defaults. Reachable from a plain YAML file: `ACL::load` rejects an *omitted* `callers` / `targets` and permitted an *empty* one. `schemas/acl-config.schema.json` had declared `minItems: 1` and `minLength: 1` on both fields since the file existed, enforced by nothing — the same shape as [apcore#107](https://github.com/aiperceivable/apcore/issues/107) and [apcore#111](https://github.com/aiperceivable/apcore/issues/111).
 

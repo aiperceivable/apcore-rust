@@ -155,12 +155,18 @@ async fn main() -> std::process::ExitCode {
     let collected: Arc<Mutex<Vec<ApCoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let registered_sink = Arc::clone(&collected);
     let toggled_sink = Arc::clone(&collected);
-    let sub_registered = client.on("apcore.registry.module_registered", move |e| {
-        registered_sink.lock().unwrap().push(e.clone());
-    });
-    let sub_toggled = client.on("apcore.module.toggled", move |e| {
-        toggled_sink.lock().unwrap().push(e.clone());
-    });
+    // `on()` errors with SYS_MODULES_DISABLED when the client has no event bus;
+    // `build_client()` enables sys_modules, so these succeed.
+    let sub_registered = client
+        .on("apcore.registry.module_registered", move |e| {
+            registered_sink.lock().unwrap().push(e.clone());
+        })
+        .expect("events are enabled on this client");
+    let sub_toggled = client
+        .on("apcore.module.toggled", move |e| {
+            toggled_sink.lock().unwrap().push(e.clone());
+        })
+        .expect("events are enabled on this client");
 
     run_lifecycle(&client).await;
 
@@ -180,8 +186,12 @@ async fn main() -> std::process::ExitCode {
     };
 
     // Unsubscribe; subsequent events would no longer be collected.
-    client.off(&sub_registered);
-    client.off(&sub_toggled);
+    client
+        .off(&sub_registered)
+        .expect("events are enabled on this client");
+    client
+        .off(&sub_toggled)
+        .expect("events are enabled on this client");
 
     println!("{}", "=".repeat(92));
     let total = expectations.len();

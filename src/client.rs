@@ -593,7 +593,16 @@ impl APCore {
     /// unsubscribe the specific handler, or use [`off_by_type()`](Self::off_by_type)
     /// to remove all handlers for an event type at once.
     ///
-    /// Lazily initializes the event emitter on first use.
+    /// # Errors
+    ///
+    /// [`ErrorCode::SysModulesDisabled`](crate::errors::ErrorCode::SysModulesDisabled)
+    /// when no event bus is configured. This mirrors apcore-python and
+    /// apcore-typescript, both of which raise `SysModulesDisabledError` from
+    /// `on()` when events are not enabled, and the `APCore.on` contract in
+    /// `docs/features/apcore-client.md`. Earlier versions lazily created a
+    /// standalone local bus here instead, which made a subscription against a
+    /// misconfigured client look like it had succeeded while no framework event
+    /// would ever reach it.
     ///
     /// # Example
     ///
@@ -608,7 +617,7 @@ impl APCore {
         &mut self,
         event_type: &str,
         callback: impl Fn(&crate::events::emitter::ApCoreEvent) + Send + Sync + 'static,
-    ) -> String {
+    ) -> Result<String, ModuleError> {
         let subscriber = Box::new(ClosureSubscriber {
             id: uuid::Uuid::new_v4().to_string(),
             callback: Box::new(callback),
@@ -621,21 +630,45 @@ impl APCore {
     /// Use this when you need a custom [`EventSubscriber`] implementation. For
     /// closure-based subscriptions (the common case), prefer [`on()`](Self::on)
     /// which matches the Python/TypeScript API shape.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::SysModulesDisabled`](crate::errors::ErrorCode::SysModulesDisabled)
+    /// when no event bus is configured — same condition as [`on()`](Self::on).
     pub fn on_subscriber(
         &mut self,
         event_type: &str,
         subscriber: Box<dyn EventSubscriber>,
-    ) -> String {
+    ) -> Result<String, ModuleError> {
+        let emitter = Self::require_event_emitter(self.event_emitter.as_ref(), "on()")?;
         let wrapped = Box::new(EventTypeSubscriber {
             event_type: event_type.to_string(),
             inner: subscriber,
         });
-        let emitter = self
-            .event_emitter
-            .get_or_insert_with(|| Arc::new(EventEmitter::new()));
         let id = wrapped.subscriber_id().to_string();
         emitter.subscribe(wrapped);
-        id
+        Ok(id)
+    }
+
+    /// Shared guard for the event-subscription surface.
+    ///
+    /// Returns the configured emitter, or `SysModulesDisabled` when there is
+    /// none. Mirrors the `sys_modules_context.is_none()` guard that
+    /// [`disable()`](Self::disable) / [`enable()`](Self::enable) already apply,
+    /// and the `self.events is None` guard in apcore-python's `on`/`off`.
+    fn require_event_emitter<'a>(
+        emitter: Option<&'a Arc<EventEmitter>>,
+        method: &str,
+    ) -> Result<&'a Arc<EventEmitter>, ModuleError> {
+        emitter.ok_or_else(|| {
+            ModuleError::new(
+                crate::errors::ErrorCode::SysModulesDisabled,
+                format!(
+                    "{method} requires events to be enabled. Pass a Config with \
+                     sys_modules.enabled=true and sys_modules.events.enabled=true to APCore."
+                ),
+            )
+        })
     }
 
     /// Deprecated: use [`on()`](Self::on) instead.
@@ -650,7 +683,7 @@ impl APCore {
         &mut self,
         event_type: &str,
         callback: impl Fn(&crate::events::emitter::ApCoreEvent) + Send + Sync + 'static,
-    ) -> String {
+    ) -> Result<String, ModuleError> {
         self.on(event_type, callback)
     }
 
@@ -661,10 +694,19 @@ impl APCore {
     ///
     /// To remove all handlers bound to a given event type, use
     /// [`off_by_type()`](Self::off_by_type).
-    pub fn off(&mut self, subscriber_id: &str) -> bool {
-        self.event_emitter
-            .as_ref()
-            .is_some_and(|e| e.unsubscribe_by_id(subscriber_id))
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::SysModulesDisabled`](crate::errors::ErrorCode::SysModulesDisabled)
+    /// when no event bus is configured, matching apcore-python and
+    /// apcore-typescript, which raise `SysModulesDisabledError` from `off()`.
+    /// The `bool` payload is retained (Python/TypeScript return void): "no such
+    /// subscriber" and "events are off" are different answers, and collapsing
+    /// the first into the second is what let a misconfigured client look
+    /// merely empty.
+    pub fn off(&mut self, subscriber_id: &str) -> Result<bool, ModuleError> {
+        let emitter = Self::require_event_emitter(self.event_emitter.as_ref(), "off()")?;
+        Ok(emitter.unsubscribe_by_id(subscriber_id))
     }
 
     /// Unsubscribe all handlers registered for `event_type`.
@@ -672,10 +714,16 @@ impl APCore {
     /// Matches Python/TypeScript `off(event_type)` semantics — passing an event
     /// type string removes every handler bound to that type in a single call.
     /// Returns the number of handlers removed.
-    pub fn off_by_type(&mut self, event_type: &str) -> usize {
-        self.event_emitter
-            .as_ref()
-            .map_or(0, |e| e.unsubscribe_by_event_type(event_type))
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::SysModulesDisabled`](crate::errors::ErrorCode::SysModulesDisabled)
+    /// when no event bus is configured — same guard as [`off()`](Self::off),
+    /// applied here so the whole subscription surface answers consistently
+    /// rather than leaving one entry point silently returning `0`.
+    pub fn off_by_type(&mut self, event_type: &str) -> Result<usize, ModuleError> {
+        let emitter = Self::require_event_emitter(self.event_emitter.as_ref(), "off_by_type()")?;
+        Ok(emitter.unsubscribe_by_event_type(event_type))
     }
 
     /// Get this client's event bus, if one exists.

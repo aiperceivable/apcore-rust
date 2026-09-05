@@ -388,9 +388,11 @@ async fn on_input_event_type_non_empty() {
     let mut client = APCore::with_config(sys_config());
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = Arc::clone(&counter);
-    let _id = client.on("", move |_e| {
-        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    });
+    let _id = client
+        .on("", move |_e| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("events enabled");
     let emitter = client.events().expect("local emitter exists after on()");
     emitter
         .emit_sequential(&apcore::events::emitter::ApCoreEvent::new(
@@ -403,12 +405,20 @@ async fn on_input_event_type_non_empty() {
 
 // clause: apcore_client.on.error.SYS_MODULES_DISABLED
 #[tokio::test]
-#[ignore = "apcore_client.on.error.SYS_MODULES_DISABLED: Rust on() lazily creates a local \
-emitter and never errors when events are disabled (contract gap vs Python SysModulesDisabledError)"]
 async fn on_error_sys_modules_disabled() {
+    // A client built without sys_modules has no event bus. on() MUST report
+    // that rather than lazily creating a standalone bus no framework event
+    // reaches — parity with apcore-python / apcore-typescript, which raise
+    // SysModulesDisabledError here.
     let mut client = APCore::new();
-    // No error path exists: this returns a subscriber id rather than erroring.
-    let _id = client.on("apcore.health.error_threshold_exceeded", |_e| {});
+    let err = client
+        .on("apcore.health.error_threshold_exceeded", |_e| {})
+        .expect_err("on() must error when events are disabled");
+    assert_eq!(err.code, apcore::errors::ErrorCode::SysModulesDisabled);
+    assert!(
+        client.events().is_none(),
+        "a refused subscription must not leave a bus behind"
+    );
 }
 
 // clause: apcore_client.on.property.thread_safe
@@ -423,9 +433,11 @@ async fn on_property_thread_safe() {
             let mut client = APCore::with_config(sys_config());
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let c = Arc::clone(&counter);
-            client.on("evt.shared", move |_e| {
-                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            });
+            client
+                .on("evt.shared", move |_e| {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .expect("events enabled");
             let emitter = client.events().expect("emitter");
             emitter
                 .emit_sequential(&apcore::events::emitter::ApCoreEvent::new(
@@ -450,12 +462,16 @@ async fn on_property_idempotent_false() {
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c1 = Arc::clone(&counter);
     let c2 = Arc::clone(&counter);
-    client.on("evt.dup", move |_e| {
-        c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    });
-    client.on("evt.dup", move |_e| {
-        c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    });
+    client
+        .on("evt.dup", move |_e| {
+            c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("events enabled");
+    client
+        .on("evt.dup", move |_e| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("events enabled");
     let emitter = client.events().expect("emitter");
     emitter
         .emit_sequential(&apcore::events::emitter::ApCoreEvent::new(
@@ -472,9 +488,12 @@ async fn on_returns_subscriber() {
     // Rust on() returns a subscriber-id String (spec Rust row) instead of a
     // subscriber object; off() accepts that id.
     let mut client = APCore::with_config(sys_config());
-    let id = client.on("evt.x", |_e| {});
+    let id = client.on("evt.x", |_e| {}).expect("events enabled");
     assert!(!id.is_empty(), "on() returns a non-empty subscriber id");
-    assert!(client.off(&id), "off() removes the subscriber by id");
+    assert!(
+        client.off(&id).expect("events enabled"),
+        "off() removes the subscriber by id"
+    );
 }
 
 // Regression: `on()`'s `event_type` is filtered by EXACT equality, per the
@@ -491,9 +510,11 @@ async fn on_event_type_is_exact_match_not_glob() {
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = Arc::clone(&counter);
     // Subscribes to the literal event type "apcore.acl.*" — not a prefix glob.
-    client.on("apcore.acl.*", move |_e| {
-        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    });
+    client
+        .on("apcore.acl.*", move |_e| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("events enabled");
     let emitter = client.events().expect("local emitter exists after on()");
 
     // A DIFFERENT event type that would glob-match "apcore.acl.*" must NOT
@@ -530,11 +551,14 @@ async fn on_event_type_is_exact_match_not_glob() {
 
 // clause: apcore_client.off.error.SYS_MODULES_DISABLED
 #[tokio::test]
-#[ignore = "apcore_client.off.error.SYS_MODULES_DISABLED: Rust off() returns false when no \
-emitter exists and never errors (contract gap vs Python SysModulesDisabledError)"]
 async fn off_error_sys_modules_disabled() {
+    // "no such subscriber" and "events are off" are different answers; off()
+    // MUST NOT collapse the second into a plain `false`.
     let mut client = APCore::new();
-    let _ = client.off("nonexistent-id");
+    let err = client
+        .off("nonexistent-id")
+        .expect_err("off() must error when events are disabled");
+    assert_eq!(err.code, apcore::errors::ErrorCode::SysModulesDisabled);
 }
 
 // clause: apcore_client.off.property.idempotent_true
@@ -544,12 +568,17 @@ async fn off_property_idempotent_true() {
     let mut client = APCore::with_config(sys_config());
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = Arc::clone(&counter);
-    let id = client.on("evt.off", move |_e| {
-        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    });
-    assert!(client.off(&id), "first off() removes the subscriber");
+    let id = client
+        .on("evt.off", move |_e| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("events enabled");
     assert!(
-        !client.off(&id),
+        client.off(&id).expect("events enabled"),
+        "first off() removes the subscriber"
+    );
+    assert!(
+        !client.off(&id).expect("events enabled"),
         "second off() is a safe no-op (returns false)"
     );
     let emitter = client.events().expect("emitter");
@@ -573,10 +602,12 @@ async fn off_property_thread_safe() {
             let mut client = APCore::with_config(sys_config());
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let c = Arc::clone(&counter);
-            let id = client.on("evt.toff", move |_e| {
-                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            });
-            let removed = client.off(&id);
+            let id = client
+                .on("evt.toff", move |_e| {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .expect("events enabled");
+            let removed = client.off(&id).expect("events enabled");
             let emitter = client.events().expect("emitter");
             emitter
                 .emit_sequential(&apcore::events::emitter::ApCoreEvent::new(

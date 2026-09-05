@@ -289,9 +289,11 @@ async fn phase3_validation_failure_emits_post_validation_event() {
 
     let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&captured);
-    apcore.on("apcore.stream.post_validation_failed", move |event| {
-        sink.lock().push(event.data.clone());
-    });
+    apcore
+        .on("apcore.stream.post_validation_failed", move |event| {
+            sink.lock().push(event.data.clone());
+        })
+        .expect("events enabled");
 
     let mut s = apcore
         .executor()
