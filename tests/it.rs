@@ -120,6 +120,8 @@ mod test_approval_callback_handler;
 mod test_approval_decision_event;
 #[path = "test_approval_request_caller_id_action.rs"]
 mod test_approval_request_caller_id_action;
+#[path = "test_approval_request_fields_conformance.rs"]
+mod test_approval_request_fields_conformance;
 #[path = "test_approval_request_live_module_metadata.rs"]
 mod test_approval_request_live_module_metadata;
 #[path = "test_async_task.rs"]
