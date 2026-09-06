@@ -1436,13 +1436,31 @@ impl Config {
     /// the tier 2-5 majority, whose project root already is CWD and for whom
     /// nothing changes at all.
     ///
-    /// Fired per load rather than once per process, unlike the
-    /// `observability.redaction.*` legacy-key warning. That one guards a key
-    /// read on a hot path; this one guards a *document*, so its natural
-    /// cardinality is one per document read — and [`Self::reload`] genuinely
-    /// re-reads the file, where an operator who has just edited it should see
-    /// the notice again. It also keeps the check free of process-global state,
-    /// which a one-shot flag would otherwise let one test consume from another.
+    /// **Cadence: once per configuration load, never once per process.** This is
+    /// normative — §9.2.2 requirement 2 states it outright and forbids
+    /// suppressing the warning with process-global state — so it is not a local
+    /// judgement call: an implementation holding a once-per-process flag is
+    /// non-conforming as of spec v1.36.0.
+    ///
+    /// v1.35.0 required the warning and its two narrowing conditions but said
+    /// nothing about cadence, and the three SDKs immediately invented three
+    /// (Python deduplicating through the `warnings` filter, TypeScript holding
+    /// a module-global once-flag, Rust warning per load). v1.36.0 adopts this
+    /// SDK's reading and gives the two reasons for it. The warning is a
+    /// property of *the document being loaded*, so every load meeting both
+    /// conditions emits and a load meeting neither is silent. A once-per-process
+    /// flag makes emission **order-dependent** — whichever configuration loads
+    /// first consumes the warning, so a later affected document is silent and
+    /// the operator cannot tell which one triggered it — and that same global is
+    /// a test-isolation hazard, one test consuming the warning another needed.
+    /// De-duplication for log volume belongs to the host logging layer.
+    ///
+    /// It follows that [`Self::reload`], which genuinely re-reads the file,
+    /// warns again: §9.2.2 says a reload SHOULD re-evaluate, and an operator who
+    /// has just edited the document should see the notice against the version
+    /// they just wrote. This is the opposite cadence to the
+    /// `observability.redaction.*` legacy-key warning, which guards a key read
+    /// on a hot path rather than a document.
     fn warn_if_path_resolution_will_change(&self) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let root = self.project_root();
@@ -3547,6 +3565,116 @@ mod path_base_deprecation_tests {
         assert!(
             !logs.contains("DEPRECATION"),
             "absolute paths pin today's behaviour, so there is nothing to warn about: {logs}"
+        );
+    }
+
+    #[test]
+    fn two_affected_configurations_in_one_process_both_warn() {
+        // §9.2.2 requirement 2's cadence clause, which spec v1.36.0 states
+        // normatively: ONCE PER CONFIGURATION LOAD, never once per process.
+        // Implementations MUST NOT suppress the warning with process-global
+        // state.
+        //
+        // The failure the clause forbids is invisible to a one-config test. A
+        // once-per-process flag passes every single-load assertion in this
+        // module: the first load warns, which is all any of them observe. It is
+        // only the SECOND affected document that goes silent, and by then the
+        // operator has two candidate configurations and one warning naming
+        // neither of them in particular.
+        //
+        // The two documents differ, and each warning must name its OWN project
+        // root, so a second warning that were somehow a replay of the first
+        // fails here too.
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = write_config(
+            first_dir.path(),
+            "./extensions",
+            "./schemas",
+            "./acl",
+            "./bindings",
+        );
+        let second = write_config(
+            second_dir.path(),
+            "./ext2",
+            "./schemas2",
+            "./acl2",
+            "./bindings2",
+        );
+
+        let first_logs = capture_logs(|| {
+            Config::load(&first).unwrap();
+        });
+        let second_logs = capture_logs(|| {
+            Config::load(&second).unwrap();
+        });
+
+        for (which, logs, dir) in [
+            ("first", &first_logs, first_dir.path()),
+            ("second", &second_logs, second_dir.path()),
+        ] {
+            assert!(
+                logs.contains("DEPRECATION"),
+                "the {which} affected configuration must warn — a warning \
+                 consumed by an earlier load is the process-global suppression \
+                 §9.2.2 forbids: {logs}"
+            );
+            let root = dir.canonicalize().unwrap();
+            assert!(
+                logs.contains(&root.display().to_string()),
+                "the {which} warning must name that document's own project \
+                 root {}: {logs}",
+                root.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unaffected_configuration_between_two_affected_ones_stays_silent() {
+        // The other half of "a property of the document being loaded": a load
+        // that meets neither condition emits nothing, and does not disturb the
+        // loads on either side of it. Together with the test above this pins
+        // the cadence to the DOCUMENT rather than to the process in both
+        // directions.
+        let affected_dir = tempfile::tempdir().unwrap();
+        let clean_dir = tempfile::tempdir().unwrap();
+        let affected = write_config(
+            affected_dir.path(),
+            "./extensions",
+            "./schemas",
+            "./acl",
+            "./bindings",
+        );
+        let abs = clean_dir.path().to_str().unwrap().to_string();
+        let clean = write_config(
+            clean_dir.path(),
+            &format!("{abs}/extensions"),
+            &format!("{abs}/schemas"),
+            &format!("{abs}/acl"),
+            &format!("{abs}/bindings"),
+        );
+
+        let before = capture_logs(|| {
+            Config::load(&affected).unwrap();
+        });
+        let middle = capture_logs(|| {
+            Config::load(&clean).unwrap();
+        });
+        let after = capture_logs(|| {
+            Config::load(&affected).unwrap();
+        });
+
+        assert!(before.contains("DEPRECATION"), "{before}");
+        assert!(
+            !middle.contains("DEPRECATION"),
+            "every path-typed value is absolute, so this document cannot \
+             re-root and must be silent: {middle}"
+        );
+        assert!(
+            after.contains("DEPRECATION"),
+            "re-reading the same affected document warns again — §9.2.2: a \
+             reload SHOULD re-evaluate, and an operator who has just edited the \
+             file should see the notice against what they wrote: {after}"
         );
     }
 
