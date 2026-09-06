@@ -66,6 +66,21 @@ path = "tests/config_discovery.rs"
 name = "conformance_test"
 path = "tests/conformance_test.rs"
 
+# The three §9.2.1 / §9.2.2 / §5.12.6 conformance drivers. Each mutates the
+# process environment (`APCORE_*`, `HOME`) and/or the working directory, which
+# is exactly the state `tests/it.rs` cannot share across its threads.
+[[test]]
+name = "test_config_path_typed_keys_conformance"
+path = "tests/test_config_path_typed_keys_conformance.rs"
+
+[[test]]
+name = "test_bindings_dir_resolution_conformance"
+path = "tests/test_bindings_dir_resolution_conformance.rs"
+
+[[test]]
+name = "test_config_project_root_conformance"
+path = "tests/test_config_project_root_conformance.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
