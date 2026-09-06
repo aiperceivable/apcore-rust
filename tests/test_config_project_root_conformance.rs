@@ -43,22 +43,20 @@ const OWNED_ENV: &[&str] = &[
     "APCORE_BINDINGS_DIR",
 ];
 
-/// Cases this SDK does not satisfy as the fixture states them. Driven by the
-/// `#[ignore]`d test below rather than dropped, so the divergence shows up in
-/// `cargo test` output and fails loudly under `--ignored`.
+/// Cases this SDK does not satisfy as the fixture states them.
 ///
-/// `no_warning_when_all_path_values_absolute`: the case's config declares
-/// `schema.root` and `acl.root` absolute but leaves `extensions.root` and
-/// `bindings.dir` undeclared, so their §9.1.1 relative defaults (`./extensions`,
-/// `./bindings`) still stand in the merged configuration. §9.2.2's target
-/// semantics clause 2 says a relative DEFAULT re-roots exactly as a written
-/// value does, so this SDK counts them, finds a relative path-typed value
-/// present, and warns. The case's precondition
-/// (`relative_path_typed_values_present: false`) is not established by the
-/// config it writes. Reported upstream rather than papered over: the SHOULD in
-/// requirement 2 is satisfied by the SDK's reading, and narrowing the warning
-/// to file-declared values only would contradict clause 2.
-const DIVERGENT: &[&str] = &["no_warning_when_all_path_values_absolute"];
+/// EMPTY as of spec v1.36.0. It held `no_warning_when_all_path_values_absolute`,
+/// whose config spelled only `schema.root` and `acl.root` absolutely and left
+/// `extensions.root` and `bindings.dir` at their relative §9.1.1 defaults —
+/// which §9.2.2's target-semantics clause 2 counts, so the case's own
+/// precondition (`relative_path_typed_values_present: false`) was not
+/// established by the config it wrote and the warning correctly fired. All
+/// three SDKs reported it independently; v1.36.0 repaired the case to spell
+/// EVERY §9.2.1 key absolutely, and it is now driven green in the main loop.
+///
+/// Kept as an (empty) declaration rather than deleted so the cross-check below
+/// keeps its shape for the next divergence.
+const DIVERGENT: &[&str] = &[];
 
 /// Serialises the cases: each sets `$HOME`, `APCORE_*` and the working
 /// directory, all process-global.
@@ -79,19 +77,61 @@ fn fixture() -> Value {
 // Layout
 // ---------------------------------------------------------------------------
 
-/// The fixture spells §9.14 tier 6 as `~/.config/apcore/`, which §9.14 itself
-/// glosses as "XDG on Linux, `~/Library/Application Support` on macOS". This
-/// maps the fixture's path onto the location this platform's discovery actually
-/// searches; without it the tier-6 case would test that a file nobody looks for
-/// is not found.
-fn translate(relative: &str) -> String {
-    const FIXTURE_TIER6: &str = "fakehome/.config/apcore";
+/// The directory the driver redirects `$HOME` to, named by the fixture's
+/// `layout.home`.
+fn home_dir(root: &Path, fx: &Value) -> PathBuf {
+    root.join(
+        fx["layout"]["home"]
+            .as_str()
+            .expect("layout names the home directory to redirect to"),
+    )
+}
+
+/// This platform's §9.14 tier-6 directory under the redirected home.
+///
+/// §9.14 states tier 6 is platform-varying: `~/.config/apcore` on Linux,
+/// `~/Library/Application Support/apcore` on macOS. The fixture therefore names
+/// the TIER through a token and leaves the spelling to the driver — as first
+/// published it hardcoded the POSIX path, which made every driver fail on macOS
+/// while asserting nothing extra on Linux.
+fn tier6_dir(root: &Path, fx: &Value) -> PathBuf {
+    let home = home_dir(root, fx);
     if cfg!(target_os = "macos") {
-        if let Some(rest) = relative.strip_prefix(FIXTURE_TIER6) {
-            return format!("fakehome/Library/Application Support/apcore{rest}");
+        home.join("Library")
+            .join("Application Support")
+            .join("apcore")
+    } else {
+        home.join(".config").join("apcore")
+    }
+}
+
+/// Tier 7's `~/.apcore`. Not platform-varying, but HOME-relative, so it takes
+/// the same token treatment rather than a literal path under the workspace.
+fn tier7_dir(root: &Path, fx: &Value) -> PathBuf {
+    home_dir(root, fx).join(".apcore")
+}
+
+/// Resolve one fixture path: a `<...>` TOKEN against this platform's location,
+/// anything else as a path relative to the case workspace.
+///
+/// An unrecognised token is a hard failure rather than a fall-through to
+/// `root.join("<something>")`, which would silently create a literal directory
+/// named after the token and pass.
+fn layout_path(root: &Path, fx: &Value, spec: &str) -> PathBuf {
+    match spec {
+        "<tier6_config>" => tier6_dir(root, fx).join("config.yaml"),
+        "<tier6_dir>" => tier6_dir(root, fx),
+        "<tier7_config>" => tier7_dir(root, fx).join("config.yaml"),
+        "<tier7_dir>" => tier7_dir(root, fx),
+        other => {
+            assert!(
+                !(other.starts_with('<') && other.ends_with('>')),
+                "FAIL: {FIXTURE} grew token `{other}` that this driver cannot resolve — \
+                 teach the driver, do not join it as a literal directory name"
+            );
+            root.join(other)
         }
     }
-    relative.to_string()
 }
 
 fn canon(path: &Path) -> PathBuf {
@@ -107,8 +147,8 @@ fn canon(path: &Path) -> PathBuf {
 /// fixture}` with no `version`, which `Config::load` rejects. The line is
 /// prepended rather than the document rewritten, so the fixture's own YAML —
 /// including every path-typed value the case is about — reaches disk unchanged.
-fn write_fs_entry(root: &Path, relative: &str, content: &str) {
-    let target = root.join(translate(relative));
+fn write_fs_entry(root: &Path, fx: &Value, relative: &str, content: &str) {
+    let target = layout_path(root, fx, relative);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).expect("create fs parent");
     }
@@ -120,13 +160,20 @@ fn write_fs_entry(root: &Path, relative: &str, content: &str) {
     std::fs::write(&target, body).expect("write fs entry");
 }
 
+/// Create the layout's own directories.
+///
+/// The tier-6 and tier-7 subdirectories are deliberately NOT listed by the
+/// fixture — tier 6's location is platform-varying — so they are created by
+/// [`write_fs_entry`] when a case materialises `<tier6_config>` /
+/// `<tier7_config>`. The redirected home itself IS listed, because every case
+/// needs it to exist whether or not it holds a config file.
 fn build_layout(root: &Path, fx: &Value) {
     for dir in fx["layout"]["dirs"]
         .as_array()
         .expect("layout declares dirs")
     {
         let dir = dir.as_str().expect("dir is a string");
-        std::fs::create_dir_all(root.join(translate(dir))).expect("create layout dir");
+        std::fs::create_dir_all(layout_path(root, fx, dir)).expect("create layout dir");
     }
 }
 
@@ -219,8 +266,8 @@ fn relative_path_typed_keys(config: &Config) -> Vec<String> {
 /// an SDK anchored at CWD would keep finding one. The two policy documents the
 /// fixture writes are byte-identical, which is why presence, not content, is the
 /// observable.
-fn assert_acl_root(config: &Config, root: &Path, want: &str, id: &str) {
-    let policy = root.join(want).join("global_acl.yaml");
+fn assert_acl_root(config: &Config, root: &Path, fx: &Value, want: &str, id: &str) {
+    let policy = layout_path(root, fx, want).join("global_acl.yaml");
     assert!(
         policy.is_file(),
         "[{id}] precondition: the fixture layout must put a policy at {}",
@@ -250,9 +297,16 @@ fn assert_acl_root(config: &Config, root: &Path, want: &str, id: &str) {
 /// The fixture creates both `schemas/` directories (via `.keep`) precisely so
 /// exactly one semantics passes; the loader needs a file to find, so the driver
 /// drops a marker schema into each and reads back which one loaded.
-fn assert_schema_root(config: &Config, root: &Path, want: &str, candidates: &[&str], id: &str) {
+fn assert_schema_root(
+    config: &Config,
+    root: &Path,
+    fx: &Value,
+    want: &str,
+    candidates: &[&str],
+    id: &str,
+) {
     for candidate in candidates {
-        let dir = root.join(candidate);
+        let dir = layout_path(root, fx, candidate);
         assert!(
             dir.is_dir(),
             "[{id}] precondition: the fixture layout must create {}",
@@ -317,7 +371,7 @@ fn run_case(fx: &Value, tc: &Value, root: &Path, id: &str) -> (Config, String) {
 
     // Home isolation: tiers 6-7 must never read the real user's home, and no
     // other case may pick up a config file that lives there.
-    std::env::set_var("HOME", root.join("fakehome"));
+    std::env::set_var("HOME", home_dir(root, fx));
     std::env::remove_var("XDG_CONFIG_HOME");
     for name in OWNED_ENV {
         std::env::remove_var(name);
@@ -334,7 +388,7 @@ fn run_case(fx: &Value, tc: &Value, root: &Path, id: &str) -> (Config, String) {
             // The fixture's paths are relative to the layout root; CWD is
             // `project/`, so the selector has to be absolutised or tier 1 would
             // resolve against the wrong directory.
-            std::env::set_var(name, root.join(translate(value)));
+            std::env::set_var(name, layout_path(root, fx, value));
         } else {
             std::env::set_var(name, value);
         }
@@ -343,6 +397,7 @@ fn run_case(fx: &Value, tc: &Value, root: &Path, id: &str) -> (Config, String) {
     for (relative, content) in tc["fs"].as_object().unwrap_or(&empty) {
         write_fs_entry(
             root,
+            fx,
             relative,
             content.as_str().expect("fs content is text"),
         );
@@ -354,7 +409,7 @@ fn run_case(fx: &Value, tc: &Value, root: &Path, id: &str) -> (Config, String) {
         .as_str()
         .or_else(|| fx["layout"]["cwd"].as_str())
         .expect("a case or the layout names a cwd");
-    std::env::set_current_dir(root.join(cwd)).expect("chdir into the layout cwd");
+    std::env::set_current_dir(layout_path(root, fx, cwd)).expect("chdir into the layout cwd");
 
     if let Some(mapping) = tc.get("config_from_mapping") {
         // No discovery ran and there is no source path.
@@ -391,7 +446,7 @@ fn assert_case(fx: &Value, tc: &Value, root: &Path, id: &str) {
                 });
                 match want.as_str() {
                     Some(relative) => {
-                        let expect = canon(&root.join(translate(relative)));
+                        let expect = canon(&layout_path(root, fx, relative));
                         assert_eq!(
                             actual,
                             Some(expect),
@@ -413,7 +468,7 @@ fn assert_case(fx: &Value, tc: &Value, root: &Path, id: &str) {
                 let relative = want.as_str().expect("project_root is a string");
                 assert_eq!(
                     canon(&config.project_root()),
-                    canon(&root.join(translate(relative))),
+                    canon(&layout_path(root, fx, relative)),
                     "[{id}] project_root"
                 );
             }
@@ -460,6 +515,7 @@ fn assert_case(fx: &Value, tc: &Value, root: &Path, id: &str) {
                 assert_acl_root(
                     &config,
                     root,
+                    fx,
                     want.as_str().expect("resolved_acl_root is a string"),
                     id,
                 );
@@ -472,6 +528,7 @@ fn assert_case(fx: &Value, tc: &Value, root: &Path, id: &str) {
                 assert_schema_root(
                     &config,
                     root,
+                    fx,
                     want.as_str().expect("resolved_schema_root is a string"),
                     &["project/schemas", "elsewhere/schemas"],
                     id,
@@ -525,51 +582,18 @@ fn conformance_config_project_root() {
     saved.restore();
 }
 
-/// The `no_warning_when_all_path_values_absolute` case, driven exactly as the
-/// fixture states it.
+/// The fixture's `tier_6_config` / `tier_7_config` tokens must resolve to the
+/// location this platform's §9.14 discovery actually searches.
 ///
-/// IGNORED, not deleted: the case's config leaves `extensions.root` and
-/// `bindings.dir` undeclared, so their relative §9.1.1 defaults stand and this
-/// SDK — which counts defaults, as §9.2.2's clause 2 requires — reports a
-/// relative path-typed value present and warns. Run it with
-/// `cargo test --test test_config_project_root_conformance -- --ignored`
-/// to see the divergence.
+/// Without this, a driver bug that resolved the tokens to a directory nobody
+/// looks in would make both tier cases pass for the wrong reason: no config
+/// file is found, `Config::discover` falls back to `from_defaults()`, and
+/// `project_root` is CWD — which is exactly what those cases assert. The
+/// `config_source_dir` half is what stops that, so this pins the token
+/// resolution itself against the SDK rather than against the driver's own
+/// arithmetic.
 #[test]
-#[ignore = "divergence: the case's config leaves relative path-typed DEFAULTS standing, which this SDK counts (apcore#113)"]
-fn conformance_config_project_root_all_absolute() {
-    let _guard = env_guard();
-    let saved = CaseEnv::capture();
-    let fx = fixture();
-    let id = DIVERGENT[0];
-    let case = fx["test_cases"]
-        .as_array()
-        .expect("test_cases is an array")
-        .iter()
-        .find(|tc| tc["id"] == Value::String(id.to_string()))
-        .unwrap_or_else(|| panic!("{FIXTURE} declares {id}"))
-        .clone();
-
-    let workspace = tempfile::tempdir().expect("tempdir");
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_case(&fx, &case, workspace.path(), id);
-    }));
-    saved.restore();
-    drop(workspace);
-    if let Err(payload) = outcome {
-        std::panic::resume_unwind(payload);
-    }
-}
-
-/// The substantive half of §9.2.2 requirement 2's second negative, driven green.
-///
-/// The companion to the `#[ignore]`d case above: with EVERY §9.2.1 key spelled
-/// absolutely — including the three that otherwise stand at their relative
-/// §9.1.1 defaults — a project root outside CWD must produce no warning. Without
-/// this, the divergence note would leave the requirement's second negative
-/// unasserted, and an implementation that warns on the project-root difference
-/// alone would pass everything that remains.
-#[test]
-fn no_warning_when_every_path_typed_value_is_genuinely_absolute() {
+fn the_tier_tokens_resolve_where_discovery_looks() {
     let _guard = env_guard();
     let saved = CaseEnv::capture();
     let fx = fixture();
@@ -578,51 +602,37 @@ fn no_warning_when_every_path_typed_value_is_genuinely_absolute() {
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         build_layout(&root, &fx);
-        std::env::set_var("HOME", root.join("fakehome"));
+        std::env::set_var("HOME", home_dir(&root, &fx));
         std::env::remove_var("XDG_CONFIG_HOME");
         for name in OWNED_ENV {
             std::env::remove_var(name);
         }
-
-        let elsewhere = root.join("elsewhere");
-        let config_path = elsewhere.join("apcore.yaml");
-        std::env::set_var("APCORE_CONFIG_FILE", &config_path);
-        let base = elsewhere.display();
-        std::fs::write(
-            &config_path,
-            format!(
-                "version: '1.0.0'\n\
-                 project: {{name: fixture}}\n\
-                 extensions:\n  root: {base}/extensions\n\
-                 schema:\n  root: {base}/schemas\n\
-                 acl:\n  root: {base}/acl\n\
-                 bindings:\n  dir: {base}/bindings\n"
-            ),
-        )
-        .expect("write config");
-
         std::env::set_current_dir(root.join("project")).expect("chdir");
-        let mut loaded = None;
-        let logs = capture_logs(|| {
-            loaded = Some(Config::discover().expect("discovery must not error"));
-        });
-        let config = loaded.expect("discovery produced a config");
-        let cwd = std::env::current_dir().expect("cwd");
 
-        assert_ne!(
-            canon(&config.project_root()),
-            canon(&cwd),
-            "precondition: the project root must differ from CWD, or the case is vacuous"
-        );
-        assert!(
-            relative_path_typed_keys(&config).is_empty(),
-            "precondition: no path-typed value may remain relative, got {:?}",
-            relative_path_typed_keys(&config)
-        );
-        assert!(
-            !logs.contains("DEPRECATION"),
-            "absolute values cannot re-root, so there is nothing to warn about:\n{logs}"
-        );
+        for (config_token, dir_token) in [
+            ("<tier6_config>", "<tier6_dir>"),
+            ("<tier7_config>", "<tier7_dir>"),
+        ] {
+            let path = layout_path(&root, &fx, config_token);
+            assert_eq!(
+                path.parent().expect("a config file has a parent"),
+                layout_path(&root, &fx, dir_token),
+                "{config_token} must sit inside {dir_token}"
+            );
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create tier dir");
+            std::fs::write(&path, "version: '1.0.0'\nproject: {name: fixture}\n")
+                .expect("write tier config");
+
+            let config = Config::discover().expect("discovery must not error");
+            assert_eq!(
+                config.source_path().map(canon),
+                Some(canon(&path)),
+                "{config_token} resolved to {}, which §9.14 discovery does not search on \
+                 this platform",
+                path.display()
+            );
+            std::fs::remove_file(&path).expect("remove tier config");
+        }
     }));
 
     saved.restore();
