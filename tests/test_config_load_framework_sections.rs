@@ -112,7 +112,7 @@ id_map:
     legacy.name: executor.new.name
 bindings:
   dir: ./my-bindings
-  pattern: "*.binding.yaml"
+  pattern: "*.bind.yaml"
 obs:
   redaction:
     sensitive_keys:
@@ -200,8 +200,13 @@ fn declared_pairs() -> Vec<(&'static str, Value)> {
             "id_map.overrides",
             json!({"legacy.name": "executor.new.name"}),
         ),
+        // Both spelled DIFFERENTLY from their canonical defaults (`./bindings`,
+        // `*.binding.yaml`, added to `defaults.schema.json` in spec v1.36.0).
+        // `absent_sections_are_not_invented` enforces that difference: since
+        // the two keys now have a default layer underneath, only a value the
+        // default cannot supply proves the file was read.
         ("bindings.dir", json!("./my-bindings")),
-        ("bindings.pattern", json!("*.binding.yaml")),
+        ("bindings.pattern", json!("*.bind.yaml")),
         ("obs.redaction.sensitive_keys", json!(["vendor_token"])),
         ("obs.redaction.replacement", json!("[GONE]")),
     ]
@@ -229,7 +234,7 @@ fn expected_subtrees() -> Vec<(&'static str, Value)> {
         ),
         (
             "bindings",
-            json!({"dir": "./my-bindings", "pattern": "*.binding.yaml"}),
+            json!({"dir": "./my-bindings", "pattern": "*.bind.yaml"}),
         ),
         (
             "obs",
@@ -272,26 +277,52 @@ fn walk<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
 // Guard: the fixture cannot pass by coincidence
 // ---------------------------------------------------------------------------
 
-/// None of these sections has a `CONFIG_DEFAULTS` entry, so a config that does
-/// not declare them must answer `None` / empty.
+/// A config that declares none of these sections must answer `None` / empty for
+/// every key that has no canonical default, and a value the file did NOT write
+/// for the two that do.
 ///
 /// This is what makes every `get` assertion below non-vacuous: it proves the
 /// values they see could only have come from the file. `test_config_load_
 /// sections.rs` gets the same protection from `every_fixture_value_differs_
-/// from_its_canonical_default`; these sections have no default to differ from,
-/// so absence is the discriminator instead.
+/// from_its_canonical_default`; most sections here have no default to differ
+/// from, so absence is the discriminator instead.
+///
+/// `bindings.dir` and `bindings.pattern` are the exception since spec v1.36.0,
+/// which added the `bindings` section to `defaults.schema.json`: they now
+/// resolve to `./bindings` and `*.binding.yaml` for a config that never
+/// declared them. For those two the discriminator is the one
+/// `test_config_load_sections.rs` uses — the fixture's value must differ from
+/// the canonical default, so a reader answering from the default table cannot
+/// pass the assertions below.
 #[test]
 fn absent_sections_are_not_invented() {
     let (_dir, config) = load_file("apcore.yaml", "apcore:\n  version: \"1.0\"\n");
 
-    for (key, _) in declared_pairs() {
-        assert_eq!(
-            config.get(key),
-            None,
-            "`{key}` was never declared and has no canonical default, so `get` \
-             must report absence rather than inventing a value — if this starts \
-             returning Some, every assertion in this file is vacuous"
-        );
+    for (key, declared) in declared_pairs() {
+        match Config::default_for(key) {
+            None => assert_eq!(
+                config.get(key),
+                None,
+                "`{key}` was never declared and has no canonical default, so \
+                 `get` must report absence rather than inventing a value — if \
+                 this starts returning Some, every assertion in this file is \
+                 vacuous"
+            ),
+            Some(canonical) => {
+                assert_eq!(
+                    config.get(key),
+                    Some(canonical.clone()),
+                    "`{key}` carries a canonical default, so an undeclared \
+                     config must resolve it to exactly that value"
+                );
+                assert_ne!(
+                    canonical, declared,
+                    "`{key}` has a canonical default, so the fixture MUST \
+                     declare a different value — otherwise every assertion \
+                     about it passes on a reader that ignored the file"
+                );
+            }
+        }
     }
     for section in SECTIONS {
         assert_eq!(

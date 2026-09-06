@@ -28,11 +28,29 @@ const CONFIG_KEY_BINDINGS_DIR: &str = "bindings.dir";
 /// Config key naming the glob binding files must match within that directory.
 const CONFIG_KEY_BINDINGS_PATTERN: &str = "bindings.pattern";
 
-/// Canonical default for `bindings.dir`, from `$defs/BindingsConfig` in
+/// Canonical default for `bindings.dir`, from `schemas/defaults.schema.json`
+/// (spec v1.36.0) and `$defs/BindingsConfig` in
 /// `schemas/apcore-config.schema.json`.
+///
+/// KEPT after v1.36.0 gave the key a canonical default, rather than deleted.
+/// Since that release `Config::get("bindings.dir")` resolves `./bindings`
+/// through `CONFIG_DEFAULTS`, so every call that supplies a [`Config`] reaches
+/// the default through the one precedence chain §5.12.6 clause 2 requires and
+/// never touches this constant. What it still serves is the call that supplies
+/// **no** `Config` at all — `load_binding_dir_with_config(None, None, None)`,
+/// a supported public invocation with nothing for `Config::get` to answer
+/// from. The alternative, synthesising a `Config::from_defaults()` inside the
+/// loader, would make the no-config path apply `APCORE_*` overrides that its
+/// caller never asked for.
+///
+/// The duplication that a second copy of a canonical value always risks is
+/// pinned rather than trusted: `the_loader_default_matches_the_canonical_
+/// default_table` asserts these two constants equal `Config::default_for` for
+/// their keys, so the pair cannot drift.
 const DEFAULT_BINDING_DIR: &str = "./bindings";
 
-/// Canonical default for `bindings.pattern`, from the same schema.
+/// Canonical default for `bindings.pattern`, from the same schemas, kept on the
+/// same terms as [`DEFAULT_BINDING_DIR`].
 const DEFAULT_BINDING_PATTERN: &str = "*.binding.yaml";
 
 const SUPPORTED_SPEC_VERSIONS: &[&str] = &["1.0"];
@@ -510,13 +528,14 @@ impl BindingLoader {
     /// through [`Config::get`] here is what implements §9.2's precedence chain.
     /// This SDK deliberately does not read the environment directly.
     ///
-    /// Unlike `extensions.root` and `schema.root`, the default tier does need
-    /// its own branch: `schemas/defaults.schema.json` — which `CONFIG_DEFAULTS`
-    /// transcribes verbatim — declares no `bindings` entry, so
-    /// [`Config::get`] returns `None` for an undeclared `bindings.dir` rather
-    /// than falling back. The `./bindings` and `*.binding.yaml` defaults below
-    /// are the ones `$defs/BindingsConfig` in
-    /// `schemas/apcore-config.schema.json` declares.
+    /// The default tier is `Config`'s as of spec v1.36.0: that release added the
+    /// `bindings` section to `schemas/defaults.schema.json`, which
+    /// `CONFIG_DEFAULTS` transcribes, so [`Config::get`] answers `./bindings`
+    /// and `*.binding.yaml` for an undeclared key exactly as it does for
+    /// `extensions.root` and `schema.root`. The `DEFAULT_BINDING_*` constants
+    /// below are reached only when the caller supplies no `Config` at all,
+    /// where there is nothing to resolve through; they are pinned equal to
+    /// [`Config::default_for`] by an in-crate test.
     ///
     /// Scanning stays **user-invoked**. Nothing in this SDK calls this at client
     /// initialisation, and §5.12.6's MUST does not ask for that: it binds a
@@ -1504,15 +1523,24 @@ mod bindings_dir_from_config_tests {
 
     #[test]
     fn default_applies_when_the_config_declares_no_bindings_section() {
-        // Tier 3. Unlike `extensions.root` and `schema.root`, this default
-        // cannot come from `Config::get`: `defaults.schema.json` declares no
-        // `bindings` entry, so `CONFIG_DEFAULTS` carries none either and the
-        // loader must supply `./bindings` itself. Asserted through the error
-        // message because `./bindings` does not exist under the test CWD.
-        assert!(
-            Config::default_for("bindings.dir").is_none(),
-            "precondition: the canonical default table has no bindings entry, \
-             so the loader owns this default"
+        // Tier 3. Spec v1.36.0 moved this default INTO `defaults.schema.json`,
+        // so `CONFIG_DEFAULTS` now carries it and `Config::get` is what answers
+        // `./bindings` here — the loader's own constant is not consulted on
+        // this path any more.
+        //
+        // This assertion was `Config::default_for("bindings.dir").is_none()`
+        // and existed to stop the loader's hardcoded default from being quietly
+        // deleted while nothing else supplied one. v1.36.0 supplies one, so the
+        // guard is inverted rather than dropped: the key MUST now resolve
+        // through the canonical table, and to the same value the loader would
+        // otherwise have used.
+        assert_eq!(
+            Config::default_for("bindings.dir")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .as_deref(),
+            Some(DEFAULT_BINDING_DIR),
+            "precondition: since spec v1.36.0 the canonical default table owns \
+             this default, and it must agree with the loader's constant"
         );
 
         let workspace = tempfile::tempdir().unwrap();
@@ -1554,5 +1582,29 @@ mod bindings_dir_from_config_tests {
         assert_eq!(count, 1);
         assert!(loader.resolve("alpha").is_ok());
         assert_eq!(DEFAULT_BINDING_PATTERN, "*.binding.yaml");
+    }
+
+    #[test]
+    fn the_loader_default_matches_the_canonical_default_table() {
+        // The constants survive v1.36.0 only for the no-`Config` invocation
+        // (`load_binding_dir_with_config(None, None, None)`), where there is
+        // nothing for `Config::get` to answer from. A second copy of a
+        // canonical value is a drift risk, so it is pinned instead of trusted:
+        // if `defaults.schema.json` ever changes either value,
+        // `CONFIG_DEFAULTS` follows it (the governance fixture forces that) and
+        // this test then reports the loader constant left behind.
+        for (key, loader_default) in [
+            ("bindings.dir", DEFAULT_BINDING_DIR),
+            ("bindings.pattern", DEFAULT_BINDING_PATTERN),
+        ] {
+            assert_eq!(
+                Config::default_for(key)
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .as_deref(),
+                Some(loader_default),
+                "`{key}`: the loader constant and the canonical default table \
+                 must not drift"
+            );
+        }
     }
 }

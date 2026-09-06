@@ -430,6 +430,15 @@ const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
     ("acl.default_effect", DefaultValue::Str("deny")),
     ("sys_modules.enabled", DefaultValue::Bool(false)),
     ("stream.max_merge_depth", DefaultValue::Int(32)),
+    // Spec v1.36.0 added the `bindings` section to `defaults.schema.json`.
+    // Until then the section was declared in §9.1.1 and in
+    // `apcore-config.schema.json` but absent from the file that IS the
+    // canonical default tier, so no SDK could carry the default and all three
+    // hardcoded `./bindings` at their binding loader instead. With these two
+    // entries `Config::get("bindings.dir")` answers the documented value, which
+    // is what §5.12.6 clause 1's "default `./bindings`" tier resolves through.
+    ("bindings.dir", DefaultValue::Str("./bindings")),
+    ("bindings.pattern", DefaultValue::Str("*.binding.yaml")),
 ];
 
 /// Executor namespace configuration (`PROTOCOL_SPEC` §9.1).
@@ -3386,8 +3395,19 @@ mod path_base_deprecation_tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// A §9.1-valid config whose four path-typed keys take the given values.
-    fn write_config(dir: &Path, extensions: &str, schema: &str, acl: &str) -> std::path::PathBuf {
+    /// A §9.1-valid config whose scalar path-typed keys take the given values.
+    ///
+    /// `bindings.dir` is written like its three siblings rather than left out:
+    /// since spec v1.36.0 it carries the canonical default `./bindings`, so an
+    /// omitted key is a RELATIVE path-typed value in the merged configuration,
+    /// not an absent one.
+    fn write_config(
+        dir: &Path,
+        extensions: &str,
+        schema: &str,
+        acl: &str,
+        bindings: &str,
+    ) -> std::path::PathBuf {
         let path = dir.join("apcore.yaml");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "version: '0.15.0'").unwrap();
@@ -3400,13 +3420,21 @@ mod path_base_deprecation_tests {
         writeln!(f, "acl:").unwrap();
         writeln!(f, "  root: {acl}").unwrap();
         writeln!(f, "  default_effect: deny").unwrap();
+        writeln!(f, "bindings:").unwrap();
+        writeln!(f, "  dir: {bindings}").unwrap();
         path
     }
 
     #[test]
     fn warns_when_the_project_root_differs_from_cwd_and_a_relative_path_key_is_present() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), "./extensions", "./schemas", "./acl");
+        let path = write_config(
+            dir.path(),
+            "./extensions",
+            "./schemas",
+            "./acl",
+            "./bindings",
+        );
 
         let logs = capture_logs(|| {
             let config = Config::load(&path).unwrap();
@@ -3425,7 +3453,7 @@ mod path_base_deprecation_tests {
             logs.contains("aiperceivable/apcore#113"),
             "the warning must name the issue that explains the change: {logs}"
         );
-        for key in ["extensions.root", "schema.root", "acl.root"] {
+        for key in ["extensions.root", "schema.root", "acl.root", "bindings.dir"] {
             assert!(
                 logs.contains(key),
                 "the warning must name the affected key {key}: {logs}"
@@ -3445,6 +3473,7 @@ mod path_base_deprecation_tests {
             &format!("{abs}/extensions"),
             &format!("{abs}/schemas"),
             &format!("{abs}/acl"),
+            &format!("{abs}/bindings"),
         );
 
         let logs = capture_logs(|| {
@@ -3474,7 +3503,8 @@ mod path_base_deprecation_tests {
                 { "root": "./plugins", "namespace": "plugins" }
             ]},
             "schema": { "root": "/abs/schemas" },
-            "acl": { "root": "/abs/acl", "default_effect": "deny" }
+            "acl": { "root": "/abs/acl", "default_effect": "deny" },
+            "bindings": { "dir": "/abs/bindings" }
         }))
         .unwrap();
 
