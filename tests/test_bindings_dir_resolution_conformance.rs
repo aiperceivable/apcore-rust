@@ -38,25 +38,30 @@ const FIXTURE: &str = "bindings_dir_resolution.json";
 ///
 /// Removed — never set to `""` — before every case that does not name them:
 /// §9.2 makes an empty `APCORE_BINDINGS_DIR` a declaration of `bindings.dir`
-/// with an empty value, which is an override, not a neutral state.
+/// with an empty value, which is an override, not a neutral state. (Since spec
+/// v1.36.0 §9.2.1 requirement 5 makes this SDK discard such a value, but the
+/// isolation must not depend on the behaviour under test.)
 const OWNED_ENV: &[&str] = &[
     "APCORE_BINDINGS_DIR",
     "APCORE_BINDINGS_PATTERN",
     "APCORE_CONFIG_FILE",
 ];
 
-/// Cases this SDK does not satisfy as the fixture states them. Driven by the
-/// `#[ignore]`d test below rather than dropped, so the divergence is visible in
-/// `cargo test` output and fails loudly under `--ignored`.
+/// Cases this SDK does not satisfy as the fixture states them.
 ///
-/// `missing_configured_dir_is_not_an_error`: the fixture expects a configured
-/// `bindings.dir` that does not exist to yield an empty result with no error.
-/// This SDK raises `BINDING_FILE_INVALID` for a non-directory, on the explicit
-/// and the config-resolved path alike (`BindingLoader::load_binding_dir_with_
-/// config`), and §5.12.6 states no requirement either way. Reported upstream
-/// rather than repaired here: changing it is a behaviour change to a public
-/// entry point, not a test.
-const DIVERGENT: &[&str] = &["missing_configured_dir_is_not_an_error"];
+/// EMPTY as of spec v1.36.0. It held `missing_configured_dir_is_not_an_error`,
+/// where the fixture expected a configured `bindings.dir` that does not exist
+/// to yield an empty result with no error while this SDK raised
+/// `BINDING_FILE_INVALID`. §5.12.6 stated no outcome either way, so the
+/// divergence was reported upstream rather than repaired here — and v1.36.0's
+/// clause 5 settled it in this SDK's favour: a missing resolved directory
+/// **MUST** raise, naming the directory, and **MUST NOT** return an empty
+/// result. The case is now `missing_configured_dir_raises` and is driven green
+/// in the main loop below.
+///
+/// Kept as an (empty) declaration rather than deleted so the cross-check below
+/// keeps its shape for the next divergence.
+const DIVERGENT: &[&str] = &[];
 
 /// Serialises the cases against each other: each one sets `APCORE_BINDINGS_*`
 /// and `chdir`s into its own layout, both of which are process-global.
@@ -79,53 +84,50 @@ fn clear_owned_env() {
     }
 }
 
-/// The module ID a fixture `fs` entry stands for: the file name up to its first
-/// dot.
+/// Look up the named binding descriptor in the fixture's `binding_files` map.
 ///
-/// The fixture writes one shared descriptor into differently-NAMED files
-/// (`greet.binding.yaml`, `file_side.binding.yaml`, `decoy.binding.yaml`) and
-/// then expects different `loaded_module_ids` per case, so the name is what
-/// distinguishes the candidates. A driver that wrote `module_id: greet` into
-/// every file would make each case's decoys indistinguishable from its winner.
-fn module_id_for(relative: &str) -> String {
-    Path::new(relative)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.split('.').next())
-        .unwrap_or_else(|| panic!("{relative} has a file name"))
-        .to_string()
+/// Every `fs` value NAMES one of these (the fixture's
+/// `fs_values_name_a_descriptor` clause). The descriptors carry DISTINCT
+/// `module_id`s on purpose: a case that plants files in two candidate
+/// directories can then tell which one was scanned, where a single shared id
+/// made such a case pass whichever directory won.
+fn descriptor<'a>(fx: &'a Value, name: &str, id: &str) -> &'a Value {
+    fx["binding_files"]
+        .get(name)
+        .unwrap_or_else(|| panic!("[{id}] {FIXTURE} declares no binding_files entry `{name}`"))
 }
 
-/// Write the fixture's binding descriptor to `root/relative`.
+/// The `module_id` a descriptor declares. Read from the descriptor, never
+/// derived from the file name: the descriptor is what the loader parses.
+fn descriptor_module_ids(template: &Value, name: &str) -> Vec<String> {
+    template["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("binding_files.{name} declares a bindings array"))
+        .iter()
+        .map(|entry| {
+            entry["module_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("binding_files.{name} entry declares a module_id"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// Write a fixture binding descriptor to `root/relative`, VERBATIM.
 ///
-/// One field is translated: the fixture spells the target `target_id`
-/// (PROTOCOL_SPEC §5.12.2), while this SDK's `BindingEntry` spells it `target`.
-/// That naming divergence is pre-existing and outside §5.12.6's subject — this
-/// fixture asserts which directory is scanned, not the descriptor's field
-/// names — so the driver maps it and reports it rather than failing every case
-/// on it.
+/// Nothing is translated any more. Through spec v1.35.0 the fixture spelled the
+/// target field `target_id` while the canonical schema, both binding fixtures
+/// and all three SDK loaders used `target`, so this driver rewrote the key.
+/// v1.36.0 corrected §5.12.2 and the fixture (apcore#115): a file written from
+/// the section that defines the binding-file format now loads, and a driver
+/// that still rewrote the field would hide a regression in the SDK's own
+/// parser.
 fn write_binding_file(root: &Path, relative: &str, template: &Value) {
     let target = root.join(relative);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).expect("create binding dir");
     }
-
-    let mut document = template.clone();
-    let entries = document["bindings"]
-        .as_array_mut()
-        .expect("binding_file declares a bindings array");
-    for entry in entries.iter_mut() {
-        let object = entry.as_object_mut().expect("binding entry is an object");
-        if let Some(target_id) = object.remove("target_id") {
-            object.insert("target".to_string(), target_id);
-        }
-        object.insert(
-            "module_id".to_string(),
-            Value::String(module_id_for(relative)),
-        );
-    }
-
-    let yaml = serde_yaml_ng::to_string(&document).expect("binding descriptor serializes");
+    let yaml = serde_yaml_ng::to_string(template).expect("binding descriptor serializes");
     std::fs::write(&target, yaml).expect("write binding file");
 }
 
@@ -157,23 +159,21 @@ fn write_config_file(root: &Path, block: &Value) -> PathBuf {
 
 /// Materialise a case's `fs` block and return `module_id -> directory`, the map
 /// that turns an observed load back into the directory it was scanned from.
-fn materialise_fs(root: &Path, fs: &Value, template: &Value, id: &str) -> BTreeMap<String, String> {
+fn materialise_fs(root: &Path, fx: &Value, fs: &Value, id: &str) -> BTreeMap<String, String> {
     let mut origins = BTreeMap::new();
     let empty = serde_json::Map::new();
-    for (relative, kind) in fs.as_object().unwrap_or(&empty) {
-        match kind.as_str().expect("fs value is a string") {
-            "binding_file" => {
-                write_binding_file(root, relative, template);
-                let dir = Path::new(relative)
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                origins.insert(module_id_for(relative), dir);
-            }
-            other => panic!(
-                "FAIL [{id}]: {FIXTURE} grew fs kind `{other}` that this driver cannot \
-                 materialise — teach the driver, do not skip it"
-            ),
+    for (relative, name) in fs.as_object().unwrap_or(&empty) {
+        let name = name.as_str().unwrap_or_else(|| {
+            panic!("[{id}] fs value must NAME a binding_files descriptor, got {name}")
+        });
+        let template = descriptor(fx, name, id);
+        write_binding_file(root, relative, template);
+        let dir = Path::new(relative)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for module_id in descriptor_module_ids(template, name) {
+            origins.insert(module_id, dir.clone());
         }
     }
     origins
@@ -227,9 +227,15 @@ fn expected_ids(expected: &serde_json::Map<String, Value>, id: &str) -> Vec<Stri
 ///
 /// Returns the temp dir (kept alive by the caller), the config it loaded and
 /// the `module_id -> directory` map.
+///
+/// `env_set_after_config_load` is applied here, AFTER `Config::load` returns
+/// and before the caller invokes the loader. That ordering is the whole point
+/// of the §5.12.6 clause 2 case: a loader reading the merged `Config` sees the
+/// FILE value, while one reading the raw environment itself sees the variable —
+/// the apcore-typescript#36 defect the clause exists to forbid.
 fn prepare(
     tc: &Value,
-    template: &Value,
+    fx: &Value,
     id: &str,
 ) -> (tempfile::TempDir, Config, BTreeMap<String, String>) {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -245,7 +251,7 @@ fn prepare(
         std::env::set_var(name, value.as_str().expect("env value is a string"));
     }
 
-    let origins = materialise_fs(&root, &tc["fs"], template, id);
+    let origins = materialise_fs(&root, fx, &tc["fs"], id);
     let config_path = write_config_file(&root, &tc["config_file"]);
 
     // The case's paths (`./custom_bindings`, `from_argument`) are relative to
@@ -254,7 +260,143 @@ fn prepare(
 
     let config = Config::load(&config_path)
         .unwrap_or_else(|e| panic!("[{id}] the case's config file must load: {e:?}"));
+
+    for (name, value) in tc["env_set_after_config_load"]
+        .as_object()
+        .unwrap_or(&empty)
+    {
+        assert!(
+            OWNED_ENV.contains(&name.as_str()),
+            "[{id}] case sets {name} after load, which this driver does not isolate"
+        );
+        std::env::set_var(name, value.as_str().expect("env value is a string"));
+    }
+
     (workspace, config, origins)
+}
+
+/// Assert the `no_auto_scan_at_init` case: constructing a client MUST NOT scan.
+fn assert_no_auto_scan(
+    expected: &serde_json::Map<String, Value>,
+    config: Config,
+    origins: &BTreeMap<String, String>,
+    id: &str,
+) {
+    // §5.12.6 clause 3. The configured directory holds a well-formed binding
+    // file that would load cleanly if anything scanned it, so the observable
+    // claim is that its module ID is absent from the registry.
+    assert_eq!(
+        expected["scanned"].as_bool(),
+        Some(false),
+        "[{id}] a no-loader case must expect no scan"
+    );
+    assert!(
+        !origins.is_empty(),
+        "[{id}] the case must plant a binding file, or 'nothing was scanned' is vacuous"
+    );
+    let client = APCore::with_options(None, None, Some(config), None);
+    let registered = client.list_modules(None, None);
+    assert_eq!(
+        registered,
+        Vec::<String>::new(),
+        "[{id}] registered_module_ids (expected {})",
+        expected["registered_module_ids"]
+    );
+    for module_id in origins.keys() {
+        assert!(
+            !registered.contains(module_id),
+            "[{id}] client construction scanned the binding directory"
+        );
+    }
+}
+
+/// Assert a case whose `expected` declares an `error_code`: §5.12.6 clause 5.
+fn assert_raises(
+    expected: &serde_json::Map<String, Value>,
+    outcome: Result<(Vec<String>, Vec<String>), apcore::errors::ModuleError>,
+    id: &str,
+) {
+    assert!(
+        !expected.contains_key("loaded_module_ids"),
+        "[{id}] a raising case must not also declare loaded_module_ids"
+    );
+    let error = match outcome {
+        Ok((ids, _)) => panic!(
+            "[{id}] §5.12.6 clause 5: a resolved directory that does not exist MUST raise, \
+             not return an empty result — got {ids:?}"
+        ),
+        Err(e) => e,
+    };
+    assert_eq!(
+        format!("{:?}", error.code),
+        "BindingFileInvalid",
+        "[{id}] error_code is {}, got {:?}: {}",
+        expected["error_code"],
+        error.code,
+        error.message
+    );
+    assert_eq!(
+        expected["error_code"].as_str(),
+        Some("BINDING_FILE_INVALID"),
+        "[{id}] this driver maps only BINDING_FILE_INVALID"
+    );
+
+    if expected["error_message_names_resolved_dir"].as_bool() == Some(true) {
+        let resolved = expected["scanned_dir"]
+            .as_str()
+            .unwrap_or_else(|| panic!("[{id}] a raising case states no scanned_dir"));
+        assert!(
+            error.message.contains(resolved),
+            "[{id}] §5.12.6 clause 5 requires the message to NAME the resolved directory \
+             `{resolved}` — an operator who mis-set `bindings.dir` otherwise cannot tell \
+             which directory was attempted: {}",
+            error.message
+        );
+    }
+}
+
+/// Assert a case that loads successfully.
+fn assert_scan(
+    expected: &serde_json::Map<String, Value>,
+    outcome: Result<(Vec<String>, Vec<String>), apcore::errors::ModuleError>,
+    id: &str,
+) {
+    let (module_ids, scanned) =
+        outcome.unwrap_or_else(|e| panic!("[{id}] the loader must succeed: {e:?}"));
+
+    assert_eq!(
+        module_ids,
+        expected_ids(expected, id),
+        "[{id}] loaded_module_ids"
+    );
+
+    let want_dir = expected["scanned_dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("[{id}] case states no scanned_dir"));
+    assert_eq!(
+        scanned,
+        vec![want_dir.to_string()],
+        "[{id}] scanned_dir: the loader enumerated the wrong directory"
+    );
+}
+
+/// Refuse to pass a case whose `expected` grew a key this driver ignores.
+fn assert_expectation_keys_are_known(expected: &serde_json::Map<String, Value>, id: &str) {
+    const KNOWN: &[&str] = &[
+        "scanned",
+        "scanned_dir",
+        "loaded_module_ids",
+        "registered_module_ids",
+        "error_code",
+        "error_message_names_resolved_dir",
+    ];
+    for key in expected.keys() {
+        assert!(
+            KNOWN.contains(&key.as_str()),
+            "FAIL [{id}]: {FIXTURE} grew expectation `{key}` that this driver does not \
+             assert — teach the driver, do not skip it"
+        );
+    }
 }
 
 #[test]
@@ -262,9 +404,8 @@ fn conformance_bindings_dir_resolution() {
     let _guard = env_guard();
     let original_cwd = std::env::current_dir().expect("cwd");
     let fx = fixture();
-    let template = fx["binding_file"].clone();
     let cases = fx["test_cases"].as_array().expect("test_cases is an array");
-    assert_eq!(cases.len(), 8, "driver is written against all 8 cases");
+    assert_eq!(cases.len(), 9, "driver is written against all 9 cases");
 
     let ids: Vec<&str> = cases
         .iter()
@@ -277,6 +418,11 @@ fn conformance_bindings_dir_resolution() {
              re-check whether it still applies"
         );
     }
+    assert!(
+        ids.contains(&"env_var_must_not_be_read_directly_at_the_loader"),
+        "§5.12.6 clause 2 has exactly one case, and without it an implementation reading \
+         the raw APCORE_BINDINGS_DIR passes every other case in {FIXTURE}"
+    );
 
     for tc in cases {
         let id = tc["id"].as_str().expect("every case needs an id");
@@ -286,64 +432,28 @@ fn conformance_bindings_dir_resolution() {
         let expected = tc["expected"]
             .as_object()
             .unwrap_or_else(|| panic!("[{id}] case has no expected object"));
+        assert_expectation_keys_are_known(expected, id);
 
-        let (workspace, config, origins) = prepare(tc, &template, id);
+        let (workspace, config, origins) = prepare(tc, &fx, id);
 
         if tc["invoke_loader"].as_bool() == Some(false) {
-            // §5.12.6 clause 3: constructing a client MUST NOT scan. The
-            // configured directory holds a well-formed binding file that would
-            // load cleanly if anything scanned it, so the observable claim is
-            // that its module ID is absent from the registry.
+            assert_no_auto_scan(expected, config, &origins, id);
+        } else {
             assert_eq!(
                 expected["scanned"].as_bool(),
-                Some(false),
-                "[{id}] a no-loader case must expect no scan"
+                Some(true),
+                "[{id}] this driver expects a scan for every loader case"
             );
-            let client = APCore::with_options(None, None, Some(config), None);
-            let registered = client.list_modules(None, None);
-            assert_eq!(
-                registered,
-                Vec::<String>::new(),
-                "[{id}] registered_module_ids (expected {})",
-                expected["registered_module_ids"]
-            );
-            for module_id in origins.keys() {
-                assert!(
-                    !registered.contains(module_id),
-                    "[{id}] client construction scanned the binding directory"
-                );
+            // `explicit_dir: null` MUST reach the loader as a genuinely absent
+            // argument: a directory the driver computed itself works under BOTH
+            // the pre-#114 and the corrected behaviour.
+            let outcome = observe_load(&config, tc["explicit_dir"].as_str(), &origins);
+            if expected.contains_key("error_code") {
+                assert_raises(expected, outcome, id);
+            } else {
+                assert_scan(expected, outcome, id);
             }
-            std::env::set_current_dir(&original_cwd).expect("restore cwd");
-            drop(workspace);
-            continue;
         }
-
-        assert_eq!(
-            expected["scanned"].as_bool(),
-            Some(true),
-            "[{id}] this driver expects a scan for every loader case"
-        );
-        // `explicit_dir: null` MUST reach the loader as a genuinely absent
-        // argument: a directory the driver computed itself works under BOTH the
-        // pre-#114 and the corrected behaviour.
-        let explicit_dir = tc["explicit_dir"].as_str();
-        let (module_ids, scanned) = observe_load(&config, explicit_dir, &origins)
-            .unwrap_or_else(|e| panic!("[{id}] the loader must succeed: {e:?}"));
-
-        assert_eq!(
-            module_ids,
-            expected_ids(expected, id),
-            "[{id}] loaded_module_ids"
-        );
-
-        let want_dir = expected["scanned_dir"]
-            .as_str()
-            .unwrap_or_else(|| panic!("[{id}] case states no scanned_dir"));
-        assert_eq!(
-            scanned,
-            vec![want_dir.to_string()],
-            "[{id}] scanned_dir: the loader enumerated the wrong directory"
-        );
 
         std::env::set_current_dir(&original_cwd).expect("restore cwd");
         drop(workspace);
@@ -353,95 +463,84 @@ fn conformance_bindings_dir_resolution() {
     std::env::set_current_dir(&original_cwd).expect("restore cwd");
 }
 
-/// The `missing_configured_dir_is_not_an_error` case, driven exactly as the
-/// fixture states it.
+/// §5.12.6 clause 5 holds for all THREE provenances, not only the configured
+/// one the fixture exercises.
 ///
-/// IGNORED, not deleted: this SDK returns `BINDING_FILE_INVALID` for a
-/// configured `bindings.dir` that does not exist, where the fixture expects an
-/// empty result and no error. §5.12.6 requires neither, so this is a genuine
-/// fixture-vs-SDK divergence to settle upstream. Run it with
-/// `cargo test --test test_bindings_dir_resolution_conformance -- --ignored`
-/// to see the current behaviour.
+/// The fixture's `missing_configured_dir_raises` resolves the directory from
+/// `bindings.dir`. Clause 5 says the requirement "holds whether the directory
+/// came from an explicit argument, from `bindings.dir`, or from the
+/// `\"./bindings\"` default" — three provenances, one of which the fixture can
+/// state. The other two are asserted here, against the same two claims: the
+/// loader raises `BINDING_FILE_INVALID`, and the message NAMES the directory it
+/// resolved, so an operator can tell which of the three tiers supplied it.
 #[test]
-#[ignore = "divergence: this SDK errors on a missing bindings.dir; the fixture expects an empty result (apcore#114)"]
-fn conformance_bindings_dir_resolution_missing_dir() {
+fn clause_5_raises_and_names_the_directory_for_every_provenance() {
     let _guard = env_guard();
     let original_cwd = std::env::current_dir().expect("cwd");
-    let fx = fixture();
-    let template = fx["binding_file"].clone();
-    let case = fx["test_cases"]
-        .as_array()
-        .expect("test_cases is an array")
-        .iter()
-        .find(|tc| tc["id"] == Value::String(DIVERGENT[0].to_string()))
-        .unwrap_or_else(|| panic!("{FIXTURE} declares {}", DIVERGENT[0]));
-    let id = DIVERGENT[0];
+    clear_owned_env();
 
-    let (workspace, config, origins) = prepare(case, &template, id);
-    let outcome = observe_load(&config, case["explicit_dir"].as_str(), &origins);
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let root = workspace.path().to_path_buf();
+    let config_path = root.join("apcore.yaml");
+    std::fs::write(
+        &config_path,
+        "version: '1.0.0'\nproject:\n  name: clause-5\nbindings:\n  dir: ./configured_missing\n",
+    )
+    .expect("write config");
+    let bare_path = root.join("bare.yaml");
+    std::fs::write(&bare_path, "version: '1.0.0'\nproject:\n  name: clause-5\n")
+        .expect("write bare config");
+
+    std::env::set_current_dir(&root).expect("chdir");
+    let configured = Config::load(&config_path).expect("config loads");
+    let bare = Config::load(&bare_path).expect("bare config loads");
+
+    // (provenance, config, explicit argument, the directory the message must name)
+    let cases: Vec<(&str, Option<&Config>, Option<&Path>, &str)> = vec![
+        (
+            "explicit argument",
+            Some(&configured),
+            Some(Path::new("explicit_missing")),
+            "explicit_missing",
+        ),
+        (
+            "bindings.dir",
+            Some(&configured),
+            None,
+            "./configured_missing",
+        ),
+        ("the ./bindings default", Some(&bare), None, "./bindings"),
+        // The same default reached with no Config at all, which is the one path
+        // where `Config::get` has nothing to answer from.
+        ("the ./bindings default", None, None, "./bindings"),
+    ];
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (provenance, config, explicit, named) in cases {
+            let mut loader = BindingLoader::new();
+            let error = loader
+                .load_binding_dir_with_config(explicit, None, config)
+                .expect_err(&format!(
+                    "§5.12.6 clause 5: a missing directory from {provenance} MUST raise"
+                ));
+            assert_eq!(
+                error.code,
+                apcore::errors::ErrorCode::BindingFileInvalid,
+                "{provenance}: clause 5 raises the binding-file error"
+            );
+            assert!(
+                error.message.contains(named),
+                "{provenance}: the message MUST name the RESOLVED directory `{named}`, \
+                 so the three tiers are distinguishable from the error alone: {}",
+                error.message
+            );
+        }
+    }));
 
     std::env::set_current_dir(&original_cwd).expect("restore cwd");
     clear_owned_env();
     drop(workspace);
-
-    let expected = case["expected"].as_object().expect("expected object");
-    assert!(
-        expected["error"].is_null(),
-        "[{id}] the fixture expects no error"
-    );
-    let (module_ids, _) =
-        outcome.unwrap_or_else(|e| panic!("[{id}] a missing bindings.dir must not error: {e:?}"));
-    assert_eq!(
-        module_ids,
-        expected_ids(expected, id),
-        "[{id}] loaded_module_ids"
-    );
-}
-
-/// Pin the divergence to exactly a raise, so it cannot quietly widen.
-///
-/// The companion to the `#[ignore]`d case above: `bindings.dir` still resolves
-/// through the config tier when the directory is missing — the error names the
-/// CONFIGURED directory, not the `./bindings` default — and the difference from
-/// the fixture is confined to "raises instead of returning empty". apcore-python
-/// and apcore-typescript record the same divergence, so this is a fixture-side
-/// question, not a Rust one.
-#[test]
-fn missing_configured_dir_still_resolves_through_the_config_tier() {
-    let _guard = env_guard();
-    let original_cwd = std::env::current_dir().expect("cwd");
-    let fx = fixture();
-    let template = fx["binding_file"].clone();
-    let id = DIVERGENT[0];
-    let case = fx["test_cases"]
-        .as_array()
-        .expect("test_cases is an array")
-        .iter()
-        .find(|tc| tc["id"] == Value::String(id.to_string()))
-        .unwrap_or_else(|| panic!("{FIXTURE} declares {id}"))
-        .clone();
-
-    let configured = case["config_file"]["content"]["bindings"]["dir"]
-        .as_str()
-        .expect("the case configures a bindings.dir")
-        .to_string();
-
-    let (workspace, config, origins) = prepare(&case, &template, id);
-    let outcome = observe_load(&config, case["explicit_dir"].as_str(), &origins);
-
-    std::env::set_current_dir(&original_cwd).expect("restore cwd");
-    clear_owned_env();
-    drop(workspace);
-
-    let error = outcome.expect_err("this SDK raises for a missing binding directory");
-    assert_eq!(
-        error.code,
-        apcore::errors::ErrorCode::BindingFileInvalid,
-        "the divergence is a BINDING_FILE_INVALID raise and nothing else"
-    );
-    assert!(
-        error.message.contains(configured.trim_start_matches("./")),
-        "the configured directory must be the one attempted, not the default: {}",
-        error.message
-    );
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
 }
