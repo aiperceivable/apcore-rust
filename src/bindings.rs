@@ -22,6 +22,19 @@ use crate::schema::openai_strict::assert_openai_strict_compatible;
 
 const CURRENT_SPEC_VERSION: &str = "1.0";
 
+/// Config key naming the directory scanned for binding files (§9.1.1).
+const CONFIG_KEY_BINDINGS_DIR: &str = "bindings.dir";
+
+/// Config key naming the glob binding files must match within that directory.
+const CONFIG_KEY_BINDINGS_PATTERN: &str = "bindings.pattern";
+
+/// Canonical default for `bindings.dir`, from `$defs/BindingsConfig` in
+/// `schemas/apcore-config.schema.json`.
+const DEFAULT_BINDING_DIR: &str = "./bindings";
+
+/// Canonical default for `bindings.pattern`, from the same schema.
+const DEFAULT_BINDING_PATTERN: &str = "*.binding.yaml";
+
 const SUPPORTED_SPEC_VERSIONS: &[&str] = &["1.0"];
 
 /// Boxed async handler function type.
@@ -462,12 +475,87 @@ impl BindingLoader {
     }
 
     /// Load all YAML binding files matching `pattern` in `dir`.
+    ///
+    /// The explicit-argument tier of [`Self::load_binding_dir_with_config`];
+    /// equivalent to calling it with `Some(dir)` and no [`Config`]. Kept so the
+    /// existing call sites, which always know their directory, stay unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::BindingFileInvalid`] when `dir` is not a directory, or when
+    /// any binding file inside it fails to load.
     pub fn load_binding_dir(
         &mut self,
         dir: &Path,
         pattern: Option<&str>,
     ) -> Result<usize, ModuleError> {
-        let pattern = pattern.unwrap_or("*.binding.yaml");
+        self.load_binding_dir_with_config(Some(dir), pattern, None)
+    }
+
+    /// Load all YAML binding files matching `pattern` in the binding directory,
+    /// resolving both from `config` when they are not passed explicitly
+    /// (PROTOCOL_SPEC §5.12.6).
+    ///
+    /// Each of the two settings resolves through the same three tiers —
+    /// **explicit argument > config > canonical default**:
+    ///
+    /// | | argument | config key | default |
+    /// |---|---|---|---|
+    /// | directory | `dir` | `bindings.dir` | `./bindings` |
+    /// | pattern | `pattern` | `bindings.pattern` | `*.binding.yaml` |
+    ///
+    /// The env tier arrives for free: `APCORE_BINDINGS_DIR` and
+    /// `APCORE_BINDINGS_PATTERN` are applied to the `Config` by
+    /// `apply_env_overrides` like every other `APCORE_*` variable, so reading
+    /// through [`Config::get`] here is what implements §9.2's precedence chain.
+    /// This SDK deliberately does not read the environment directly.
+    ///
+    /// Unlike `extensions.root` and `schema.root`, the default tier does need
+    /// its own branch: `schemas/defaults.schema.json` — which `CONFIG_DEFAULTS`
+    /// transcribes verbatim — declares no `bindings` entry, so
+    /// [`Config::get`] returns `None` for an undeclared `bindings.dir` rather
+    /// than falling back. The `./bindings` and `*.binding.yaml` defaults below
+    /// are the ones `$defs/BindingsConfig` in
+    /// `schemas/apcore-config.schema.json` declares.
+    ///
+    /// Scanning stays **user-invoked**. Nothing in this SDK calls this at client
+    /// initialisation, and §5.12.6's MUST does not ask for that: it binds a
+    /// loader that was invoked, so no filesystem I/O is added to a startup that
+    /// never asked for bindings.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::BindingFileInvalid`] when the resolved directory is not a
+    /// directory, or when any binding file inside it fails to load.
+    pub fn load_binding_dir_with_config(
+        &mut self,
+        dir: Option<&Path>,
+        pattern: Option<&str>,
+        config: Option<&crate::config::Config>,
+    ) -> Result<usize, ModuleError> {
+        let from_config = |key: &str| -> Option<String> {
+            config.and_then(|c| c.get(key)).and_then(|v| {
+                v.as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(std::string::ToString::to_string)
+            })
+        };
+
+        let dir: PathBuf = match dir {
+            Some(explicit) => explicit.to_path_buf(),
+            None => PathBuf::from(
+                from_config(CONFIG_KEY_BINDINGS_DIR)
+                    .unwrap_or_else(|| DEFAULT_BINDING_DIR.to_string()),
+            ),
+        };
+        let pattern: String = match pattern {
+            Some(explicit) => explicit.to_string(),
+            None => from_config(CONFIG_KEY_BINDINGS_PATTERN)
+                .unwrap_or_else(|| DEFAULT_BINDING_PATTERN.to_string()),
+        };
+
+        let dir = dir.as_path();
+        let pattern = pattern.as_str();
 
         if !dir.is_dir() {
             return Err(ModuleError::new(
@@ -1268,5 +1356,203 @@ bindings:
         let display = entry.display.as_ref().unwrap();
         assert_eq!(display["alias"], "x_short");
         assert_eq!(display["cli"]["alias"], "x");
+    }
+}
+
+#[cfg(test)]
+mod bindings_dir_from_config_tests {
+    //! `bindings.dir` / `bindings.pattern` reaching the loader from a
+    //! **config file** (aiperceivable/apcore#114, PROTOCOL_SPEC §5.12.6).
+    //!
+    //! The discriminating shape #114 asks for is a config *file* that declares
+    //! the key, with no explicit directory argument. Every pre-existing
+    //! `load_binding_dir` test passes the directory explicitly, and that is
+    //! precisely the one path which behaved identically before and after the
+    //! fix, so none of them can tell the two apart.
+
+    use super::{BindingLoader, DEFAULT_BINDING_DIR, DEFAULT_BINDING_PATTERN};
+    use crate::config::Config;
+    use std::path::Path;
+
+    /// Write a §9.1-valid config file that declares `bindings` as given.
+    ///
+    /// The required fields are the ones legacy-mode `validate()` enforces
+    /// (A-D-03): version, project.name, extensions.root, schema.root,
+    /// acl.root, acl.default_effect.
+    fn write_config(dir: &Path, bindings_yaml: &str) -> std::path::PathBuf {
+        let path = dir.join("apcore.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "version: '0.15.0'\n\
+                 project:\n  name: demo\n\
+                 extensions:\n  root: ./extensions\n\
+                 schema:\n  root: ./schemas\n\
+                 acl:\n  root: ./acl\n  default_effect: deny\n\
+                 {bindings_yaml}"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_binding(dir: &Path, name: &str, module_id: &str) {
+        std::fs::write(
+            dir.join(name),
+            format!(
+                "spec_version: \"1.0\"\nbindings:\n  - module_id: {module_id}\n    target: \"m.{module_id}:fn\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bindings_dir_declared_in_a_config_file_drives_the_scan() {
+        // The #114 case. Before this wiring existed the key was registered in
+        // the §9.1.1 surface, validated by §9.3, and read by nothing: an
+        // operator who set `bindings.dir` in apcore.yaml got no scan at all.
+        let workspace = tempfile::tempdir().unwrap();
+        let bindings_dir = workspace.path().join("my-bindings");
+        std::fs::create_dir(&bindings_dir).unwrap();
+        write_binding(&bindings_dir, "a.binding.yaml", "alpha");
+        write_binding(&bindings_dir, "b.binding.yaml", "beta");
+
+        let config_path = write_config(
+            workspace.path(),
+            &format!("bindings:\n  dir: {}\n", bindings_dir.to_str().unwrap()),
+        );
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config
+                .get("bindings.dir")
+                .and_then(|v| v.as_str().map(str::to_string)),
+            Some(bindings_dir.to_string_lossy().into_owned()),
+            "precondition: the key must survive the load"
+        );
+
+        let mut loader = BindingLoader::new();
+        let count = loader
+            .load_binding_dir_with_config(None, None, Some(&config))
+            .unwrap();
+
+        assert_eq!(
+            count, 2,
+            "the configured directory must actually be scanned"
+        );
+        assert!(loader.resolve("alpha").is_ok());
+        assert!(loader.resolve("beta").is_ok());
+    }
+
+    #[test]
+    fn bindings_pattern_declared_in_a_config_file_drives_the_match() {
+        // `bindings.pattern` was in the same position as `dir`: its default
+        // lived in the loader signature rather than being read from config.
+        let workspace = tempfile::tempdir().unwrap();
+        let bindings_dir = workspace.path().join("bindings");
+        std::fs::create_dir(&bindings_dir).unwrap();
+        write_binding(&bindings_dir, "a.bind.yaml", "alpha");
+        write_binding(&bindings_dir, "b.binding.yaml", "beta");
+
+        let config_path = write_config(
+            workspace.path(),
+            &format!(
+                "bindings:\n  dir: {}\n  pattern: '*.bind.yaml'\n",
+                bindings_dir.to_str().unwrap()
+            ),
+        );
+        let config = Config::load(&config_path).unwrap();
+
+        let mut loader = BindingLoader::new();
+        let count = loader
+            .load_binding_dir_with_config(None, None, Some(&config))
+            .unwrap();
+
+        assert_eq!(count, 1, "only the configured pattern must match");
+        assert!(loader.resolve("alpha").is_ok());
+        assert!(
+            loader.resolve("beta").is_err(),
+            "the default *.binding.yaml pattern must not survive a configured one"
+        );
+    }
+
+    #[test]
+    fn explicit_arguments_outrank_the_config_file() {
+        // Tier 1 of explicit > config > default. An embedder who names a
+        // directory must never have it redirected by a config file.
+        let workspace = tempfile::tempdir().unwrap();
+        let configured = workspace.path().join("configured");
+        let explicit = workspace.path().join("explicit");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::create_dir(&explicit).unwrap();
+        write_binding(&configured, "c.binding.yaml", "from_config");
+        write_binding(&explicit, "e.binding.yaml", "from_argument");
+
+        let config_path = write_config(
+            workspace.path(),
+            &format!("bindings:\n  dir: {}\n", configured.to_str().unwrap()),
+        );
+        let config = Config::load(&config_path).unwrap();
+
+        let mut loader = BindingLoader::new();
+        loader
+            .load_binding_dir_with_config(Some(&explicit), None, Some(&config))
+            .unwrap();
+
+        assert!(loader.resolve("from_argument").is_ok());
+        assert!(loader.resolve("from_config").is_err());
+    }
+
+    #[test]
+    fn default_applies_when_the_config_declares_no_bindings_section() {
+        // Tier 3. Unlike `extensions.root` and `schema.root`, this default
+        // cannot come from `Config::get`: `defaults.schema.json` declares no
+        // `bindings` entry, so `CONFIG_DEFAULTS` carries none either and the
+        // loader must supply `./bindings` itself. Asserted through the error
+        // message because `./bindings` does not exist under the test CWD.
+        assert!(
+            Config::default_for("bindings.dir").is_none(),
+            "precondition: the canonical default table has no bindings entry, \
+             so the loader owns this default"
+        );
+
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = write_config(workspace.path(), "");
+        let config = Config::load(&config_path).unwrap();
+
+        let mut loader = BindingLoader::new();
+        let err = loader
+            .load_binding_dir_with_config(None, None, Some(&config))
+            .unwrap_err();
+
+        assert!(
+            err.message.contains(DEFAULT_BINDING_DIR),
+            "the canonical default directory must be the one attempted: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn default_applies_when_no_config_is_supplied_at_all() {
+        let mut loader = BindingLoader::new();
+        let err = loader
+            .load_binding_dir_with_config(None, None, None)
+            .unwrap_err();
+        assert!(err.message.contains(DEFAULT_BINDING_DIR), "{}", err.message);
+    }
+
+    #[test]
+    fn the_legacy_two_argument_entry_point_is_unchanged() {
+        // Source compatibility: `load_binding_dir(dir, None)` still means
+        // "this directory, default pattern", consulting no config.
+        let dir = tempfile::tempdir().unwrap();
+        write_binding(dir.path(), "a.binding.yaml", "alpha");
+        write_binding(dir.path(), "ignored.yaml", "ignored");
+
+        let mut loader = BindingLoader::new();
+        let count = loader.load_binding_dir(dir.path(), None).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(loader.resolve("alpha").is_ok());
+        assert_eq!(DEFAULT_BINDING_PATTERN, "*.binding.yaml");
     }
 }
