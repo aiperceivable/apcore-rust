@@ -885,6 +885,7 @@ impl Config {
         init_builtin_namespaces();
         config.apply_env_overrides();
         config.validate()?;
+        config.warn_if_path_resolution_will_change();
         Ok(config)
     }
 
@@ -908,6 +909,7 @@ impl Config {
         init_builtin_namespaces();
         config.apply_env_overrides();
         config.validate()?;
+        config.warn_if_path_resolution_will_change();
         Ok(config)
     }
 
@@ -1332,6 +1334,128 @@ impl Config {
     #[must_use]
     pub fn source_path(&self) -> Option<&std::path::Path> {
         self.yaml_path.as_deref()
+    }
+
+    /// The directory relative path-typed configuration values are *about*
+    /// (aiperceivable/apcore#113, spec §9.2.2):
+    ///
+    /// ```text
+    /// project_root =
+    ///     directory of the config file   when it came from §9.14 tier 1-5
+    ///                                    (explicitly pointed at, or project-local)
+    ///     CWD                            when it came from tier 6-7 (user-level),
+    ///                                    or when no config file was found
+    /// ```
+    ///
+    /// Tiers 6-7 anchor at CWD because a per-user config's relative paths are
+    /// per-*project* by intent: `extensions.root: ./extensions` in
+    /// `~/.config/apcore/config.yaml` cannot sensibly mean
+    /// `~/.config/apcore/extensions`. Tiers 2-5 — the overwhelmingly common
+    /// case — are the ones where the config file's directory already *is* CWD,
+    /// so the two candidate bases are indistinguishable there.
+    ///
+    /// The returned path is absolute, and canonicalized when the config file
+    /// exists. `Config`s with no source path — [`Self::from_defaults`] and
+    /// those deserialized in memory — report CWD.
+    ///
+    /// **This accessor changes nothing.** As of this release
+    /// [`crate::acl::ACL::discover`] still resolves `acl.root` against the
+    /// config file's directory for every tier including 6-7, and
+    /// [`crate::schema::loader::SchemaLoader::with_config`] still resolves
+    /// `schema.root` against CWD. Publishing the base is the §13.2 deprecation
+    /// phase of unifying them; see
+    /// [`Self::path_typed_keys`] for which keys it will apply to.
+    #[must_use]
+    pub fn project_root(&self) -> std::path::PathBuf {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match self.source_path() {
+            Some(source) if !is_user_level_config_path(source) => source
+                .canonicalize()
+                .unwrap_or_else(|_| cwd.join(source))
+                .parent()
+                .map_or_else(|| cwd.clone(), std::path::Path::to_path_buf),
+            _ => cwd,
+        }
+    }
+
+    /// Path-typed keys (§9.2.1) whose currently-resolved value is a **relative**
+    /// path, reported using the [`Self::path_typed_keys`] spelling.
+    ///
+    /// Read through [`Self::get`], so a key left undeclared but carrying a
+    /// canonical default counts — `schema.root`'s `./schemas` re-roots under a
+    /// unified base exactly as a hand-written `./schemas` would. A config that
+    /// spells every path-typed key absolutely yields an empty list, which is
+    /// what makes it a usable guard rather than a restatement of
+    /// `project_root != cwd`.
+    ///
+    /// `extensions.roots` is list-valued; it counts when *any* element is
+    /// relative, in either the bare-string or the `{ root, namespace }` form.
+    fn relative_path_typed_keys(&self) -> Vec<&'static str> {
+        fn is_relative(value: Option<&str>) -> bool {
+            value.is_some_and(|s| !s.is_empty() && std::path::Path::new(s).is_relative())
+        }
+
+        let mut relative = Vec::new();
+        for key in Self::path_typed_keys() {
+            let hit = match key.strip_suffix("[]") {
+                Some(list_key) => matches!(
+                    self.get(list_key),
+                    Some(serde_json::Value::Array(ref items))
+                        if items.iter().any(|item| is_relative(match item {
+                            serde_json::Value::String(s) => Some(s.as_str()),
+                            serde_json::Value::Object(o) =>
+                                o.get("root").and_then(serde_json::Value::as_str),
+                            _ => None,
+                        }))
+                ),
+                None => is_relative(self.get(key).as_ref().and_then(serde_json::Value::as_str)),
+            };
+            if hit {
+                relative.push(*key);
+            }
+        }
+        relative
+    }
+
+    /// Warn that this config's relative path-typed values will re-root when
+    /// §9.2.2's single base lands (aiperceivable/apcore#113).
+    ///
+    /// Deliberately **narrow**: it fires only when both halves of the condition
+    /// hold — [`Self::project_root`] differs from CWD *and*
+    /// [`Self::relative_path_typed_keys`] is non-empty. A blanket warning on
+    /// every load would train operators to ignore it, and would be wrong for
+    /// the tier 2-5 majority, whose project root already is CWD and for whom
+    /// nothing changes at all.
+    ///
+    /// Fired per load rather than once per process, unlike the
+    /// `observability.redaction.*` legacy-key warning. That one guards a key
+    /// read on a hot path; this one guards a *document*, so its natural
+    /// cardinality is one per document read — and [`Self::reload`] genuinely
+    /// re-reads the file, where an operator who has just edited it should see
+    /// the notice again. It also keeps the check free of process-global state,
+    /// which a one-shot flag would otherwise let one test consume from another.
+    fn warn_if_path_resolution_will_change(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let root = self.project_root();
+        if root == cwd {
+            return;
+        }
+        let relative = self.relative_path_typed_keys();
+        if relative.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            project_root = %root.display(),
+            cwd = %cwd.display(),
+            keys = %relative.join(", "),
+            "[apcore] DEPRECATION (spec §13.2): this config file's directory is not the \
+             process working directory, and the path-typed keys listed above hold relative \
+             values. Today they resolve against different bases per key — acl.root against \
+             the config file's directory, schema.root and extensions.root against the \
+             working directory. A future major version resolves all of them against the \
+             single project root shown above. Nothing changes in this release; write \
+             absolute paths to pin today's behaviour. See aiperceivable/apcore#113"
+        );
     }
 
     /// Discover and load config using the §9.14 search order.
@@ -2501,27 +2625,58 @@ fn discover_config_file() -> Option<std::path::PathBuf> {
         }
     }
 
-    if let Some(home) = dirs_home() {
-        #[cfg(target_os = "macos")]
-        let xdg = home
-            .join("Library")
-            .join("Application Support")
-            .join("apcore")
-            .join("config.yaml");
-        #[cfg(not(target_os = "macos"))]
-        let xdg = home.join(".config").join("apcore").join("config.yaml");
+    user_level_config_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
 
-        if xdg.exists() {
-            return Some(xdg);
-        }
+/// The §9.14 **tier 6-7** candidates, in search order: the user-level config
+/// locations.
+///
+/// Tier 6 is the XDG-style path — `~/Library/Application Support/apcore/` on
+/// macOS, `~/.config/apcore/` elsewhere — and tier 7 the legacy `~/.apcore/`.
+///
+/// Split out of [`discover_config_file`] so [`is_user_level_config_path`] can
+/// answer "did this config come from a user-level tier?" against exactly the
+/// set discovery searches, rather than a second hand-maintained copy that could
+/// drift from it.
+fn user_level_config_candidates() -> Vec<std::path::PathBuf> {
+    let Some(home) = dirs_home() else {
+        return Vec::new();
+    };
 
-        let legacy = home.join(".apcore").join("config.yaml");
-        if legacy.exists() {
-            return Some(legacy);
-        }
-    }
+    #[cfg(target_os = "macos")]
+    let xdg = home
+        .join("Library")
+        .join("Application Support")
+        .join("apcore")
+        .join("config.yaml");
+    #[cfg(not(target_os = "macos"))]
+    let xdg = home.join(".config").join("apcore").join("config.yaml");
 
-    None
+    vec![xdg, home.join(".apcore").join("config.yaml")]
+}
+
+/// Whether `path` names one of the §9.14 tier 6-7 user-level config locations.
+///
+/// This is the tier test [`Config::project_root`] needs, and it is answered by
+/// **location** rather than by recording which discovery branch fired. The two
+/// differ in exactly one case: `$APCORE_CONFIG_FILE` (tier 1) pointing straight
+/// at the user-level file, which this reports as user-level. That is the
+/// answer #113 wants either way — the reason tiers 6-7 anchor at CWD is that a
+/// per-user config's relative paths are per-*project* by intent, and that is a
+/// property of where the document lives, not of how it was found.
+///
+/// Paths are compared after canonicalization where possible, so `~/.apcore/`
+/// reached through a symlink still matches.
+fn is_user_level_config_path(path: &std::path::Path) -> bool {
+    let canonical = path.canonicalize();
+    let target = canonical.as_deref().unwrap_or(path);
+    user_level_config_candidates().iter().any(|candidate| {
+        candidate
+            .canonicalize()
+            .map_or_else(|_| candidate == path, |c| c == target)
+    })
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -3179,5 +3334,162 @@ mod tests {
         ] {
             assert!(!Config::path_typed_keys().contains(&key), "{key}");
         }
+    }
+}
+
+#[cfg(test)]
+mod path_base_deprecation_tests {
+    //! The §13.2 deprecation notice for §9.2.2's single path base
+    //! (aiperceivable/apcore#113, Option B-prime).
+    //!
+    //! Only the *warning* is under test here; the tier matrix behind
+    //! [`Config::project_root`] needs the process working directory and `$HOME`
+    //! and therefore lives in `tests/config_discovery.rs`, which serialises
+    //! those. Nothing in this file changes CWD: every case puts the config file
+    //! in a temp directory, which is already not the CWD the test binary runs
+    //! under.
+
+    use super::Config;
+    use std::io::Write;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// A §9.1-valid config whose four path-typed keys take the given values.
+    fn write_config(dir: &Path, extensions: &str, schema: &str, acl: &str) -> std::path::PathBuf {
+        let path = dir.join("apcore.yaml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "version: '0.15.0'").unwrap();
+        writeln!(f, "project:").unwrap();
+        writeln!(f, "  name: demo").unwrap();
+        writeln!(f, "extensions:").unwrap();
+        writeln!(f, "  root: {extensions}").unwrap();
+        writeln!(f, "schema:").unwrap();
+        writeln!(f, "  root: {schema}").unwrap();
+        writeln!(f, "acl:").unwrap();
+        writeln!(f, "  root: {acl}").unwrap();
+        writeln!(f, "  default_effect: deny").unwrap();
+        path
+    }
+
+    #[test]
+    fn warns_when_the_project_root_differs_from_cwd_and_a_relative_path_key_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "./extensions", "./schemas", "./acl");
+
+        let logs = capture_logs(|| {
+            let config = Config::load(&path).unwrap();
+            assert_ne!(
+                config.project_root(),
+                std::env::current_dir().unwrap(),
+                "precondition: a temp-dir config must not sit in the test CWD"
+            );
+        });
+
+        assert!(
+            logs.contains("DEPRECATION"),
+            "a config whose relative path keys will re-root must say so: {logs}"
+        );
+        assert!(
+            logs.contains("aiperceivable/apcore#113"),
+            "the warning must name the issue that explains the change: {logs}"
+        );
+        for key in ["extensions.root", "schema.root", "acl.root"] {
+            assert!(
+                logs.contains(key),
+                "the warning must name the affected key {key}: {logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn stays_silent_when_every_path_typed_value_is_absolute() {
+        // The half of the condition that stops this being a restatement of
+        // `project_root != cwd`. An operator who already writes absolute paths
+        // is unaffected by §9.2.2 and must not be warned.
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().to_str().unwrap().to_string();
+        let path = write_config(
+            dir.path(),
+            &format!("{abs}/extensions"),
+            &format!("{abs}/schemas"),
+            &format!("{abs}/acl"),
+        );
+
+        let logs = capture_logs(|| {
+            let config = Config::load(&path).unwrap();
+            assert_ne!(config.project_root(), std::env::current_dir().unwrap());
+            assert!(
+                config.relative_path_typed_keys().is_empty(),
+                "precondition: no relative path-typed value should remain"
+            );
+        });
+
+        assert!(
+            !logs.contains("DEPRECATION"),
+            "absolute paths pin today's behaviour, so there is nothing to warn about: {logs}"
+        );
+    }
+
+    #[test]
+    fn relative_path_typed_keys_reports_the_list_form() {
+        // `extensions.roots` is list-valued and both element shapes carry a
+        // path; an implementation modelling only the bare-string form would
+        // under-report and silently skip the warning.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "version": "1.0.0",
+            "project": { "name": "demo" },
+            "extensions": { "root": "/abs/extensions", "roots": [
+                { "root": "./plugins", "namespace": "plugins" }
+            ]},
+            "schema": { "root": "/abs/schemas" },
+            "acl": { "root": "/abs/acl", "default_effect": "deny" }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.relative_path_typed_keys(),
+            vec!["extensions.roots[]"]
+        );
+    }
+
+    #[test]
+    fn a_config_with_no_source_path_reports_cwd_as_its_project_root() {
+        // Tier "no config file found": `from_defaults` has no source path, so
+        // there is no directory to prefer over CWD.
+        let config = Config::from_defaults();
+        assert_eq!(config.source_path(), None);
+        assert_eq!(config.project_root(), std::env::current_dir().unwrap());
     }
 }
