@@ -376,6 +376,38 @@ pub fn config_default_keys() -> Vec<&'static str> {
     CONFIG_DEFAULTS.iter().map(|(k, _)| *k).collect()
 }
 
+/// The closed set of **path-typed** configuration keys — those whose value is a
+/// filesystem path (PROTOCOL_SPEC §9.2.1).
+///
+/// Declared canonically by `"x-apcore-path": true` in
+/// `schemas/apcore-config.schema.json`; this slice is that projection.
+///
+/// It exists for consumers outside this SDK. Anything forwarding apcore
+/// configuration across a process boundary — a CLI spawning a worker, a
+/// supervisor building a container environment — has to know which `APCORE_*`
+/// variables carry paths, because a relative value silently re-roots wherever
+/// the working directory differs. Without a published set, each such consumer
+/// builds its own and drifts from the others.
+///
+/// Two exclusions are deliberate, being the mistakes an implementer would
+/// otherwise make. `bindings.pattern` is a glob matched against filenames
+/// *within* `bindings.dir`, never resolved as a path itself. `id_map.overrides`
+/// holds module IDs.
+///
+/// `extensions.roots` is list-valued and every element carries a path, in both
+/// the bare-string and the `{ root, namespace }` form — hence the element key
+/// `extensions.roots[]`.
+///
+/// This set says *which* keys carry paths. It says nothing about what a relative
+/// value resolves against; that base is unspecified as of spec v1.34.0.
+const PATH_TYPED_CONFIG_KEYS: &[&str] = &[
+    "acl.root",
+    "bindings.dir",
+    "extensions.root",
+    "extensions.roots[]",
+    "schema.root",
+];
+
 const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
     // No `version` entry, and no `project.name`: `defaults.schema.json`
     // declares neither, which is exactly what makes them §9.1's two required
@@ -1310,6 +1342,25 @@ impl Config {
             Some(path) => Self::load(&path),
             None => Ok(Self::from_defaults()),
         }
+    }
+
+    /// The closed set of path-typed configuration keys (PROTOCOL_SPEC §9.2.1).
+    ///
+    /// A path-typed key is one whose value is a filesystem path. The set is
+    /// declared canonically by `"x-apcore-path": true` in
+    /// `schemas/apcore-config.schema.json`; this returns that projection,
+    /// sorted.
+    ///
+    /// `extensions.roots` is reported as `extensions.roots[]` because it is
+    /// list-valued and every element carries a path.
+    ///
+    /// Note what this does NOT tell you: what a *relative* value in one of these
+    /// keys resolves against. That base is unspecified as of spec v1.34.0 and
+    /// currently differs between keys — `acl.root` resolves against the config
+    /// file's directory, `schema.root` against the process CWD.
+    #[must_use]
+    pub fn path_typed_keys() -> &'static [&'static str] {
+        PATH_TYPED_CONFIG_KEYS
     }
 
     /// Get a config value by dot-path key.
@@ -3086,5 +3137,47 @@ mod tests {
         }"#;
         let cfg_ok: Config = serde_json::from_str(valid_str).expect("should parse");
         assert!(cfg_ok.validate().is_ok());
+    }
+    #[test]
+    fn path_typed_keys_matches_the_declared_set_in_both_directions() {
+        use std::collections::BTreeSet;
+        let actual: BTreeSet<&str> = Config::path_typed_keys().iter().copied().collect();
+        let expected: BTreeSet<&str> = [
+            "acl.root",
+            "bindings.dir",
+            "extensions.root",
+            "extensions.roots[]",
+            "schema.root",
+        ]
+        .into_iter()
+        .collect();
+        let invented: Vec<_> = actual.difference(&expected).collect();
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        assert!(invented.is_empty(), "keys the SDK invented: {invented:?}");
+        assert!(missing.is_empty(), "keys the SDK is missing: {missing:?}");
+    }
+
+    #[test]
+    fn bindings_pattern_is_not_path_typed() {
+        // Discriminating case. It sits in the same section as `bindings.dir` and
+        // its default (`*.binding.yaml`) looks like a filename, so an
+        // implementation that classifies by section sweeps it in. It is a glob
+        // matched WITHIN `bindings.dir`, never resolved as a path itself.
+        assert!(!Config::path_typed_keys().contains(&"bindings.pattern"));
+    }
+
+    #[test]
+    fn non_path_string_keys_are_not_path_typed() {
+        // An implementation that marks every string key as path-typed passes any
+        // presence-only assertion and fails here.
+        for key in [
+            "acl.default_effect",
+            "schema.strategy",
+            "logging.level",
+            "observability.tracing.exporter",
+            "project.name",
+        ] {
+            assert!(!Config::path_typed_keys().contains(&key), "{key}");
+        }
     }
 }
