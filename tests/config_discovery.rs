@@ -542,3 +542,187 @@ fn tier_1_resolution_behaviour_is_unchanged_by_the_project_root_accessor() {
         "acl.root must still resolve against the config file's directory"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §9.2.1 requirement 5 — an empty string is not a path
+// (aiperceivable/apcore#114, spec v1.36.0)
+// ---------------------------------------------------------------------------
+//
+// §9.2 counts a *set but empty* `APCORE_*` variable as an override, so
+// `export APCORE_ACL_ROOT=` used to blank out a directory the configuration
+// file correctly declared, and the `""` that replaced it resolves to the
+// working directory on every filesystem API. The failure is silent, which is
+// what separates it from apcore#88's phantom `config.file` key: nothing errors,
+// the process just looks in the wrong place.
+//
+// The guard sits at the point the environment override is APPLIED
+// (`Config::apply_one_env_override`), not at each consumer, so these tests read
+// the merged value through `Config::get` rather than through `ACL::discover` or
+// `SchemaLoader` — the property under test is that no consumer ever sees the
+// empty value, present or future.
+
+/// `APCORE_<KEY>` for a path-typed key, per §9.2's naming convention.
+fn env_name_for(key: &str) -> String {
+    format!(
+        "APCORE_{}",
+        key.trim_end_matches("[]").replace('.', "_").to_uppercase()
+    )
+}
+
+/// A config file declaring exactly the given body plus the two §9.1 required
+/// fields.
+fn write_config_body(dir: &TempDir, body: &str) -> std::path::PathBuf {
+    write_minimal_yaml(
+        dir,
+        "apcore.yaml",
+        &format!("version: '1.0.0'\nproject:\n  name: demo\n{body}"),
+    )
+}
+
+#[test]
+fn an_empty_path_typed_env_var_falls_through_to_the_configuration_file() {
+    let _guard = env_guard();
+    let dir = TempDir::new().unwrap();
+    let path = write_config_body(&dir, "acl:\n  root: ./declared_acl\n");
+
+    std::env::set_var("APCORE_ACL_ROOT", "");
+    let config = apcore::Config::load(&path).unwrap();
+    std::env::remove_var("APCORE_ACL_ROOT");
+
+    assert_eq!(
+        config
+            .get("acl.root")
+            .and_then(|v| v.as_str().map(str::to_string)),
+        Some("./declared_acl".to_string()),
+        "an empty APCORE_ACL_ROOT must be discarded, leaving the directory the \
+         configuration file declared — blanking it is the silent failure §9.2.1 \
+         requirement 5 exists to stop"
+    );
+}
+
+#[test]
+fn an_empty_path_typed_env_var_falls_through_to_the_canonical_default() {
+    let _guard = env_guard();
+    let dir = TempDir::new().unwrap();
+    // Declares no `schema` section at all, so the next tier below the discarded
+    // environment value is the §9.1.1 default rather than a file value.
+    let path = write_config_body(&dir, "");
+
+    std::env::set_var("APCORE_SCHEMA_ROOT", "");
+    let config = apcore::Config::load(&path).unwrap();
+    std::env::remove_var("APCORE_SCHEMA_ROOT");
+
+    assert_eq!(
+        config
+            .get("schema.root")
+            .and_then(|v| v.as_str().map(str::to_string)),
+        Some("./schemas".to_string()),
+        "resolution must fall through to the NEXT tier, exactly as if the \
+         variable had been unset — not stop at the empty override"
+    );
+}
+
+#[test]
+fn an_empty_path_typed_env_var_never_reaches_the_merged_configuration() {
+    let _guard = env_guard();
+    let dir = TempDir::new().unwrap();
+    let path = write_config_body(&dir, "");
+
+    for key in apcore::Config::path_typed_keys() {
+        let name = env_name_for(key);
+        std::env::set_var(&name, "");
+        let config = apcore::Config::load(&path).unwrap();
+        std::env::remove_var(&name);
+
+        let merged = config.get(key.trim_end_matches("[]"));
+        assert_ne!(
+            merged,
+            Some(serde_json::Value::String(String::new())),
+            "`{name}` set but empty left `{key}` holding \"\" in the merged \
+             configuration. \"\" is a legal relative path to every filesystem \
+             API and resolves to the working directory, so this is the silent \
+             re-rooting §9.2.1 requirement 5 forbids"
+        );
+        assert_eq!(
+            merged,
+            apcore::Config::default_for(key.trim_end_matches("[]")),
+            "with the empty override discarded, `{key}` must read exactly as it \
+             would have with `{name}` unset"
+        );
+    }
+}
+
+#[test]
+fn an_empty_env_var_for_a_key_that_is_not_path_typed_is_still_an_override() {
+    let _guard = env_guard();
+    let dir = TempDir::new().unwrap();
+    let path = write_config_body(&dir, "logging:\n  level: debug\n");
+
+    // The discriminating case. §9.2.1 requirement 5 is scoped to the CLOSED
+    // path-typed set, and deliberately so: "" is meaningless only where the
+    // value is a path. A blanket "drop every empty override" would pass every
+    // assertion above while silently changing §9.2 for keys the requirement
+    // never mentioned.
+    std::env::set_var("APCORE_LOGGING_LEVEL", "");
+    let config = apcore::Config::load(&path).unwrap();
+    std::env::remove_var("APCORE_LOGGING_LEVEL");
+
+    assert_eq!(
+        config.get("logging.level"),
+        Some(serde_json::Value::String(String::new())),
+        "`logging.level` is not path-typed, so §9.2's ordinary override rule \
+         still applies to it unchanged"
+    );
+}
+
+#[test]
+fn bindings_pattern_is_not_path_typed_so_an_empty_value_still_overrides() {
+    let _guard = env_guard();
+    let dir = TempDir::new().unwrap();
+    let path = write_config_body(&dir, "");
+
+    // The sharpest discriminator available: `bindings.pattern` sits in the same
+    // config section as `bindings.dir` and reads like a path, and §9.2.1
+    // requirement 4 says outright that it is NOT one — it is a glob matched
+    // against filenames within `bindings.dir`. An implementation that guarded
+    // by section, or by "looks like a path", fails here.
+    std::env::set_var("APCORE_BINDINGS_PATTERN", "");
+    let config = apcore::Config::load(&path).unwrap();
+    std::env::remove_var("APCORE_BINDINGS_PATTERN");
+
+    assert_eq!(
+        config.get("bindings.pattern"),
+        Some(serde_json::Value::String(String::new())),
+        "`bindings.pattern` is not in §9.2.1's path-typed set, so the empty \
+         override must survive"
+    );
+}
+
+#[test]
+fn discarding_an_empty_path_typed_env_var_names_the_key() {
+    let _guard = env_guard();
+    let dir = TempDir::new().unwrap();
+    let path = write_config_body(&dir, "acl:\n  root: ./declared_acl\n");
+
+    // §9.2.1 requirement 5's MAY. An operator who exported the variable meant
+    // something by it, so silently ignoring it trades one invisible behaviour
+    // for another; the warning has to name the key, or it cannot be acted on.
+    std::env::set_var("APCORE_ACL_ROOT", "");
+    let (config, logs) = capture_logs(|| apcore::Config::load(&path).unwrap());
+    std::env::remove_var("APCORE_ACL_ROOT");
+
+    assert!(
+        logs.contains("acl.root"),
+        "the warning must name the discarded key: {logs}"
+    );
+    assert!(
+        logs.contains("APCORE_ACL_ROOT"),
+        "and the variable that carried it: {logs}"
+    );
+    assert_eq!(
+        config
+            .get("acl.root")
+            .and_then(|v| v.as_str().map(str::to_string)),
+        Some("./declared_acl".to_string())
+    );
+}

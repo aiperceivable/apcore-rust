@@ -2194,7 +2194,7 @@ impl Config {
             // 1. Global env_map (bare env var → top-level/dot-path key).
             if let Some(config_key) = gmap.get(&key) {
                 tracing::debug!(env = %key, path = %config_key, "Applying legacy env override (global env_map)");
-                self.set(config_key, parsed);
+                self.apply_one_env_override(&key, config_key, parsed);
                 continue;
             }
 
@@ -2209,7 +2209,7 @@ impl Config {
             if let Some(suffix) = key.strip_prefix("APCORE_") {
                 let dot_path = Self::env_key_to_dot_path(suffix);
                 tracing::debug!(env = %key, path = %dot_path, "Applying legacy env override");
-                self.set(&dot_path, parsed);
+                self.apply_one_env_override(&key, &dot_path, parsed);
             }
         }
     }
@@ -2246,14 +2246,14 @@ impl Config {
 
             // 1. Global env_map (bare env var → top-level key).
             if let Some(config_key) = gmap.get(&env_key) {
-                self.set(config_key, parsed);
+                self.apply_one_env_override(&env_key, config_key, parsed);
                 continue;
             }
 
             // 2. Namespace env_map (bare env var → namespace key).
             if let Some(&(ns_name, config_key)) = ns_env_maps.get(env_key.as_str()) {
                 let full_path = format!("{ns_name}.{config_key}");
-                self.set(&full_path, parsed);
+                self.apply_one_env_override(&env_key, &full_path, parsed);
                 continue;
             }
 
@@ -2269,7 +2269,7 @@ impl Config {
                     let key = Self::resolve_env_suffix(suffix, reg);
                     let full_path = format!("{}.{key}", reg.name);
                     tracing::debug!(env = %env_key, path = %full_path, "Applying namespace env override");
-                    self.set(&full_path, parsed.clone());
+                    self.apply_one_env_override(&env_key, &full_path, parsed.clone());
                     matched = true;
                     break;
                 }
@@ -2283,10 +2283,69 @@ impl Config {
                 if let Some(suffix) = env_key.strip_prefix("APCORE_") {
                     let dot_path = Self::env_key_to_dot_path(suffix);
                     tracing::debug!(env = %env_key, path = %dot_path, "Applying fallback env override (no namespace match)");
-                    self.set(&dot_path, parsed);
+                    self.apply_one_env_override(&env_key, &dot_path, parsed);
                 }
             }
         }
+    }
+
+    /// Whether `key` names one of the path-typed configuration keys (§9.2.1).
+    ///
+    /// Compared against [`Self::path_typed_keys`] with the list marker
+    /// stripped, so `extensions.roots` matches the `extensions.roots[]` entry
+    /// the set publishes.
+    fn is_path_typed_key(key: &str) -> bool {
+        Self::path_typed_keys()
+            .iter()
+            .any(|declared| declared.trim_end_matches("[]") == key)
+    }
+
+    /// Apply one resolved environment override, discarding an **empty**
+    /// path-typed value (PROTOCOL_SPEC §9.2.1 requirement 5).
+    ///
+    /// **An empty string is not a path.** §9.2 counts a *set but empty*
+    /// `APCORE_*` variable as an override, so `export APCORE_ACL_ROOT=` — and a
+    /// variable inherited empty from a container spec, which is the same thing
+    /// to the tooling — used to blank out a directory the configuration file
+    /// correctly declared. The `""` that replaced it is a legal relative path
+    /// to every filesystem API and resolves to the working directory, so the
+    /// failure was silent: the config said `./acl`, the process looked in `.`,
+    /// and nothing reported a difference. The same shape is on record for
+    /// `APCORE_CONFIG_FILE` (apcore#88), where an empty value injected a
+    /// phantom `config.file` key.
+    ///
+    /// The value is therefore dropped and resolution falls through to the next
+    /// tier — configuration file, then canonical default — exactly as if the
+    /// variable had never been set. §9.2.1 permits a warning naming the key,
+    /// which is emitted here rather than swallowed: an operator who exported
+    /// the variable meant something by it.
+    ///
+    /// **Applied here, once, rather than at each consumer.** This is the single
+    /// point where an environment tier becomes a configuration value, so every
+    /// present and future reader of a path-typed key inherits the guard without
+    /// having to know it exists. A per-consumer check is the arrangement that
+    /// produced the defect: `ACL::discover` and `SchemaLoader` each decide what
+    /// to do with an empty root, and a consumer added tomorrow decides again.
+    ///
+    /// Non-path-typed keys are untouched. An empty `APCORE_LOGGING_LEVEL` is a
+    /// value the operator can mean, and §9.2.1's requirement is scoped to the
+    /// closed path-typed set precisely because `""` is meaningless only there.
+    fn apply_one_env_override(&mut self, env_key: &str, dot_path: &str, value: serde_json::Value) {
+        let empty_path = Self::is_path_typed_key(dot_path)
+            && matches!(&value, serde_json::Value::String(s) if s.is_empty());
+        if empty_path {
+            tracing::warn!(
+                env = %env_key,
+                key = %dot_path,
+                "[apcore] `{env_key}` is set but empty, and `{dot_path}` is a path-typed \
+                 configuration key (spec §9.2.1). An empty string is not a path, so the \
+                 override is DISCARDED and `{dot_path}` falls through to the configuration \
+                 file and then to its canonical default. Unset the variable to silence this, \
+                 or give it the directory you meant."
+            );
+            return;
+        }
+        self.set(dot_path, value);
     }
 
     /// Map a canonical dot-path key to a typed field value.
