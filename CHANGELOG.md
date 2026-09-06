@@ -14,6 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`bindings.dir` and `bindings.pattern` are canonical defaults (spec v1.36.0).** `schemas/defaults.schema.json` gained the `bindings` section it never had, so `Config::get("bindings.dir")` now resolves `./bindings` and `Config::get("bindings.pattern")` `*.binding.yaml` for a configuration that declares neither. Until this release the two keys were declared in PROTOCOL_SPEC §9.1.1 and in `apcore-config.schema.json` but absent from the file that IS the canonical default tier, and `conformance/fixtures/config_key_governance.json` pins this SDK's default table to that file — so no SDK *could* carry the default, and all three hardcoded `./bindings` at their binding loader instead. `BindingLoader`'s `DEFAULT_BINDING_DIR` / `DEFAULT_BINDING_PATTERN` are kept for the one invocation that supplies no `Config` at all (`load_binding_dir_with_config(None, None, None)`), and are now pinned equal to `Config::default_for` by a test so the two cannot drift.
+
+  **One consequence worth knowing:** `bindings.dir` is path-typed, so a configuration that leaves it undeclared now has a *relative* path-typed value (`./bindings`) standing in its merged view where it previously had none. A config whose other path-typed keys are all absolute, loaded from a directory that is not the process working directory, will therefore emit the §9.2.2 deprecation warning it did not emit before. Spelling `bindings.dir` absolutely silences it, exactly as for its three sibling roots.
+
+### Fixed
+
+- **A set-but-empty `APCORE_*` variable silently blanked a path-typed configuration key (spec v1.36.0 §9.2.1 requirement 5).** §9.2 counts a *set but empty* variable as an override, so `export APCORE_ACL_ROOT=` — and a variable inherited empty from a container spec, which is indistinguishable to the tooling — replaced a directory the configuration file correctly declared with `""`, which every filesystem API accepts as a legal relative path meaning the working directory. Nothing errored and nothing reported a difference: the config said `./acl`, the process looked in `.`. The same shape is on record for `APCORE_CONFIG_FILE` ([apcore#88](https://github.com/aiperceivable/apcore/issues/88)), where an empty value injected a phantom `config.file` key; the path-typed keys are the population where it fails silently rather than loudly.
+
+  An empty value for any key in `Config::path_typed_keys()` is now **discarded**, and resolution falls through to the configuration file and then to the canonical default exactly as if the variable had been unset. A warning naming both the key and the variable is logged. The guard sits at the single point an environment tier becomes a configuration value, not at each consumer, so no present or future reader of a path-typed key can see the empty string. Keys outside the closed path-typed set are untouched: an empty `APCORE_LOGGING_LEVEL` is still an override, and so is `APCORE_BINDINGS_PATTERN`, which §9.2.1 requirement 4 states is not path-typed despite sitting in the same section as `bindings.dir`.
+
+### Changed
+
+- **The §9.2.2 deprecation warning's once-per-load cadence is now normative rather than a local choice.** Behaviour is unchanged — this SDK already emitted per load — but spec v1.36.0 adopted that reading and forbids suppressing the warning with process-global state, so the doc comment cites the clause instead of arguing the point, and two tests pin it: a once-per-process flag passes every single-load assertion, and only the *second* affected document goes silent.
+
+- **The three §9.2.x / §5.12.6 conformance drivers track the repaired fixtures, and carry no divergences.** `bindings_dir_resolution` grew a ninth case for §5.12.6 clause 2 (the environment tier must reach the loader through §9.2's mechanism, never a raw `APCORE_BINDINGS_DIR` read), its descriptors moved from one shared entry to a named map with distinct module IDs, and its target field is `target` rather than `target_id`. `config_project_root`'s tier-6 and tier-7 cases name the *tier* through tokens the driver resolves at the running platform's §9.14 location, instead of a POSIX spelling that failed on macOS. Both `#[ignore]`d divergence cases are gone: §5.12.6 clause 5 settled "a missing binding directory raises" in this SDK's favour, and `no_warning_when_all_path_values_absolute` became satisfiable once the case spelled every §9.2.1 key absolutely.
+
 ---
 
 ## [0.29.0] - 2026-09-05
