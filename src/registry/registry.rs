@@ -1913,6 +1913,57 @@ impl Registry {
         self.extension_roots.read().clone()
     }
 
+    /// Populate the extension roots from a [`Config`], unless they are already set.
+    ///
+    /// This is the config tier of the precedence apcore-python and
+    /// apcore-typescript implement in their `Registry` constructors —
+    /// **explicit > config > default**:
+    ///
+    /// 1. Roots already set by [`Self::set_extension_roots`] win and are left
+    ///    alone. That is the explicit tier; an embedder who wired roots by hand
+    ///    must never have them overwritten by a config file.
+    /// 2. Otherwise `extensions.roots` (multi-root mode) is read, accepting both
+    ///    element forms — a bare path string and a `{ root, namespace }` object.
+    /// 3. Otherwise `extensions.root` is read. `Config::get` already falls back
+    ///    to the canonical `./extensions` default, so the default tier needs no
+    ///    separate branch here.
+    ///
+    /// Before this existed, `extension_roots` initialised empty and was written
+    /// only by `set_extension_roots`, so a client built from a `Config` that set
+    /// `extensions.root` handed an empty slice to the discoverer and
+    /// `APCore::discover()` returned `Ok(0)` — a silent no-op indistinguishable
+    /// from an empty directory.
+    pub fn set_extension_roots_from_config(&self, config: &crate::config::Config) {
+        if !self.extension_roots.read().is_empty() {
+            return;
+        }
+
+        if let Some(serde_json::Value::Array(items)) = config.get("extensions.roots") {
+            let roots: Vec<String> = items
+                .iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Object(o) => {
+                        o.get("root").and_then(|r| r.as_str()).map(str::to_string)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !roots.is_empty() {
+                *self.extension_roots.write() = roots;
+                return;
+            }
+        }
+
+        if let Some(root) = config.get("extensions.root").and_then(|v| {
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .map(std::string::ToString::to_string)
+        }) {
+            *self.extension_roots.write() = vec![root];
+        }
+    }
+
     /// Set the validator.
     pub fn set_validator(&self, validator: Box<dyn ModuleValidator>) {
         *self.validator.write() = Some(validator.into());
@@ -2052,5 +2103,100 @@ impl Registry {
 impl Default for Registry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod extension_roots_from_config_tests {
+    use super::Registry;
+    use crate::config::Config;
+
+    fn config_from(json: serde_json::Value) -> Config {
+        serde_json::from_value(json).expect("config fixture must deserialize")
+    }
+
+    #[test]
+    fn config_extensions_root_reaches_the_registry() {
+        // The #39 case. Before `set_extension_roots_from_config` existed this
+        // registry kept an empty root list and `discover()` returned Ok(0).
+        let registry = Registry::new();
+        assert!(registry.extension_roots().is_empty());
+
+        let config = config_from(serde_json::json!({
+            "version": "1.0.0",
+            "project": { "name": "demo" },
+            "extensions": { "root": "./my-modules" }
+        }));
+        registry.set_extension_roots_from_config(&config);
+
+        assert_eq!(registry.extension_roots(), vec!["./my-modules".to_string()]);
+    }
+
+    #[test]
+    fn default_applies_when_config_declares_nothing() {
+        // Consequence 2 of #39: the canonical `./extensions` default never
+        // reached Rust, because an empty vec has no fallback. `Config::get`
+        // resolves the default tier, so reading through it is enough.
+        let registry = Registry::new();
+        let config = config_from(serde_json::json!({
+            "version": "1.0.0",
+            "project": { "name": "demo" }
+        }));
+        registry.set_extension_roots_from_config(&config);
+
+        assert_eq!(registry.extension_roots(), vec!["./extensions".to_string()]);
+    }
+
+    #[test]
+    fn explicit_roots_are_never_overwritten_by_config() {
+        // The explicit tier. An embedder who wired roots by hand must keep them.
+        let registry = Registry::new();
+        registry.set_extension_roots(vec!["./hand-wired".to_string()]);
+
+        let config = config_from(serde_json::json!({
+            "version": "1.0.0",
+            "project": { "name": "demo" },
+            "extensions": { "root": "./from-config" }
+        }));
+        registry.set_extension_roots_from_config(&config);
+
+        assert_eq!(registry.extension_roots(), vec!["./hand-wired".to_string()]);
+    }
+
+    #[test]
+    fn multi_root_mode_accepts_both_element_forms() {
+        // `extensions.roots` elements are a bare string OR a {root, namespace}
+        // object; an implementation that models only one form drops roots.
+        let registry = Registry::new();
+        let config = config_from(serde_json::json!({
+            "version": "1.0.0",
+            "project": { "name": "demo" },
+            "extensions": { "roots": [
+                "./extensions",
+                { "root": "./plugins", "namespace": "plugins" }
+            ]}
+        }));
+        registry.set_extension_roots_from_config(&config);
+
+        assert_eq!(
+            registry.extension_roots(),
+            vec!["./extensions".to_string(), "./plugins".to_string()]
+        );
+    }
+
+    #[test]
+    fn multi_root_takes_precedence_over_single_root() {
+        let registry = Registry::new();
+        let config = config_from(serde_json::json!({
+            "version": "1.0.0",
+            "project": { "name": "demo" },
+            "extensions": { "roots": ["./a", "./b"] }
+        }));
+        registry.set_extension_roots_from_config(&config);
+
+        assert_eq!(
+            registry.extension_roots(),
+            vec!["./a".to_string(), "./b".to_string()]
+        );
     }
 }

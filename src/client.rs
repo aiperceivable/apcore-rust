@@ -106,6 +106,16 @@ impl APCore {
             None => Arc::new(registry.unwrap_or_default()),
         };
 
+        // Config-driven extension roots. `extension_roots` initialises empty and
+        // was previously written only by `set_extension_roots`, so a client built
+        // from a `Config` carrying `extensions.root` handed an empty slice to the
+        // discoverer: `discover()` returned Ok(0), silently, indistinguishable
+        // from an empty directory. Python and TypeScript both resolve
+        // explicit > config > default in their Registry constructors; this is the
+        // Rust equivalent, placed here because `Registry::new()` takes no Config.
+        // Roots already set explicitly are left alone (see the method's docs).
+        registry.set_extension_roots_from_config(&config);
+
         // Track whether the caller supplied their own Executor: if so, respect
         // its ACL wiring as-is and skip config-driven ACL discovery below.
         let executor_supplied = executor.is_some();
