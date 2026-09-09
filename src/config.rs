@@ -1586,6 +1586,47 @@ impl Config {
                 true
             })
             .collect();
+
+        // The environment tier declares too, and `user_namespaces` cannot see
+        // it for the four typed `observability.*` leaves: `Config::set`
+        // short-circuits into `set_typed_field` for those and never touches the
+        // bag. Measured before this: `APCORE_LOGGING_LEVEL` warned and
+        // `APCORE_OBSERVABILITY_TRACING_ENABLED` did not, while apcore-python
+        // named both — six of the ten keys reachable at this tier instead of
+        // ten, in one SDK.
+        //
+        // The dot path is computed with the SAME `env_key_to_dot_path` the
+        // override loop itself uses, rather than by re-deriving §9.2's naming
+        // convention here. Re-deriving it is how two spellings of one rule end
+        // up in one file.
+        //
+        // A set-but-EMPTY variable still counts. §9.2 treats it as an override,
+        // and §9.2.1 requirement 5's "an empty string is not a path" carve-out
+        // is scoped to PATH-TYPED keys — none of these ten is one. Measured
+        // against apcore-python, which warns for `APCORE_LOGGING_LEVEL=` and
+        // resolves the key to `""`. Skipping empties here was the first version
+        // of this loop and it re-created the divergence it was written to close.
+        let mut declared: Vec<&str> = declared;
+        for (var, _value) in std::env::vars() {
+            if var == ENV_CONFIG_FILE {
+                continue;
+            }
+            let Some(suffix) = var.strip_prefix("APCORE_") else {
+                continue;
+            };
+            let dot_path = Self::env_key_to_dot_path(suffix);
+            if let Some(key) = DEPRECATED_INERT_KEYS
+                .iter()
+                .copied()
+                .find(|k| **k == *dot_path && !declared.contains(k))
+            {
+                declared.push(key);
+            }
+        }
+        // Report in the constant's order, so two SDKs name them the same way
+        // whichever tier supplied each one.
+        declared.sort_by_key(|k| DEPRECATED_INERT_KEYS.iter().position(|d| d == k));
+
         if declared.is_empty() {
             return;
         }

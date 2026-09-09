@@ -47,7 +47,8 @@
 //! reads a value back — this is a diagnostic, and the diagnostic is the only
 //! thing that changed.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::fmt::Write as _;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use apcore::acl::ACL;
 use apcore::config::Config;
@@ -113,10 +114,26 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
     }
 }
 
+/// Serialises every case in this file.
+///
+/// Three of them set `APCORE_*` variables, and the process environment is
+/// shared by every thread the harness runs. Without this, an environment case
+/// and [`a_clean_configuration_is_silent`] overlap and the CLEAN one goes red —
+/// a failure reported against a test that touched no environment at all.
+/// Measured: `cargo test` red on two negatives, `--test-threads=1` green.
+///
+/// Poisoning is ignored, as in `config_discovery.rs`: a panicking case should
+/// not turn every later case into an unrelated `PoisonError`.
+static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+fn env_guard() -> MutexGuard<'static, ()> {
+    ENV_GUARD.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Run `f` under a THREAD-LOCAL subscriber and return everything it logged.
 ///
 /// Thread-local (not global) so these cases neither steal nor are polluted by
-/// the output of the rest of the consolidated `it` binary running beside them.
+/// the output of anything else the harness runs beside them.
 fn capture_logs(f: impl FnOnce()) -> String {
     let buf = CaptureWriter::default();
     let subscriber = tracing_subscriber::fmt()
@@ -196,7 +213,7 @@ fn document_declaring(key: &str) -> String {
         yaml.push_str(":\n");
     }
     yaml.push_str(&"  ".repeat(parents.len()));
-    yaml.push_str(&format!("{leaf}: {value}\n"));
+    writeln!(yaml, "{leaf}: {value}").expect("writing to a String cannot fail");
     document(&yaml)
 }
 
@@ -212,6 +229,7 @@ fn document_declaring(key: &str) -> String {
 /// key is quietly missing from the traversal.
 #[test]
 fn each_deprecated_key_warns_and_the_notice_names_it() {
+    let _env = env_guard();
     for key in DEPRECATED_INERT_KEYS {
         let logs = load_config_capturing(&document_declaring(key));
         assert!(
@@ -236,6 +254,7 @@ fn each_deprecated_key_warns_and_the_notice_names_it() {
 /// three different sequences is a diff an operator has to reconcile by hand.
 #[test]
 fn all_ten_declared_at_once_are_named_in_spec_order() {
+    let _env = env_guard();
     let logs = load_config_capturing(&document(
         "observability:\n  \
            tracing:\n    \
@@ -285,6 +304,7 @@ fn all_ten_declared_at_once_are_named_in_spec_order() {
 /// implementation of this notice actually did.
 #[test]
 fn a_clean_configuration_is_silent() {
+    let _env = env_guard();
     let logs = load_config_capturing(&document(""));
     assert!(
         !logs.contains(CONFIG_MARKER),
@@ -306,6 +326,7 @@ fn a_clean_configuration_is_silent() {
 /// to reach the leaf before it may report anything.
 #[test]
 fn a_declared_section_with_no_deprecated_leaf_is_silent() {
+    let _env = env_guard();
     let logs = load_config_capturing(&document(
         "observability:\n  \
            tracing: {}\n  \
@@ -333,6 +354,7 @@ const ACL_RULES: &str = "default_effect: deny\nrules: []\n";
 /// An `audit:` block in an ACL file warns.
 #[test]
 fn an_acl_file_with_an_audit_block_warns() {
+    let _env = env_guard();
     let logs = load_acl_capturing(&format!(
         "{ACL_RULES}audit:\n  enabled: true\n  include_denied: true\n  log_level: \"info\"\n"
     ));
@@ -353,6 +375,7 @@ fn an_acl_file_with_an_audit_block_warns() {
 /// An ACL file with no `audit:` block is SILENT.
 #[test]
 fn an_acl_file_without_an_audit_block_is_silent() {
+    let _env = env_guard();
     let logs = load_acl_capturing(ACL_RULES);
     assert!(
         !logs.contains(ACL_MARKER),
@@ -371,6 +394,7 @@ fn an_acl_file_without_an_audit_block_is_silent() {
 /// nothing else about how the file is read.
 #[test]
 fn an_acl_file_with_an_unrelated_unknown_root_key_is_silent() {
+    let _env = env_guard();
     let logs = load_acl_capturing(&format!(
         "{ACL_RULES}metadata:\n  owner: \"platform-team\"\n  reviewed: \"2026-09-09\"\n"
     ));
@@ -380,5 +404,70 @@ fn an_acl_file_with_an_unrelated_unknown_root_key_is_silent() {
          block. The §9.2.4.1 notice is a deprecation notice for ONE block, not \
          unknown-key closure for ACL files — every other root key keeps being \
          ignored exactly as before. Captured:\n{logs}"
+    );
+}
+
+/// §9.2.4 requirement 1 covers the ENVIRONMENT tier, and this SDK could not see
+/// four of the ten keys there.
+///
+/// `Config::set` short-circuits into `set_typed_field` for the four typed
+/// `observability.*` leaves and never touches `user_namespaces`, which is where
+/// this notice reads from. Measured before the fix: `APCORE_LOGGING_LEVEL`
+/// warned and `APCORE_OBSERVABILITY_TRACING_ENABLED` did not, while
+/// apcore-python named both — six of ten reachable at this tier, in one SDK.
+///
+/// Serialised against the other cases by the same lock they use, because it
+/// mutates process-wide environment state.
+#[test]
+fn the_environment_tier_declares_all_ten_keys_not_only_the_untyped_ones() {
+    let _env = env_guard();
+    for (var, value, key) in [
+        ("APCORE_LOGGING_LEVEL", "debug", "logging.level"),
+        (
+            "APCORE_OBSERVABILITY_TRACING_ENABLED",
+            "true",
+            "observability.tracing.enabled",
+        ),
+        ("APCORE_ACL_AUDIT_ENABLED", "false", "acl.audit.enabled"),
+    ] {
+        // SAFETY: `env_guard()` above serialises every case in this file, and
+        // the file is its own test binary, so nothing reads the variable
+        // concurrently.
+        unsafe { std::env::set_var(var, value) };
+        let logs = load_config_capturing(&document(""));
+        unsafe { std::env::remove_var(var) };
+        assert!(
+            logs.contains(CONFIG_MARKER) && logs.contains(key),
+            "{var} declares {key} at the environment tier, so the §9.2.4 notice \
+             must name it. The typed `observability` leaves are the ones this \
+             used to miss, because `Config::set` routes them to \
+             `set_typed_field` and never into `user_namespaces`. Captured:\n{logs}"
+        );
+    }
+}
+
+/// A set-but-EMPTY environment variable still declares the key.
+///
+/// §9.2 counts a set-but-empty `APCORE_*` variable as an override, and §9.2.1
+/// requirement 5's "an empty string is not a path" carve-out is scoped to
+/// PATH-TYPED keys — none of these ten is one. So `APCORE_LOGGING_LEVEL=`
+/// resolves `logging.level` to `""` and has declared it.
+///
+/// Pinned because the first version of the environment scan skipped empty
+/// values, which would have made this SDK silent where apcore-python warns —
+/// re-creating, at a different tier, the divergence the scan was added to
+/// close. Measured against apcore-python: 1 notice, `get("logging.level") == ""`.
+#[test]
+fn a_set_but_empty_environment_variable_still_declares_the_key() {
+    let _env = env_guard();
+    // SAFETY: as above.
+    unsafe { std::env::set_var("APCORE_LOGGING_LEVEL", "") };
+    let logs = load_config_capturing(&document(""));
+    unsafe { std::env::remove_var("APCORE_LOGGING_LEVEL") };
+    assert!(
+        logs.contains(CONFIG_MARKER) && logs.contains("logging.level"),
+        "§9.2 counts a set-but-empty APCORE_* variable as an override, and \
+         requirement 5's path-typed carve-out does not reach `logging.level`, \
+         so the §9.2.4 notice must name it. Captured:\n{logs}"
     );
 }
