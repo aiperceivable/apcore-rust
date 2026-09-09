@@ -265,6 +265,8 @@ mod test_redaction_config_conformance;
 mod test_redaction_config_keys;
 #[path = "test_redaction_default_keys.rs"]
 mod test_redaction_default_keys;
+#[path = "test_redaction_regex_value_types.rs"]
+mod test_redaction_regex_value_types;
 #[path = "test_register_module_annotations.rs"]
 mod test_register_module_annotations;
 #[path = "test_registry.rs"]
