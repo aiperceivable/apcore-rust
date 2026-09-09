@@ -3,11 +3,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use glob::Pattern;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 
 use crate::config::Config;
+use crate::utils::helpers::match_glob;
 
 /// Default replacement string for redacted values.
 pub const DEFAULT_REPLACEMENT: &str = "***REDACTED***";
@@ -125,8 +125,16 @@ fn read_redaction_key(
 /// (`x-sensitive`) annotations.
 #[derive(Debug, Clone, Default)]
 pub struct RedactionConfig {
-    /// Compiled glob patterns (entries containing `*`/`?`/`[`).
-    field_patterns: Vec<Pattern>,
+    /// Glob-dialect entries (those containing `*` or `?`), LOWER-CASED.
+    ///
+    /// PROTOCOL_SPEC 10.6.1: they are matched with Algorithm A25 against the
+    /// lower-cased field name, so the case fold applies to the pattern AND the
+    /// name alike. Storing them folded is what makes that structural rather
+    /// than a call-site convention: the previous code lowered only the name,
+    /// so `"*Token*"` — or any capitalised spelling — was a perfectly valid
+    /// pattern that matched nothing, redacting in Python and TypeScript and
+    /// leaving PLAINTEXT here, with no warning (#117 section 1).
+    field_patterns: Vec<String>,
     /// Plain substring patterns, pre-normalized via [`normalize_key_for_match`].
     field_substrings: Vec<String>,
     value_patterns: Vec<Regex>,
@@ -190,22 +198,23 @@ impl RedactionConfig {
         Self::with_default_sensitive_keys()
     }
 
-    /// Append one entry to the matcher. Glob patterns (containing `*`, `?`,
-    /// or `[`) compile to a [`glob::Pattern`]; bare strings are stored as
-    /// pre-normalized substrings.
+    /// Append one entry to the matcher (PROTOCOL_SPEC 10.6.1).
+    ///
+    /// An entry containing `*` or `?` is a glob-dialect pattern stored
+    /// lower-cased and matched with A25; anything else is a substring stored
+    /// pre-normalized. `[` is not a trigger and a pattern can never fail.
     fn add_sensitive_key(&mut self, key: &str) {
         if key.is_empty() {
             return;
         }
-        if key.contains(['*', '?', '[']) {
-            match Pattern::new(key) {
-                Ok(p) => self.field_patterns.push(p),
-                Err(e) => tracing::warn!(
-                    pattern = %key,
-                    error = %e,
-                    "Skipping invalid sensitive_keys glob"
-                ),
-            }
+        // PROTOCOL_SPEC 10.6.1: `[` is NOT a trigger. Brackets are literals
+        // under A25 (9.2.3 requirement 4), so `[!p]assword` carries no `*` and
+        // no `?` and is an ordinary substring — inert, rather than read as a
+        // negated character class the way `glob::Pattern` read it. There is
+        // also nothing left to fail: A25 has no parse phase, so an entry can
+        // no longer be silently dropped as an "invalid glob".
+        if key.contains(['*', '?']) {
+            self.field_patterns.push(key.to_lowercase());
         } else {
             self.field_substrings.push(normalize_key_for_match(key));
         }
@@ -375,19 +384,21 @@ impl RedactionConfig {
         }
     }
 
-    /// Check whether a field name matches any sensitive-key entry. Glob
-    /// patterns are evaluated case-insensitively against the raw key; bare
-    /// substrings are evaluated against the normalized form (lower-cased,
-    /// `-`/whitespace mapped to `_`, and an `_` inserted at every
-    /// `lowercase->uppercase` boundary so `AccessKey` matches `access_key`).
+    /// Check whether a field name matches any sensitive-key entry.
+    ///
+    /// Glob entries are matched with Algorithm A25 against the lower-cased
+    /// name, with the pattern lower-cased at construction so the fold applies
+    /// to both sides (PROTOCOL_SPEC 10.6.1 clause 1). Bare substrings are
+    /// evaluated against the normalized form (lower-cased, `-`/whitespace
+    /// mapped to `_`, and an `_` inserted at every `lowercase->uppercase`
+    /// boundary so `AccessKey` matches `access_key`).
     #[must_use]
     pub fn field_matches(&self, name: &str) -> bool {
-        if self.field_patterns.iter().any(|p| {
-            // Try the raw name and the lowered form so legacy globs like
-            // `_secret_*` still match `_secret_token` while case-insensitive
-            // operator entries like `password*` match `Password123`.
-            p.matches(name) || p.matches(&name.to_lowercase())
-        }) {
+        // Both sides are folded: the patterns at construction, the name here.
+        // Folding only the name is a silent bypass on a redaction surface —
+        // see the field's own documentation.
+        let lowered = name.to_lowercase();
+        if self.field_patterns.iter().any(|p| match_glob(p, &lowered)) {
             return true;
         }
         if self.field_substrings.is_empty() {
@@ -423,12 +434,10 @@ pub struct RedactionConfigBuilder {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedactionConfigError {
-    #[error("invalid field glob pattern '{pattern}': {source}")]
-    InvalidFieldPattern {
-        pattern: String,
-        #[source]
-        source: glob::PatternError,
-    },
+    // `InvalidFieldPattern` was removed in v1.37.0: PROTOCOL_SPEC 9.2.3
+    // requirement 2 makes every string a valid A25 pattern, so a field pattern
+    // has no failure mode left. The variant it replaced existed only because
+    // `glob::Pattern` rejects `a[b` and `a**b`.
     #[error("invalid value regex '{pattern}': {source}")]
     InvalidValuePattern {
         pattern: String,
@@ -461,7 +470,7 @@ impl RedactionConfigBuilder {
     }
 
     /// Append `sensitive_keys` entries (D-54). Each entry is auto-detected:
-    /// strings containing `*`, `?`, or `[` are compiled as globs; bare
+    /// strings containing `*` or `?` are glob-dialect patterns (A25); bare
     /// strings become case-insensitive substring matchers (with separator +
     /// camelCase normalization). Operator-supplied lists MUST replace the
     /// canonical default — call [`RedactionConfig::with_default_sensitive_keys`]
@@ -482,18 +491,19 @@ impl RedactionConfigBuilder {
         self
     }
 
-    /// Compile the patterns. Returns an error if any glob/regex is malformed.
+    /// Compile the value regexes. Returns an error if any is malformed.
+    ///
+    /// Field patterns can no longer fail: PROTOCOL_SPEC 9.2.3 requirement 2
+    /// makes every string a valid A25 pattern, so there is nothing left to
+    /// reject. They are lower-cased here for the same reason
+    /// [`RedactionConfig::add_sensitive_key`] does — the case fold has to
+    /// reach the pattern, not only the field name.
     pub fn try_build(self) -> Result<RedactionConfig, RedactionConfigError> {
-        let field_patterns = self
+        let field_patterns: Vec<String> = self
             .field_patterns
             .into_iter()
-            .map(|p| {
-                Pattern::new(&p).map_err(|source| RedactionConfigError::InvalidFieldPattern {
-                    pattern: p,
-                    source,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|p| p.to_lowercase())
+            .collect();
         let value_patterns = self
             .value_patterns
             .into_iter()

@@ -9,7 +9,19 @@ pub const DEFAULT_MAX_CALL_DEPTH: usize = 32;
 /// Default maximum repeat count for a single module in the call chain.
 pub const DEFAULT_MAX_MODULE_REPEAT: usize = 3;
 
-/// Match a string against a glob-like pattern (supports `*` wildcards).
+/// Match a **module ID** against an ACL pattern (Algorithm A08).
+///
+/// `*` is the ONLY metacharacter; every other character is a literal, `?`,
+/// `[`, `]`, `{`, `}` and `\` included. Used by ACL rule matching and by
+/// pipeline `match_modules`, and by nothing else.
+///
+/// This is deliberately NOT [`match_glob`] (Algorithm A25), which is the
+/// matcher for every other pattern-valued value in the specification and which
+/// also honours `?`. PROTOCOL_SPEC §9.2.3 requirement 5 gives the reason:
+/// promoting `?` here would widen ACL `allow` rules that are inert today
+/// (§2.7 forbids `?` in a module ID), which is the one direction an
+/// authorization matcher must not move silently. §6.2.2 closes that hole with
+/// a diagnostic instead.
 ///
 /// Ported from apcore-python `utils/pattern.py::match_pattern`.
 #[must_use]
@@ -51,6 +63,91 @@ pub fn match_pattern(pattern: &str, value: &str) -> bool {
     }
 
     true
+}
+
+/// Match `value` against a glob-dialect `pattern` (Algorithm A25).
+///
+/// PROTOCOL_SPEC §9.2.3. The matcher for every glob-dialect pattern-valued
+/// value in the specification: `bindings.pattern`,
+/// `obs.redaction.sensitive_keys` glob entries, event `event_pattern` /
+/// `include_events` / `exclude_events`, and `path_filter`.
+///
+/// Exactly two metacharacters:
+///
+/// - `*` — zero or more characters, crossing `.` and `/`
+/// - `?` — exactly one character
+///
+/// **Every other character is a literal**, `[`, `]`, `{`, `}`, `\`, `!`, `^`
+/// and `-` included. There is no escape character, and the match is anchored
+/// to the whole value.
+///
+/// **Do not delegate to `glob::Pattern`.** It reads `[…]` as a character class
+/// with its own negation spelling, and — the part that bit hardest — it
+/// *rejects* patterns: `a[b` is an "invalid range pattern" and `a**b` a
+/// misplaced recursive wildcard, so a control-plane request the other two SDKs
+/// served was refused here (#117). A25 has no parse phase: every string is a
+/// valid pattern and this function never fails.
+///
+/// Operates on `char`s, not bytes, so `?` matches one character rather than
+/// one UTF-8 byte.
+#[must_use]
+pub fn match_glob(pattern: &str, value: &str) -> bool {
+    let segments: Vec<Vec<char>> = pattern.split('*').map(|s| s.chars().collect()).collect();
+    let value: Vec<char> = value.chars().collect();
+
+    if segments.len() == 1 {
+        return match_exact(&segments[0], &value);
+    }
+
+    if !match_prefix(&segments[0], &value) {
+        return false;
+    }
+    let mut pos = segments[0].len();
+
+    for segment in &segments[1..segments.len() - 1] {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment.len() > value.len() {
+            return false;
+        }
+        let mut found = None;
+        for j in pos..=(value.len() - segment.len()) {
+            if match_exact(segment, &value[j..j + segment.len()]) {
+                found = Some(j);
+                break;
+            }
+        }
+        match found {
+            Some(j) => pos = j + segment.len(),
+            None => return false,
+        }
+    }
+
+    let last = &segments[segments.len() - 1];
+    if last.is_empty() {
+        return true;
+    }
+    if value.len() - pos < last.len() {
+        return false;
+    }
+    match_exact(last, &value[value.len() - last.len()..])
+}
+
+/// True when `text` starts with `segment`, treating `?` as any character.
+fn match_prefix(segment: &[char], text: &[char]) -> bool {
+    if text.len() < segment.len() {
+        return false;
+    }
+    segment
+        .iter()
+        .zip(text.iter())
+        .all(|(s, t)| *s == '?' || s == t)
+}
+
+/// True when `segment` covers `text` exactly, treating `?` as any character.
+fn match_exact(segment: &[char], text: &[char]) -> bool {
+    segment.len() == text.len() && match_prefix(segment, text)
 }
 
 /// Guard against call depth and circular call violations.

@@ -6,6 +6,6 @@ pub mod helpers;
 
 pub use error_propagation::{propagate_error, propagate_module_error};
 pub use helpers::{
-    calculate_specificity, guard_call_chain, guard_call_chain_with_repeat, match_pattern,
-    normalize_to_canonical_id, DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_MODULE_REPEAT,
+    calculate_specificity, guard_call_chain, guard_call_chain_with_repeat, match_glob,
+    match_pattern, normalize_to_canonical_id, DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_MODULE_REPEAT,
 };

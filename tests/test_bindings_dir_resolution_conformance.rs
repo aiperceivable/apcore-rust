@@ -405,7 +405,7 @@ fn conformance_bindings_dir_resolution() {
     let original_cwd = std::env::current_dir().expect("cwd");
     let fx = fixture();
     let cases = fx["test_cases"].as_array().expect("test_cases is an array");
-    assert_eq!(cases.len(), 9, "driver is written against all 9 cases");
+    assert_eq!(cases.len(), 13, "driver is written against all 13 cases");
 
     let ids: Vec<&str> = cases
         .iter()

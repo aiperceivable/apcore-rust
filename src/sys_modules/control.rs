@@ -8,7 +8,6 @@
 //          dependency-topological reload order
 
 use async_trait::async_trait;
-use glob::Pattern;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +22,7 @@ use crate::observability::redaction::DEFAULT_REPLACEMENT;
 use crate::registry::dependencies::resolve_dependencies;
 use crate::registry::registry::Registry;
 use crate::registry::types::DepInfo;
+use crate::utils::helpers::match_glob;
 
 use super::audit::{build_audit_entry, record_audit, AuditAction, AuditChange, AuditStore};
 use super::overrides::{persist_one, write_override, OverridesStore};
@@ -586,18 +586,17 @@ impl ReloadModule {
         reason: &str,
         ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError> {
-        let pattern = Pattern::new(&path_filter).map_err(|e| {
-            ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
-                format!("'path_filter' is not a valid glob pattern: {e}"),
-            )
-        })?;
-
+        // PROTOCOL_SPEC 6.7 clause 4 / 9.2.3: `path_filter` is matched with
+        // Algorithm A25 against each registered module ID. `glob::Pattern`
+        // was the obvious local answer and the wrong one twice over: it
+        // expands `[em]` as a character class, and it REJECTS patterns
+        // (`a[b`, `a**b`), so a control-plane request the other two SDKs
+        // served was refused here (#117). A25 never fails to parse.
         let mut matched: Vec<String> = self
             .registry
             .module_ids()
             .into_iter()
-            .filter(|id| pattern.matches(id))
+            .filter(|id| match_glob(&path_filter, id))
             .collect();
         matched.sort();
 

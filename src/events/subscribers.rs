@@ -856,37 +856,22 @@ impl EventSubscriber for FilterSubscriber {
     }
 }
 
-/// Simple `*`-only glob matcher used by `FilterSubscriber`.
+/// Event-type pattern matching for `FilterSubscriber` (Algorithm A25).
 ///
-/// Supports any number of `*` wildcards in the pattern; each matches zero or
-/// more characters. This is the subset of `fnmatch` behaviour the spec
-/// fixtures and YAML examples actually exercise.
+/// PROTOCOL_SPEC §9.16.3. This used to be a local `*`-only matcher whose own
+/// doc comment scoped it to "the subset of `fnmatch` behaviour the spec
+/// fixtures and YAML examples actually exercise" — an accurate description of
+/// what happens whenever a specification is silent: **the corpus becomes the
+/// contract, and the corpus under-specifies.** Every event pattern in every
+/// fixture was `*` or a literal name, so `?` never came up (#117).
+///
+/// The direction matters: `exclude_events` FAILS OPEN. A pattern that does not
+/// match means the event is DELIVERED, so a matcher understanding fewer
+/// metacharacters than the operator wrote does not narrow the filter, it opens
+/// it — a subscriber excluding `secret.?vent` received it here while the other
+/// two SDKs discarded it.
 fn match_glob_pattern(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let mut remaining = value;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            if let Some(rest) = remaining.strip_prefix(part) {
-                remaining = rest;
-            } else {
-                return false;
-            }
-        } else if let Some(pos) = remaining.find(part) {
-            remaining = &remaining[pos + part.len()..];
-        } else {
-            return false;
-        }
-    }
-    if !pattern.ends_with('*') && !remaining.is_empty() {
-        return false;
-    }
-    true
+    crate::utils::helpers::match_glob(pattern, value)
 }
 
 // ---------------------------------------------------------------------------

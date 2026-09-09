@@ -1143,6 +1143,35 @@ impl Config {
             }
         }
 
+        // PROTOCOL_SPEC §9.2.3 requirement 6d / §10.6.1: an
+        // `obs.redaction.regex_patterns` entry the engine cannot compile MUST
+        // be reported here, not skipped at the first log record. A redaction
+        // rule that redacts nothing is indistinguishable, from the outside,
+        // from one that works — and on this surface the difference is
+        // credentials in plaintext. The `regex` crate is the engine that
+        // refuses lookaround and backreferences by design (to keep matching
+        // linear in the input), so this fires on patterns that compile
+        // perfectly well in Python and JavaScript: exactly the configuration
+        // that redacts elsewhere and silently does nothing here.
+        if let Some(serde_json::Value::Array(patterns)) = self.get("obs.redaction.regex_patterns") {
+            for (index, entry) in patterns.iter().enumerate() {
+                let Some(pattern) = entry.as_str() else {
+                    continue;
+                };
+                if pattern.is_empty() {
+                    continue;
+                }
+                if let Err(e) = regex::Regex::new(pattern) {
+                    errors.push(format!(
+                        "obs.redaction.regex_patterns[{index}] does not compile and would redact \
+                         nothing: '{pattern}' ({e}). Patterns should stay inside the portable \
+                         subset — no lookaround, no backreferences, no inline (?i) flags \
+                         (PROTOCOL_SPEC 9.2.3 requirement 6)."
+                    ));
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

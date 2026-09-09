@@ -603,40 +603,19 @@ impl EventEmitter {
         }
     }
 
-    /// Simple glob-style pattern matching with `*` wildcard.
+    /// Event-type pattern matching (Algorithm A25, PROTOCOL_SPEC §9.16.3).
     ///
     /// - `"*"` matches everything.
     /// - `"foo.*"` matches `"foo.bar"`, `"foo.baz"`, etc.
-    /// - An exact string matches only itself.
+    /// - `?` matches exactly one character.
+    /// - Every other character is a literal, `[`, `]`, `{`, `}` and `\`
+    ///   included — a subscriber pattern is never rejected.
+    ///
+    /// This was a local `*`-only matcher, one of three different metacharacter
+    /// sets across the three SDKs while no section of the specification said
+    /// which was right (#117).
     fn matches_pattern(pattern: &str, event_type: &str) -> bool {
-        if pattern == "*" {
-            return true;
-        }
-        // Split pattern by '*' and check that all parts appear in order.
-        let parts: Vec<&str> = pattern.split('*').collect();
-        let mut remaining = event_type;
-        for (i, part) in parts.iter().enumerate() {
-            if part.is_empty() {
-                continue;
-            }
-            if i == 0 {
-                // First part must be a prefix.
-                if let Some(rest) = remaining.strip_prefix(part) {
-                    remaining = rest;
-                } else {
-                    return false;
-                }
-            } else if let Some(pos) = remaining.find(part) {
-                remaining = &remaining[pos + part.len()..];
-            } else {
-                return false;
-            }
-        }
-        // If pattern doesn't end with *, remaining must be empty.
-        if !pattern.ends_with('*') && !remaining.is_empty() {
-            return false;
-        }
-        true
+        crate::utils::helpers::match_glob(pattern, event_type)
     }
 }
 

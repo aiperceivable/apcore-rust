@@ -242,6 +242,24 @@ fn pattern_never_matches(field: &str, patterns: &[String]) -> Option<String> {
     } else {
         patterns
     };
+    // PROTOCOL_SPEC §6.2.2 (v1.37.0): A08 has `*` as its ONLY metacharacter,
+    // and §2.7 forbids `?` in a module ID, so a pattern carrying one matches
+    // nothing and can never match anything. The author meant a wildcard — `?`
+    // IS one in every other pattern surface the spec defines (A25, §9.2.3) —
+    // and got a rule that is silently inert. Reported, never rejected:
+    // promoting `?` in A08 would widen `allow` rules that are inert in every
+    // deployed policy today, which is the one direction an authorization
+    // matcher must not move without an operator's consent.
+    if !operands.is_empty() && operands.iter().all(|p| p.contains('?')) {
+        return Some(format!(
+            "every '{field}' pattern contains '?', which is a LITERAL in ACL matching \
+             (Algorithm A08 — '*' is the only metacharacter) and which §2.7 forbids in a \
+             module ID, so this rule matches nothing and can never match anything. '?' is a \
+             wildcard in every other pattern surface (A25, §9.2.3), which is where the \
+             expectation comes from. The rule loads and changes no decision — it simply \
+             never fires."
+        ));
+    }
     if field == "targets" && operands.iter().all(|p| p == EXTERNAL_CALLER) {
         return Some(format!(
             "'{field}' matches only '{EXTERNAL_CALLER}', which is the caller-side sentinel \
@@ -1065,6 +1083,29 @@ impl ACL {
     /// valid configurations on ordering alone. [`ACL::validate_rules`] is the
     /// deterministic check to run once registration is complete.
     fn warn_rule_faults(rules: &[ACLRule], index_offset: usize) {
+        // PROTOCOL_SPEC §6.2.2 clause 1 — the load-time half of the `?`
+        // diagnostic, on the §6.1.2 precedent: warn, never fail, and change no
+        // decision. `validate_rules()` reports the same condition at deploy.
+        for (i, rule) in rules.iter().enumerate() {
+            for (field, patterns) in [("callers", &rule.callers), ("targets", &rule.targets)] {
+                for pattern in patterns.iter().filter(|p| p.contains('?')) {
+                    tracing::warn!(
+                        rule_index = index_offset + i,
+                        field = field,
+                        pattern = %pattern,
+                        effect = %rule.effect,
+                        "ACL pattern contains '?', which is a LITERAL in ACL matching \
+                         (Algorithm A08 — '*' is the only metacharacter) and which \
+                         PROTOCOL_SPEC §2.7 forbids in a module ID. The pattern therefore \
+                         matches nothing and can never match anything: a 'deny' rule guards \
+                         nothing, an 'allow' rule never fires. '?' IS a wildcard in every \
+                         other pattern surface (Algorithm A25, §9.2.3), which is where the \
+                         expectation comes from. Nothing about this rule's meaning has \
+                         changed — see §6.2.2."
+                    );
+                }
+            }
+        }
         for (i, rule) in rules.iter().enumerate() {
             let Some(conditions) = rule.conditions.as_ref() else {
                 continue;

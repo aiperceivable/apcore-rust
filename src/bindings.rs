@@ -19,6 +19,7 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::module::ModuleAnnotations;
 use crate::registry::registry::Registry;
 use crate::schema::openai_strict::assert_openai_strict_compatible;
+use crate::utils::helpers::match_glob;
 
 const CURRENT_SPEC_VERSION: &str = "1.0";
 
@@ -586,8 +587,6 @@ impl BindingLoader {
             ));
         }
 
-        let suffix = pattern.strip_prefix('*').unwrap_or(pattern);
-
         let mut entries: Vec<_> = std::fs::read_dir(dir)
             .map_err(|e| {
                 ModuleError::new(
@@ -596,11 +595,16 @@ impl BindingLoader {
                 )
             })?
             .filter_map(std::result::Result::ok)
+            // PROTOCOL_SPEC 5.12.6 clause 1 / 9.2.3: the pattern is matched
+            // with Algorithm A25 against each entry's FILENAME. The suffix
+            // comparison this replaces stripped a LEADING `*` and compared with
+            // `ends_with`, so `data*.yaml` — an ordinary glob — matched nothing
+            // while apcore-python matched one file (#116).
             .filter(|entry| {
                 entry
                     .file_name()
                     .to_str()
-                    .is_some_and(|name| name.ends_with(suffix))
+                    .is_some_and(|name| match_glob(pattern, name))
             })
             .collect();
 

@@ -16,7 +16,8 @@ use apcore::context::{Context, Identity};
 use apcore::errors::{ErrorCode, ErrorCodeRegistry};
 use apcore::schema::SchemaValidator;
 use apcore::utils::{
-    calculate_specificity, guard_call_chain_with_repeat, match_pattern, normalize_to_canonical_id,
+    calculate_specificity, guard_call_chain_with_repeat, match_glob, match_pattern,
+    normalize_to_canonical_id,
 };
 use apcore::version::negotiate_version;
 
@@ -72,6 +73,51 @@ fn conformance_pattern_matching() {
             expected,
             "FAIL [{id}]: match_pattern({pattern:?}, {value:?}) expected {expected}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Glob Matching (A25) — PROTOCOL_SPEC 9.2.3 (#116, #117)
+//
+// The matcher for every glob-dialect pattern-valued value EXCEPT module-ID
+// matching: `bindings.pattern`, `obs.redaction.sensitive_keys` glob entries,
+// event patterns, and `path_filter`. Kept in its own fixture rather than folded
+// into `pattern_matching` on purpose — 9.2.3 requirement 5 states why the two
+// algorithms are separate, and one shared fixture would hide it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conformance_glob_matching() {
+    let fixture = load_fixture("glob_matching");
+    for tc in fixture["test_cases"].as_array().unwrap() {
+        let id = tc["id"].as_str().unwrap();
+        let pattern = tc["pattern"].as_str().unwrap();
+        let value = tc["value"].as_str().unwrap();
+        let expected = tc["expected"].as_bool().unwrap();
+        let why = tc["_why"].as_str().unwrap_or("");
+
+        assert_eq!(
+            match_glob(pattern, value),
+            expected,
+            "FAIL [{id}]: match_glob({pattern:?}, {value:?}) expected {expected} — {why}"
+        );
+    }
+}
+
+/// 9.2.3 requirement 2: every string is a valid pattern, so there is no parse
+/// phase.
+///
+/// Pinned separately because the failure it guards is a PANIC or an `Err`, not
+/// a wrong boolean. This is the requirement `glob::Pattern` violated — it
+/// rejects `a[b` ("invalid range pattern") and `a**b` ("recursive wildcards
+/// must form a single path component") — which is how the same control-plane
+/// request came to be refused by this SDK and served by the other two.
+#[test]
+fn conformance_glob_matching_never_rejects_a_pattern() {
+    for pattern in ["a[b", "a**b", "[!", "{a,b}", "\\", "***", "[]", "?", ""] {
+        for value in ["", "a", "a[b", "executor.email.send"] {
+            let _ = match_glob(pattern, value);
+        }
     }
 }
 

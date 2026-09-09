@@ -346,6 +346,116 @@ async fn conformance_builtin_filter_discards_nonmatching() {
 }
 
 // ---------------------------------------------------------------------------
+// The event-pattern DIALECT — PROTOCOL_SPEC 9.16.3, Algorithm A25 (#117)
+//
+// Written on `exclude_events` wherever possible, because exclude FAILS OPEN: a
+// pattern that does not match means the event is DELIVERED, so a matcher
+// understanding fewer metacharacters than the operator wrote does not narrow
+// the filter, it opens it. This SDK's matcher was `*`-only, and its own doc
+// comment scoped it to "the subset of fnmatch behaviour the spec fixtures and
+// YAML examples actually exercise" — an accurate account of what happens when
+// the specification is silent: the corpus becomes the contract, and the corpus
+// under-specifies.
+//
+// Driven by name rather than by iteration because this file addresses each case
+// individually; a new case is therefore invisible until it is named here, which
+// is why `every_case_in_the_fixture_is_named_by_this_driver` below exists.
+// ---------------------------------------------------------------------------
+
+/// Every case in the canonical fixture is addressed by this driver.
+///
+/// This file looks cases up by id, so a case added upstream runs nowhere and
+/// nothing goes red — the "N skipped is not N diverge" failure mode. The list
+/// is hand-written so that adding a case upstream fails HERE, by name.
+#[test]
+fn every_case_in_the_fixture_is_named_by_this_driver() {
+    const NAMED: &[&str] = &[
+        "subscriber_factory_registered_type",
+        "builtin_stdout_type",
+        "builtin_file_type",
+        "builtin_filter_passes_matching",
+        "builtin_filter_discards_nonmatching",
+        "filter_exclude_question_mark_is_a_wildcard",
+        "filter_exclude_character_class_does_not_expand",
+        "filter_include_question_mark_is_a_wildcard",
+        "circuit_open_after_threshold",
+        "circuit_discards_in_open_state",
+        "circuit_half_open_after_window",
+        "circuit_closes_on_success",
+        "event_naming_canonical",
+    ];
+    let fixture = load_fixture();
+    let ids: Vec<&str> = fixture["test_cases"]
+        .as_array()
+        .expect("test_cases must be an array")
+        .iter()
+        .map(|c| c["id"].as_str().expect("every case needs an id"))
+        .collect();
+    for id in &ids {
+        assert!(
+            NAMED.contains(id),
+            "event_management_hardening.json gained case `{id}` that this driver does not \
+             address — teach the driver, do not let it run nowhere"
+        );
+    }
+    for id in NAMED {
+        assert!(
+            ids.contains(id),
+            "this driver names case `{id}` the fixture no longer defines"
+        );
+    }
+}
+
+/// One filter case, driven entirely from the fixture.
+async fn drive_filter_case(id: &str) {
+    let record = Arc::new(CallRecord::default());
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, id);
+    let subscriber_config = case["input"]["subscriber_config"].clone();
+    let event = parse_event(&case["input"]["event"]);
+
+    let sub = {
+        let _guard = registry_lock().lock();
+        reset_subscriber_registry();
+        install_recording_webhook(record.clone());
+        let s = create_subscriber(&subscriber_config).expect("filter built-in must be available");
+        reset_subscriber_registry();
+        s
+    };
+
+    sub.on_event(&event).await.unwrap();
+
+    let want_delivered = case["expected"]["delivery_attempted"]
+        .as_bool()
+        .expect("case must state delivery_attempted");
+    assert_eq!(
+        case["expected"]["discarded"].as_bool(),
+        Some(!want_delivered),
+        "[{id}] the fixture's two expectations must be each other's negation"
+    );
+    assert_eq!(
+        record.count(),
+        usize::from(want_delivered),
+        "[{id}] delegate delivery does not match the fixture"
+    );
+}
+
+#[tokio::test]
+async fn conformance_filter_exclude_question_mark_is_a_wildcard() {
+    drive_filter_case("filter_exclude_question_mark_is_a_wildcard").await;
+}
+
+#[tokio::test]
+async fn conformance_filter_exclude_character_class_does_not_expand() {
+    drive_filter_case("filter_exclude_character_class_does_not_expand").await;
+}
+
+#[tokio::test]
+async fn conformance_filter_include_question_mark_is_a_wildcard() {
+    drive_filter_case("filter_include_question_mark_is_a_wildcard").await;
+}
+
+// ---------------------------------------------------------------------------
 // Case 6 — circuit_open_after_threshold
 // ---------------------------------------------------------------------------
 
