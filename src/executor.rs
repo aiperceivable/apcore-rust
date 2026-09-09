@@ -38,6 +38,26 @@ use crate::utils::propagate_module_error;
 /// Aligned with apcore-python and apcore-typescript (32) per spec (sync STREAM-001).
 const DEEP_MERGE_MAX_DEPTH: usize = 32;
 
+/// Resolve `stream.max_merge_depth` (PROTOCOL_SPEC §5; canonical default 32).
+///
+/// §5 calls 32 the *canonical default*, which implies an override — and until
+/// now there was none: the key was declared in all three key surfaces, carried
+/// a canonical default in `defaults.schema.json`, and was read by no code path
+/// (apcore#118), so the constant WAS the contract.
+///
+/// A non-positive or non-integer value falls back to the canonical default
+/// rather than disabling the cap. The cap exists to prevent stack exhaustion
+/// from adversarial chunk shapes, so a misconfiguration must not remove it.
+#[must_use]
+pub fn resolve_merge_depth(config: &Config) -> usize {
+    config
+        .get("stream.max_merge_depth")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n >= 1)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEEP_MERGE_MAX_DEPTH)
+}
+
 /// Deep-merge a list of JSON Value chunks into a single accumulated Value.
 ///
 /// Retained for tests that explicitly verify the unchecked merge behavior;
@@ -48,7 +68,7 @@ const DEEP_MERGE_MAX_DEPTH: usize = 32;
 fn deep_merge_chunks(chunks: &[Value]) -> Value {
     let mut acc = Value::Null;
     for chunk in chunks {
-        deep_merge_value(&mut acc, chunk, 0);
+        deep_merge_value(&mut acc, chunk, 0, DEEP_MERGE_MAX_DEPTH);
     }
     acc
 }
@@ -64,12 +84,25 @@ fn deep_merge_chunks(chunks: &[Value]) -> Value {
 /// `chunks` may be empty; in that case the function returns an empty object
 /// (mirroring Python's `accumulated: dict[str, Any] = {}` initial state).
 pub fn deep_merge_chunks_checked(chunks: &[Value]) -> Result<Value, ModuleError> {
+    deep_merge_chunks_checked_with_depth(chunks, DEEP_MERGE_MAX_DEPTH)
+}
+
+/// [`deep_merge_chunks_checked`] with an explicit depth cap.
+///
+/// The cap is `stream.max_merge_depth` (PROTOCOL_SPEC §5), resolved by
+/// [`resolve_merge_depth`]. The no-cap entry point above keeps the canonical
+/// default so every existing caller — tests and the conformance driver
+/// included — is unaffected.
+pub fn deep_merge_chunks_checked_with_depth(
+    chunks: &[Value],
+    max_depth: usize,
+) -> Result<Value, ModuleError> {
     let mut acc: Value = Value::Object(serde_json::Map::new());
     for (idx, chunk) in chunks.iter().enumerate() {
         if !chunk.is_object() {
             return Err(stream_chunk_not_object_error(idx, chunk));
         }
-        deep_merge_value(&mut acc, chunk, 0);
+        deep_merge_value(&mut acc, chunk, 0, max_depth);
     }
     Ok(acc)
 }
@@ -116,8 +149,8 @@ fn json_type_name(v: &Value) -> &'static str {
     }
 }
 
-fn deep_merge_value(base: &mut Value, overlay: &Value, depth: usize) {
-    if depth >= DEEP_MERGE_MAX_DEPTH {
+fn deep_merge_value(base: &mut Value, overlay: &Value, depth: usize, max_depth: usize) {
+    if depth >= max_depth {
         // At the depth limit, stop recursing (stack safety) but still merge
         // SHALLOWLY: assign each overlay key onto base rather than replacing
         // the whole node. Replacing dropped every base-only key, so streaming
@@ -143,7 +176,7 @@ fn deep_merge_value(base: &mut Value, overlay: &Value, depth: usize) {
         (Value::Object(base_map), Value::Object(overlay_map)) => {
             for (k, v) in overlay_map {
                 let entry = base_map.entry(k.clone()).or_insert(Value::Null);
-                deep_merge_value(entry, v, depth + 1);
+                deep_merge_value(entry, v, depth + 1, max_depth);
             }
         }
         (base, overlay) => {
@@ -248,6 +281,10 @@ struct StreamSetup {
     module_id: String,
     registry: Option<Arc<crate::registry::registry::Registry>>,
     default_timeout_ms: u64,
+    /// `stream.max_merge_depth` resolved once at setup (PROTOCOL_SPEC §5).
+    /// Carried on the setup rather than re-read in Phase 3 so one stream uses
+    /// one cap even if the configuration is mutated mid-stream.
+    merge_depth: usize,
 }
 
 /// Internal: outcome of `Executor::prepare_stream`. A Phase-1 (pre-execute)
@@ -1442,7 +1479,7 @@ impl Executor {
     async fn run_stream_phase3(setup: &StreamSetup, accumulated: &[Value], module_id: &str) {
         // D-58: enforce that all chunks are objects before merging. A non-object
         // chunk is logged and skips post-stream validation.
-        let merged = match deep_merge_chunks_checked(accumulated) {
+        let merged = match deep_merge_chunks_checked_with_depth(accumulated, setup.merge_depth) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -1677,20 +1714,41 @@ impl Executor {
         })?;
         let output_schema = module.output_schema();
 
-        let executed_middlewares = pipe_ctx.executed_middlewares.clone();
-        let event_emitter = pipe_ctx.event_emitter.clone();
-        Ok(StreamPrep::Setup(Box::new(StreamSetup {
+        Ok(StreamPrep::Setup(Box::new(self.build_stream_setup(
+            module,
+            output_schema,
+            module_id,
+            pipe_ctx,
+        ))))
+    }
+
+    /// Assemble the [`StreamSetup`] Phase 2 and Phase 3 run from.
+    ///
+    /// Extracted from `prepare_stream` so that function stays inside clippy's
+    /// `too_many_lines` bound; it is pure assembly and holds no logic of its
+    /// own. The two configuration reads live here because both are resolved
+    /// ONCE per stream: a configuration mutated mid-stream must not change the
+    /// timeout or the merge cap of a stream already in flight.
+    fn build_stream_setup(
+        &self,
+        module: Arc<dyn crate::module::Module>,
+        output_schema: Value,
+        module_id: &str,
+        pipe_ctx: PipelineContext,
+    ) -> StreamSetup {
+        StreamSetup {
             module,
             inputs: pipe_ctx.inputs,
             context: pipe_ctx.context,
             output_schema,
             middleware_manager: pipe_ctx.middleware_manager.clone(),
-            executed_middlewares,
-            event_emitter,
+            executed_middlewares: pipe_ctx.executed_middlewares.clone(),
+            event_emitter: pipe_ctx.event_emitter.clone(),
             module_id: module_id.to_string(),
             registry: pipe_ctx.registry.clone(),
             default_timeout_ms: self.config.executor.default_timeout,
-        })))
+            merge_depth: resolve_merge_depth(&self.config),
+        }
     }
 
     /// Get a reference to the executor's execution strategy.
