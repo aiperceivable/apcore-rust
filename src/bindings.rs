@@ -290,12 +290,23 @@ impl ValidationLimits {
 /// PROTOCOL_SPEC §9.1.2 requirement 6 — the semver.org grammar, unmodified and
 /// written into the specification as a literal so three implementations cannot
 /// invent three. `1.0` does NOT match: the patch component is required.
+///
+/// Assembled with `concat!` rather than a line-continued raw string. A `\`
+/// before a newline does NOT continue a RAW string in Rust, so the first
+/// version of this literal kept the backslash, the newline and the indentation
+/// — and `cargo fmt` then joined the lines, leaving three runs of literal
+/// spaces inside the pattern. It compiled, and it rejected EVERY version
+/// including valid SemVer. There is no `(?x)` flag here: whitespace in this
+/// pattern is significant, so it must contain none.
 fn semver_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(
-            r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)             (?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)             (?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?             (?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$",
-        )
+        regex::Regex::new(concat!(
+            r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)",
+            r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)",
+            r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?",
+            r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$",
+        ))
         .expect("the §9.1.2 semver grammar is a compile-time constant")
     })
 }
@@ -1160,6 +1171,52 @@ fn display_into_metadata(
 
 #[cfg(test)]
 mod tests {
+
+    /// PROTOCOL_SPEC §9.1.2 requirement 6 — BOTH halves.
+    ///
+    /// The rejection half alone is not coverage, and this test exists because
+    /// that is exactly how the defect shipped: the only case anyone wrote was
+    /// `version: "1.0"` expecting a rejection, and it passed against a pattern
+    /// that rejected *everything*. A constraint that refuses valid input is as
+    /// broken as one that accepts invalid input, and only the acceptance half
+    /// can tell them apart.
+    #[test]
+    fn semver_grammar_accepts_valid_versions_and_rejects_invalid_ones() {
+        for accepted in [
+            "0.0.0",
+            "1.0.0",
+            "0.1.0",
+            "10.20.30",
+            "1.2.3-rc.1",
+            "1.2.3-0.3.7",
+            "1.2.3+build.5",
+            "1.2.3-beta.1+exp.sha.5114f85",
+        ] {
+            assert!(
+                semver_re().is_match(accepted),
+                "§9.1.2's grammar must accept the valid SemVer {accepted:?}"
+            );
+        }
+        for rejected in ["1.0", "1", "v1.0.0", "1.0.0.0", "01.0.0", "", "1.0.0 "] {
+            assert!(
+                !semver_re().is_match(rejected),
+                "§9.1.2's grammar must reject {rejected:?}"
+            );
+        }
+    }
+
+    /// The pattern must contain no whitespace: there is no `(?x)` flag, so a
+    /// stray space is a mandatory character in the subject string. This is the
+    /// mechanism of the defect above, pinned separately so a future reformat
+    /// cannot reintroduce it silently.
+    #[test]
+    fn semver_pattern_contains_no_whitespace() {
+        let pattern = semver_re().as_str();
+        assert!(
+            !pattern.chars().any(char::is_whitespace),
+            "the §9.1.2 semver pattern must contain no whitespace, found: {pattern:?}"
+        );
+    }
     use super::*;
     use serde_json::json;
 
