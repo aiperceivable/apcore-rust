@@ -408,6 +408,22 @@ const PATH_TYPED_CONFIG_KEYS: &[&str] = &[
     "schema.root",
 ];
 
+/// PROTOCOL_SPEC §9.2.4 — the ten declared configuration keys that reach no
+/// consumer in any implementation (aiperceivable/apcore#118). Order is the
+/// order they are reported in, so two SDKs name them the same way.
+const DEPRECATED_INERT_KEYS: &[&str] = &[
+    "observability.tracing.enabled",
+    "observability.tracing.sampling_rate",
+    "observability.tracing.exporter",
+    "observability.metrics.enabled",
+    "observability.metrics.exporter",
+    "logging.level",
+    "logging.format",
+    "acl.audit.enabled",
+    "acl.audit.include_denied",
+    "acl.audit.log_level",
+];
+
 const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
     // No `version` entry, and no `project.name`: `defaults.schema.json`
     // declares neither, which is exactly what makes them §9.1's two required
@@ -905,6 +921,7 @@ impl Config {
         config.apply_env_overrides();
         config.validate()?;
         config.warn_if_path_resolution_will_change();
+        config.warn_deprecated_inert_keys();
         Ok(config)
     }
 
@@ -929,6 +946,7 @@ impl Config {
         config.apply_env_overrides();
         config.validate()?;
         config.warn_if_path_resolution_will_change();
+        config.warn_deprecated_inert_keys();
         Ok(config)
     }
 
@@ -1521,6 +1539,64 @@ impl Config {
              working directory. A future major version resolves all of them against the \
              single project root shown above. Nothing changes in this release; write \
              absolute paths to pin today's behaviour. See aiperceivable/apcore#113"
+        );
+    }
+
+    /// PROTOCOL_SPEC §9.2.4 — warn for declared keys that reach no consumer.
+    ///
+    /// Driven by the **declared** document, never the merged view (requirement
+    /// 2). Every one of these keys has a default, so a merged-view check would
+    /// fire for every configuration ever loaded — the blanket warning §9.2.2
+    /// rejects, which trains operators to ignore the one that matters.
+    ///
+    /// Behaviour is unchanged (requirement 3): the keys still parse, still
+    /// validate, still answer `get()`, and are still accepted under
+    /// `_config.strict`. This adds the one thing they have never had — a way for
+    /// an operator to find out that setting them does nothing.
+    fn warn_deprecated_inert_keys(&self) {
+        // Read the AS-WRITTEN document, not `get_declared` and not `data()`.
+        // `observability` is a typed struct field, so both of those always carry
+        // every leaf: `get_declared("observability.tracing.enabled")` answers
+        // `Some(false)` for a document that never mentions it, and this warning
+        // would then fire for every configuration ever loaded — the blanket
+        // warning §9.2.2 rejects and §9.2.4 requirement 2 forbids.
+        //
+        // `user_namespaces` is the right source because it retains the RAW
+        // object of every typed section exactly as the file wrote it (see the
+        // field's own documentation), which is also what makes the three SDKs
+        // report the same key set for the same file. That Rust's `get_declared`
+        // cannot answer this question is a separate divergence, recorded rather
+        // than repaired here.
+        let declared: Vec<&str> = DEPRECATED_INERT_KEYS
+            .iter()
+            .copied()
+            .filter(|key| {
+                let Some((section, rest)) = key.split_once('.') else {
+                    return false;
+                };
+                let Some(mut node) = self.user_namespaces.get(section) else {
+                    return false;
+                };
+                for part in rest.split('.') {
+                    match node.get(part) {
+                        Some(next) => node = next,
+                        None => return false,
+                    }
+                }
+                true
+            })
+            .collect();
+        if declared.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            count = declared.len(),
+            keys = %declared.join(", "),
+            "[apcore] DEPRECATION (spec §9.2.4): this configuration declares keys that \
+             reach no consumer in any apcore SDK and have no effect. They keep parsing and \
+             validating for the whole 1.x line and are removed no earlier than v2.0 \
+             (§13.2 / §13.4). Nothing has changed in this release — the keys did nothing \
+             before this warning existed. See aiperceivable/apcore#118"
         );
     }
 

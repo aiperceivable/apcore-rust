@@ -1641,6 +1641,30 @@ impl ACL {
             )
         })?;
 
+        // PROTOCOL_SPEC §9.2.4.1 (aiperceivable/apcore#118): an `audit:` block
+        // in an ACL file has never been read. Deleting it from
+        // `acl-config.schema.json` would produce no signal at all — no
+        // implementation validates an ACL file against that schema, and this
+        // loader parses into a `serde_json::Value` and takes the fields it
+        // wants, so any unknown root key is dropped in silence. The diagnostic
+        // therefore has to live here.
+        //
+        // Scoped to `audit` deliberately: this is a deprecation notice, NOT
+        // unknown-key closure for ACL files. Every other unrecognised root key
+        // keeps being ignored exactly as before, and the block itself is still
+        // ignored — nothing about this file's behaviour changes.
+        if raw.get("audit").is_some() {
+            tracing::warn!(
+                path = %path,
+                "[apcore] DEPRECATION (spec §9.2.4.1): this ACL file declares an 'audit:' \
+                 block, which no apcore SDK has ever read — auditing is wired \
+                 programmatically through ACL::set_audit_logger. The same three settings are \
+                 also declared as 'acl.audit.*' in apcore.yaml and are equally inert. One of \
+                 the two declarations is removed no earlier than v2.0 (§13.2 / §13.4); \
+                 nothing has changed in this release. See aiperceivable/apcore#118"
+            );
+        }
+
         // §6.2.1 point 2: `default_effect` is judged FIRST — ahead of the
         // individual rules AND ahead of the file-level checks on the `rules`
         // collection itself. It used to sit behind the missing-`rules` check
