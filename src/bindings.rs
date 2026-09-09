@@ -177,6 +177,129 @@ impl AutoSchemaValue {
     }
 }
 
+/// The `validation.binding.*` limits of PROTOCOL_SPEC §9.1.2, resolved once.
+///
+/// **Every limit is unconstrained by default.** apcore does not impose limits
+/// on the content its users author; it offers them, and an operator opts in.
+/// [`ValidationLimits::default`] checks nothing, which is what a loader built
+/// without a configuration uses — so a binding file that loaded before this
+/// type existed still loads after it.
+#[derive(Debug, Default, Clone)]
+pub struct ValidationLimits {
+    description_max: Option<usize>,
+    documentation_max: Option<usize>,
+    tags_pattern: Option<regex::Regex>,
+    require_semver: bool,
+}
+
+impl ValidationLimits {
+    /// Read the four keys from a [`Config`]. Unset keys stay unconstrained.
+    ///
+    /// A `tags_pattern` that does not compile is an error rather than a silent
+    /// skip (§9.2.3 requirement 6d): a constraint that quietly checks nothing
+    /// is the failure mode §10.6.1 exists to forbid.
+    pub fn from_config(config: &crate::config::Config) -> Result<Self, ModuleError> {
+        let usize_key = |key: &str| -> Option<usize> {
+            config
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .and_then(|n| usize::try_from(n).ok())
+        };
+        let tags_pattern = match config
+            .get("validation.binding.tags_pattern")
+            .and_then(|v| v.as_str().map(std::string::ToString::to_string))
+            .filter(|s: &String| !s.is_empty())
+        {
+            None => None,
+            Some(src) => Some(regex::Regex::new(&src).map_err(|e| {
+                ModuleError::new(
+                    ErrorCode::BindingFileInvalid,
+                    format!(
+                        "validation.binding.tags_pattern '{src}' does not compile ({e}), \
+                         so no tag could be checked against it"
+                    ),
+                )
+            })?),
+        };
+        Ok(Self {
+            description_max: usize_key("validation.binding.description_max_length"),
+            documentation_max: usize_key("validation.binding.documentation_max_length"),
+            tags_pattern,
+            require_semver: config
+                .get("validation.binding.version_require_semver")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        })
+    }
+
+    /// Apply the configured limits to one entry. Unset limits check nothing.
+    fn check(&self, entry: &BindingEntry, path: &Path) -> Result<(), ModuleError> {
+        let invalid = |reason: String| {
+            ModuleError::new(
+                ErrorCode::BindingFileInvalid,
+                format!("{}: {reason}", path.display()),
+            )
+        };
+        for (field, value, max) in [
+            (
+                "description",
+                entry.description.as_deref(),
+                self.description_max,
+            ),
+            (
+                "documentation",
+                entry.documentation.as_deref(),
+                self.documentation_max,
+            ),
+        ] {
+            if let (Some(value), Some(max)) = (value, max) {
+                // §9.1.2 requirement 4: characters, not bytes.
+                let len = value.chars().count();
+                if len > max {
+                    return Err(invalid(format!(
+                        "binding '{}' field '{field}' is {len} characters, over the {max} \
+                         configured by validation.binding.{field}_max_length",
+                        entry.module_id
+                    )));
+                }
+            }
+        }
+        if let Some(pattern) = &self.tags_pattern {
+            for tag in &entry.tags {
+                if !pattern.is_match(tag) {
+                    return Err(invalid(format!(
+                        "binding '{}' tag '{tag}' does not match \
+                         validation.binding.tags_pattern '{}'",
+                        entry.module_id,
+                        pattern.as_str()
+                    )));
+                }
+            }
+        }
+        if self.require_semver && !semver_re().is_match(&entry.version) {
+            return Err(invalid(format!(
+                "binding '{}' version '{}' is not SemVer, required by \
+                 validation.binding.version_require_semver",
+                entry.module_id, entry.version
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// PROTOCOL_SPEC §9.1.2 requirement 6 — the semver.org grammar, unmodified and
+/// written into the specification as a literal so three implementations cannot
+/// invent three. `1.0` does NOT match: the patch component is required.
+fn semver_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)             (?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)             (?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?             (?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$",
+        )
+        .expect("the §9.1.2 semver grammar is a compile-time constant")
+    })
+}
+
 /// A single binding entry. Mirrors the canonical YAML structure defined in
 /// `DECLARATIVE_CONFIG_SPEC.md` §3.3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +366,10 @@ pub struct BindingLoader {
     bindings: HashMap<String, BindingEntry>,
     /// Resolved schemas (after `schema_ref` loading) keyed by `module_id`.
     schemas: HashMap<String, ResolvedSchemas>,
+    /// PROTOCOL_SPEC §9.1.2 limits, resolved from the configuration when the
+    /// loader is invoked with one. Default is unconstrained, which is what a
+    /// loader built without a configuration keeps.
+    limits: ValidationLimits,
 }
 
 impl BindingLoader {
@@ -252,6 +379,7 @@ impl BindingLoader {
         Self {
             bindings: HashMap::new(),
             schemas: HashMap::new(),
+            limits: ValidationLimits::default(),
         }
     }
 
@@ -330,6 +458,8 @@ impl BindingLoader {
         for mut entry in file.bindings {
             // §2.2 target syntax, at parse time — see `validate_target`.
             validate_target(&entry.target)?;
+            // §9.1.2 — unconstrained unless the operator configured a limit.
+            self.limits.check(&entry, source_path)?;
             // Record the originating file so downstream diagnostics can emit
             // the `{file_path}: ` prefix mandated by DECLARATIVE_CONFIG_SPEC
             // §7.2 (parity with apcore-python / apcore-typescript).
@@ -560,6 +690,13 @@ impl BindingLoader {
                     .map(std::string::ToString::to_string)
             })
         };
+
+        // §9.1.2 — resolve the validation limits from the same configuration
+        // that supplies `bindings.dir`. Every one is unconstrained by default,
+        // so this changes nothing for a configuration that sets none of them.
+        if let Some(cfg) = config {
+            self.limits = ValidationLimits::from_config(cfg)?;
+        }
 
         let dir: PathBuf = match dir {
             Some(explicit) => explicit.to_path_buf(),

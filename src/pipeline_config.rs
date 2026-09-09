@@ -306,6 +306,68 @@ fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
 // Build strategy from YAML config
 // ---------------------------------------------------------------------------
 
+/// Apply the `validation.pipeline.*` limits (PROTOCOL_SPEC §9.1.2).
+///
+/// `remove:` is deliberately not name-checked: those names identify steps that
+/// already exist rather than naming new ones, so a limit there would reject a
+/// request to remove a step the operator did not author.
+fn validate_pipeline_limits(
+    pipeline_config: &Value,
+    config: &crate::config::Config,
+) -> Result<(), ModuleError> {
+    let limit = |key: &str| -> Option<u64> { config.get(key).and_then(|v| v.as_u64()) };
+    let max_name = limit("validation.pipeline.step_name_max_length");
+    let max_timeout = limit("validation.pipeline.timeout_ms_max");
+    if max_name.is_none() && max_timeout.is_none() {
+        return Ok(());
+    }
+
+    let check_timeout = |where_: &str, value: Option<&Value>| -> Result<(), ModuleError> {
+        if let (Some(max), Some(v)) = (max_timeout, value.and_then(serde_json::Value::as_u64)) {
+            if v > max {
+                return Err(ModuleError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!(
+                        "{where_}: timeout_ms {v} is over the {max} configured by \
+                         validation.pipeline.timeout_ms_max"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(Value::Object(configure)) = pipeline_config.get("configure") {
+        for (step_name, overrides) in configure {
+            check_timeout(&format!("Step '{step_name}'"), overrides.get("timeout_ms"))?;
+        }
+    }
+
+    if let Some(steps) = pipeline_config.get("steps").and_then(|v| v.as_array()) {
+        for step in steps {
+            let name = step.get("name").and_then(serde_json::Value::as_str);
+            if let (Some(max), Some(name)) = (max_name, name) {
+                // §9.1.2 requirement 4: characters, not bytes.
+                let len = name.chars().count() as u64;
+                if len > max {
+                    return Err(ModuleError::new(
+                        ErrorCode::ConfigInvalid,
+                        format!(
+                            "Step '{name}': name is {len} characters, over the {max} configured \
+                             by validation.pipeline.step_name_max_length"
+                        ),
+                    ));
+                }
+            }
+            check_timeout(
+                &format!("Step '{}'", name.unwrap_or("<unnamed>")),
+                step.get("timeout_ms"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Build an `ExecutionStrategy` from a YAML pipeline configuration section.
 ///
 /// Starts with `build_standard_strategy()`, then applies:
@@ -327,10 +389,27 @@ fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
 ///   ]
 /// }
 /// ```
-#[allow(clippy::too_many_lines)] // declarative-config dispatcher; splitting hurts readability more than length helps
 pub fn build_strategy_from_config(
     pipeline_config: &Value,
 ) -> Result<ExecutionStrategy, ModuleError> {
+    build_strategy_from_config_with_limits(pipeline_config, None)
+}
+
+/// [`build_strategy_from_config`] with the PROTOCOL_SPEC §9.1.2
+/// `validation.pipeline.*` limits applied.
+///
+/// **Both limits are unconstrained by default**, so passing `None` — which is
+/// what the entry point above does, and what every caller before v1.38.0 did —
+/// checks nothing and a pipeline that parsed before still parses. apcore does
+/// not impose limits on the content its users author; it offers them.
+#[allow(clippy::too_many_lines)] // declarative-config dispatcher; splitting hurts readability more than length helps
+pub fn build_strategy_from_config_with_limits(
+    pipeline_config: &Value,
+    config: Option<&crate::config::Config>,
+) -> Result<ExecutionStrategy, ModuleError> {
+    if let Some(cfg) = config {
+        validate_pipeline_limits(pipeline_config, cfg)?;
+    }
     let mut strategy = build_standard_strategy();
 
     // (1) Remove steps — Issue #33 §1.2: fail-fast when YAML refers to a

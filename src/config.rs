@@ -438,6 +438,16 @@ const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
     // entries `Config::get("bindings.dir")` answers the documented value, which
     // is what §5.12.6 clause 1's "default `./bindings`" tier resolves through.
     ("bindings.dir", DefaultValue::Str("./bindings")),
+    // PROTOCOL_SPEC §9.1.2 (spec v1.38.0, apcore#118). The six `validation.*`
+    // keys are UNCONSTRAINED by default — apcore does not impose limits on the
+    // content its users author, it offers them. Five of the six are
+    // unconstrained AS null, and null is the absence of a default, so only this
+    // one carries a canonical value: `defaults.schema.json` declares exactly
+    // this entry and `config_key_governance.json` pins this table to that file.
+    (
+        "validation.binding.version_require_semver",
+        DefaultValue::Bool(false),
+    ),
     ("bindings.pattern", DefaultValue::Str("*.binding.yaml")),
 ];
 
