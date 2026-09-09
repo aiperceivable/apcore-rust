@@ -560,59 +560,100 @@ pub fn register_sys_modules_with_options(
 
     let emitter_arc = Arc::new(emitter);
 
-    // --- Step 4: Build module list (health + manifest + usage always) ---
-    let mut modules: Vec<(&str, Box<dyn Module>, Vec<String>)> = vec![
-        (
-            "system.health.summary",
-            Box::new(health::HealthSummaryModule::new(
-                Arc::clone(&registry),
-                metrics_collector.clone(),
-                error_history.clone(),
-                Arc::clone(&config_arc),
-            )),
-            vec!["system".into(), "health".into()],
-        ),
-        (
-            "system.health.module",
-            Box::new(health::HealthModule::new(
-                Arc::clone(&registry),
-                metrics_collector.clone(),
-                error_history.clone(),
-            )),
-            vec!["system".into(), "health".into()],
-        ),
-        (
-            "system.manifest.module",
-            Box::new(manifest::ManifestModule::new(
-                Arc::clone(&registry),
-                Arc::clone(&config_arc),
-            )),
-            vec!["system".into(), "manifest".into()],
-        ),
-        (
-            "system.manifest.full",
-            Box::new(manifest::ManifestFullModule::new(
-                Arc::clone(&registry),
-                Arc::clone(&config_arc),
-            )),
-            vec!["system".into(), "manifest".into()],
-        ),
-        (
-            "system.usage.summary",
-            Box::new(usage::UsageSummaryModule::new(usage_collector.clone())),
-            vec!["system".into(), "usage".into()],
-        ),
-        (
-            "system.usage.module",
-            Box::new(usage::UsageModule::new(
-                Arc::clone(&registry),
-                usage_collector.clone(),
-            )),
-            vec!["system".into(), "usage".into()],
-        ),
-    ];
+    // --- Step 4: Build the module list the per-group flags select ---
+    //
+    // `sys_modules.enabled` is the master switch (checked above). The three
+    // flags here select WHICH modules register once activation has happened —
+    // the split PROTOCOL_SPEC 9.15.3 states (v1.17.0) and
+    // `schemas/sys-modules.schema.json` declares key by key: "Whether
+    // system.health.summary and system.health.module are registered", and so
+    // on. All three default to true, so a flag narrows and never widens.
+    //
+    // They were read by nothing until now (apcore#118): every flag false
+    // registered the same six modules as every flag true, while the master
+    // switch worked — a half-alive section, so a smoke test of it passes.
+    let group_enabled = |group: &str| -> bool {
+        effective_config
+            .get(&format!("sys_modules.{group}.enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    };
+    let health_enabled = group_enabled("health");
+    let manifest_enabled = group_enabled("manifest");
+    let usage_enabled = group_enabled("usage");
+    let control_enabled = group_enabled("control");
 
-    // --- Step 5: Control modules only if events.enabled ---
+    let mut modules: Vec<(&str, Box<dyn Module>, Vec<String>)> = Vec::new();
+    if health_enabled {
+        modules.extend::<Vec<(&str, Box<dyn Module>, Vec<String>)>>(vec![
+            (
+                "system.health.summary",
+                Box::new(health::HealthSummaryModule::new(
+                    Arc::clone(&registry),
+                    metrics_collector.clone(),
+                    error_history.clone(),
+                    Arc::clone(&config_arc),
+                )),
+                vec!["system".into(), "health".into()],
+            ),
+            (
+                "system.health.module",
+                Box::new(health::HealthModule::new(
+                    Arc::clone(&registry),
+                    metrics_collector.clone(),
+                    error_history.clone(),
+                )),
+                vec!["system".into(), "health".into()],
+            ),
+        ]);
+    }
+    if manifest_enabled {
+        modules.extend::<Vec<(&str, Box<dyn Module>, Vec<String>)>>(vec![
+            (
+                "system.manifest.module",
+                Box::new(manifest::ManifestModule::new(
+                    Arc::clone(&registry),
+                    Arc::clone(&config_arc),
+                )),
+                vec!["system".into(), "manifest".into()],
+            ),
+            (
+                "system.manifest.full",
+                Box::new(manifest::ManifestFullModule::new(
+                    Arc::clone(&registry),
+                    Arc::clone(&config_arc),
+                )),
+                vec!["system".into(), "manifest".into()],
+            ),
+        ]);
+    }
+    if usage_enabled {
+        modules.extend::<Vec<(&str, Box<dyn Module>, Vec<String>)>>(vec![
+            (
+                "system.usage.summary",
+                Box::new(usage::UsageSummaryModule::new(usage_collector.clone())),
+                vec!["system".into(), "usage".into()],
+            ),
+            (
+                "system.usage.module",
+                Box::new(usage::UsageModule::new(
+                    Arc::clone(&registry),
+                    usage_collector.clone(),
+                )),
+                vec!["system".into(), "usage".into()],
+            ),
+        ]);
+    }
+
+    // --- Step 5: Control modules only if events.enabled AND control.enabled ---
+    //
+    // `control.enabled` selects whether the Level 2 WRITE plane registers once
+    // `events.enabled` has activated it — the schema reads "Whether the
+    // system.control.* modules are registered". Default true, so it narrows and
+    // never widens. Read by nothing until now (apcore#118), which made it the
+    // most consequential of the four inert sub-flags: an operator writing
+    // `control.enabled: false` to keep the approval-gated write surface off a
+    // deployment got all three modules anyway.
     if events_enabled {
         let error_rate_threshold = effective_config
             .get("sys_modules.events.thresholds.error_rate")
@@ -635,38 +676,40 @@ pub fn register_sys_modules_with_options(
             tracing::error!(error = %e, middleware = "PlatformNotifyMiddleware", "sys middleware registration failed");
         }
 
-        modules.push((
-            "system.control.update_config",
-            Box::new(
-                UpdateConfigModule::new(Arc::clone(&config_arc), Arc::clone(&emitter_arc))
+        if control_enabled {
+            modules.push((
+                "system.control.update_config",
+                Box::new(
+                    UpdateConfigModule::new(Arc::clone(&config_arc), Arc::clone(&emitter_arc))
+                        .with_overrides_path(overrides_path.clone())
+                        .with_overrides_store(overrides_store.clone())
+                        .with_audit_store(audit_store.clone()),
+                ),
+                vec!["system".into(), "control".into()],
+            ));
+            modules.push((
+                "system.control.reload_module",
+                Box::new(
+                    ReloadModule::new(Arc::clone(&registry), Arc::clone(&emitter_arc))
+                        .with_audit_store(audit_store.clone()),
+                ),
+                vec!["system".into(), "control".into()],
+            ));
+            modules.push((
+                "system.control.toggle_feature",
+                Box::new(
+                    ToggleFeatureModule::new(
+                        Arc::clone(&registry),
+                        Arc::clone(&emitter_arc),
+                        Arc::clone(&toggle_state),
+                    )
                     .with_overrides_path(overrides_path.clone())
                     .with_overrides_store(overrides_store.clone())
                     .with_audit_store(audit_store.clone()),
-            ),
-            vec!["system".into(), "control".into()],
-        ));
-        modules.push((
-            "system.control.reload_module",
-            Box::new(
-                ReloadModule::new(Arc::clone(&registry), Arc::clone(&emitter_arc))
-                    .with_audit_store(audit_store.clone()),
-            ),
-            vec!["system".into(), "control".into()],
-        ));
-        modules.push((
-            "system.control.toggle_feature",
-            Box::new(
-                ToggleFeatureModule::new(
-                    Arc::clone(&registry),
-                    Arc::clone(&emitter_arc),
-                    Arc::clone(&toggle_state),
-                )
-                .with_overrides_path(overrides_path.clone())
-                .with_overrides_store(overrides_store.clone())
-                .with_audit_store(audit_store.clone()),
-            ),
-            vec!["system".into(), "control".into()],
-        ));
+                ),
+                vec!["system".into(), "control".into()],
+            ));
+        }
     }
 
     // --- Register all modules ---
