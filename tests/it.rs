@@ -225,6 +225,8 @@ mod test_middleware_on_error_single_site;
 mod test_module;
 #[path = "test_multi_module_discovery_conformance.rs"]
 mod test_multi_module_discovery_conformance;
+#[path = "test_obs_logging_middleware_redaction.rs"]
+mod test_obs_logging_middleware_redaction;
 #[path = "test_observability.rs"]
 mod test_observability;
 #[path = "test_observability_hardening_conformance.rs"]
