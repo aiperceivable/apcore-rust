@@ -95,6 +95,10 @@ path = "tests/test_deprecated_inert_keys.rs"
 name = "test_get_declared_typed_sections"
 path = "tests/test_get_declared_typed_sections.rs"
 
+[[test]]
+name = "test_capture_point_redaction"
+path = "tests/test_capture_point_redaction.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use crate::context::Identity;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::ApCoreEvent;
-use crate::executor::{has_schema, redact_sensitive, validate_against_schema};
+use crate::executor::{has_schema, redact_sensitive_with, validate_against_schema};
 use crate::pipeline::{BuiltinGate, ExecutionStrategy, PipelineContext, Step, StepResult};
 use crate::policy::PolicyDecision;
 
@@ -356,7 +356,8 @@ impl Step for BuiltinModuleLookup {
         // middleware runs (step 6), so logging sees redacted data.
         let input_schema = module.input_schema().clone();
         if has_schema(&input_schema) {
-            let redacted = redact_sensitive(&ctx.inputs, &input_schema);
+            let redacted =
+                redact_sensitive_with(&ctx.inputs, &input_schema, ctx.redaction.as_deref());
             ctx.context.redacted_inputs = Some(
                 redacted
                     .as_object()
@@ -943,7 +944,8 @@ impl Step for BuiltinInputValidation {
 
         // Store redacted inputs on context.
         if has_schema(&input_schema) {
-            let redacted = redact_sensitive(&ctx.inputs, &input_schema);
+            let redacted =
+                redact_sensitive_with(&ctx.inputs, &input_schema, ctx.redaction.as_deref());
             ctx.context.redacted_inputs = Some(
                 redacted
                     .as_object()
@@ -1194,7 +1196,7 @@ impl Step for BuiltinOutputValidation {
         // redacted_inputs). Previously stored under data["_apcore.executor.
         // redacted_output"] which was filtered out by serialize().
         if has_schema(&output_schema) {
-            let redacted = redact_sensitive(output, &output_schema);
+            let redacted = redact_sensitive_with(output, &output_schema, ctx.redaction.as_deref());
             ctx.context.redacted_output = Some(
                 redacted
                     .as_object()

@@ -14,6 +14,7 @@ use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::EventEmitter;
 use crate::middleware::manager::MiddlewareManager;
 use crate::module::Module;
+use crate::observability::redaction::RedactionConfig;
 use crate::policy::ExecutionPolicy;
 use crate::registry::registry::Registry;
 use crate::utils::helpers::match_pattern;
@@ -311,6 +312,21 @@ pub struct PipelineContext {
     pub registry: Option<Arc<Registry>>,
     /// Executor configuration (timeouts, call depth limits, etc.).
     pub config: Option<Arc<Config>>,
+    /// The `obs.redaction.*` rules the input/output capture point applies.
+    ///
+    /// PROTOCOL_SPEC §10.6.1 "Where the rules apply": the union of §10.6's
+    /// `x-sensitive` rule and the two configured rules MUST hold at BOTH log
+    /// emission and this capture point, with the same rules at each. Until
+    /// this field existed `redact_sensitive(data, schema)` had no parameter for
+    /// them at all, so an operator's `regex_patterns` entry redacted a bearer
+    /// token in the log line they were watching and stored it in the audit
+    /// record they were not (aiperceivable/apcore#120).
+    ///
+    /// Resolved ONCE by the executor and injected, rather than built per
+    /// execution from `config` above: §10.6.1 requirement 5 puts compilation at
+    /// the configuration read. `None` means the spec defaults, which is what
+    /// the capture point already applied.
+    pub redaction: Option<Arc<RedactionConfig>>,
     /// Access control list, if configured.
     pub acl: Option<Arc<ACL>>,
     /// Approval handler, if configured.
@@ -361,6 +377,7 @@ impl PipelineContext {
             executed_middlewares: vec![],
             registry: None,
             config: None,
+            redaction: None,
             acl: None,
             approval_handler: None,
             policy: None,

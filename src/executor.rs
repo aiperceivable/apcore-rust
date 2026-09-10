@@ -25,6 +25,7 @@ use crate::middleware::base::Middleware;
 use crate::middleware::manager::{MiddlewareHandle, MiddlewareManager};
 use crate::module::PreflightCheckResult as PfCheck;
 use crate::module::{PreflightCheckResult, PreflightResult};
+use crate::observability::redaction::RedactionConfig;
 use crate::pipeline::{
     BuiltinGate, ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
 };
@@ -414,11 +415,49 @@ fn stream_deadline_exceeded(deadline: Option<f64>, module_id: &str) -> Option<Mo
 ///
 /// Returns a deep copy of `data` with sensitive values replaced by `"***REDACTED***"`.
 /// Also redacts any keys starting with `_secret_` regardless of schema.
+///
+/// Applies §10.6's schema rule ONLY. The executor's capture point must apply
+/// the configured `obs.redaction.*` rules as well — use
+/// [`redact_sensitive_with`] there. This signature is kept because it is the
+/// published §10.6 algorithm and public API.
+#[must_use]
 pub fn redact_sensitive(data: &Value, schema: &Value) -> Value {
     let mut redacted = data.clone();
     if let Some(obj) = redacted.as_object_mut() {
         redact_fields(obj, schema);
         redact_secret_prefix(obj);
+    }
+    redacted
+}
+
+/// Redact for the executor's input/output capture point.
+///
+/// PROTOCOL_SPEC §10.6.1 "Where the rules apply": the union of §10.6's
+/// `x-sensitive` rule and the two configured `obs.redaction.*` rules MUST hold
+/// at BOTH log emission and this capture point, with the same rules at each.
+/// Until `rules` existed the capture point had no parameter for them at all —
+/// the signature was `(data, schema)`, faithfully mirroring §10.6's published
+/// algorithm — so an operator's `regex_patterns` entry redacted a bearer token
+/// in the log line they were watching and stored it in the audit record they
+/// were not (aiperceivable/apcore#120).
+///
+/// `rules` of `None` means the spec DEFAULTS, per requirement 3: "no
+/// configuration" means the defaults, never no redaction. That is what this
+/// path did before, so an unconfigured caller sees no change.
+#[must_use]
+pub fn redact_sensitive_with(
+    data: &Value,
+    schema: &Value,
+    rules: Option<&RedactionConfig>,
+) -> Value {
+    let mut redacted = data.clone();
+    if let Some(obj) = redacted.as_object_mut() {
+        redact_fields(obj, schema);
+        redact_secret_prefix(obj);
+    }
+    match rules {
+        Some(cfg) => cfg.redact(&mut redacted),
+        None => RedactionConfig::defaults().redact(&mut redacted),
     }
     redacted
 }
@@ -629,6 +668,13 @@ pub struct Executor {
     /// governance warnings (apcore#76). Executor-owned so dedup persists across
     /// calls; threaded into each `PipelineContext` by `inject_resources`.
     governance_warned: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// The `obs.redaction.*` rules the capture point applies, built ONCE from
+    /// `config` (PROTOCOL_SPEC §10.6.1 requirement 5, aiperceivable/apcore#120).
+    ///
+    /// Lazy rather than eager so an `Executor` constructed and never used pays
+    /// nothing, and so a `Config` mutated between construction and first call
+    /// is still read — `Config::set` is public and callers do use it.
+    redaction: std::sync::OnceLock<Arc<RedactionConfig>>,
     pub middleware_manager: Arc<MiddlewareManager>,
     /// Execution strategy — all calls go through PipelineEngine.
     strategy: ExecutionStrategy,
@@ -664,6 +710,7 @@ impl Executor {
             policy: None,
             event_emitter: None,
             governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            redaction: std::sync::OnceLock::new(),
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
                 &toggle_state,
@@ -691,6 +738,7 @@ impl Executor {
             policy: None,
             event_emitter: None,
             governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            redaction: std::sync::OnceLock::new(),
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
             instance_handle: Arc::new(()),
@@ -712,6 +760,7 @@ impl Executor {
             policy: None,
             event_emitter: None,
             governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            redaction: std::sync::OnceLock::new(),
             middleware_manager: Arc::new(MiddlewareManager::new()),
             strategy,
             instance_handle: Arc::new(()),
@@ -746,6 +795,7 @@ impl Executor {
             policy: None,
             event_emitter: None,
             governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            redaction: std::sync::OnceLock::new(),
             middleware_manager: Arc::new(middleware_manager),
             strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
                 &toggle_state,
@@ -2004,9 +2054,16 @@ impl Executor {
 
     /// Inject executor resources into a pipeline context so builtin steps
     /// can access the registry, config, ACL, approval handler, and middleware.
+    /// The resolved capture-point redaction rules, built on first use.
+    fn redaction(&self) -> &Arc<RedactionConfig> {
+        self.redaction
+            .get_or_init(|| Arc::new(RedactionConfig::from_config(&self.config)))
+    }
+
     fn inject_resources(&self, ctx: &mut PipelineContext) {
         ctx.registry = Some(Arc::clone(&self.registry));
         ctx.config = Some(Arc::clone(&self.config));
+        ctx.redaction = Some(Arc::clone(self.redaction()));
         ctx.acl = self.acl.as_ref().map(Arc::clone);
         ctx.approval_handler = self.approval_handler.as_ref().map(Arc::clone);
         ctx.policy = self.policy.as_ref().map(Arc::clone);
