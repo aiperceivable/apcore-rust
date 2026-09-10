@@ -878,12 +878,26 @@ impl<'de> Deserialize<'de> for Config {
                 })
                 .collect();
 
+        let raw_modules_path = core_data.get("modules_path").cloned();
+
         let helper: ConfigHelper = serde_json::from_value(serde_json::Value::Object(core_data))
             .map_err(D::Error::custom)?;
 
         let mut user_namespaces = helper.user_namespaces;
         for (name, raw) in raw_typed_sections {
             user_namespaces.insert(name.to_string(), serde_json::Value::Object(raw));
+        }
+        // `modules_path` is the one typed field that is a SCALAR at the top
+        // level rather than a section, so `TYPED_SECTIONS` above cannot carry
+        // it: `core_data.get("modules_path")` is a string, not an object. Serde
+        // moves it into `helper.modules_path` and leaves no as-written record,
+        // which made `get_declared("modules_path")` answer `None` for a legacy
+        // file that declares it — while a namespace-mode file answered `Some`,
+        // because the `apcore:` members are lifted into `user_namespaces`
+        // wholesale. Retaining it here is what makes the two modes agree
+        // (aiperceivable/apcore#119).
+        if let Some(raw_modules_path) = raw_modules_path {
+            user_namespaces.insert("modules_path".to_string(), raw_modules_path);
         }
 
         Ok(Config {
@@ -1587,42 +1601,16 @@ impl Config {
             })
             .collect();
 
-        // The environment tier declares too, and `user_namespaces` cannot see
-        // it for the four typed `observability.*` leaves: `Config::set`
-        // short-circuits into `set_typed_field` for those and never touches the
-        // bag. Measured before this: `APCORE_LOGGING_LEVEL` warned and
-        // `APCORE_OBSERVABILITY_TRACING_ENABLED` did not, while apcore-python
-        // named both — six of the ten keys reachable at this tier instead of
-        // ten, in one SDK.
-        //
-        // The dot path is computed with the SAME `env_key_to_dot_path` the
-        // override loop itself uses, rather than by re-deriving §9.2's naming
-        // convention here. Re-deriving it is how two spellings of one rule end
-        // up in one file.
-        //
-        // A set-but-EMPTY variable still counts. §9.2 treats it as an override,
-        // and §9.2.1 requirement 5's "an empty string is not a path" carve-out
-        // is scoped to PATH-TYPED keys — none of these ten is one. Measured
-        // against apcore-python, which warns for `APCORE_LOGGING_LEVEL=` and
-        // resolves the key to `""`. Skipping empties here was the first version
-        // of this loop and it re-created the divergence it was written to close.
+        // No separate environment scan: an `APCORE_*` override goes through
+        // `apply_env_overrides` -> `set()`, and `set()` now leaves the same
+        // as-written record in `user_namespaces` that a file load leaves, for
+        // typed leaves as well (#119). Until that fix `set()` short-circuited
+        // into `set_typed_field` and touched nothing, so this function carried
+        // a second traversal that re-derived the tier from `std::env::vars()`
+        // — two spellings of one rule, in one file. The `set()` mirror deletes
+        // the need for it; the environment-tier cases in
+        // `tests/test_deprecated_inert_keys.rs` are what hold that claim.
         let mut declared: Vec<&str> = declared;
-        for (var, _value) in std::env::vars() {
-            if var == ENV_CONFIG_FILE {
-                continue;
-            }
-            let Some(suffix) = var.strip_prefix("APCORE_") else {
-                continue;
-            };
-            let dot_path = Self::env_key_to_dot_path(suffix);
-            if let Some(key) = DEPRECATED_INERT_KEYS
-                .iter()
-                .copied()
-                .find(|k| **k == *dot_path && !declared.contains(k))
-            {
-                declared.push(key);
-            }
-        }
         // Report in the constant's order, so two SDKs name them the same way
         // whichever tier supplied each one.
         declared.sort_by_key(|k| DEPRECATED_INERT_KEYS.iter().position(|d| d == k));
@@ -1766,7 +1754,7 @@ impl Config {
     /// distinguish "declared" from "defaulted".
     #[must_use]
     pub fn get_declared(&self, key: &str) -> Option<serde_json::Value> {
-        if let Some(val) = self.get_direct(key) {
+        if let Some(val) = self.get_as_written(key) {
             return Some(val);
         }
         if self.mode == ConfigMode::Namespace
@@ -1774,7 +1762,7 @@ impl Config {
             && !key.starts_with("apcore.")
             && self.user_namespaces.contains_key("apcore")
         {
-            return self.get_direct(&format!("apcore.{key}"));
+            return self.get_as_written(&format!("apcore.{key}"));
         }
         None
     }
@@ -1902,6 +1890,18 @@ impl Config {
             return walk_view(self.executor_view(), rest);
         }
 
+        self.get_as_written(key)
+    }
+
+    /// Resolve `key` against the AS-WRITTEN store only — `user_namespaces`,
+    /// never a typed struct and never a reconciled view.
+    ///
+    /// This is the half of `get_direct` that answers "is it in the document",
+    /// as opposed to "what is its effective value", and [`Self::get_declared`]
+    /// needs exactly that half. Extracted rather than copied: two spellings of
+    /// one traversal is how `observability` came to have two stores that
+    /// disagreed (see [`OBSERVABILITY_NS`]).
+    fn get_as_written(&self, key: &str) -> Option<serde_json::Value> {
         // Longest-prefix match against the registered namespaces, then fall
         // back to dot-split on the first segment. Hyphenated names like
         // `apcore-mcp` cannot be reached by naive `split('.')`.
@@ -1972,6 +1972,9 @@ impl Config {
         self.generation += 1;
         // Try canonical typed fields.
         if self.set_typed_field(key, &value) {
+            // A typed write is still a DECLARATION, so it leaves the same
+            // as-written record a file load leaves (#119).
+            self.record_typed_as_written(key, &value);
             return;
         }
 
@@ -2562,6 +2565,50 @@ impl Config {
     }
 
     /// Try to set a canonical typed field. Returns true if matched.
+    /// Mirror a typed-field write into `user_namespaces`, the as-written store.
+    ///
+    /// `Config::deserialize` already does this for every name in
+    /// [`TYPED_FRAMEWORK_SECTIONS`] — the raw object is retained beside the
+    /// typed struct and the two are reconciled with the typed struct overlaid
+    /// last. The `set()` path did not, so the same framework section had an
+    /// as-written record when it came from a file and none when it came from
+    /// `set()` or an `APCORE_*` override, and [`Self::get_declared`] could not
+    /// tell "the document declared this" from "the struct has a default"
+    /// (aiperceivable/apcore#119).
+    ///
+    /// Writing the raw copy is idempotent against the reconciled view: the
+    /// overlay puts the typed value on top of a raw value it just equalled.
+    fn record_typed_as_written(&mut self, key: &str, value: &serde_json::Value) {
+        let parts: Vec<&str> = key.split('.').collect();
+        if parts.len() == 1 {
+            self.user_namespaces.insert(key.to_string(), value.clone());
+            return;
+        }
+        let mut current = self
+            .user_namespaces
+            .entry(parts[0].to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        for part in &parts[1..parts.len() - 1] {
+            if !current.is_object() {
+                *current = serde_json::Value::Object(serde_json::Map::new());
+            }
+            // INVARIANT: the branch above guarantees object shape.
+            current = current
+                .as_object_mut()
+                .unwrap()
+                .entry((*part).to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        }
+        if !current.is_object() {
+            *current = serde_json::Value::Object(serde_json::Map::new());
+        }
+        // INVARIANT: as above.
+        current
+            .as_object_mut()
+            .unwrap()
+            .insert(parts[parts.len() - 1].to_string(), value.clone());
+    }
+
     fn set_typed_field(&mut self, key: &str, value: &serde_json::Value) -> bool {
         match key {
             "executor.max_call_depth" => {

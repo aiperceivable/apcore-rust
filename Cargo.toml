@@ -89,6 +89,12 @@ path = "tests/test_config_project_root_conformance.rs"
 name = "test_deprecated_inert_keys"
 path = "tests/test_deprecated_inert_keys.rs"
 
+# Mutates `APCORE_*` for the environment tier, so it gets its own process
+# like the discovery drivers above.
+[[test]]
+name = "test_get_declared_typed_sections"
+path = "tests/test_get_declared_typed_sections.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
