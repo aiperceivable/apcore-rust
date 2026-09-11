@@ -493,7 +493,7 @@ fn register_side_effect_ordering_load_then_event() {
 fn scan_extensions_input_root_missing_rejected() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let missing = tmp.path().join("does_not_exist");
-    let err = scan_extensions(&missing, 8, false, None).expect_err("missing root must error");
+    let err = scan_extensions(&missing, 8, false, None, &[]).expect_err("missing root must error");
     assert_eq!(err.code, ErrorCode::ConfigNotFound);
     assert_eq!(code_str(&err), "CONFIG_NOT_FOUND");
 }
@@ -502,7 +502,7 @@ fn scan_extensions_input_root_missing_rejected() {
 #[test]
 fn scan_extensions_error_config_not_found() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let err = scan_extensions(&tmp.path().join("nope"), 8, false, None)
+    let err = scan_extensions(&tmp.path().join("nope"), 8, false, None, &[])
         .expect_err("missing root must error");
     assert_eq!(err.code, ErrorCode::ConfigNotFound);
     assert_eq!(code_str(&err), "CONFIG_NOT_FOUND");
@@ -521,7 +521,7 @@ fn scan_extensions_return_ordered_records() {
     std::fs::write(ext.join("greet.rs"), b"struct GreetModule;").expect("write greet");
 
     let results: Vec<DiscoveredFile> =
-        scan_extensions(&ext, 8, false, None).expect("scan succeeds");
+        scan_extensions(&ext, 8, false, None, &[]).expect("scan succeeds");
     let ids: std::collections::HashSet<String> =
         results.iter().map(|dm| dm.canonical_id.clone()).collect();
     assert_eq!(
@@ -541,7 +541,7 @@ fn scan_extensions_return_ordered_records() {
 fn scan_extensions_property_async_false() {
     // Contract declares async: false -> scan_extensions is a plain sync call.
     let tmp = tempfile::tempdir().expect("tempdir");
-    let results = scan_extensions(tmp.path(), 8, false, None).expect("scan empty");
+    let results = scan_extensions(tmp.path(), 8, false, None, &[]).expect("scan empty");
     assert!(results.is_empty());
 }
 
@@ -554,13 +554,13 @@ fn scan_extensions_property_pure_false_reads_filesystem() {
     let ext = tmp.path().join("ext");
     std::fs::create_dir(&ext).expect("mkdir ext");
     std::fs::write(ext.join("a.rs"), b"struct A;").expect("write a");
-    let first: std::collections::HashSet<String> = scan_extensions(&ext, 8, false, None)
+    let first: std::collections::HashSet<String> = scan_extensions(&ext, 8, false, None, &[])
         .expect("scan 1")
         .iter()
         .map(|dm| dm.canonical_id.clone())
         .collect();
     std::fs::write(ext.join("b.rs"), b"struct B;").expect("write b");
-    let second: std::collections::HashSet<String> = scan_extensions(&ext, 8, false, None)
+    let second: std::collections::HashSet<String> = scan_extensions(&ext, 8, false, None, &[])
         .expect("scan 2")
         .iter()
         .map(|dm| dm.canonical_id.clone())
@@ -589,7 +589,7 @@ async fn scan_extensions_property_thread_safe() {
     for _ in 0..8 {
         let ext = Arc::clone(&ext);
         handles.push(tokio::spawn(async move {
-            let out: std::collections::HashSet<String> = scan_extensions(&ext, 8, false, None)
+            let out: std::collections::HashSet<String> = scan_extensions(&ext, 8, false, None, &[])
                 .expect("scan")
                 .iter()
                 .map(|dm| dm.canonical_id.clone())

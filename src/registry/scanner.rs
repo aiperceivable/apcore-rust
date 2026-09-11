@@ -23,11 +23,22 @@ const DEFAULT_MODULE_EXTENSIONS: &[&str] = &[".rs"];
 ///
 /// Aligned with `apcore-python.scan_extensions` and
 /// `apcore-typescript.scanExtensions`.
+/// `ignore_patterns` is `extensions.ignore_patterns`, matched with Algorithm
+/// A25 (`PROTOCOL_SPEC` §9.2.3) against the ENTRY NAME — one path segment,
+/// never a path, case-sensitively. It is a UNION with [`SKIP_DIR_NAMES`] and
+/// §3.5's hidden/internal prefixes: a configured pattern adds to those and
+/// cannot switch one off.
+///
+/// Until spec v1.42.0 the key was registered in every SDK's configuration key
+/// surface and read by none, so §3.6 step 3a was a MUST whose input nothing
+/// supplied and a directory a project had excluded from discovery was scanned
+/// and registered anyway — a skip rule that failed OPEN (aiperceivable/apcore#118).
 pub fn scan_extensions(
     root: &Path,
     max_depth: u32,
     follow_symlinks: bool,
     extensions: Option<&[&str]>,
+    ignore_patterns: &[String],
 ) -> Result<Vec<DiscoveredFile>, ModuleError> {
     let root = root.canonicalize().map_err(|e| {
         ModuleError::new(
@@ -50,6 +61,7 @@ pub fn scan_extensions(
         max_depth,
         follow_symlinks,
         ext_list,
+        ignore_patterns,
         &mut results,
         &mut seen_ids,
         &mut seen_ids_lower,
@@ -68,6 +80,7 @@ fn scan_dir(
     max_depth: u32,
     follow_symlinks: bool,
     extensions: &[&str],
+    ignore_patterns: &[String],
     results: &mut Vec<DiscoveredFile>,
     seen_ids: &mut HashMap<String, PathBuf>,
     seen_ids_lower: &mut HashMap<String, String>,
@@ -104,6 +117,15 @@ fn scan_dir(
 
         // Skip hidden and private entries
         if name_str.starts_with('.') || name_str.starts_with('_') {
+            continue;
+        }
+        // Empty entries are dropped rather than treated as a pattern: A25
+        // anchors, so `""` would match only the empty name, and an operator who
+        // leaves a blank line in a YAML list means nothing by it.
+        if ignore_patterns
+            .iter()
+            .any(|p| !p.is_empty() && crate::utils::helpers::match_glob(p, &name_str))
+        {
             continue;
         }
         if SKIP_DIR_NAMES.contains(&name_str.as_ref()) {
@@ -156,6 +178,7 @@ fn scan_dir(
                     max_depth,
                     follow_symlinks,
                     extensions,
+                    ignore_patterns,
                     results,
                     seen_ids,
                     seen_ids_lower,
@@ -252,6 +275,7 @@ pub fn scan_multi_root<S: std::hash::BuildHasher>(
     max_depth: u32,
     follow_symlinks: bool,
     extensions: Option<&[&str]>,
+    ignore_patterns: &[String],
 ) -> Result<Vec<DiscoveredFile>, ModuleError> {
     let mut all_results: Vec<DiscoveredFile> = Vec::new();
     let mut seen_namespaces: HashSet<String> = HashSet::new();
@@ -284,7 +308,13 @@ pub fn scan_multi_root<S: std::hash::BuildHasher>(
     }
 
     for (root_path, namespace) in resolved {
-        let modules = scan_extensions(&root_path, max_depth, follow_symlinks, extensions)?;
+        let modules = scan_extensions(
+            &root_path,
+            max_depth,
+            follow_symlinks,
+            extensions,
+            ignore_patterns,
+        )?;
         for m in modules {
             all_results.push(DiscoveredFile {
                 file_path: m.file_path,
@@ -317,7 +347,7 @@ mod tests {
     #[test]
     fn scan_nonexistent_root_returns_error() {
         let path = std::path::Path::new("/tmp/apcore_test_nonexistent_xyz_abc");
-        let result = scan_extensions(path, 5, false, None);
+        let result = scan_extensions(path, 5, false, None, &[]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("not found") || msg.contains("No such file"));
@@ -326,7 +356,7 @@ mod tests {
     #[test]
     fn scan_empty_directory_returns_no_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        let result = scan_extensions(tmp.path(), 5, false, None, &[]).unwrap();
         assert!(result.is_empty());
     }
 
@@ -335,7 +365,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         make_test_dir(tmp.path(), &["email/send.rs", "math/add.rs"]);
 
-        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        let result = scan_extensions(tmp.path(), 5, false, None, &[]).unwrap();
         let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
 
         assert!(ids.contains(&"email.send"), "email/send.rs → email.send");
@@ -352,8 +382,8 @@ mod tests {
 
         // max_depth=1 — only the top level file; subdirectory is allowed at depth 1
         // but files inside it are at depth 2 and should be included when max_depth=2
-        let result_shallow = scan_extensions(tmp.path(), 1, false, None).unwrap();
-        let result_deep = scan_extensions(tmp.path(), 2, false, None).unwrap();
+        let result_shallow = scan_extensions(tmp.path(), 1, false, None, &[]).unwrap();
+        let result_deep = scan_extensions(tmp.path(), 2, false, None, &[]).unwrap();
 
         let shallow_ids: Vec<&str> = result_shallow
             .iter()
@@ -382,7 +412,7 @@ mod tests {
     fn scan_skips_hidden_files_and_dirs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         make_test_dir(tmp.path(), &[".hidden/module.rs", "visible.rs"]);
-        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        let result = scan_extensions(tmp.path(), 5, false, None, &[]).unwrap();
         let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
         assert!(ids.contains(&"visible"), "visible.rs should be found");
         assert!(
@@ -395,7 +425,7 @@ mod tests {
     fn scan_skips_underscore_prefixed_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
         make_test_dir(tmp.path(), &["_private.rs", "public.rs"]);
-        let result = scan_extensions(tmp.path(), 5, false, None).unwrap();
+        let result = scan_extensions(tmp.path(), 5, false, None, &[]).unwrap();
         let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
         assert!(ids.contains(&"public"), "public.rs should be found");
         assert!(!ids.contains(&"_private"), "_private.rs should be skipped");
@@ -405,7 +435,7 @@ mod tests {
     fn scan_custom_extension_filter() {
         let tmp = tempfile::tempdir().expect("tempdir");
         make_test_dir(tmp.path(), &["module.py", "module.rs"]);
-        let result = scan_extensions(tmp.path(), 5, false, Some(&[".py"])).unwrap();
+        let result = scan_extensions(tmp.path(), 5, false, Some(&[".py"]), &[]).unwrap();
         let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
         assert!(ids.contains(&"module"), "module.py should match .py filter");
         // When filtering for .py, .rs files should NOT appear
@@ -440,7 +470,7 @@ mod tests {
             .collect(),
         ];
 
-        let result = scan_multi_root(&roots, 5, false, None).unwrap();
+        let result = scan_multi_root(&roots, 5, false, None, &[]).unwrap();
         let ids: Vec<&str> = result.iter().map(|f| f.canonical_id.as_str()).collect();
 
         assert!(ids.contains(&"math.add"), "math namespace should prefix");
@@ -470,7 +500,7 @@ mod tests {
             .into_iter()
             .collect(),
         ];
-        let result = scan_multi_root(&roots, 5, false, None);
+        let result = scan_multi_root(&roots, 5, false, None, &[]);
         assert!(result.is_err(), "duplicate namespace should fail");
     }
 
@@ -480,7 +510,7 @@ mod tests {
             vec![[("namespace".to_string(), "ns".to_string())]
                 .into_iter()
                 .collect()];
-        let result = scan_multi_root(&roots, 5, false, None);
+        let result = scan_multi_root(&roots, 5, false, None, &[]);
         assert!(result.is_err(), "missing root key should fail");
     }
 }

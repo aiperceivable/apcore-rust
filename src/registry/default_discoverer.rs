@@ -85,6 +85,9 @@ pub struct DefaultDiscoverer {
     max_depth: u32,
     /// Whether to follow symlinks during scan.
     follow_symlinks: bool,
+    /// `extensions.ignore_patterns` — A25 globs matched against the ENTRY NAME
+    /// (`PROTOCOL_SPEC` §3.5 / §9.2.3), a union with the built-in skip rows.
+    ignore_patterns: Vec<String>,
     /// User-provided factory that turns a discovered entry point into a
     /// live `Arc<dyn Module>`.
     factory: ModuleFactory,
@@ -97,6 +100,7 @@ impl std::fmt::Debug for DefaultDiscoverer {
             .field("extensions", &self.extensions)
             .field("max_depth", &self.max_depth)
             .field("follow_symlinks", &self.follow_symlinks)
+            .field("ignore_patterns", &self.ignore_patterns)
             .field("factory", &"<ModuleFactory>")
             .finish()
     }
@@ -113,6 +117,7 @@ impl DefaultDiscoverer {
             extensions: vec![".rs".to_string()],
             max_depth: 8,
             follow_symlinks: false,
+            ignore_patterns: Vec::new(),
             factory: Arc::new(|_file, _entry| Ok(None)),
         }
     }
@@ -135,6 +140,53 @@ impl DefaultDiscoverer {
     #[must_use]
     pub fn with_max_depth(mut self, depth: u32) -> Self {
         self.max_depth = depth;
+        self
+    }
+
+    /// Build a discoverer whose scan parameters come from a [`Config`].
+    ///
+    /// The reason this exists rather than only the builders below: until spec
+    /// v1.42.0 apcore-rust had NO path from a `Config` to the scanner at all.
+    /// `max_depth`, `follow_symlinks` and `ignore_patterns` were builder
+    /// options an application had to pass by hand, so the three declared
+    /// configuration keys reached nothing here while apcore-python and
+    /// apcore-typescript read all three — the shape recorded as decision D-73
+    /// (a declared key MUST reach its mechanism from a `Config`).
+    ///
+    /// Explicit builder calls made afterwards still win, per D-73's precedence:
+    /// an API argument beats `Config`, which beats the declared default.
+    #[must_use]
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let mut me = Self::new();
+        if let Some(v) = config.get("extensions.max_depth").and_then(|v| v.as_u64()) {
+            me.max_depth = u32::try_from(v).unwrap_or(8);
+        }
+        if let Some(v) = config
+            .get("extensions.follow_symlinks")
+            .and_then(|v| v.as_bool())
+        {
+            me.follow_symlinks = v;
+        }
+        if let Some(items) = config
+            .get("extensions.ignore_patterns")
+            .and_then(|v| v.as_array().cloned())
+        {
+            me.ignore_patterns = items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+        }
+        me
+    }
+
+    /// Set the A25 ignore patterns explicitly (`extensions.ignore_patterns`).
+    #[must_use]
+    pub fn with_ignore_patterns<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ignore_patterns = patterns.into_iter().map(Into::into).collect();
         self
     }
 
@@ -178,8 +230,13 @@ impl Discoverer for DefaultDiscoverer {
             let path = Path::new(root);
             // scan_extensions returns ConfigNotFoundError when the root is missing
             // — exactly the spec contract for discover().
-            let mut files =
-                scan_extensions(path, self.max_depth, self.follow_symlinks, Some(&ext_refs))?;
+            let mut files = scan_extensions(
+                path,
+                self.max_depth,
+                self.follow_symlinks,
+                Some(&ext_refs),
+                &self.ignore_patterns,
+            )?;
             discovered_files.append(&mut files);
         }
 
