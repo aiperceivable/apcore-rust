@@ -382,24 +382,24 @@ fn a_declared_section_with_no_deprecated_leaf_is_silent() {
 
 const ACL_RULES: &str = "default_effect: deny\nrules: []\n";
 
-/// An `audit:` block in an ACL file warns.
+/// An `audit:` block in an ACL file NO LONGER warns.
+///
+/// §9.2.4.1's notice is SUPERSEDED by §6.3.2 (spec v1.45.0). The block had
+/// never been read, so the notice was the only signal an operator got. It is
+/// now read — it has a delivery contract — and a key that has gained a consumer
+/// must stop being announced as going away, for the same reason §9.2.4
+/// requirement 1 says the table is the whole list. This case is the one that
+/// fails against a loader that kept the notice.
 #[test]
-fn an_acl_file_with_an_audit_block_warns() {
+fn an_acl_file_with_an_audit_block_no_longer_warns() {
     let _env = env_guard();
     let logs = load_acl_capturing(&format!(
         "{ACL_RULES}audit:\n  enabled: true\n  include_denied: true\n  log_level: \"info\"\n"
     ));
     assert!(
-        logs.contains(ACL_MARKER),
-        "an ACL file declaring an `audit:` block must emit the §9.2.4.1 notice. \
-         No SDK has ever read that block and the loader drops unknown root keys \
-         in silence, so this notice is the only signal that exists. \
-         Captured:\n{logs}"
-    );
-    assert!(
-        logs.contains("audit"),
-        "the §9.2.4.1 notice must name the `audit:` block it is about. \
-         Captured:\n{logs}"
+        !logs.contains(ACL_MARKER),
+        "the §9.2.4.1 notice must NOT be emitted from spec v1.45.0 onward — the block \
+         now has a delivery contract (§6.3.2). Captured:\n{logs}"
     );
 }
 

@@ -90,6 +90,10 @@ mod test_acl;
 mod test_acl_argument_approval;
 #[path = "test_acl_argument_scoped_approval_conformance.rs"]
 mod test_acl_argument_scoped_approval_conformance;
+#[path = "test_acl_audit_delivery.rs"]
+mod test_acl_audit_delivery;
+#[path = "test_acl_audit_delivery_conformance.rs"]
+mod test_acl_audit_delivery_conformance;
 #[path = "test_acl_conditions.rs"]
 mod test_acl_conditions;
 #[path = "test_acl_effect_value_closure_conformance.rs"]

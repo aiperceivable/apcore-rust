@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml_ng as serde_yaml;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
 use crate::acl_handlers::{
@@ -728,7 +729,295 @@ pub struct AuditEntry {
 }
 
 /// Type alias for the audit logger callback.
-type AuditLoggerFn = dyn Fn(&AuditEntry) + Send + Sync;
+pub type AuditLoggerFn = dyn Fn(&AuditEntry) + Send + Sync;
+
+// ---------------------------------------------------------------------------
+// Audit delivery (PROTOCOL_SPEC §6.3.2, apcore#118 decision D-66)
+// ---------------------------------------------------------------------------
+
+/// The three settings of an ACL file's `audit:` block.
+pub const AUDIT_FIELDS: [&str; 3] = ["enabled", "include_denied", "log_level"];
+
+/// The stable name the default sink emits under (§10.3's event table).
+pub const AUDIT_EVENT_NAME: &str = "apcore.acl.audit";
+
+/// An ACL file's `audit:` block, as declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditConfig {
+    pub enabled: bool,
+    pub include_denied: bool,
+    pub log_level: String,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_denied: true,
+            log_level: "info".to_string(),
+        }
+    }
+}
+
+/// The ONE effective sink for an ACL, per §6.3.2 requirement 1.
+///
+/// Never two. A callback supplied through [`ACL::set_audit_logger`] or the
+/// constructor receives every entry and is not narrowed, levelled or silenced
+/// by the `audit:` block: an API argument beats configuration, and the
+/// alternative lets a file silently truncate a compliance sink a developer
+/// installed deliberately. The block configures the **default sink** and
+/// nothing else.
+///
+/// A sink also owns its failure state. Requirement 5 suppresses diagnostics
+/// after the first, scoped to one ACL instance **and one effective sink
+/// configuration** — replacing the sink or reloading a configuration that
+/// changes it builds a new `AuditSink`, so a new failure is never hidden behind
+/// an old one.
+pub(crate) struct AuditSink {
+    callback: Option<Arc<AuditLoggerFn>>,
+    /// `None` means the document declared no `audit:` key. Requirement 2:
+    /// DECLARATION activates the default sink, never the default value —
+    /// `enabled` defaults to true, so reading the merged view would switch a
+    /// log record per check on for every ACL file in existence.
+    config: Option<AuditConfig>,
+    failed: AtomicBool,
+}
+
+impl std::fmt::Debug for AuditSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditSink")
+            .field("callback", &self.callback.as_ref().map(|_| "..."))
+            .field("config", &self.config)
+            .field("failed", &self.failed.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl Clone for AuditSink {
+    fn clone(&self) -> Self {
+        // A clone is a NEW sink configuration for requirement 5's purposes: the
+        // clone delivers independently, so carrying the original's failure flag
+        // across would suppress the clone's first real failure.
+        Self::new(self.callback.clone(), self.config.clone())
+    }
+}
+
+impl AuditSink {
+    pub(crate) fn new(callback: Option<Arc<AuditLoggerFn>>, config: Option<AuditConfig>) -> Self {
+        Self {
+            callback,
+            config,
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        if self.callback.is_some() {
+            return true;
+        }
+        self.config.as_ref().is_some_and(|c| c.enabled)
+    }
+
+    /// Deliver one entry. NEVER propagates (§6.3.2 requirement 3).
+    fn deliver(&self, entry: &AuditEntry) {
+        if let Some(ref callback) = self.callback {
+            // Requirement 3, bounded to RECOVERABLE failures. `AuditLoggerFn` is
+            // `Fn(&AuditEntry)` with no error channel, so an unwinding panic is
+            // the only failure this can contain; a build with `panic = "abort"`
+            // cannot be, and the specification says so rather than promising
+            // what the language cannot deliver.
+            //
+            // The default panic hook still prints its own message before this
+            // returns. That is the runtime's, not ours: requirement 5 governs
+            // the diagnostic THIS sink emits.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback(entry);
+            }));
+            if outcome.is_err() {
+                self.report_failure();
+            }
+            return;
+        }
+        let Some(ref config) = self.config else {
+            return;
+        };
+        if !config.enabled {
+            return;
+        }
+        if entry.decision == "deny" && !config.include_denied {
+            // Requirement 6 — the load-time notice for this is emitted once, at
+            // load; withholding here is silent by design.
+            return;
+        }
+        Self::emit_default(entry, config);
+    }
+
+    /// §6.3.2 requirement 2 — the default sink.
+    ///
+    /// All thirteen §6.3.1 fields go out as STRUCTURED data under their
+    /// `snake_case` wire names, not interpolated into the message. Without
+    /// that, one specification yields three different "structured records"
+    /// across the SDKs and nothing downstream consumes all three.
+    #[allow(clippy::cognitive_complexity)] // five level arms, one body each
+    fn emit_default(entry: &AuditEntry, config: &AuditConfig) {
+        macro_rules! emit {
+            ($level:expr) => {
+                tracing::event!(
+                    $level,
+                    timestamp = %entry.timestamp,
+                    caller_id = %entry.caller_id,
+                    target_id = %entry.target_id,
+                    decision = %entry.decision,
+                    reason = %entry.reason,
+                    matched_rule = ?entry.matched_rule,
+                    matched_rule_index = ?entry.matched_rule_index,
+                    identity_type = ?entry.identity_type,
+                    roles = ?entry.roles,
+                    call_depth = ?entry.call_depth,
+                    trace_id = ?entry.trace_id,
+                    handler_error = ?entry.handler_error,
+                    approval_required = entry.approval_required,
+                    // The literal, because `tracing` requires one for the
+                    // message. `audit_event_name_matches_the_constant` pins it
+                    // against AUDIT_EVENT_NAME so the two cannot drift.
+                    "apcore.acl.audit"
+                )
+            };
+        }
+        match config.log_level.as_str() {
+            "trace" | "debug" => emit!(tracing::Level::DEBUG),
+            "warn" => emit!(tracing::Level::WARN),
+            "error" => emit!(tracing::Level::ERROR),
+            _ => emit!(tracing::Level::INFO),
+        }
+    }
+
+    fn report_failure(&self) {
+        if self.failed.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            "ACL audit delivery failed (the callback panicked). The access decision is \
+             unaffected (PROTOCOL_SPEC §6.3.2 requirement 3) — auditing is a side channel \
+             and does not hold a veto over access. Further failures from this sink are not \
+             reported; replacing the sink or reloading the ACL starts a new report."
+        );
+    }
+}
+
+/// §6.3.2 requirement 1 — name EVERY field the callback overrides.
+///
+/// Not only the most visible one: an operator who set `include_denied` and
+/// `log_level` and hears about one of them has been told the smaller half of
+/// what happened.
+pub(crate) fn warn_audit_block_overridden(
+    callback: Option<&Arc<AuditLoggerFn>>,
+    config: Option<&AuditConfig>,
+) {
+    if callback.is_none() || config.is_none() {
+        return;
+    }
+    tracing::warn!(
+        fields = %AUDIT_FIELDS
+            .iter()
+            .map(|f| format!("audit.{f}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        "An audit logger was supplied to this ACL, so it is the effective sink and the ACL \
+         file's 'audit:' block does not apply. The callback receives EVERY entry, allow and \
+         deny alike. The listed declared settings have no effect (PROTOCOL_SPEC §6.3.2 \
+         requirement 1)."
+    );
+}
+
+/// Validate an ACL file's `audit:` block (§6.3.2 requirement 8).
+///
+/// Returns `None` only when the document declares no `audit` key at all.
+/// **Presence, not truthiness**: `audit:` with nothing under it parses to null,
+/// and the operator still wrote the block — a declaration with every setting at
+/// its default, not an absence.
+///
+/// Validates the SUBTREE only: types and unknown keys inside the block. Every
+/// other unrecognised root key in an ACL file keeps being ignored.
+pub(crate) fn parse_audit_block(
+    raw: &serde_json::Value,
+    path: &str,
+) -> Result<Option<AuditConfig>, ModuleError> {
+    let Some(value) = raw.get("audit") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(AuditConfig::default()));
+    }
+    let Some(block) = value.as_object() else {
+        return Err(ModuleError::new(
+            ErrorCode::ConfigInvalid,
+            format!("{path}: 'audit' must be a mapping (PROTOCOL_SPEC §6.3.2)"),
+        ));
+    };
+
+    let mut unknown: Vec<&str> = block
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !AUDIT_FIELDS.contains(k))
+        .collect();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        return Err(ModuleError::new(
+            ErrorCode::ConfigInvalid,
+            format!(
+                "{path}: unknown key(s) in the 'audit' block: {}. The block accepts exactly \
+                 {} ($defs/AuditConfig in schemas/acl-config.schema.json).",
+                unknown.join(", "),
+                AUDIT_FIELDS.join(", ")
+            ),
+        ));
+    }
+
+    let mut config = AuditConfig::default();
+    for key in ["enabled", "include_denied"] {
+        if let Some(v) = block.get(key) {
+            let Some(b) = v.as_bool() else {
+                return Err(ModuleError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("{path}: 'audit.{key}' must be a boolean, got {v}"),
+                ));
+            };
+            if key == "enabled" {
+                config.enabled = b;
+            } else {
+                config.include_denied = b;
+            }
+        }
+    }
+    if let Some(v) = block.get("log_level") {
+        let levels = ["trace", "debug", "info", "warn", "error"];
+        let ok = v.as_str().is_some_and(|s| levels.contains(&s));
+        if !ok {
+            return Err(ModuleError::new(
+                ErrorCode::ConfigInvalid,
+                format!(
+                    "{path}: 'audit.log_level' must be one of {}, got {v}",
+                    levels.join(", ")
+                ),
+            ));
+        }
+        config.log_level = v.as_str().unwrap_or("info").to_string();
+    }
+
+    if !config.include_denied {
+        // §6.3.2 requirement 6 — a notice, not a refusal. It withholds the
+        // security-relevant half of the record, so an operator who wrote it
+        // deliberately gets told once per load rather than stopped.
+        tracing::warn!(
+            path = %path,
+            "This ACL file sets audit.include_denied: false, so DENIED access attempts will \
+             not be recorded by the default audit sink (PROTOCOL_SPEC §6.3.2 requirement 6). \
+             Allowed calls are still recorded. Remove the entry to restore denials."
+        );
+    }
+    Ok(Some(config))
+}
 
 /// One rule that fails PROTOCOL_SPEC §6.1.4's structural and registry
 /// precheck.
@@ -848,6 +1137,10 @@ pub struct ACL {
     default_effect: String,
     yaml_path: Option<String>,
     audit_logger: Option<Arc<AuditLoggerFn>>,
+    /// The ACL file's `audit:` block, as declared (§6.3.2 requirement 2).
+    audit_config: Option<AuditConfig>,
+    /// §6.3.2 requirement 1: one effective sink, never two.
+    audit_sink: AuditSink,
 }
 
 impl std::fmt::Debug for ACL {
@@ -857,6 +1150,8 @@ impl std::fmt::Debug for ACL {
             .field("default_effect", &self.default_effect)
             .field("yaml_path", &self.yaml_path)
             .field("audit_logger", &self.audit_logger.as_ref().map(|_| "..."))
+            .field("audit_config", &self.audit_config)
+            .field("audit_sink", &self.audit_sink)
             .finish()
     }
 }
@@ -868,6 +1163,8 @@ impl Clone for ACL {
             default_effect: self.default_effect.clone(),
             yaml_path: self.yaml_path.clone(),
             audit_logger: self.audit_logger.clone(),
+            audit_config: self.audit_config.clone(),
+            audit_sink: self.audit_sink.clone(),
         }
     }
 }
@@ -959,6 +1256,8 @@ impl ACL {
             rules,
             default_effect: default_effect.into(),
             yaml_path: None,
+            audit_sink: AuditSink::new(audit_logger.clone(), None),
+            audit_config: None,
             audit_logger,
         }
     }
@@ -1130,6 +1429,11 @@ impl ACL {
     /// Set the audit logger callback.
     pub fn set_audit_logger(&mut self, logger: impl Fn(&AuditEntry) + Send + Sync + 'static) {
         self.audit_logger = Some(Arc::new(logger));
+        // §6.3.2 requirement 1: the callback becomes the effective sink, and a
+        // NEW sink is what scopes requirement 5's once-per-failure suppression
+        // to this configuration rather than to the ACL's lifetime.
+        self.audit_sink = AuditSink::new(self.audit_logger.clone(), self.audit_config.clone());
+        warn_audit_block_overridden(self.audit_logger.as_ref(), self.audit_config.as_ref());
     }
 
     /// Evaluate all conditions with three-valued AND logic using the sync
@@ -1649,21 +1953,16 @@ impl ACL {
         // wants, so any unknown root key is dropped in silence. The diagnostic
         // therefore has to live here.
         //
-        // Scoped to `audit` deliberately: this is a deprecation notice, NOT
-        // unknown-key closure for ACL files. Every other unrecognised root key
-        // keeps being ignored exactly as before, and the block itself is still
-        // ignored — nothing about this file's behaviour changes.
-        if raw.get("audit").is_some() {
-            tracing::warn!(
-                path = %path,
-                "[apcore] DEPRECATION (spec §9.2.4.1): this ACL file declares an 'audit:' \
-                 block, which no apcore SDK has ever read — auditing is wired \
-                 programmatically through ACL::set_audit_logger. The same three settings are \
-                 also declared as 'acl.audit.*' in apcore.yaml and are equally inert. One of \
-                 the two declarations is removed no earlier than v2.0 (§13.2 / §13.4); \
-                 nothing has changed in this release. See aiperceivable/apcore#118"
-            );
-        }
+        // Scoped to `audit` deliberately: §6.3.2 requirement 8 validates this
+        // SUBTREE and nothing else, so every other unrecognised root key in an
+        // ACL file keeps being ignored exactly as before. This was never
+        // unknown-key closure for ACL files, and wiring the block does not make
+        // it one.
+        //
+        // The §9.2.4.1 deprecation notice that used to stand here is gone: spec
+        // v1.45.0 gave the block a delivery contract, and a key that has gained
+        // a consumer must stop being announced as going away.
+        let audit_config = parse_audit_block(&raw, path)?;
 
         // §6.2.1 point 2: `default_effect` is judged FIRST — ahead of the
         // individual rules AND ahead of the file-level checks on the `rules`
@@ -1803,6 +2102,11 @@ impl ACL {
             )
         })?;
         acl.yaml_path = Some(path.to_string());
+        // §6.3.2 requirement 2 — the declared block becomes the default sink's
+        // configuration. `try_new` above built a sink with no config because it
+        // knows nothing about files.
+        acl.audit_config = audit_config;
+        acl.audit_sink = AuditSink::new(acl.audit_logger.clone(), acl.audit_config.clone());
         Ok(acl)
     }
 
@@ -1927,6 +2231,19 @@ impl ACL {
 
         self.rules = reloaded.rules;
         self.default_effect = reloaded.default_effect;
+        // §6.3.2 requirement 7: a reload refreshes the `audit:` block and
+        // PRESERVES a programmatic callback, which was never read from the
+        // file. Before v1.45.0 this method refreshed only the rules and the
+        // default effect, so the audit block was the one part of the document a
+        // reload did not pick up.
+        //
+        // Building a NEW sink is also what scopes requirement 5's
+        // once-per-failure suppression: a reload that changes the sink's
+        // configuration starts a fresh report rather than hiding a new failure
+        // behind an old one.
+        self.audit_config = reloaded.audit_config;
+        self.audit_sink = AuditSink::new(self.audit_logger.clone(), self.audit_config.clone());
+        warn_audit_block_overridden(self.audit_logger.as_ref(), self.audit_config.as_ref());
         // `self.yaml_path` is intentionally left untouched: reload re-reads the
         // *stored* path, so reassigning it is a no-op (reloaded.yaml_path always
         // equals the existing path). Matches apcore-python / apcore-typescript,
@@ -2587,8 +2904,12 @@ impl ACL {
 
     /// Emit an audit entry to the registered audit logger, if any.
     fn emit_audit(&self, entry: &AuditEntry) {
-        if let Some(ref logger) = self.audit_logger {
-            logger(entry);
+        // Through the SINK, not the raw callback: delivery has to be contained
+        // (§6.3.2 requirement 3) and the failure state that scopes requirement
+        // 5's suppression lives on the sink, so a bare `Fn` could honour
+        // neither.
+        if self.audit_sink.is_active() {
+            self.audit_sink.deliver(entry);
         }
     }
 
