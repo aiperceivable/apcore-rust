@@ -236,7 +236,9 @@ pub const FRAMEWORK_CONFIG_KEYS: &[&str] = &[
     "observability.metrics.exporter",
     "observability.tracing.enabled",
     "observability.tracing.exporter",
+    "observability.tracing.otlp_endpoint",
     "observability.tracing.sampling_rate",
+    "observability.tracing.strategy",
     "pipeline.configure",
     "pipeline.remove",
     "pipeline.steps",
@@ -354,6 +356,9 @@ impl DefaultValue {
 pub const CONSTRAINED_CONFIG_KEYS: &[&str] = &[
     "acl.default_effect",
     "observability.tracing.sampling_rate",
+    "observability.tracing.strategy",
+    "observability.tracing.exporter",
+    "observability.tracing.otlp_endpoint",
     "sys_modules.events.thresholds.error_rate",
     "sys_modules.events.thresholds.latency_p99_ms",
     "extensions.max_depth",
@@ -408,13 +413,15 @@ const PATH_TYPED_CONFIG_KEYS: &[&str] = &[
     "schema.root",
 ];
 
-/// PROTOCOL_SPEC §9.2.4 — the ten declared configuration keys that reach no
+/// PROTOCOL_SPEC §9.2.4 — the declared configuration keys that reach no
 /// consumer in any implementation (aiperceivable/apcore#118). Order is the
 /// order they are reported in, so two SDKs name them the same way.
+///
+/// Ten when the window opened in spec v1.39.0; seven since v1.44.0, which gave
+/// `observability.tracing.enabled` / `.sampling_rate` / `.exporter` consumers
+/// (§10.1.1) and cancelled their withdrawal. A key that has left the table MUST
+/// NOT warn — §9.2.4 requirement 1.
 const DEPRECATED_INERT_KEYS: &[&str] = &[
-    "observability.tracing.enabled",
-    "observability.tracing.sampling_rate",
-    "observability.tracing.exporter",
     "observability.metrics.enabled",
     "observability.metrics.exporter",
     "logging.level",
@@ -545,9 +552,31 @@ pub struct TracingConfig {
     /// apcore-typescript both reject it with `CONFIG_INVALID` — and a
     /// legitimate `0.1` never survived a `data()` round-trip.
     pub sampling_rate: f64,
-    /// Trace exporter: `"stdout" | "otlp" | "in_memory"`. Default `"stdout"`
-    /// (PROTOCOL_SPEC §9.15.2).
+    /// Trace exporter: `"stdout" | "otlp" | "jaeger"`. Default `"stdout"`.
+    ///
+    /// PROTOCOL_SPEC §10.1.1 requirement 2. §9.15.2 used to document
+    /// `in_memory` here instead of `jaeger`, disagreeing with
+    /// `schemas/apcore-config.schema.json`; v1.44.0 makes the schema canonical
+    /// and forbids the in-memory exporter as a configuration value, since a
+    /// caller selecting it by name has no standardised way to read the spans
+    /// it holds.
     pub exporter: String,
+    /// How the sampling decision is made: `"full" | "proportional" |
+    /// "error_first" | "off"`. Default `"full"` (PROTOCOL_SPEC §10.7).
+    ///
+    /// Declared by §9.15.2's namespace registration since that section was
+    /// written and absent from the schema until v1.44.0, so `_config.strict`
+    /// rejected it as an unknown key while the specification documented its
+    /// default. Modelled as a real field for the same reason `sampling_rate`
+    /// is: otherwise the constraint in [`Config::validate_key_constraint`] is
+    /// unreachable and the value does not survive a `data()` round-trip.
+    pub strategy: String,
+    /// OTLP collector endpoint, or `None` for the implementation default.
+    ///
+    /// PROTOCOL_SPEC §10.1.1 requirement 3. Read only when `exporter` is
+    /// `"otlp"`; setting it alongside any other exporter is a load-time
+    /// `CONFIG_INVALID` error rather than a silent no-op.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl Default for TracingConfig {
@@ -555,6 +584,8 @@ impl Default for TracingConfig {
         Self {
             enabled: false,
             sampling_rate: 1.0,
+            strategy: "full".to_string(),
+            otlp_endpoint: None,
             exporter: "stdout".to_string(),
         }
     }
@@ -1032,6 +1063,23 @@ impl Config {
                 as_number(value).is_some_and(|n| (0.0..=1.0).contains(&n)),
                 "must be a number in [0.0, 1.0]",
             ),
+            "observability.tracing.strategy" => (
+                matches!(
+                    value.as_str(),
+                    Some("full" | "proportional" | "error_first" | "off")
+                ),
+                "must be 'full', 'proportional', 'error_first' or 'off'",
+            ),
+            "observability.tracing.exporter" => (
+                // `in_memory` is deliberately absent: PROTOCOL_SPEC §10.1.1
+                // requirement 2.
+                matches!(value.as_str(), Some("stdout" | "otlp" | "jaeger")),
+                "must be 'stdout', 'otlp' or 'jaeger'",
+            ),
+            "observability.tracing.otlp_endpoint" => (
+                value.is_null() || value.as_str().is_some_and(|s| !s.trim().is_empty()),
+                "must be a non-empty URL string, or null",
+            ),
             "sys_modules.events.thresholds.latency_p99_ms" => (
                 as_number(value).is_some_and(|n| n > 0.0),
                 "must be a positive number",
@@ -1123,6 +1171,24 @@ impl Config {
         // configuration meaning "no single module over 30s, whole chain under
         // 10s". Neither apcore-python, apcore-typescript, nor the PROTOCOL_SPEC
         // §9.3 constraint table rejects it.
+
+        // --- 2b. `observability.tracing` cross-key consistency (§10.1.1) ---
+        //
+        // Requirement 3: an OTLP endpoint set against an exporter that does not
+        // read it is a rejected configuration, not a silent no-op. A value an
+        // operator wrote down and nothing reads is the shape of every defect
+        // apcore#118 found. Runs in both modes — the disagreement is between
+        // two keys, and which file layout declared them changes nothing.
+        if self.observability.tracing.otlp_endpoint.is_some() {
+            let exporter = &self.observability.tracing.exporter;
+            if exporter != "otlp" {
+                errors.push(format!(
+                    "observability.tracing.otlp_endpoint is set but \
+                     observability.tracing.exporter is '{exporter}', which does not read it. \
+                     Set exporter to 'otlp', or remove the endpoint."
+                ));
+            }
+        }
 
         // --- 3. Unknown framework keys (§9.14) -----------------------------
         //
@@ -1324,6 +1390,28 @@ impl Config {
                     .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
             } else {
                 None
+            }
+        }
+
+        // The `observability.tracing.*` constraints DELEGATE to
+        // `validate_key_constraint` rather than being restated here.
+        //
+        // This routine and `validate_key_constraint` are two hand-written
+        // implementations of one table, and the pair has already drifted once:
+        // the match arms added for spec v1.44.0 were reachable from
+        // `validate_key_constraint` and invisible to `validate()`, so
+        // `exporter: in_memory` — a value §10.1.1 requirement 2 forbids — loaded
+        // without a word. Delegating means a key added to the match is enforced
+        // by `validate()` for free.
+        for key in [
+            "observability.tracing.strategy",
+            "observability.tracing.exporter",
+            "observability.tracing.otlp_endpoint",
+        ] {
+            if let Some(value) = self.get(key) {
+                if let Some(Err(msg)) = Self::validate_key_constraint(key, &value) {
+                    errors.push(format!("{key} {msg} (got {value})"));
+                }
             }
         }
 
@@ -2553,6 +2641,16 @@ impl Config {
             "observability.tracing.exporter" => Some(serde_json::Value::String(
                 self.observability.tracing.exporter.clone(),
             )),
+            "observability.tracing.strategy" => Some(serde_json::Value::String(
+                self.observability.tracing.strategy.clone(),
+            )),
+            "observability.tracing.otlp_endpoint" => Some(
+                self.observability
+                    .tracing
+                    .otlp_endpoint
+                    .clone()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            ),
             "observability.metrics.enabled" => {
                 Some(serde_json::Value::Bool(self.observability.metrics.enabled))
             }
@@ -2658,6 +2756,22 @@ impl Config {
             "observability.tracing.exporter" => {
                 if let Some(s) = value.as_str() {
                     self.observability.tracing.exporter = s.to_string();
+                    return true;
+                }
+            }
+            "observability.tracing.strategy" => {
+                if let Some(s) = value.as_str() {
+                    self.observability.tracing.strategy = s.to_string();
+                    return true;
+                }
+            }
+            "observability.tracing.otlp_endpoint" => {
+                if value.is_null() {
+                    self.observability.tracing.otlp_endpoint = None;
+                    return true;
+                }
+                if let Some(s) = value.as_str() {
+                    self.observability.tracing.otlp_endpoint = Some(s.to_string());
                     return true;
                 }
             }

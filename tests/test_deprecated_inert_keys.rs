@@ -1,4 +1,4 @@
-//! PROTOCOL_SPEC §9.2.4 / §9.2.4.1 — the deprecation notice for the ten
+//! PROTOCOL_SPEC §9.2.4 / §9.2.4.1 — the deprecation notice for the
 //! declared configuration keys that reach no consumer in any SDK
 //! (aiperceivable/apcore#118).
 //!
@@ -40,7 +40,7 @@
 //!
 //! ## What is NOT asserted
 //!
-//! Behaviour. §9.2.4 requirement 3 keeps all ten keys parsing, validating,
+//! Behaviour. §9.2.4 requirement 3 keeps every listed key parsing, validating,
 //! answering `get()` and passing `_config.strict` for the whole 1.x line; the
 //! `audit:` block keeps being ignored. Nothing in this file loads a
 //! configuration that would fail before the warning existed, and nothing here
@@ -57,17 +57,21 @@ use apcore::config::Config;
 // The key set
 // ---------------------------------------------------------------------------
 
-/// PROTOCOL_SPEC §9.2.4's ten keys, in the order the notice reports them.
+/// PROTOCOL_SPEC §9.2.4's keys, in the order the notice reports them.
+///
+/// Ten when the window opened in spec v1.39.0; **seven** since v1.44.0, which
+/// gave `observability.tracing.enabled` / `.sampling_rate` / `.exporter`
+/// consumers (§10.1.1) and cancelled their withdrawal. The three that left are
+/// pinned from the other side by [`WIRED_KEYS`] — a table that never shrank
+/// would pass every case that asserts a warning and fail those.
 ///
 /// Spelled out rather than read from `src/config.rs` — `DEPRECATED_INERT_KEYS`
 /// is private, and restating the spec's list here is what makes
-/// [`all_ten_declared_at_once_are_named_in_spec_order`] an independent check on
-/// the const rather than a mirror of it. The order is load-bearing: it is what
-/// makes three SDKs name the same keys in the same sequence for the same file.
-const DEPRECATED_INERT_KEYS: [&str; 10] = [
-    "observability.tracing.enabled",
-    "observability.tracing.sampling_rate",
-    "observability.tracing.exporter",
+/// [`all_deprecated_keys_at_once_are_named_in_spec_order`] an independent check
+/// on the const rather than a mirror of it. The order is load-bearing: it is
+/// what makes three SDKs name the same keys in the same sequence for the same
+/// file.
+const DEPRECATED_INERT_KEYS: [&str; 7] = [
     "observability.metrics.enabled",
     "observability.metrics.exporter",
     "logging.level",
@@ -75,6 +79,17 @@ const DEPRECATED_INERT_KEYS: [&str; 10] = [
     "acl.audit.enabled",
     "acl.audit.include_denied",
     "acl.audit.log_level",
+];
+
+/// The three keys spec v1.44.0 wired, plus the one it added to the schema.
+///
+/// Declaring any of these MUST NOT produce the notice — §9.2.4 requirement 1:
+/// the table is the whole list.
+const WIRED_KEYS: [&str; 4] = [
+    "observability.tracing.enabled",
+    "observability.tracing.sampling_rate",
+    "observability.tracing.exporter",
+    "observability.tracing.strategy",
 ];
 
 /// The substring that identifies the `apcore.yaml` notice.
@@ -185,7 +200,7 @@ fn document(sections: &str) -> String {
 }
 
 /// The smallest document that declares exactly `key`, and no other member of
-/// the ten.
+/// the set.
 ///
 /// Nests one YAML level per dotted segment, so it handles both the
 /// three-segment keys (`observability.tracing.enabled`) and the two-segment
@@ -201,6 +216,7 @@ fn document_declaring(key: &str) -> String {
     let value = match *leaf {
         "sampling_rate" => "0.25",
         "exporter" => "\"stdout\"",
+        "strategy" => "\"off\"",
         "level" | "log_level" => "\"info\"",
         "format" => "\"json\"",
         _ => "true",
@@ -221,9 +237,27 @@ fn document_declaring(key: &str) -> String {
 // apcore.yaml — the ten keys warn
 // ---------------------------------------------------------------------------
 
-/// Each of the ten, declared alone, warns and is named in the notice.
+/// Each key spec v1.44.0 wired is SILENT.
 ///
-/// One case per key rather than ten cases: the notice reports the keys it found
+/// §9.2.4 requirement 1 — the table is the whole list, and a key that has left
+/// it MUST NOT warn. This is the half that fails against a table which never
+/// shrank; every case that asserts a warning passes either way.
+#[test]
+fn a_wired_key_does_not_warn() {
+    let _env = env_guard();
+    for key in WIRED_KEYS {
+        let logs = load_config_capturing(&document_declaring(key));
+        assert!(
+            !logs.contains(CONFIG_MARKER),
+            "`{key}` gained a consumer in spec v1.44.0 (§10.1.1) and left §9.2.4's \
+             table, so declaring it must NOT emit the notice. Captured:\n{logs}"
+        );
+    }
+}
+
+/// Each of the seven, declared alone, warns and is named in the notice.
+///
+/// One case per key rather than seven cases: the notice reports the keys it found
 /// as a list, so a per-key document is the only shape that proves the *reported*
 /// key is the *declared* one, and a loop over the whole set is what proves no
 /// key is quietly missing from the traversal.
@@ -247,20 +281,16 @@ fn each_deprecated_key_warns_and_the_notice_names_it() {
     }
 }
 
-/// All ten in one document are reported together, in the spec's order.
+/// All seven in one document are reported together, in the spec's order.
 ///
 /// Pins the count and the ordering the const's own documentation claims: the
-/// notice is a cross-SDK diagnostic, and three SDKs naming the same ten keys in
+/// notice is a cross-SDK diagnostic, and three SDKs naming the same keys in
 /// three different sequences is a diff an operator has to reconcile by hand.
 #[test]
-fn all_ten_declared_at_once_are_named_in_spec_order() {
+fn all_deprecated_keys_at_once_are_named_in_spec_order() {
     let _env = env_guard();
     let logs = load_config_capturing(&document(
         "observability:\n  \
-           tracing:\n    \
-             enabled: true\n    \
-             sampling_rate: 0.25\n    \
-             exporter: \"stdout\"\n  \
            metrics:\n    \
              enabled: true\n    \
              exporter: \"prometheus\"\n\
@@ -276,16 +306,17 @@ fn all_ten_declared_at_once_are_named_in_spec_order() {
 
     assert!(
         logs.contains(CONFIG_MARKER),
-        "a configuration declaring all ten keys must emit the §9.2.4 notice. \
+        "a configuration declaring every listed key must emit the §9.2.4 \
+         notice. Captured:\n{logs}"
+    );
+    assert!(
+        logs.contains("count=7"),
+        "every listed key is declared, so the notice must report seven. \
          Captured:\n{logs}"
     );
     assert!(
-        logs.contains("count=10"),
-        "all ten keys are declared, so the notice must report ten. Captured:\n{logs}"
-    );
-    assert!(
         logs.contains(&DEPRECATED_INERT_KEYS.join(", ")),
-        "the notice must list the ten keys in §9.2.4's order so every SDK names \
+        "the notice must list the keys in §9.2.4's order so every SDK names \
          them the same way for the same file. Captured:\n{logs}"
     );
 }
@@ -294,9 +325,9 @@ fn all_ten_declared_at_once_are_named_in_spec_order() {
 // apcore.yaml — the negative half
 // ---------------------------------------------------------------------------
 
-/// A configuration declaring none of the ten is SILENT.
+/// A configuration declaring none of them is SILENT.
 ///
-/// This is the requirement, not a nicety. Every one of the ten has a canonical
+/// This is the requirement, not a nicety. Every one of them has a canonical
 /// default and four of them are typed struct leaves that always carry a value,
 /// so a notice driven by the merged view — `get_declared`, or `data()` — fires
 /// here, for every configuration ever loaded. That is the blanket warning
@@ -419,14 +450,14 @@ fn an_acl_file_with_an_unrelated_unknown_root_key_is_silent() {
 /// Serialised against the other cases by the same lock they use, because it
 /// mutates process-wide environment state.
 #[test]
-fn the_environment_tier_declares_all_ten_keys_not_only_the_untyped_ones() {
+fn the_environment_tier_declares_every_key_not_only_the_untyped_ones() {
     let _env = env_guard();
     for (var, value, key) in [
         ("APCORE_LOGGING_LEVEL", "debug", "logging.level"),
         (
-            "APCORE_OBSERVABILITY_TRACING_ENABLED",
+            "APCORE_OBSERVABILITY_METRICS_ENABLED",
             "true",
-            "observability.tracing.enabled",
+            "observability.metrics.enabled",
         ),
         ("APCORE_ACL_AUDIT_ENABLED", "false", "acl.audit.enabled"),
     ] {

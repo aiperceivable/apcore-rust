@@ -335,6 +335,10 @@ mod test_system_modules_hardening_conformance;
 mod test_trace_context;
 #[path = "test_trace_context_conformance.rs"]
 mod test_trace_context_conformance;
+#[path = "test_tracing_from_config.rs"]
+mod test_tracing_from_config;
+#[path = "test_tracing_from_config_conformance.rs"]
+mod test_tracing_from_config_conformance;
 #[path = "test_true_streaming.rs"]
 mod test_true_streaming;
 #[path = "test_unified_registry.rs"]

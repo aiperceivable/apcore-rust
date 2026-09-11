@@ -146,6 +146,37 @@ impl APCore {
             }
         }
 
+        // Config-driven tracing (PROTOCOL_SPEC §10.1.1). `observability.tracing.*`
+        // was five declared keys that reached nothing: no SDK had ever built a
+        // TracingMiddleware from configuration, so `enabled: true` installed
+        // nothing and the other four configured a middleware that did not exist.
+        //
+        // Skipped when the caller supplied their own Executor — an Executor the
+        // caller built is respected as-is, tracing included, exactly as
+        // config-driven ACL discovery above treats it. That is also what makes
+        // §10.1.1 requirement 6 hold without a second check: the Executor built
+        // here has an empty middleware chain, so configuration can never be the
+        // thing that adds a SECOND tracing middleware.
+        //
+        // A self-contradictory configuration (requirement 3) is logged rather
+        // than propagated, for the same reason `ACL::discover` above is:
+        // `APCore::with_options` returns `Self` and cannot carry an error. The
+        // middleware is not installed, so nothing runs under a configuration
+        // this constructor could not honour.
+        if !executor_supplied {
+            match crate::observability::tracing_config::build_tracing_middleware(&config) {
+                Ok(Some(mw)) => {
+                    if let Err(e) = executor.use_middleware(Box::new(mw)) {
+                        tracing::error!(error = %e, "Failed to install the configured tracing middleware");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "observability.tracing.* is invalid; no tracing middleware was installed");
+                }
+            }
+        }
+
         let sys_modules_context = if Self::sys_modules_enabled(&config) {
             match crate::sys_modules::register_sys_modules_with_options(
                 Arc::clone(&registry),

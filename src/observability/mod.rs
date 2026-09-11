@@ -11,6 +11,7 @@ pub mod redaction;
 pub mod span;
 pub mod storage;
 pub mod store;
+pub mod tracing_config;
 pub mod tracing_middleware;
 pub mod usage;
 pub mod usage_exporter;

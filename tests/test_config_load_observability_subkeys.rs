@@ -14,7 +14,7 @@
 //! | family | keys |
 //! |---|---|
 //! | `redaction` | `sensitive_keys`, `regex_patterns`, `replacement` |
-//! | `tracing` (unmodelled leaves) | `strategy`, `otlp_endpoint` |
+//! | `tracing` (modelled since spec v1.44.0) | `strategy`, `otlp_endpoint` |
 //! | `metrics` (unmodelled leaf) | `exporter` |
 //! | `logging` | `enabled`, `level`, `format`, `redact_sensitive` |
 //! | `error_history` | `max_entries_per_module`, `max_total_entries` |
@@ -60,7 +60,7 @@ observability:
     enabled: true
     sampling_rate: 0.25
     exporter: otlp
-    strategy: sampled
+    strategy: error_first
     otlp_endpoint: "http://collector.internal:4318"
   metrics:
     enabled: true
@@ -154,12 +154,22 @@ fn load_preserves_observability_redaction_subtree() {
     );
 }
 
-/// `observability.tracing.strategy` / `.otlp_endpoint` — the unmodelled leaves
-/// sitting *beside* modelled ones.
+/// `observability.tracing.strategy` / `.otlp_endpoint` — once the unmodelled
+/// leaves sitting *beside* modelled ones, now typed fields themselves.
 ///
-/// The sharpest shape of the defect: `tracing.enabled` survived and
+/// The sharpest shape of the original defect: `tracing.enabled` survived and
 /// `tracing.strategy` did not, from the same YAML mapping. An operator had no
 /// way to infer that half their `tracing:` block was being read.
+///
+/// **Spec v1.44.0 changed why this passes, not whether it does.** Both keys are
+/// now `TracingConfig` fields with a closed value set, because §9.15.2 declared
+/// them and `schemas/apcore-config.schema.json` did not — so `_config.strict`
+/// rejected them as unknown keys while the specification documented their
+/// defaults (#118, D-68 C'). The value here changed from `sampled`, which was
+/// never one of §10.7's four and survived only because nothing validated an
+/// untyped passthrough leaf. That it had to change is the point: this file
+/// pinned that the string arrived intact and could not have noticed that no
+/// string was ever legal.
 ///
 /// `otlp_endpoint` is the one with teeth. §9.15.2 defaults it to `null`; a
 /// service that sets it and has its value dropped exports spans nowhere while
@@ -167,7 +177,11 @@ fn load_preserves_observability_redaction_subtree() {
 #[test]
 fn load_preserves_unmodelled_observability_tracing_leaves() {
     let (_dir, config) = loaded();
-    assert_get(&config, "observability.tracing.strategy", &json!("sampled"));
+    assert_get(
+        &config,
+        "observability.tracing.strategy",
+        &json!("error_first"),
+    );
     assert_get(
         &config,
         "observability.tracing.otlp_endpoint",
@@ -277,7 +291,11 @@ fn namespace_observability_reflects_the_file_not_the_registered_default() {
     assert_eq!(logging["format"], json!("text"));
 
     let tracing = ns.get("tracing").expect("tracing present");
-    assert_eq!(tracing["strategy"], json!("sampled"), "default is 'full'");
+    assert_eq!(
+        tracing["strategy"],
+        json!("error_first"),
+        "default is 'full'"
+    );
     assert_eq!(
         tracing["otlp_endpoint"],
         json!("http://collector.internal:4318"),
@@ -525,7 +543,7 @@ fn data_round_trips_both_typed_leaves_and_unmodelled_subkeys() {
     assert_eq!(observability["tracing"]["exporter"], json!("otlp"));
     assert_eq!(observability["metrics"]["enabled"], json!(true));
 
-    assert_eq!(observability["tracing"]["strategy"], json!("sampled"));
+    assert_eq!(observability["tracing"]["strategy"], json!("error_first"));
     assert_eq!(
         observability["metrics"]["exporter"],
         json!("prometheus"),
