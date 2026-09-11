@@ -255,20 +255,26 @@ fn conformance_config_path_typed_keys() {
                 // clause demands: an SDK that omits one key and invents another
                 // passes any length check.
                 let sdk = sdk_keys();
-                let missing: Vec<&String> = declared.difference(&sdk).collect();
-                let extra: Vec<&String> = sdk.difference(&declared).collect();
-                assert_eq!(
-                    missing,
-                    Vec::<&String>::new(),
-                    "[{id}] missing_from_sdk (expected {})",
-                    expected["missing_from_sdk"]
-                );
-                assert_eq!(
-                    extra,
-                    Vec::<&String>::new(),
-                    "[{id}] extra_in_sdk (expected {})",
-                    expected["extra_in_sdk"]
-                );
+                let mut missing: Vec<String> = declared.difference(&sdk).cloned().collect();
+                let mut extra: Vec<String> = sdk.difference(&declared).cloned().collect();
+                missing.sort();
+                extra.sort();
+
+                // Compared against the fixture's OWN lists rather than against
+                // hardcoded empties. The previous form asserted `== vec![]` and
+                // merely interpolated `expected` into the failure message, so
+                // `check_case_pinning.py` could rewrite either list and nothing
+                // went red — the case ran and its expectation was decoration.
+                let want = |key: &str| -> Vec<String> {
+                    expected[key]
+                        .as_array()
+                        .unwrap_or_else(|| panic!("[{id}] {key} must be a list"))
+                        .iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_owned())
+                        .collect()
+                };
+                assert_eq!(missing, want("missing_from_sdk"), "[{id}] missing_from_sdk");
+                assert_eq!(extra, want("extra_in_sdk"), "[{id}] extra_in_sdk");
             }
 
             "bindings_pattern_is_not_path_typed" => {
