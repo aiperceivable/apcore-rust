@@ -195,6 +195,38 @@ async fn run(case: &Value) -> Value {
         .expect("detail should succeed")
 }
 
+/// Execute `case` through a real client and report the error code it raised.
+///
+/// `None` when the call succeeded, so a case whose input is wrongly ACCEPTED
+/// fails the assertion rather than panicking somewhere less legible.
+async fn rejection_code(case: &serde_json::Value) -> Option<String> {
+    use apcore::client::APCore;
+    use apcore::config::Config;
+
+    let raw = serde_json::json!({
+        "version": "1.0",
+        "project": {"name": "usage-contract"},
+        "sys_modules": {"enabled": true, "usage": {"enabled": true}}
+    });
+    let config: Config = serde_json::from_value(raw).expect("probe config parses");
+    let client = APCore::with_config(config);
+    let module = case["module"].as_str().expect("module");
+    let inputs = case["inputs"].clone();
+    client
+        .call(module, inputs, None, None)
+        .await
+        .err()
+        // The WIRE code, not the Rust variant name: `ErrorCode` serialises as
+        // SCREAMING_SNAKE_CASE, and the wire spelling is what the fixture
+        // declares and what an operator sees.
+        .map(|e| {
+            serde_json::to_value(e.code)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("{:?}", e.code))
+        })
+}
+
 #[tokio::test]
 async fn conformance_usage_contract() {
     let fixture = load_fixture("usage_contract");
@@ -219,6 +251,24 @@ async fn conformance_usage_contract() {
             assert!(
                 !regex::Regex::new(pattern).unwrap().is_match(period),
                 "{id}: fixture expects {period:?} to be rejected, but the pattern accepts it"
+            );
+
+            // ...and then assert what the case actually SAYS. Both checks above
+            // are about the schema; neither reads `expected["error_code"]`, so
+            // this branch passed whatever wire code the fixture declared — the
+            // case ran and its expectation asserted nothing. Found by
+            // `check_case_pinning.py`: mutating the code left all three SDKs
+            // green, which is how they came to share the same proxy.
+            //
+            // Rejection happens at input validation (§6.7.1.1), the pipeline's
+            // job rather than `execute`'s, so this goes through a real client.
+            let want = expected["error_code"].as_str().expect("error_code");
+            let err = rejection_code(case).await;
+            assert_eq!(
+                err.as_deref(),
+                Some(want),
+                "{id}: {period:?} was rejected as {err:?}, and the fixture declares \
+                 {want:?} as the wire code an operator sees"
             );
             continue;
         }

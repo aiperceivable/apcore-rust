@@ -120,13 +120,33 @@ fn id_conflict_reserved_words_conformance() {
             // their own error types, so assert the registration was refused and
             // that the message identifies the offending id, rather than pinning
             // a type name the three languages do not share.
-            Some(_) => {
+            Some(conflict) => {
                 let err = result.expect_err(&format!("[{id}] expected refusal\n  {note}"));
                 let msg = format!("{err:?}");
                 let first = new_id.split('.').next().unwrap_or(new_id);
                 assert!(
                     msg.contains(new_id) || msg.contains(first),
                     "[{id}] refusal did not name `{new_id}`: {msg}\n  {note}"
+                );
+
+                // ...and the WIRE CODE says WHICH conflict it was. Without this
+                // the driver only asserts "refused", so `check_case_pinning.py`
+                // could mutate `expected` from `reserved_word` to
+                // `duplicate_id` — a value this very fixture uses — and every
+                // SDK stayed green: the distinction the fixture exists to draw
+                // was asserted by nobody. The mapping lives in the fixture, not
+                // here, because it is one rule and §8's codes are the
+                // cross-language contract.
+                let want = fixture["error_code_by_conflict"][conflict]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("[{id}] fixture declares no code for {conflict:?}"));
+                let got = serde_json::to_value(err.code)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned));
+                assert_eq!(
+                    got.as_deref(),
+                    Some(want),
+                    "[{id}] the {conflict:?} conflict must surface as {want}\n  {note}"
                 );
             }
         }
