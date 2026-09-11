@@ -247,6 +247,10 @@ mod test_pipeline_failfast;
 mod test_pipeline_failfast_config_conformance;
 #[path = "test_pipeline_hardening_conformance.rs"]
 mod test_pipeline_hardening_conformance;
+#[path = "test_pipeline_section_is_applied.rs"]
+mod test_pipeline_section_is_applied;
+#[path = "test_pipeline_section_wiring_conformance.rs"]
+mod test_pipeline_section_wiring_conformance;
 #[path = "test_pipeline_step_middleware.rs"]
 mod test_pipeline_step_middleware;
 #[path = "test_pipeline_step_middleware_conformance.rs"]

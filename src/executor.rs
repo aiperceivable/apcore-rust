@@ -694,6 +694,92 @@ pub struct Executor {
     toggle_state: Arc<crate::sys_modules::ToggleState>,
 }
 
+// ---------------------------------------------------------------------------
+// Config-driven pipeline (PROTOCOL_SPEC §5.16 requirements 6 and 7)
+// ---------------------------------------------------------------------------
+
+/// Steps whose removal withdraws a protection rather than an ordinary stage.
+const SECURITY_STEPS: [&str; 2] = ["acl_check", "approval_gate"];
+
+/// The `pipeline` section of a loaded config, or `None` when there is nothing
+/// to apply.
+///
+/// An absent section and an empty one mean the same thing — run the default
+/// pipeline — so both return `None` and the caller takes the untouched
+/// `build_standard_strategy_with_toggle` path.
+fn pipeline_section(config: &Config) -> Option<serde_json::Value> {
+    match config.get("pipeline") {
+        Some(Value::Object(map)) if !map.is_empty() => Some(Value::Object(map)),
+        _ => None,
+    }
+}
+
+/// PROTOCOL_SPEC §5.16 requirement 7 — removing `acl_check` or `approval_gate`
+/// emits a diagnostic, once per configuration load.
+///
+/// The reason is the transition, not the steady state. Requirement 6 makes a
+/// previously ignored section take effect, so a configuration that has been
+/// carrying `remove: [acl_check]` while ACL was enforced anyway starts having
+/// ACL genuinely removed. That is the operator getting what they asked for, and
+/// it is also the one direction in which honouring configuration can withdraw a
+/// protection that was in place a moment before. It is a notice, not a refusal.
+fn warn_removed_security_steps(section: &Value) {
+    let Some(remove_list) = section.get("remove").and_then(Value::as_array) else {
+        return;
+    };
+    let removed: Vec<&str> = remove_list
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| SECURITY_STEPS.contains(name))
+        .collect();
+    if removed.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        steps = %removed.join(", "),
+        "pipeline.remove takes security step(s) out of the execution pipeline. \
+         Calls will no longer be checked against the ACL or held for approval. \
+         This is what the configuration asks for; remove the entry to restore it."
+    );
+}
+
+/// Build the execution strategy the loaded configuration declares, falling back
+/// to the standard pipeline when it declares none.
+///
+/// A section that fails to build is logged at error level and the standard
+/// pipeline runs instead, matching how this crate already handles config-driven
+/// wiring that can fail inside an infallible constructor (`ACL::discover` and
+/// `register_sys_modules` in `client.rs`). Python and TypeScript propagate the
+/// error out of their constructors; Rust's `Executor::new` returns `Self` and
+/// cannot, and panicking in a library constructor is worse than either. The
+/// fallback is the fail-safe direction: it keeps every built-in protection,
+/// and the one thing it can cost — a declared custom step — is named in the log
+/// line rather than lost silently.
+fn strategy_from_config(
+    config: &Config,
+    toggle_state: &Arc<crate::sys_modules::ToggleState>,
+) -> ExecutionStrategy {
+    let Some(section) = pipeline_section(config) else {
+        return crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(toggle_state));
+    };
+    warn_removed_security_steps(&section);
+    match crate::pipeline_config::build_strategy_from_config_with_toggle(
+        &section,
+        Some(config),
+        Arc::clone(toggle_state),
+    ) {
+        Ok(strategy) => strategy,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "The `pipeline:` section failed to build; running the standard pipeline. \
+                 Steps it declares will NOT run."
+            );
+            crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(toggle_state))
+        }
+    }
+}
+
 impl Executor {
     /// Create a new executor with the given (shared) registry and config.
     ///
@@ -702,9 +788,13 @@ impl Executor {
     /// pre-shared `Arc<Registry>`/`Arc<Config>` (required for runtime wiring).
     pub fn new(registry: impl Into<Arc<Registry>>, config: impl Into<Arc<Config>>) -> Self {
         let toggle_state = crate::sys_modules::global_toggle_state_arc();
+        let config = config.into();
+        // §5.16 requirement 6: a `pipeline:` section in the loaded config is
+        // what runs. It used to be parsed, validated and then ignored.
+        let strategy = strategy_from_config(&config, &toggle_state);
         Self {
             registry: registry.into(),
-            config: config.into(),
+            config,
             acl: None,
             approval_handler: None,
             policy: None,
@@ -712,9 +802,7 @@ impl Executor {
             governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             redaction: std::sync::OnceLock::new(),
             middleware_manager: Arc::new(MiddlewareManager::new()),
-            strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
-                &toggle_state,
-            )),
+            strategy,
             instance_handle: Arc::new(()),
             toggle_state,
         }
@@ -787,9 +875,12 @@ impl Executor {
             }
         }
         let toggle_state = crate::sys_modules::global_toggle_state_arc();
+        let config = config.into();
+        // §5.16 requirement 6 — see `Executor::new`.
+        let strategy = strategy_from_config(&config, &toggle_state);
         Self {
             registry: registry.into(),
-            config: config.into(),
+            config,
             acl: acl.map(Arc::new),
             approval_handler: approval_handler.map(|h| Arc::from(h) as Arc<dyn ApprovalHandler>),
             policy: None,
@@ -797,9 +888,7 @@ impl Executor {
             governance_warned: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             redaction: std::sync::OnceLock::new(),
             middleware_manager: Arc::new(middleware_manager),
-            strategy: crate::builtin_steps::build_standard_strategy_with_toggle(Arc::clone(
-                &toggle_state,
-            )),
+            strategy,
             instance_handle: Arc::new(()),
             toggle_state,
         }

@@ -402,15 +402,43 @@ pub fn build_strategy_from_config(
 /// what the entry point above does, and what every caller before v1.38.0 did —
 /// checks nothing and a pipeline that parsed before still parses. apcore does
 /// not impose limits on the content its users author; it offers them.
-#[allow(clippy::too_many_lines)] // declarative-config dispatcher; splitting hurts readability more than length helps
 pub fn build_strategy_from_config_with_limits(
+    pipeline_config: &Value,
+    config: Option<&crate::config::Config>,
+) -> Result<ExecutionStrategy, ModuleError> {
+    build_strategy_from_seed(build_standard_strategy(), pipeline_config, config)
+}
+
+/// [`build_strategy_from_config_with_limits`] seeded with a standard strategy
+/// bound to a specific [`ToggleState`](crate::sys_modules::ToggleState).
+///
+/// `Executor` uses this one. Seeding from the plain
+/// [`build_standard_strategy`] would bind the *process-global* toggle store to
+/// the `module_lookup` step, so `apcore.disable(module)` on one instance would
+/// leak into another — the regression issue #71 fixed for the five presets, and
+/// which applying a `pipeline:` section would otherwise reintroduce through a
+/// different door.
+pub fn build_strategy_from_config_with_toggle(
+    pipeline_config: &Value,
+    config: Option<&crate::config::Config>,
+    toggle_state: std::sync::Arc<crate::sys_modules::ToggleState>,
+) -> Result<ExecutionStrategy, ModuleError> {
+    build_strategy_from_seed(
+        crate::builtin_steps::build_standard_strategy_with_toggle(toggle_state),
+        pipeline_config,
+        config,
+    )
+}
+
+#[allow(clippy::too_many_lines)] // declarative-config dispatcher; splitting hurts readability more than length helps
+fn build_strategy_from_seed(
+    mut strategy: ExecutionStrategy,
     pipeline_config: &Value,
     config: Option<&crate::config::Config>,
 ) -> Result<ExecutionStrategy, ModuleError> {
     if let Some(cfg) = config {
         validate_pipeline_limits(pipeline_config, cfg)?;
     }
-    let mut strategy = build_standard_strategy();
 
     // (1) Remove steps — Issue #33 §1.2: fail-fast when YAML refers to a
     // nonexistent step rather than emitting a tracing::warn! and proceeding.

@@ -148,7 +148,8 @@ pub use pipeline::{
     RunOptions, RunUntilPredicate, Step, StepMiddleware, StepResult, StepTrace, StrategyInfo,
 };
 pub use pipeline_config::{
-    build_strategy_from_config, register_step_type, registered_step_types, unregister_step_type,
+    build_strategy_from_config, build_strategy_from_config_with_toggle, register_step_type,
+    registered_step_types, unregister_step_type,
 };
 pub use policy::{ExecutionPolicy, PolicyDecision, PolicyRule};
 pub use registry::registry::{
