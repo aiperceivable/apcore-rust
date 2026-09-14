@@ -12,13 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.31.0] - 2026-09-09
+## [0.31.0] - 2026-09-14
 
 ### BREAKING
 
 - **`RedactionConfigError::InvalidFieldPattern` is removed (spec v1.37.0 §9.2.3 requirement 2).** A field pattern has no failure mode left: §9.2.3 makes **every string a valid A25 pattern** — there is no parse phase, no escape character and no character class, so nothing can be malformed. The variant existed only because the matcher underneath it was `glob::Pattern`, which *rejects* `a[b` as an invalid range and `a**b` as a misplaced recursive wildcard. `RedactionConfigError` is exported from the crate root, so a downstream `match` that enumerates it stops compiling; delete the arm. `RedactionConfigBuilder::try_build` keeps its `Result` signature — `InvalidValuePattern` remains, because value patterns are regexes and the `regex` crate genuinely does refuse some of them.
 
 ### Added
+
+- **A configured `pipeline:` section is applied** (spec v1.43.0 §5.16 reqs 6–7, [apcore#118](https://github.com/aiperceivable/apcore/issues/118) D-72). `build_strategy_from_config` was public and its only callers were its own tests; nothing extracted the section from a loaded `Config`, so `pipeline: remove: [acl_check]` left all eleven steps in place.
+  Two decisions specific to this SDK. A section that fails to build is logged at **error** level and the standard pipeline runs — `Executor::new` returns `Self` and cannot propagate, and panicking in a library constructor is worse than either; this is the idiom `ACL::discover` and `register_sys_modules` already follow. And `build_strategy_from_config_with_toggle` seeds from `build_standard_strategy_with_toggle`, because seeding from the plain factory would rebind `module_lookup` to the process-global toggle store and reintroduce #71 through a different door.
+
+- **The five `observability.tracing.*` keys are wired** (spec v1.44.0 §10.1.1, D-68 C′) via `observability/tracing_config.rs`. `TracingConfig` gains `strategy` and `otlp_endpoint` as typed fields — declared by §9.15.2 all along and by no schema, so `_config.strict` **rejected** them. `jaeger` warns and installs nothing; so does `otlp` **without the `events` feature**, since this crate's OTLP exporter is a silent no-op without it and a middleware whose exporter discards every span is worse than none.
+
+- **`extensions.roots`' namespace half is honoured** (spec v1.46.0, D-70). This SDK was the only one that read the key, and it read half of it: `set_extension_roots_from_config` flattened both element shapes into `Vec<String>` and dropped the namespaces, so one document gave multiple roots here and multiple **namespaced** roots in the other two SDKs. `scan_multi_root` already existed here with the prefixing and the duplicate-namespace check; nothing reached it.
+  `Discoverer::discover(&self, roots: &[String])` is a public trait, so the namespaces travel through `DefaultDiscoverer::from_config` — which reads the same key — and are paired back up in `discover`. A root the map does not know simply has no namespace, so a caller passing roots explicitly is unaffected.
+
+- **`id_map.overrides` is read by `DefaultDiscoverer::from_config`** (spec v1.46.0, D-71) — the same door `extensions.ignore_patterns` uses here, since `Registry::discover` takes the discoverer as an argument. `with_id_map` afterwards still wins.
 
 - **`apcore::utils::match_glob` — Algorithm A25 (spec v1.37.0 §9.2.3), the one matcher for every glob-dialect pattern-valued value in the specification.** Exactly two metacharacters: `*` (zero or more characters, crossing `.` and `/`) and `?` (exactly one character). Every other character is a literal — `[`, `]`, `{`, `}`, `\`, `!`, `^` and `-` included — there is no escape character, the match is anchored to the whole value, and the function cannot fail. It operates on `char`s rather than bytes, so `?` matches one character and not one UTF-8 byte, and it is checked against all 30 cases of the canonical `glob_matching.json` fixture.
 
@@ -38,7 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A diagnostic for `?` in an ACL pattern (spec v1.37.0 §6.2.2).** `?` is a wildcard in every other pattern surface the specification defines, which is where the expectation comes from; in ACL matching it is a **literal**, and §2.7 forbids `?` in a module ID, so a rule carrying one matches nothing and can never match anything — a `deny` rule that guards nothing, an `allow` rule that never fires. Reported at load time as a warning naming the rule index, the field, the pattern and the effect, and again as a `validate_rules()` finding when every operand of a field carries one. **Reported, never rejected, and no decision changes** — on the §6.1.2 precedent.
 
+### Changed
+
+- **A panicking ACL audit callback no longer changes the access decision** (spec v1.45.0 §6.3.2 req 3, D-66). **This is a behaviour change, and it is a fix.** Measured before it: a panicking `audit_logger` propagated out of `ACL::check()` and turned an **allowed** call into a panic.
+  Containment is `catch_unwind` + `AssertUnwindSafe`, and the specification is scoped to **recoverable** failures for exactly this reason: `AuditLoggerFn` is `Fn(&AuditEntry)` with no error channel, so an unwinding panic is all this can contain and a `panic = "abort"` build cannot be. The default panic hook still prints its own message; that is the runtime's output, not the sink's.
+  The ACL file's `audit:` block gained a delivery contract with it: declaring it activates a default sink emitting `apcore.acl.audit` as a `tracing` event with all thirteen §6.3.1 fields as structured data under their `snake_case` wire names.
+
+- **`_config.allow_unknown: false` now drops unregistered namespaces** (spec v1.46.0 §9.6.3 reqs 1–4, D-69). **Read this before upgrading**: it is the only change here that makes a `get()` which returned a value return `None`. It fires only for a configuration that explicitly writes `allow_unknown: false`. The unknown-namespace set is computed from the **raw document**, not from `user_namespaces` — that bag is flattened and in namespace mode also holds the `apcore:` members lifted into `core_data`, so filtering it reported `version` as an unregistered namespace.
+
 ### Deprecated
+
+- **`acl.default_effect` in `apcore.yaml`** (spec v1.47.0 §9.1.3 req 3, D-73). An ACL's default effect is read from the **ACL file**; this twin reaches nothing. Measured: `allow` here, against an ACL file that omits the key, yields **deny**. Migrate to the ACL file's `default_effect`. Removed at v2.0.
+
+- **`Context::logger`** ([apcore#121](https://github.com/aiperceivable/apcore/issues/121)), carrying `#[deprecated(since = "0.31.0")]`. No configuration door; output fixed at stderr / `info` / JSON and notably **not** going through `tracing`, so a host that configured a subscriber never sees it. Use the host application's own logger. `ObsLoggingMiddleware` is **not** the migration target — it emits apcore's execution events, a different facility. Removed at v2.0.
+
+- **`logging.level` and `logging.format`** are withdrawn with no replacement key (spec v1.48.0, D-67). apcore does not own the host's logging policy.
 
 - **Ten declared configuration keys reach no consumer in any SDK, and now say so (spec v1.39.0 §9.2.4 / §9.2.4.1, [apcore#118](https://github.com/aiperceivable/apcore/issues/118)).** `observability.tracing.enabled` / `.sampling_rate` / `.exporter`, `observability.metrics.enabled` / `.exporter`, `logging.level` / `.format`, and `acl.audit.enabled` / `.include_denied` / `.log_level` — all schema-declared, all environment-overridable, all accepted under `_config.strict: true`, all documented with defaults, and all inert. An `audit:` block in an **ACL file** is the eleventh: no implementation has ever read it, and it is where `acl.audit.*`'s three settings are declared a second time.
 
@@ -51,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ACL half needed new code rather than a schema edit. Deleting the `audit` block from `acl-config.schema.json` would produce **no signal at all** — no implementation validates an ACL file against that schema, and `ACL::load` parses into a `serde_json::Value` and takes the fields it wants, so every unrecognised root key is dropped in silence. The notice therefore lives in the loader, scoped to `audit` **alone**: it is a deprecation notice, not unknown-key closure for ACL files, and every other unrecognised root key keeps being ignored exactly as before.
 
 ### Fixed
+
+- **`collect_constraint_errors` and `validate_key_constraint` were two hand-written implementations of one table, and they drifted.** Arms added to the latter were invisible to `validate()`, so `observability.tracing.exporter: in_memory` — a value §10.1.1 requirement 2 forbids — loaded without a word. The `observability.tracing.*` constraints now delegate, so a key added to the match is enforced by `validate()` for free.
 
 - **Four pattern-valued surfaces each matched with whichever library was locally at hand, and each inherited that library's dialect (spec v1.37.0 §9.2.3, [apcore#116](https://github.com/aiperceivable/apcore/issues/116), [apcore#117](https://github.com/aiperceivable/apcore/issues/117)).** All four now go through `match_glob`.
 
