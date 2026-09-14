@@ -421,7 +421,12 @@ const PATH_TYPED_CONFIG_KEYS: &[&str] = &[
 /// `observability.tracing.enabled` / `.sampling_rate` / `.exporter` consumers
 /// (§10.1.1) and cancelled their withdrawal. A key that has left the table MUST
 /// NOT warn — §9.2.4 requirement 1.
+///
+/// `acl.default_effect` joined in v1.47.0 as §9.1.3's first application: it is
+/// read from the ACL FILE, and the `apcore.yaml` twin reaches nothing. Ordered
+/// first because §9.2.4's table lists it first.
 const DEPRECATED_INERT_KEYS: &[&str] = &[
+    "acl.default_effect",
     "observability.metrics.enabled",
     "observability.metrics.exporter",
     "logging.level",
@@ -3906,7 +3911,14 @@ mod path_base_deprecation_tests {
         writeln!(f, "  root: {schema}").unwrap();
         writeln!(f, "acl:").unwrap();
         writeln!(f, "  root: {acl}").unwrap();
-        writeln!(f, "  default_effect: deny").unwrap();
+        // `acl.default_effect` deliberately NOT written. It joined §9.2.4's
+        // deprecation table in spec v1.47.0 (§9.1.3's first application — the
+        // `apcore.yaml` twin reaches nothing, the ACL file's own key does the
+        // work), so declaring it here would make every case in this module
+        // carry a §9.2.4 notice. These cases are about §9.2.2's path-base
+        // notice, and the "stays silent" ones assert on the absence of a
+        // DEPRECATION line: a test about one notice must not be made to pass or
+        // fail by another.
         writeln!(f, "bindings:").unwrap();
         writeln!(f, "  dir: {bindings}").unwrap();
         path

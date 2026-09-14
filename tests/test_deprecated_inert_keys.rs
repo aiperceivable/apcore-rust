@@ -71,7 +71,8 @@ use apcore::config::Config;
 /// on the const rather than a mirror of it. The order is load-bearing: it is
 /// what makes three SDKs name the same keys in the same sequence for the same
 /// file.
-const DEPRECATED_INERT_KEYS: [&str; 7] = [
+const DEPRECATED_INERT_KEYS: [&str; 8] = [
+    "acl.default_effect",
     "observability.metrics.enabled",
     "observability.metrics.exporter",
     "logging.level",
@@ -214,6 +215,7 @@ fn document_declaring(key: &str) -> String {
     let segments: Vec<&str> = key.split('.').collect();
     let (leaf, parents) = segments.split_last().expect("every key has a leaf");
     let value = match *leaf {
+        "default_effect" => "\"allow\"",
         "sampling_rate" => "0.25",
         "exporter" => "\"stdout\"",
         "strategy" => "\"off\"",
@@ -298,6 +300,7 @@ fn all_deprecated_keys_at_once_are_named_in_spec_order() {
            level: \"info\"\n  \
            format: \"json\"\n\
          acl:\n  \
+           default_effect: \"allow\"\n  \
            audit:\n    \
              enabled: true\n    \
              include_denied: true\n    \
@@ -310,8 +313,8 @@ fn all_deprecated_keys_at_once_are_named_in_spec_order() {
          notice. Captured:\n{logs}"
     );
     assert!(
-        logs.contains("count=7"),
-        "every listed key is declared, so the notice must report seven. \
+        logs.contains("count=8"),
+        "every listed key is declared, so the notice must report eight. \
          Captured:\n{logs}"
     );
     assert!(
@@ -348,13 +351,19 @@ fn a_clean_configuration_is_silent() {
 }
 
 /// A document that declares the *sections* and the *groups*, but none of the
-/// ten leaves, is silent.
+/// deprecated leaves, is silent.
 ///
 /// The sharper half of the negative: `a_clean_configuration_is_silent` is
 /// satisfied by any check that first asks "is this section present at all",
 /// while this one is not. `observability.tracing` and `acl` are both written
-/// here — `acl` even carries live, non-deprecated keys — and the traversal has
+/// here — `acl` even carries a live, non-deprecated key — and the traversal has
 /// to reach the leaf before it may report anything.
+///
+/// `acl.default_effect` used to be the live leaf standing here. Spec v1.47.0
+/// moved it INTO the table (§9.1.3's first application: it is read from the ACL
+/// FILE and the `apcore.yaml` twin reaches nothing), so `acl.root` carries the
+/// role now — same section, still live, so the case tests what it was written
+/// to test.
 #[test]
 fn a_declared_section_with_no_deprecated_leaf_is_silent() {
     let _env = env_guard();
@@ -363,16 +372,14 @@ fn a_declared_section_with_no_deprecated_leaf_is_silent() {
            tracing: {}\n  \
            metrics: {}\n\
          acl:\n  \
-           default_effect: deny\n  \
            root: \"/srv/apcore/acl\"\n",
     ));
     assert!(
         !logs.contains(CONFIG_MARKER),
         "`observability.tracing`, `observability.metrics` and `acl` are declared \
-         but not one of the ten leaves under them is — the notice must reach the \
-         LEAF before it reports, or every deployment that configures \
-         `acl.default_effect` gets a warning about keys it never wrote. \
-         Captured:\n{logs}"
+         but not one of the deprecated leaves under them is — the notice must reach \
+         the LEAF before it reports, or every deployment that configures \
+         `acl.root` gets a warning about keys it never wrote. Captured:\n{logs}"
     );
 }
 

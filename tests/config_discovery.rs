@@ -275,7 +275,12 @@ fn write_valid_yaml_at(path: &std::path::Path) {
     writeln!(f, "  root: ./schemas").unwrap();
     writeln!(f, "acl:").unwrap();
     writeln!(f, "  root: ./acl").unwrap();
-    writeln!(f, "  default_effect: deny").unwrap();
+    // `acl.default_effect` deliberately NOT written. It joined §9.2.4's
+    // deprecation table in spec v1.47.0 (§9.1.3's first application), so
+    // declaring it here would give every config in this file a §9.2.4 notice —
+    // and the cases here assert on the ABSENCE of a DEPRECATION line for
+    // §9.2.2's project-root notice. A test about one notice must not be made to
+    // pass or fail by another.
 }
 
 #[derive(Clone, Default)]
