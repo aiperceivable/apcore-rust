@@ -116,6 +116,8 @@ mod test_acl_rule_key_closure_conformance;
 mod test_acl_sync_handler_error;
 #[path = "test_acl_unevaluable_conditions.rs"]
 mod test_acl_unevaluable_conditions;
+#[path = "test_allow_unknown_namespaces_conformance.rs"]
+mod test_allow_unknown_namespaces_conformance;
 #[path = "test_approval.rs"]
 mod test_approval;
 #[path = "test_approval_callback_handler.rs"]
@@ -212,6 +214,8 @@ mod test_executor_trace_cancellation_conformance;
 mod test_extensions;
 #[path = "test_id_conflict_reserved_words_conformance.rs"]
 mod test_id_conflict_reserved_words_conformance;
+#[path = "test_id_map_from_config_conformance.rs"]
+mod test_id_map_from_config_conformance;
 #[path = "test_inject_inbound_flags.rs"]
 mod test_inject_inbound_flags;
 #[path = "test_inject_malformed_parent_id.rs"]
@@ -229,6 +233,8 @@ mod test_middleware_on_error_single_site;
 mod test_module;
 #[path = "test_multi_module_discovery_conformance.rs"]
 mod test_multi_module_discovery_conformance;
+#[path = "test_multi_root_discovery_conformance.rs"]
+mod test_multi_root_discovery_conformance;
 #[path = "test_obs_logging_middleware_redaction.rs"]
 mod test_obs_logging_middleware_redaction;
 #[path = "test_observability.rs"]

@@ -79,6 +79,15 @@ pub type ModuleFactory = Arc<
 pub struct DefaultDiscoverer {
     /// Optional path to an id_map.yaml file used at stage 2.
     id_map_path: Option<PathBuf>,
+    /// `extensions.roots`' namespace half, keyed by root path (#118, D-70).
+    ///
+    /// The `Discoverer` trait takes `roots: &[String]` and is public, so the
+    /// namespaces cannot ride along with the paths without a breaking change.
+    /// They travel here instead, read from the same key by
+    /// [`Self::from_config`], and are paired back up in `discover`. A root this
+    /// map does not know simply has no namespace, so a caller passing roots
+    /// explicitly is unaffected.
+    root_namespaces: HashMap<String, String>,
     /// File extensions considered as module candidates. Defaults to `[".rs"]`.
     extensions: Vec<String>,
     /// Maximum directory depth for filesystem scan.
@@ -97,6 +106,7 @@ impl std::fmt::Debug for DefaultDiscoverer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DefaultDiscoverer")
             .field("id_map_path", &self.id_map_path)
+            .field("root_namespaces", &self.root_namespaces)
             .field("extensions", &self.extensions)
             .field("max_depth", &self.max_depth)
             .field("follow_symlinks", &self.follow_symlinks)
@@ -114,6 +124,7 @@ impl DefaultDiscoverer {
     pub fn new() -> Self {
         Self {
             id_map_path: None,
+            root_namespaces: HashMap::new(),
             extensions: vec![".rs".to_string()],
             max_depth: 8,
             follow_symlinks: false,
@@ -176,6 +187,72 @@ impl DefaultDiscoverer {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect();
         }
+        // `id_map.overrides` (apcore#118, decision D-71). PROTOCOL_SPEC §9.1.1
+        // declared it and nothing read it: the MECHANISM is stage 2 of this
+        // discoverer and the map arrived only through `with_id_map`. Measured
+        // before the fix — with the key pointing at a map that renames
+        // `executor/orig/mod.py`, discovery still registered
+        // `executor.orig.mod`.
+        //
+        // `with_id_map` after this still wins, per D-73's precedence and
+        // exactly as the other four builder options above behave.
+        // `extensions.roots`' namespace half (#118, decision D-70). The paths
+        // reach the registry through `set_extension_roots_from_config`; this is
+        // the other half of the same key, which apcore-rust dropped entirely —
+        // it honoured "multiple roots" and not the "namespace isolation" the
+        // schema's own description leads with, so module IDs were unprefixed
+        // here and prefixed in the other two SDKs.
+        if let Some(items) = config.get("extensions.roots").and_then(|v| match v {
+            serde_json::Value::Array(a) => Some(a.clone()),
+            _ => None,
+        }) {
+            for item in items {
+                match item {
+                    serde_json::Value::String(root) if !root.trim().is_empty() => {
+                        // A bare path: the namespace is the last path segment,
+                        // which `scan_multi_root` derives itself.
+                        let derived = Path::new(&root)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned());
+                        if let Some(ns) = derived {
+                            me.root_namespaces.insert(root, ns);
+                        }
+                    }
+                    serde_json::Value::Object(obj) => {
+                        let Some(root) = obj.get("root").and_then(|r| r.as_str()) else {
+                            continue;
+                        };
+                        let ns = obj
+                            .get("namespace")
+                            .and_then(|n| n.as_str())
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                Path::new(root)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                            });
+                        if let Some(ns) = ns {
+                            me.root_namespaces.insert(root.to_string(), ns);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(declared) = config
+            .get("id_map.overrides")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .filter(|s| !s.trim().is_empty())
+        {
+            // Used AS DECLARED: a relative value resolves against the process
+            // working directory, exactly as `extensions.root` does. §9.2.1
+            // leaves the base for path-typed keys deliberately unspecified
+            // (#113) — `acl.root` uses the config file's directory,
+            // `schema.root` the CWD — and this key follows its SIBLING rather
+            // than settling that: the two are halves of one discovery
+            // configuration, so a split base between them is worse than either.
+            me.id_map_path = Some(PathBuf::from(declared));
+        }
         me
     }
 
@@ -226,18 +303,44 @@ impl Discoverer for DefaultDiscoverer {
         // Stage 1: scan every root recursively.
         let mut discovered_files: Vec<DiscoveredFile> = Vec::new();
         let ext_refs: Vec<&str> = self.extensions.iter().map(String::as_str).collect();
-        for root in roots {
-            let path = Path::new(root);
-            // scan_extensions returns ConfigNotFoundError when the root is missing
-            // — exactly the spec contract for discover().
-            let mut files = scan_extensions(
-                path,
+
+        // The same dispatch apcore-python and apcore-typescript make: any root
+        // carrying a namespace puts the whole scan through `scan_multi_root`,
+        // which prefixes each module ID and rejects a duplicate namespace
+        // before scanning anything.
+        if roots.iter().any(|r| self.root_namespaces.contains_key(r)) {
+            let entries: Vec<HashMap<String, String>> = roots
+                .iter()
+                .map(|root| {
+                    let mut entry = HashMap::new();
+                    entry.insert("root".to_string(), root.clone());
+                    if let Some(ns) = self.root_namespaces.get(root) {
+                        entry.insert("namespace".to_string(), ns.clone());
+                    }
+                    entry
+                })
+                .collect();
+            discovered_files = crate::registry::scanner::scan_multi_root(
+                &entries,
                 self.max_depth,
                 self.follow_symlinks,
                 Some(&ext_refs),
                 &self.ignore_patterns,
             )?;
-            discovered_files.append(&mut files);
+        } else {
+            for root in roots {
+                let path = Path::new(root);
+                // scan_extensions returns ConfigNotFoundError when the root is
+                // missing — exactly the spec contract for discover().
+                let mut files = scan_extensions(
+                    path,
+                    self.max_depth,
+                    self.follow_symlinks,
+                    Some(&ext_refs),
+                    &self.ignore_patterns,
+                )?;
+                discovered_files.append(&mut files);
+            }
         }
 
         // Stage 2: apply id_map overrides if configured.

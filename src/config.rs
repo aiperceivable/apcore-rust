@@ -931,6 +931,17 @@ impl<'de> Deserialize<'de> for Config {
             user_namespaces.insert("modules_path".to_string(), raw_modules_path);
         }
 
+        // §9.6.3's `allow_unknown` row, both halves of which were inert
+        // (apcore#118, decision D-69).
+        if mode == ConfigMode::Namespace {
+            // From `raw`, not from `user_namespaces`: the latter is a flattened
+            // bag that in namespace mode also holds the `apcore:` members
+            // lifted into `core_data` (`version`, `project`, …). Those are
+            // framework keys, not namespaces, and a first draft that filtered
+            // the bag reported `version` as an unregistered namespace.
+            apply_allow_unknown(&raw, &mut user_namespaces);
+        }
+
         Ok(Config {
             modules_path: helper.modules_path,
             executor: helper.executor,
@@ -941,6 +952,88 @@ impl<'de> Deserialize<'de> for Config {
             generation: 0,
             mounts: Vec::new(),
         })
+    }
+}
+
+/// PROTOCOL_SPEC §9.6.3's `allow_unknown` row (apcore#118, decision D-69).
+///
+/// Both halves of that row were inert. `allow_unknown: false` is documented as
+/// "silently ignored (not stored)" and the namespace was stored anyway, so
+/// `get()` answered for it; `allow_unknown: true` is documented as "stored,
+/// accessible, **WARN logged**" and no implementation logged anything. Fixing
+/// one without the other would leave the row half true, and both live here.
+///
+/// **Namespace mode only, by construction.** §9.6.3 is about *namespaces*, and
+/// a legacy document has none — its root IS the `apcore` namespace, so an
+/// unrecognised top-level key there is a framework key governed by §9.14's walk
+/// under `strict`, not by this field. `strict`'s own clause (b) says it
+/// "applies in legacy mode too", which is the specification saying clause (a)
+/// does not.
+///
+/// Only a deployment that explicitly writes `allow_unknown: false` changes
+/// behaviour, and what changes is that it finally gets the published contract
+/// instead of a no-op — but the change is real: a `get()` that returned a value
+/// now returns `None`.
+fn apply_allow_unknown(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    user_namespaces: &mut HashMap<String, serde_json::Value>,
+) {
+    // An ABSENT `_config` is the default pair `strict: false, allow_unknown:
+    // true`, not an exemption: §9.6.3's matrix describes the defaults, so a
+    // document that declares an unregistered namespace and no `_config` at all
+    // is the row that warns. This is not the blanket warning §9.2.2 rejects —
+    // it fires on a condition specific to the document (there IS an
+    // unregistered namespace), never on every configuration ever loaded.
+    let meta = raw.get("_config").and_then(|v| v.as_object());
+    let strict = meta
+        .and_then(|m| m.get("strict"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if strict {
+        // `strict` already rejects an unknown namespace outright (clause a), so
+        // this field is "only relevant when strict: false" per §9.6.3's own
+        // comment.
+        return;
+    }
+    let allow = meta
+        .and_then(|m| m.get("allow_unknown"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    let registered = global_ns_registry().read();
+    let mut unknown: Vec<String> = raw
+        .keys()
+        .filter(|k| {
+            k.as_str() != "apcore"
+                && k.as_str() != "_config"
+                && !registered.contains_key(k.as_str())
+        })
+        .cloned()
+        .collect();
+    drop(registered);
+    unknown.sort_unstable();
+    if unknown.is_empty() {
+        return;
+    }
+
+    if allow {
+        tracing::warn!(
+            namespaces = %unknown.join(", "),
+            "Configuration declares namespace(s) that no package has registered. They are \
+             stored and readable through get(), and NOT validated against any schema \
+             (PROTOCOL_SPEC §9.6.3). Set _config.allow_unknown: false to have them dropped \
+             instead, or _config.strict: true to reject them."
+        );
+        return;
+    }
+
+    tracing::info!(
+        namespaces = %unknown.join(", "),
+        "Dropping unregistered namespace(s) per _config.allow_unknown: false (PROTOCOL_SPEC \
+         §9.6.3). Their keys are not stored and get() will not answer for them."
+    );
+    for name in unknown {
+        user_namespaces.remove(&name);
     }
 }
 
