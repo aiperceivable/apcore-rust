@@ -507,16 +507,54 @@ fn _use_identity() -> Identity {
 fn test_on_returns_unique_handles() {
     let registry = Registry::new();
 
-    let h1 = registry.on(
-        "register",
-        Box::new(|_: &str, _: &dyn apcore::module::Module| {}),
-    );
-    let h2 = registry.on(
-        "register",
-        Box::new(|_: &str, _: &dyn apcore::module::Module| {}),
-    );
+    let h1 = registry
+        .on(
+            "register",
+            Box::new(|_: &str, _: &dyn apcore::module::Module| {}),
+        )
+        .expect("register is a valid event");
+    let h2 = registry
+        .on(
+            "register",
+            Box::new(|_: &str, _: &dyn apcore::module::Module| {}),
+        )
+        .expect("register is a valid event");
 
     assert_ne!(h1, h2, "each on() call must return a distinct handle");
+}
+
+#[test]
+fn test_on_rejects_event_names_outside_the_closed_set() {
+    // D-80: the event set is closed. Accepting a typo and returning a
+    // valid-looking handle made the subscription permanently silent.
+    let registry = Registry::new();
+
+    for bad in ["change", "add", "remove", "Register", ""] {
+        let err = registry
+            .on(bad, Box::new(|_: &str, _: &dyn apcore::module::Module| {}))
+            .expect_err("unknown event must be rejected");
+        assert_eq!(
+            err.code,
+            apcore::errors::ErrorCode::GeneralInvalidInput,
+            "event {bad:?}"
+        );
+    }
+
+    // apcore-rust's watch() re-runs discovery and emits unregister/register,
+    // so per requirement 3 it must NOT emit — nor advertise — file_changed.
+    assert!(registry
+        .on(
+            "file_changed",
+            Box::new(|_: &str, _: &dyn apcore::module::Module| {})
+        )
+        .is_err());
+
+    // The whole advertised set is accepted (requirement 2).
+    for good in apcore::registry::registry_events::ALL {
+        assert!(registry
+            .on(good, Box::new(|_: &str, _: &dyn apcore::module::Module| {}))
+            .is_ok());
+    }
 }
 
 #[test]
@@ -526,12 +564,14 @@ fn test_off_removes_callback_by_handle() {
     let counter = Arc::new(Mutex::new(0u32));
 
     let c = counter.clone();
-    let handle = registry.on(
-        "register",
-        Box::new(move |_: &str, _: &dyn apcore::module::Module| {
-            *c.lock().unwrap() += 1;
-        }),
-    );
+    let handle = registry
+        .on(
+            "register",
+            Box::new(move |_: &str, _: &dyn apcore::module::Module| {
+                *c.lock().unwrap() += 1;
+            }),
+        )
+        .expect("register is a valid event");
 
     // Register a module to trigger the callback once
     registry
@@ -731,12 +771,14 @@ mod discoverer_tests {
         let callback_count = Arc::new(std::sync::Mutex::new(0usize));
         let cc = Arc::clone(&callback_count);
         let registry = Registry::new();
-        registry.on(
-            "register",
-            Box::new(move |_: &str, _: &dyn Module| {
-                *cc.lock().unwrap() += 1;
-            }),
-        );
+        registry
+            .on(
+                "register",
+                Box::new(move |_: &str, _: &dyn Module| {
+                    *cc.lock().unwrap() += 1;
+                }),
+            )
+            .expect("valid registry event");
 
         let discoverer =
             FixedDiscoverer::new(vec![dm("math.add", stub()), dm("math.subtract", stub())]);
@@ -959,16 +1001,18 @@ mod lifecycle_tests {
         let present_at_callback = Arc::new(AtomicUsize::new(0));
         let pac_clone = Arc::clone(&present_at_callback);
         let registry_weak = Arc::downgrade(&registry);
-        registry.on(
-            "unregister",
-            Box::new(move |name, _module| {
-                if let Some(reg) = registry_weak.upgrade() {
-                    if matches!(reg.get(name), Ok(Some(_))) {
-                        pac_clone.store(1, Ordering::SeqCst);
+        registry
+            .on(
+                "unregister",
+                Box::new(move |name, _module| {
+                    if let Some(reg) = registry_weak.upgrade() {
+                        if matches!(reg.get(name), Ok(Some(_))) {
+                            pac_clone.store(1, Ordering::SeqCst);
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .expect("valid registry event");
 
         registry.unregister("foo.bar").unwrap();
 

@@ -621,12 +621,14 @@ async fn case_reload_order_is_topological_not_alphabetical() {
     // loop, so the recorded sequence is the reload sequence.
     let unregister_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let recorder = Arc::clone(&unregister_order);
-    registry.on(
-        RegistryEvents::UNREGISTER,
-        Box::new(move |name: &str, _module: &dyn Module| {
-            recorder.lock().unwrap().push(name.to_string());
-        }),
-    );
+    registry
+        .on(
+            RegistryEvents::UNREGISTER,
+            Box::new(move |name: &str, _module: &dyn Module| {
+                recorder.lock().unwrap().push(name.to_string());
+            }),
+        )
+        .expect("valid registry event");
 
     crate::reload_support::RestoringDiscoverer::attach_for(&registry, &registered);
 

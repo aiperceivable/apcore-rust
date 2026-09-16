@@ -150,111 +150,149 @@ fn match_exact(segment: &[char], text: &[char]) -> bool {
     segment.len() == text.len() && match_prefix(segment, text)
 }
 
-/// Guard against call depth and circular call violations.
+/// Guard against call depth, frequency, and circular call violations
+/// (Algorithm A20).
 ///
-/// See [`guard_call_chain_with_repeat`] for the full contract; this is the
-/// convenience wrapper using the default `max_module_repeat` of 3.
-pub fn guard_call_chain(
-    ctx: &Context<serde_json::Value>,
-    module_name: &str,
-    max_depth: u32,
-) -> Result<(), ModuleError> {
-    guard_call_chain_with_repeat(ctx, module_name, max_depth, DEFAULT_MAX_MODULE_REPEAT)
-}
-
-/// Guard against call depth, frequency, and circular call violations with configurable repeat limit.
+/// This is the signature `call-chain-guard.md` publishes for Rust and is
+/// normative since spec v1.49.0 (D-83). It takes the chain directly and is
+/// free of the `Context<T>` type parameter, so a host whose services type is
+/// not `serde_json::Value` can call it — the crate previously exposed only a
+/// `&Context<serde_json::Value>` form, which meant such a host could not reach
+/// the guard at all and ran nested calls with no depth, cycle or frequency
+/// enforcement.
 ///
-/// Implements Algorithm A20. The cross-language canonical contract (matching
-/// apcore-python `utils/call_chain.py` and apcore-typescript) is that
-/// `ctx.call_chain` ALREADY includes `module_name` at the end (appended by the
-/// executor via [`Context::child`](crate::context::Context::child) before this
-/// guard runs). The three checks run in order:
+/// The cross-language canonical contract (matching apcore-python
+/// `utils/call_chain.py` and apcore-typescript) is that `call_chain` ALREADY
+/// includes `module_id` at the end (appended by
+/// [`Context::child`](crate::context::Context::child) before this guard runs).
+/// The three checks run in order:
 ///
-/// 1. **Depth** — `len(call_chain) > max_depth` → `CallDepthExceeded`.
-/// 2. **Circular** — strip the trailing self-entry, then if `module_name`
+/// 1. **Depth** — `len(call_chain) > max_call_depth` → `CallDepthExceeded`.
+/// 2. **Circular** — strip the trailing self-entry, then if `module_id`
 ///    appears in the prior chain forming a cycle of length >= 2 →
 ///    `CircularCall`.
-/// 3. **Frequency** — count occurrences of `module_name` over the FULL chain
+/// 3. **Frequency** — count occurrences of `module_id` over the FULL chain
 ///    (including the trailing self); if `count > max_module_repeat` →
 ///    `CallFrequencyExceeded`.
 ///
 /// Because the chain includes the trailing self, this is equivalent to the
 /// spec pseudocode form (which excludes self and uses `>=`): a module
 /// appearing exactly `max_module_repeat` times is allowed; one more throws.
-pub fn guard_call_chain_with_repeat(
-    ctx: &Context<serde_json::Value>,
-    module_name: &str,
-    max_depth: u32,
+///
+/// [`DEFAULT_MAX_CALL_DEPTH`] (32) and [`DEFAULT_MAX_MODULE_REPEAT`] (3) are
+/// the documented defaults; Rust has no default arguments, so pass them
+/// explicitly or use [`guard_call_chain_for_context`], which applies both.
+///
+/// ```
+/// use apcore::utils::{guard_call_chain, DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_MODULE_REPEAT};
+///
+/// let chain = vec!["a".to_string(), "b".to_string(), "a".to_string()];
+/// let err = guard_call_chain("a", &chain, DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_MODULE_REPEAT)
+///     .expect_err("a -> b -> a is a cycle");
+/// assert_eq!(err.code, apcore::errors::ErrorCode::CircularCall);
+/// ```
+///
+/// # Errors
+///
+/// - [`ErrorCode::GeneralInvalidInput`] when either limit is below 1.
+/// - [`ErrorCode::CallDepthExceeded`], [`ErrorCode::CircularCall`] or
+///   [`ErrorCode::CallFrequencyExceeded`] per the checks above.
+pub fn guard_call_chain(
+    module_id: &str,
+    call_chain: &[String],
+    max_call_depth: usize,
     max_module_repeat: usize,
 ) -> Result<(), ModuleError> {
     // 0. Floor validation — reject non-positive limits defensively, matching
     // apcore-python `call_chain.py` and apcore-typescript `call-chain.ts`
     // (both raise on max_call_depth < 1 / max_module_repeat < 1).
-    if max_depth < 1 {
-        return Err(ModuleError::new(
-            ErrorCode::GeneralInvalidInput,
-            format!("max_depth must be >= 1, got {max_depth}"),
+    // D-84: the typed error is what a cross-language caller can catch, and the
+    // only form carrying a code from the registry. It goes through
+    // `ModuleError::invalid_input` so it carries `ai_guidance` like the three
+    // guard errors below — `ai_guidance` is `skip_serializing_if`, so leaving
+    // it unset drops the field from the wire envelope entirely.
+    if max_call_depth < 1 {
+        return Err(ModuleError::invalid_input(format!(
+            "max_call_depth must be >= 1, got {max_call_depth}"
+        ))
+        .with_ai_guidance(
+            "The call-depth limit is not a positive integer. Set `executor.max_call_depth` \
+             to at least 1 (the documented default is 32) and retry.",
         ));
     }
     if max_module_repeat < 1 {
-        return Err(ModuleError::new(
-            ErrorCode::GeneralInvalidInput,
-            format!("max_module_repeat must be >= 1, got {max_module_repeat}"),
+        return Err(ModuleError::invalid_input(format!(
+            "max_module_repeat must be >= 1, got {max_module_repeat}"
+        ))
+        .with_ai_guidance(
+            "The module-repeat limit is not a positive integer. Set \
+             `executor.max_module_repeat` to at least 1 (the documented default is 3) and retry.",
         ));
     }
 
-    // 1. Depth check — chain length must not exceed max_depth.
-    #[allow(clippy::cast_possible_truncation)]
-    // call_chain length is bounded by max_depth which is u32
-    if ctx.call_chain.len() as u32 > max_depth {
-        let depth = ctx.call_chain.len();
+    // 1. Depth check — chain length must not exceed max_call_depth.
+    if call_chain.len() > max_call_depth {
+        let depth = call_chain.len();
         // Structured details mirror apcore-python CallDepthExceededError
         // (errors.py:624): {depth, max_depth, call_chain} — sync finding A-D-17.
         let mut details = std::collections::HashMap::new();
         details.insert("depth".to_string(), serde_json::json!(depth));
-        details.insert("max_depth".to_string(), serde_json::json!(max_depth));
-        details.insert("call_chain".to_string(), serde_json::json!(ctx.call_chain));
+        details.insert("max_depth".to_string(), serde_json::json!(max_call_depth));
+        details.insert("call_chain".to_string(), serde_json::json!(call_chain));
         return Err(ModuleError::new(
             ErrorCode::CallDepthExceeded,
-            format!("Call depth exceeded: chain length {depth} > max_depth {max_depth}"),
+            format!("Call depth exceeded: chain length {depth} > max_depth {max_call_depth}"),
         )
-        .with_details(details));
+        .with_details(details)
+        // `ai_guidance` is `skip_serializing_if = "Option::is_none"`, so
+        // omitting it drops the field from the wire envelope entirely — while
+        // apcore-python `CallDepthExceededError` and apcore-typescript
+        // `CallDepthExceededError` always carry it. Same wording as both.
+        .with_ai_guidance(format!(
+            "Call depth {depth} exceeds maximum {max_call_depth}. Simplify the module call chain \
+             or restructure to reduce nesting depth."
+        )));
     }
 
     // 2. Circular detection: strict cycles of length >= 2.
-    // call_chain already includes module_name at the end (from child()),
+    // call_chain already includes module_id at the end (from child()),
     // so always strip the last entry and inspect the prior chain for a
     // previous occurrence forming A->...->A.
-    let prior = if ctx.call_chain.is_empty() {
-        &ctx.call_chain[..]
+    let prior = if call_chain.is_empty() {
+        call_chain
     } else {
-        &ctx.call_chain[..ctx.call_chain.len() - 1]
+        &call_chain[..call_chain.len() - 1]
     };
-    if let Some(last_idx) = prior.iter().rposition(|n| n.as_str() == module_name) {
+    if let Some(last_idx) = prior.iter().rposition(|n| n.as_str() == module_id) {
         let subsequence = &prior[last_idx + 1..];
         if !subsequence.is_empty() {
             // Structured details mirror apcore-python CircularCallError
             // (errors.py): {module_id, call_chain} — sync finding A-D-17.
             let mut details = std::collections::HashMap::new();
-            details.insert("module_id".to_string(), serde_json::json!(module_name));
-            details.insert("call_chain".to_string(), serde_json::json!(ctx.call_chain));
+            details.insert("module_id".to_string(), serde_json::json!(module_id));
+            details.insert("call_chain".to_string(), serde_json::json!(call_chain));
             return Err(ModuleError::new(
                 ErrorCode::CircularCall,
                 format!(
-                    "Circular call detected: '{}' already in call chain {:?}",
-                    module_name, ctx.call_chain
+                    "Circular call detected: '{module_id}' already in call chain {call_chain:?}"
                 ),
             )
-            .with_details(details));
+            .with_details(details)
+            // Same wording as apcore-python / apcore-typescript
+            // `CircularCallError`; see the depth arm above for why the field
+            // must not be left unset.
+            .with_ai_guidance(
+                "A circular call was detected in the module call chain. Review the call_chain \
+                 in error details and restructure to eliminate the cycle.",
+            ));
         }
     }
 
     // 3. Frequency throttle: count over the FULL chain (including the trailing
     // self); the module must not appear MORE than max_module_repeat times.
-    let count = ctx
-        .call_chain
+    let count = call_chain
         .iter()
-        .filter(|name| name.as_str() == module_name)
+        .filter(|name| name.as_str() == module_id)
         .count();
 
     if count > max_module_repeat {
@@ -262,28 +300,70 @@ pub fn guard_call_chain_with_repeat(
         // (errors.py:683): {module_id, count, max_repeat, call_chain} — sync
         // finding A-D-17.
         let mut details = std::collections::HashMap::new();
-        details.insert("module_id".to_string(), serde_json::json!(module_name));
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
         details.insert("count".to_string(), serde_json::json!(count));
         details.insert(
             "max_repeat".to_string(),
             serde_json::json!(max_module_repeat),
         );
-        details.insert("call_chain".to_string(), serde_json::json!(ctx.call_chain));
+        details.insert("call_chain".to_string(), serde_json::json!(call_chain));
         return Err(ModuleError::new(
             ErrorCode::CallFrequencyExceeded,
             format!(
-                "Module '{module_name}' called {count} times, exceeds max repeat limit of {max_module_repeat}"
+                "Module '{module_id}' called {count} times, exceeds max repeat limit of {max_module_repeat}"
             ),
         )
         .with_details(details)
         .with_ai_guidance(format!(
-            "Module '{module_name}' was called {count} times in this chain (limit \
+            "Module '{module_id}' was called {count} times in this chain (limit \
              {max_module_repeat}), tripping the frequency guard. Reduce repeated calls or \
              batch the work before retrying."
         )));
     }
 
     Ok(())
+}
+
+/// Guard a [`Context`]'s call chain using the documented defaults
+/// [`DEFAULT_MAX_CALL_DEPTH`] (32) and [`DEFAULT_MAX_MODULE_REPEAT`] (3).
+///
+/// A thin wrapper over [`guard_call_chain`], generic over the context's
+/// services type so it is reachable from any host (D-83). Use
+/// [`guard_call_chain_with_repeat`] when the limits come from configuration,
+/// as the executor's `call_chain_guard` pipeline step does.
+///
+/// # Errors
+///
+/// As [`guard_call_chain`].
+pub fn guard_call_chain_for_context<T>(
+    ctx: &Context<T>,
+    module_id: &str,
+) -> Result<(), ModuleError> {
+    guard_call_chain(
+        module_id,
+        &ctx.call_chain,
+        DEFAULT_MAX_CALL_DEPTH,
+        DEFAULT_MAX_MODULE_REPEAT,
+    )
+}
+
+/// Guard a [`Context`]'s call chain with explicit limits.
+///
+/// A thin wrapper over [`guard_call_chain`], generic over the context's
+/// services type (D-83). This is the form the executor's `call_chain_guard`
+/// pipeline step uses, with the limits read from
+/// `executor.max_call_depth` / `executor.max_module_repeat`.
+///
+/// # Errors
+///
+/// As [`guard_call_chain`].
+pub fn guard_call_chain_with_repeat<T>(
+    ctx: &Context<T>,
+    module_name: &str,
+    max_depth: usize,
+    max_module_repeat: usize,
+) -> Result<(), ModuleError> {
+    guard_call_chain(module_name, &ctx.call_chain, max_depth, max_module_repeat)
 }
 
 /// Convert a single segment to `snake_case` by detecting case boundaries.
@@ -474,14 +554,14 @@ mod tests {
     #[test]
     fn test_guard_call_chain_empty_chain_passes() {
         let ctx = Context::<serde_json::Value>::anonymous();
-        assert!(guard_call_chain(&ctx, "mod.a", 10).is_ok());
+        assert!(guard_call_chain_with_repeat(&ctx, "mod.a", 10, DEFAULT_MAX_MODULE_REPEAT).is_ok());
     }
 
     #[test]
     fn test_guard_call_chain_depth_exceeded() {
         let mut ctx = Context::<serde_json::Value>::anonymous();
         ctx.call_chain = vec!["a".into(), "b".into(), "c".into(), "d".into()];
-        let result = guard_call_chain(&ctx, "e", 3);
+        let result = guard_call_chain_with_repeat(&ctx, "e", 3, DEFAULT_MAX_MODULE_REPEAT);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, ErrorCode::CallDepthExceeded);
     }
@@ -490,9 +570,42 @@ mod tests {
     fn test_guard_call_chain_circular_detection() {
         let mut ctx = Context::<serde_json::Value>::anonymous();
         ctx.call_chain = vec!["mod.a".into(), "mod.b".into(), "mod.a".into()];
-        let result = guard_call_chain(&ctx, "mod.a", 100);
+        let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, ErrorCode::CircularCall);
+    }
+
+    #[test]
+    fn test_guard_call_chain_depth_error_carries_ai_guidance() {
+        // `ai_guidance` is `skip_serializing_if = "Option::is_none"`, so leaving
+        // it unset removed the field from the wire envelope for the two most
+        // common guard trips while Python and TypeScript always carried it.
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let err = guard_call_chain_with_repeat(&ctx, "e", 3, DEFAULT_MAX_MODULE_REPEAT)
+            .expect_err("depth guard should trip");
+        assert_eq!(
+            err.ai_guidance.as_deref(),
+            Some(
+                "Call depth 4 exceeds maximum 3. Simplify the module call chain or restructure \
+                 to reduce nesting depth."
+            )
+        );
+    }
+
+    #[test]
+    fn test_guard_call_chain_circular_error_carries_ai_guidance() {
+        let mut ctx = Context::<serde_json::Value>::anonymous();
+        ctx.call_chain = vec!["mod.a".into(), "mod.b".into(), "mod.a".into()];
+        let err = guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT)
+            .expect_err("circular guard should trip");
+        assert_eq!(
+            err.ai_guidance.as_deref(),
+            Some(
+                "A circular call was detected in the module call chain. Review the call_chain \
+                 in error details and restructure to eliminate the cycle."
+            )
+        );
     }
 
     #[test]
@@ -502,7 +615,7 @@ mod tests {
         // exactly max_module_repeat (default 3) times must PASS, not throw.
         let mut ctx = Context::<serde_json::Value>::anonymous();
         ctx.call_chain = vec!["mod.a".into(), "mod.a".into(), "mod.a".into()];
-        let result = guard_call_chain(&ctx, "mod.a", 100);
+        let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT);
         assert!(
             result.is_ok(),
             "exactly max_module_repeat (3) occurrences must pass, got {result:?}"
@@ -519,7 +632,7 @@ mod tests {
             "mod.a".into(),
             "mod.a".into(),
         ];
-        let result = guard_call_chain(&ctx, "mod.a", 100);
+        let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
     }
@@ -550,7 +663,7 @@ mod tests {
     fn test_guard_call_chain_ok_within_limits() {
         let mut ctx = Context::<serde_json::Value>::anonymous();
         ctx.call_chain = vec!["mod.a".into(), "mod.b".into()];
-        assert!(guard_call_chain(&ctx, "mod.c", 10).is_ok());
+        assert!(guard_call_chain_with_repeat(&ctx, "mod.c", 10, DEFAULT_MAX_MODULE_REPEAT).is_ok());
     }
 
     #[test]

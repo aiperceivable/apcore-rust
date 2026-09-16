@@ -20,7 +20,7 @@ use crate::events::emitter::EventEmitter;
 use crate::module::Module;
 use crate::observability::redaction::DEFAULT_REPLACEMENT;
 use crate::registry::dependencies::resolve_dependencies;
-use crate::registry::registry::Registry;
+use crate::registry::registry::{Registry, DEFAULT_MODULE_VERSION};
 use crate::registry::types::DepInfo;
 use crate::utils::helpers::match_glob;
 
@@ -548,6 +548,7 @@ impl ReloadModule {
     async fn verify_and_emit_reloaded(
         &self,
         unregistered: Vec<String>,
+        previous_versions: &std::collections::HashMap<String, String>,
         reason: &str,
         ctx: &Context<serde_json::Value>,
     ) -> (Vec<String>, Vec<String>) {
@@ -559,10 +560,27 @@ impl ReloadModule {
                 continue;
             }
             let timestamp = chrono::Utc::now().to_rfc3339();
+            // SYS-15: the real versions, as the single-module path already
+            // emits. Both fields were the literal string "unknown" here, so a
+            // subscriber watching `apcore.module.reloaded` could not tell a
+            // version bump from a no-op reload on the bulk path — while the
+            // same event carried real versions when one module was reloaded by
+            // ID. `previous_versions` is captured BEFORE the unregister, which
+            // is the only moment the old version is still readable.
+            let previous_version = previous_versions
+                .get(&mid)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_MODULE_VERSION.to_string());
+            let new_version = self
+                .registry
+                .get_definition(&mid)
+                .ok()
+                .flatten()
+                .map_or_else(|| previous_version.clone(), |d| d.version);
             let event_data = augment_with_context_identity(
                 json!({
-                    "previous_version": "unknown",
-                    "new_version": "unknown",
+                    "previous_version": previous_version,
+                    "new_version": new_version,
                     "reason": reason,
                 }),
                 ctx,
@@ -609,9 +627,15 @@ impl ReloadModule {
         // deletion, and this method previously returned `success: true` for exactly
         // that (it pushed each id here and never re-discovered at all).
         let mut unregistered: Vec<String> = Vec::new();
+        // SYS-15: capture each module's version while it is still registered.
+        let mut previous_versions: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for mid in order {
             if !self.registry.has(&mid) {
                 continue;
+            }
+            if let Ok(Some(descriptor)) = self.registry.get_definition(&mid) {
+                previous_versions.insert(mid.clone(), descriptor.version);
             }
             match self.registry.safe_unregister(&mid, 5000).await {
                 Ok(_) => unregistered.push(mid),
@@ -648,7 +672,7 @@ impl ReloadModule {
 
         // Phase 3 — a module counts as reloaded only if it is actually back.
         let (reloaded, missing) = self
-            .verify_and_emit_reloaded(unregistered, reason, ctx)
+            .verify_and_emit_reloaded(unregistered, &previous_versions, reason, ctx)
             .await;
 
         if !missing.is_empty() {

@@ -108,6 +108,46 @@ impl SchemaLoader {
         schema: &serde_json::Value,
         current_file: Option<&Path>,
     ) -> Result<serde_json::Value, ModuleError> {
+        match self.build_resolver(current_file).resolve(schema) {
+            Ok(resolved) => Ok(resolved),
+            // D-104: the file root is the primary base for a local `#/…`
+            // pointer (A05 step 4a) and stays so. When it does not resolve
+            // there, the schema NODE being resolved is the fallback — a `$defs`
+            // block nested inside `input_schema`, which apcore-python and
+            // apcore-typescript accept and which used to raise
+            // SCHEMA_NOT_FOUND here. Each SDK rejected what the other accepted,
+            // so no schema file carrying a local `$ref` loaded in all three.
+            //
+            // The retry is per node rather than per document so a pointer
+            // inside `output_schema` can never resolve into `input_schema`'s
+            // `$defs`: each node is resolved with itself as its own fallback,
+            // which is exactly what the two peers do.
+            Err(err) if err.code == ErrorCode::SchemaNotFound => {
+                let Some(obj) = schema.as_object() else {
+                    return Err(err);
+                };
+                if !obj.contains_key("input_schema") && !obj.contains_key("output_schema") {
+                    return Err(err);
+                }
+                let mut out = serde_json::Map::with_capacity(obj.len());
+                for (key, node) in obj {
+                    let resolver = match key.as_str() {
+                        "input_schema" | "output_schema" | "error_schema" => self
+                            .build_resolver(current_file)
+                            .with_node_fallback(node.clone()),
+                        _ => self.build_resolver(current_file),
+                    };
+                    out.insert(key.clone(), resolver.resolve_in_document(node, schema)?);
+                }
+                Ok(serde_json::Value::Object(out))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Build a [`RefResolver`] carrying this loader's depth cap, schemas root,
+    /// current file and in-memory registrations.
+    fn build_resolver(&self, current_file: Option<&Path>) -> RefResolver {
         let mut resolver = RefResolver::with_max_depth(self.max_ref_depth);
         if let Some(dir) = self.schemas_dir.as_deref() {
             resolver = resolver.with_schemas_dir(dir);
@@ -120,7 +160,7 @@ impl SchemaLoader {
         for (name, value) in &self.schemas {
             resolver.register(name, value.clone());
         }
-        resolver.resolve(schema)
+        resolver
     }
 
     /// Spec-compatible load: resolve a schema for `module_id` and return a [`SchemaDefinition`].

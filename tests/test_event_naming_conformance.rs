@@ -222,7 +222,7 @@ async fn run_platform_notify_triggers(pattern: &str, triggers: &[Value]) -> Vec<
                 let errors = (rate * 100.0).round();
                 let successes = 100.0 - errors;
                 let mut labels = HashMap::new();
-                labels.insert("module".to_string(), module_id.to_string());
+                labels.insert("module_id".to_string(), module_id.to_string());
                 labels.insert("status".to_string(), "error".to_string());
                 metrics.increment("apcore_module_calls_total", labels.clone(), errors);
                 labels.insert("status".to_string(), "success".to_string());
@@ -255,7 +255,7 @@ async fn run_platform_notify_triggers(pattern: &str, triggers: &[Value]) -> Vec<
                 // threshold while an alert is outstanding. Counters only grow,
                 // so drive it down with successes.
                 let mut labels = HashMap::new();
-                labels.insert("module".to_string(), module_id.to_string());
+                labels.insert("module_id".to_string(), module_id.to_string());
                 labels.insert("status".to_string(), "success".to_string());
                 metrics.increment("apcore_module_calls_total", labels, 5000.0);
                 pn.after(module_id, json!({}), json!({}), &ctx)

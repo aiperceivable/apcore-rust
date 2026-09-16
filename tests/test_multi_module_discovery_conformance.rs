@@ -52,14 +52,27 @@ fn fixture_case<'a>(fixture: &'a Value, id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("fixture case '{id}' not present"))
 }
 
+/// Read each class's per-class multi-class marker (D-107).
+///
+/// The per-class `multi_class` field is the ONLY opt-in. The fixture used to
+/// carry a file-level `multi_class_enabled` — the model decision-log D-06
+/// withdrew — and this driver briefly accepted it as a fallback while the
+/// fixture migrated. That fallback is deliberately gone: tolerating both models
+/// is exactly what let three SDKs implement three different ones and stay
+/// green, so a driver that still accepts the withdrawn spelling cancels out the
+/// discrimination the corrected fixture exists to provide. A class that omits
+/// the marker is un-marked, which is the correct reading of "did not opt in".
 fn parse_classes(input: &Value) -> Vec<DiscoveredClass> {
     input["classes"]
         .as_array()
         .map(|arr| {
             arr.iter()
-                .map(|c| DiscoveredClass {
-                    name: c["name"].as_str().unwrap().to_string(),
-                    implements_module: c["implements_module"].as_bool().unwrap_or(true),
+                .map(|c| {
+                    DiscoveredClass::new(
+                        c["name"].as_str().unwrap(),
+                        c["implements_module"].as_bool().unwrap_or(true),
+                    )
+                    .with_multi_class(c["multi_class"].as_bool().unwrap_or(false))
                 })
                 .collect()
         })
@@ -71,10 +84,13 @@ fn run_derive(case: &Value) -> Result<Vec<String>, apcore::errors::ModuleError> 
     let file_path = PathBuf::from(input["file_path"].as_str().unwrap());
     let extensions_root = input["extensions_root"].as_str().unwrap_or("extensions");
     let classes = parse_classes(input);
-    let config = DiscoveryConfig {
-        multi_class: input["multi_class_enabled"].as_bool().unwrap_or(false),
-    };
-    derive_module_ids(&file_path, extensions_root, &classes, &config)
+    // Inert since D-107: passed only because the signature still takes it.
+    derive_module_ids(
+        &file_path,
+        extensions_root,
+        &classes,
+        &DiscoveryConfig::default(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -211,16 +227,10 @@ fn conformance_full_id_grammar_valid() {
     let file_path = PathBuf::from(case["input"]["file_path"].as_str().unwrap());
     let extensions_root = case["input"]["extensions_root"].as_str().unwrap();
     let two_classes = vec![
-        DiscoveredClass {
-            name: "Addition".to_string(),
-            implements_module: true,
-        },
-        DiscoveredClass {
-            name: "Subtraction".to_string(),
-            implements_module: true,
-        },
+        DiscoveredClass::new("Addition", true).with_multi_class(true),
+        DiscoveredClass::new("Subtraction", true).with_multi_class(true),
     ];
-    let config = DiscoveryConfig::with_multi_class();
+    let config = DiscoveryConfig::default();
     let multi_ids = derive_module_ids(&file_path, extensions_root, &two_classes, &config).unwrap();
     for id in &multi_ids {
         assert!(

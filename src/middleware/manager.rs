@@ -107,6 +107,23 @@ impl MiddlewareManager {
     /// to be held as `Arc<MiddlewareManager>` and mutated without `Arc::get_mut`
     /// hacks, even after the `Arc` has been cloned into pipeline contexts.
     pub fn add(&self, middleware: Box<dyn Middleware>) -> Result<MiddlewareHandle, ModuleError> {
+        self.add_shared(Arc::from(middleware))
+    }
+
+    /// Add an already-shared middleware handle to the pipeline.
+    ///
+    /// Identical to [`Self::add`] except the caller keeps a reference. Used by
+    /// [`ExtensionManager::apply`](crate::extensions::ExtensionManager::apply),
+    /// which retains its registrations so a second `apply` wires the same set
+    /// again (D-78).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModuleError`] if the middleware's priority exceeds 1000.
+    pub fn add_shared(
+        &self,
+        middleware: Arc<dyn Middleware>,
+    ) -> Result<MiddlewareHandle, ModuleError> {
         let priority = middleware.priority();
         if priority > 1000 {
             tracing::warn!(
@@ -126,7 +143,7 @@ impl MiddlewareManager {
         }
         let mut mws = self.middlewares.lock();
         let mut handles = self.handles.lock();
-        let arc: Arc<dyn Middleware> = Arc::from(middleware);
+        let arc: Arc<dyn Middleware> = middleware;
         // Find the first position where existing priority is strictly less than
         // the new priority. Insert before that position to maintain stable
         // ordering (later registrations go after earlier ones at same priority).

@@ -33,6 +33,15 @@ impl Module for NoopModule {
     fn description(&self) -> &'static str {
         "noop module that requires approval"
     }
+    /// Declared on the INSTANCE: PROTOCOL_SPEC §7.4 Step 5 gates on
+    /// `module.annotations`, so this is what makes the gate fire. The
+    /// descriptor below carries the same value for introspection.
+    fn annotations(&self) -> ModuleAnnotations {
+        ModuleAnnotations {
+            requires_approval: true,
+            ..ModuleAnnotations::default()
+        }
+    }
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         Ok(json!({}))
     }

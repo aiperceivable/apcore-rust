@@ -63,12 +63,12 @@ fn code_str(code: ErrorCode) -> String {
 // helper takes a pre-resolved `&[DiscoveredClass]` (all qualifying here).
 // ---------------------------------------------------------------------------
 fn qualifying(names: &[&str]) -> Vec<DiscoveredClass> {
+    // D-107: the per-class marker is the only multi-class opt-in path, so the
+    // participating classes carry it. `DiscoveryConfig` is still passed by
+    // these clauses but no longer gates anything.
     names
         .iter()
-        .map(|n| DiscoveredClass {
-            name: (*n).to_string(),
-            implements_module: true,
-        })
+        .map(|n| DiscoveredClass::new(*n, true).with_multi_class(true))
         .collect()
 }
 
@@ -100,7 +100,7 @@ impl Module for StubModule {
 fn entries(names: &[&str]) -> Vec<MultiClassEntry> {
     names
         .iter()
-        .map(|n| MultiClassEntry::new(*n, Box::new(StubModule)))
+        .map(|n| MultiClassEntry::new(*n, Box::new(StubModule)).with_multi_class(true))
         .collect()
 }
 

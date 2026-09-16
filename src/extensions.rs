@@ -4,6 +4,7 @@
 // and approval handlers) into the apcore runtime.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::acl::ACL;
 use crate::approval::ApprovalHandler;
@@ -36,19 +37,26 @@ pub struct ExtensionPoint {
 /// A type-safe wrapper for the different kinds of extensions that can be
 /// registered. This replaces the Python/TypeScript `Any` approach with Rust
 /// enums so the type system enforces correctness at compile time.
+///
+/// Each variant holds an `Arc`, not a `Box`, because
+/// [`ExtensionManager::apply`] must retain its registrations (D-78): it wires a
+/// *clone* of the handle into the registry/executor and keeps its own. The same
+/// property makes [`ExtensionManager::unregister`]'s identity comparison
+/// expressible from outside the manager (D-91) — hold the `Arc`, register a
+/// clone of it, and hand back another clone to remove it.
 pub enum ExtensionKind {
     /// A custom module discovery strategy.
-    Discoverer(Box<dyn Discoverer>),
+    Discoverer(Arc<dyn Discoverer>),
     /// Execution middleware.
-    Middleware(Box<dyn Middleware>),
+    Middleware(Arc<dyn Middleware>),
     /// Access control provider.
-    Acl(ACL),
+    Acl(Arc<ACL>),
     /// Tracing span exporter.
-    SpanExporter(Box<dyn SpanExporter>),
+    SpanExporter(Arc<dyn SpanExporter>),
     /// Custom module validation.
-    ModuleValidator(Box<dyn ModuleValidator>),
+    ModuleValidator(Arc<dyn ModuleValidator>),
     /// Approval handler for Step 4.5 gate.
-    ApprovalHandler(Box<dyn ApprovalHandler>),
+    ApprovalHandler(Arc<dyn ApprovalHandler>),
 }
 
 impl std::fmt::Debug for ExtensionKind {
@@ -71,6 +79,25 @@ impl std::fmt::Debug for ExtensionKind {
 }
 
 impl ExtensionKind {
+    /// Address of the extension object this variant holds.
+    ///
+    /// The identity [`ExtensionManager::unregister`] compares on — the address
+    /// of the extension itself, not of the enum wrapping it, so two
+    /// `ExtensionKind` values built around the same object compare equal.
+    /// Because the variants hold `Arc`s, two clones of one handle also compare
+    /// equal, which is what makes an outside-the-manager removal expressible
+    /// (D-91).
+    fn object_address(&self) -> *const () {
+        match self {
+            ExtensionKind::Discoverer(d) => std::ptr::from_ref(&**d).cast::<()>(),
+            ExtensionKind::Middleware(m) => std::ptr::from_ref(&**m).cast::<()>(),
+            ExtensionKind::Acl(acl) => std::ptr::from_ref(&**acl).cast::<()>(),
+            ExtensionKind::SpanExporter(e) => std::ptr::from_ref(&**e).cast::<()>(),
+            ExtensionKind::ModuleValidator(v) => std::ptr::from_ref(&**v).cast::<()>(),
+            ExtensionKind::ApprovalHandler(h) => std::ptr::from_ref(&**h).cast::<()>(),
+        }
+    }
+
     /// Return the extension point name this kind corresponds to.
     fn point_name(&self) -> &str {
         match self {
@@ -156,11 +183,31 @@ fn built_in_points() -> HashMap<String, ExtensionPoint> {
 pub struct ExtensionManager {
     points: HashMap<String, ExtensionPoint>,
     extensions: HashMap<String, Vec<ExtensionKind>>,
+    /// Parallel to `extensions`: the handle issued for each registration, so
+    /// [`ExtensionManager::unregister_handle`] can remove exactly one without
+    /// the caller having to reconstruct an [`ExtensionKind`] (D-91).
+    handles: HashMap<String, Vec<ExtensionHandle>>,
+    next_handle: u64,
 }
+
+/// Opaque token identifying one extension registration, returned by
+/// [`ExtensionManager::register`] and consumed by
+/// [`ExtensionManager::unregister_handle`].
+///
+/// The cross-language contract removes by IDENTITY: apcore-python and
+/// apcore-typescript take the extension object back and compare with `is` /
+/// `===`. Rust's manager owns its registrations, so this handle is the identity
+/// a caller can hold independently of the object. Mirrors
+/// [`MiddlewareHandle`](crate::middleware::MiddlewareHandle), which exists for
+/// the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExtensionHandle(u64);
 
 impl std::fmt::Debug for ExtensionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtensionManager")
+            .field("next_handle", &self.next_handle)
+            .field("handles", &self.handles)
             .field("points", &self.points.keys().collect::<Vec<_>>())
             .field(
                 "extensions",
@@ -187,13 +234,24 @@ impl ExtensionManager {
         let points = built_in_points();
         let extensions: HashMap<String, Vec<ExtensionKind>> =
             points.keys().map(|k| (k.clone(), Vec::new())).collect();
-        Self { points, extensions }
+        let handles: HashMap<String, Vec<ExtensionHandle>> =
+            points.keys().map(|k| (k.clone(), Vec::new())).collect();
+        Self {
+            points,
+            extensions,
+            handles,
+            next_handle: 0,
+        }
     }
 
     /// Register an extension for the given extension point.
     ///
     /// The `extension` must be an [`ExtensionKind`] variant whose internal
     /// point name matches `point_name`.
+    ///
+    /// Returns the [`ExtensionHandle`] for this registration. Keep it to remove
+    /// exactly this extension later via [`Self::unregister_handle`] (D-91);
+    /// discarding it with `?;` or `.unwrap();` stays valid.
     ///
     /// # Errors
     ///
@@ -203,7 +261,7 @@ impl ExtensionManager {
         &mut self,
         point_name: &str,
         extension: ExtensionKind,
-    ) -> Result<(), ModuleError> {
+    ) -> Result<ExtensionHandle, ModuleError> {
         if !self.points.contains_key(point_name) {
             let mut available: Vec<&str> = self
                 .points
@@ -234,17 +292,118 @@ impl ExtensionManager {
             ));
         }
 
+        let handle = ExtensionHandle(self.next_handle);
+        self.next_handle += 1;
+
         let point = &self.points[point_name];
         if point.multiple {
             // INVARIANT: new() pre-populates extensions[point_name] for every point in self.points;
             // the register() guard above ensures point_name is in self.points before reaching here.
             self.extensions.get_mut(point_name).unwrap().push(extension);
+            self.handles
+                .entry(point_name.to_string())
+                .or_default()
+                .push(handle);
         } else {
             self.extensions
                 .insert(point_name.to_string(), vec![extension]);
+            self.handles.insert(point_name.to_string(), vec![handle]);
         }
 
-        Ok(())
+        Ok(handle)
+    }
+
+    /// Return the first extension registered at `point_name`, or `None`.
+    ///
+    /// The reader half of the spec's Contract block
+    /// (`docs/features/extension-system.md` "## Contract: ExtensionManager.get"):
+    /// this manager could register and count extensions but never read one
+    /// back. Returns `None` for an unknown point rather than erroring, matching
+    /// the contract's "No errors raised".
+    ///
+    /// For a single-cardinality point (`acl`, `module_validator`,
+    /// `approval_handler`, `discoverer`) this is *the* registered extension.
+    #[must_use]
+    pub fn get(&self, point_name: &str) -> Option<&ExtensionKind> {
+        self.extensions
+            .get(point_name)
+            .and_then(|exts| exts.first())
+    }
+
+    /// Return every extension registered at `point_name`, in registration
+    /// order.
+    ///
+    /// Empty for an unknown point and for a point with nothing registered —
+    /// the spec's Contract block raises no error for either.
+    #[must_use]
+    pub fn get_all(&self, point_name: &str) -> &[ExtensionKind] {
+        self.extensions.get(point_name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Remove one specific extension from `point_name`.
+    ///
+    /// Identity comparison, per the spec's Contract block: the extension whose
+    /// underlying object IS `extension` is removed, not one that merely looks
+    /// like it. Returns `true` when a match was found and removed, `false` for
+    /// an unknown point or no match — the contract makes a miss a silent no-op.
+    ///
+    /// This is NOT [`Self::clear`], which drops every extension at the point.
+    ///
+    /// Rust caveat (D-91): the manager OWNS each registered extension, so the
+    /// reference passed here cannot be one borrowed from this same manager (the
+    /// borrow checker refuses the immutable borrow across the `&mut self`
+    /// call). Since [`ExtensionKind`] holds `Arc`s, the way to express a
+    /// positive removal from outside is to keep the `Arc`, register a clone of
+    /// it, and pass another clone here:
+    ///
+    /// ```ignore
+    /// let mw: Arc<dyn Middleware> = Arc::new(MyMiddleware);
+    /// mgr.register("middleware", ExtensionKind::Middleware(Arc::clone(&mw)))?;
+    /// assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(mw)));
+    /// ```
+    ///
+    /// [`Self::unregister_handle`] is the same removal keyed on the token
+    /// `register` hands back, for callers that would rather not keep the
+    /// object. [`Self::clear`] drops everything at the point.
+    pub fn unregister(&mut self, point_name: &str, extension: &ExtensionKind) -> bool {
+        let target = extension.object_address();
+        let Some(exts) = self.extensions.get_mut(point_name) else {
+            return false;
+        };
+        let Some(index) = exts.iter().position(|e| e.object_address() == target) else {
+            return false;
+        };
+        exts.remove(index);
+        if let Some(handles) = self.handles.get_mut(point_name) {
+            if index < handles.len() {
+                handles.remove(index);
+            }
+        }
+        true
+    }
+
+    /// Remove exactly the extension [`Self::register`] returned `handle` for.
+    ///
+    /// Returns `false` if it is no longer registered — a miss is a silent
+    /// no-op, as with [`Self::unregister`].
+    ///
+    /// This is the removal path D-91 requires: the manager owns its
+    /// extensions, so the token is what a host can hold independently of the
+    /// object it registered.
+    pub fn unregister_handle(&mut self, handle: ExtensionHandle) -> bool {
+        for (point_name, handles) in &mut self.handles {
+            let Some(index) = handles.iter().position(|h| *h == handle) else {
+                continue;
+            };
+            handles.remove(index);
+            if let Some(exts) = self.extensions.get_mut(point_name) {
+                if index < exts.len() {
+                    exts.remove(index);
+                }
+            }
+            return true;
+        }
+        false
     }
 
     /// Return the count of extensions registered at the given point, or
@@ -283,6 +442,9 @@ impl ExtensionManager {
         match self.extensions.get_mut(point_name) {
             Some(exts) => {
                 exts.clear();
+                if let Some(handles) = self.handles.get_mut(point_name) {
+                    handles.clear();
+                }
                 Ok(())
             }
             None => Err(ModuleError::new(
@@ -296,6 +458,9 @@ impl ExtensionManager {
     pub fn clear_all(&mut self) {
         for exts in self.extensions.values_mut() {
             exts.clear();
+        }
+        for handles in self.handles.values_mut() {
+            handles.clear();
         }
     }
 
@@ -312,41 +477,53 @@ impl ExtensionManager {
     ///   `TracingMiddleware::set_exporter`); logs a warning and applies nothing
     ///   if no `TracingMiddleware` is present. A new `TracingMiddleware` is
     ///   never appended here.
+    ///
+    /// # Postconditions (D-78)
+    ///
+    /// The store is INTACT afterwards: every registration is still readable
+    /// through [`Self::get`] / [`Self::get_all`] and still counted by
+    /// [`Self::count`]. Applying the same manager to a second
+    /// registry/executor pair therefore wires the same set again, and applying
+    /// it twice to the same executor stacks the middleware — which is what the
+    /// contract's `idempotent: false` row has always promised. Each extension
+    /// is wired as a shared `Arc` clone, so the manager and the runtime hold
+    /// the same object rather than copies of it.
     pub fn apply(
         &mut self,
         registry: &Registry,
         executor: &mut Executor,
     ) -> Result<(), ModuleError> {
         // Discoverer
-        if let Some(ExtensionKind::Discoverer(d)) = self.take_single("discoverer") {
-            registry.set_discoverer(d);
+        if let Some(ExtensionKind::Discoverer(d)) = self.get("discoverer") {
+            registry.set_discoverer_shared(Arc::clone(d));
         }
 
         // Module validator
-        if let Some(ExtensionKind::ModuleValidator(v)) = self.take_single("module_validator") {
-            registry.set_validator(v);
+        if let Some(ExtensionKind::ModuleValidator(v)) = self.get("module_validator") {
+            registry.set_validator_shared(Arc::clone(v));
         }
 
         // ACL
-        if let Some(ExtensionKind::Acl(acl)) = self.take_single("acl") {
-            executor.set_acl(acl);
+        if let Some(ExtensionKind::Acl(acl)) = self.get("acl") {
+            executor.set_acl_shared(Arc::clone(acl));
         }
 
         // Approval handler
-        if let Some(ExtensionKind::ApprovalHandler(h)) = self.take_single("approval_handler") {
-            executor.set_approval_handler(h);
+        if let Some(ExtensionKind::ApprovalHandler(h)) = self.get("approval_handler") {
+            executor.set_approval_handler_shared(Arc::clone(h));
         }
 
-        // Middleware — drain all entries
-        let middlewares = self
-            .extensions
-            .get_mut("middleware")
-            .map(std::mem::take)
-            .unwrap_or_default();
-        for ext in middlewares {
-            if let ExtensionKind::Middleware(mw) = ext {
-                executor.use_middleware(mw)?;
-            }
+        // Middleware — wire every entry, keeping them registered.
+        let middlewares: Vec<Arc<dyn Middleware>> = self
+            .get_all("middleware")
+            .iter()
+            .filter_map(|ext| match ext {
+                ExtensionKind::Middleware(mw) => Some(Arc::clone(mw)),
+                _ => None,
+            })
+            .collect();
+        for mw in middlewares {
+            executor.use_middleware_shared(mw)?;
         }
 
         // Span exporters: locate the EXISTING TracingMiddleware in the
@@ -355,15 +532,12 @@ impl ExtensionManager {
         // apcore-python `_find_tracing_middleware` + `set_exporter` else warn
         // (extensions.py:226) and apcore-typescript (extensions.ts:261). Sync
         // finding A-D-18.
-        let exporters: Vec<Box<dyn SpanExporter>> = self
-            .extensions
-            .get_mut("span_exporter")
-            .map(std::mem::take)
-            .unwrap_or_default()
-            .into_iter()
+        let exporters: Vec<Arc<dyn SpanExporter>> = self
+            .get_all("span_exporter")
+            .iter()
             .filter_map(|ext| {
                 if let ExtensionKind::SpanExporter(e) = ext {
-                    Some(e)
+                    Some(Arc::clone(e))
                 } else {
                     None
                 }
@@ -375,10 +549,12 @@ impl ExtensionManager {
             // a CompositeExporter so each span fans out to every exporter with
             // per-exporter error isolation. Mirrors apcore-python's
             // `_CompositeExporter` (extensions.py:27-38).
-            let combined: Box<dyn SpanExporter> = if exporters.len() == 1 {
+            let combined: Arc<dyn SpanExporter> = if exporters.len() == 1 {
                 exporters.into_iter().next().unwrap()
             } else {
-                Box::new(crate::observability::CompositeExporter::new(exporters))
+                Arc::new(crate::observability::CompositeExporter::from_shared(
+                    exporters,
+                ))
             };
 
             let tracing_mw = executor.find_middleware("tracing").and_then(|mw| {
@@ -387,7 +563,7 @@ impl ExtensionManager {
                 mw.as_any()
                     .and_then(|any| any.downcast_ref::<TracingMiddleware>())
                     .map(|tm| {
-                        tm.set_exporter(combined);
+                        tm.set_exporter_shared(combined);
                     })
             });
             if tracing_mw.is_none() {
@@ -404,14 +580,6 @@ impl ExtensionManager {
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
-
-    /// Take the single (last-registered) extension from a non-multiple point,
-    /// draining the vector.
-    fn take_single(&mut self, point_name: &str) -> Option<ExtensionKind> {
-        self.extensions
-            .get_mut(point_name)
-            .and_then(std::vec::Vec::pop)
-    }
 
     /// Map a point name to the expected `ExtensionKind` variant name.
     fn variant_name_for_point(point_name: &str) -> &'static str {
@@ -451,7 +619,7 @@ mod tests {
         let mut mgr = ExtensionManager::new();
         let result = mgr.register(
             "nonexistent",
-            ExtensionKind::Acl(ACL::new(vec![], "deny", None)),
+            ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None))),
         );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -464,7 +632,7 @@ mod tests {
         // Try to register an ACL at the "middleware" point.
         let result = mgr.register(
             "middleware",
-            ExtensionKind::Acl(ACL::new(vec![], "deny", None)),
+            ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None))),
         );
         assert!(result.is_err());
     }
@@ -472,8 +640,8 @@ mod tests {
     #[test]
     fn test_register_acl_replaces_previous() {
         let mut mgr = ExtensionManager::new();
-        let acl1 = ACL::new(vec![], "deny", None);
-        let acl2 = ACL::new(vec![], "deny", None);
+        let acl1 = Arc::new(ACL::new(vec![], "deny", None));
+        let acl2 = Arc::new(ACL::new(vec![], "deny", None));
         mgr.register("acl", ExtensionKind::Acl(acl1)).unwrap();
         assert_eq!(mgr.count("acl"), Some(1));
         mgr.register("acl", ExtensionKind::Acl(acl2)).unwrap();
@@ -485,8 +653,11 @@ mod tests {
     fn test_has_and_clear() {
         let mut mgr = ExtensionManager::new();
         assert!(!mgr.has("acl").unwrap());
-        mgr.register("acl", ExtensionKind::Acl(ACL::new(vec![], "deny", None)))
-            .unwrap();
+        mgr.register(
+            "acl",
+            ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None))),
+        )
+        .unwrap();
         assert!(mgr.has("acl").unwrap());
         mgr.clear("acl").unwrap();
         assert!(!mgr.has("acl").unwrap());
@@ -495,10 +666,190 @@ mod tests {
     #[test]
     fn test_clear_all() {
         let mut mgr = ExtensionManager::new();
-        mgr.register("acl", ExtensionKind::Acl(ACL::new(vec![], "deny", None)))
-            .unwrap();
+        mgr.register(
+            "acl",
+            ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None))),
+        )
+        .unwrap();
         mgr.clear_all();
         assert!(!mgr.has("acl").unwrap());
+    }
+
+    // ── get / get_all / unregister (spec Contract blocks) ────────────
+
+    #[derive(Debug)]
+    struct TestMiddleware(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::middleware::base::Middleware for TestMiddleware {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn before(
+            &self,
+            _module_id: &str,
+            _inputs: serde_json::Value,
+            _ctx: &crate::context::Context<serde_json::Value>,
+        ) -> Result<Option<serde_json::Value>, ModuleError> {
+            Ok(None)
+        }
+        async fn after(
+            &self,
+            _module_id: &str,
+            _inputs: serde_json::Value,
+            _output: serde_json::Value,
+            _ctx: &crate::context::Context<serde_json::Value>,
+        ) -> Result<Option<serde_json::Value>, ModuleError> {
+            Ok(None)
+        }
+        async fn on_error(
+            &self,
+            _module_id: &str,
+            _inputs: serde_json::Value,
+            _error: &ModuleError,
+            _ctx: &crate::context::Context<serde_json::Value>,
+        ) -> Result<Option<serde_json::Value>, ModuleError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_get_returns_the_registered_extension() {
+        // The manager could count and clear extensions but never read one back.
+        let mut mgr = ExtensionManager::new();
+        assert!(mgr.get("acl").is_none());
+
+        mgr.register(
+            "acl",
+            ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None))),
+        )
+        .unwrap();
+        assert!(matches!(mgr.get("acl"), Some(ExtensionKind::Acl(_))));
+
+        // Contract: no error for an unknown point, just nothing.
+        assert!(mgr.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_get_all_returns_registration_order() {
+        let mut mgr = ExtensionManager::new();
+        assert!(mgr.get_all("middleware").is_empty());
+
+        for name in ["first", "second"] {
+            mgr.register(
+                "middleware",
+                ExtensionKind::Middleware(Arc::new(TestMiddleware(name))),
+            )
+            .unwrap();
+        }
+
+        let all = mgr.get_all("middleware");
+        assert_eq!(all.len(), 2);
+        let names: Vec<&str> = all
+            .iter()
+            .map(|e| match e {
+                ExtensionKind::Middleware(m) => m.name(),
+                _ => panic!("expected middleware"),
+            })
+            .collect();
+        assert_eq!(names, vec!["first", "second"]);
+
+        assert!(mgr.get_all("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_object_address_identifies_the_extension_across_moves() {
+        // The identity `unregister` compares on is the extension object's own
+        // address, not the enum's, so it survives the enum being moved into the
+        // manager's storage.
+        let extension = ExtensionKind::Middleware(Arc::new(TestMiddleware("mw")));
+        let address = extension.object_address();
+
+        let moved = extension;
+        assert_eq!(moved.object_address(), address);
+        let stored = [moved];
+        assert_eq!(stored[0].object_address(), address);
+
+        // A separately-constructed, equal-looking extension is NOT the same one.
+        let lookalike = ExtensionKind::Middleware(Arc::new(TestMiddleware("mw")));
+        assert_ne!(lookalike.object_address(), address);
+    }
+
+    #[test]
+    fn test_unregister_removes_only_the_matching_extension() {
+        let mut mgr = ExtensionManager::new();
+        mgr.register(
+            "middleware",
+            ExtensionKind::Middleware(Arc::new(TestMiddleware("keep"))),
+        )
+        .unwrap();
+
+        // A different object is not removed, and the miss is a silent `false`
+        // rather than an error (spec Contract: "No error if the extension is
+        // not found").
+        let other = ExtensionKind::Middleware(Arc::new(TestMiddleware("keep")));
+        assert!(!mgr.unregister("middleware", &other));
+        assert_eq!(mgr.count("middleware"), Some(1));
+
+        // Unknown point: also a silent `false`.
+        assert!(!mgr.unregister("nonexistent", &other));
+
+        // `unregister` is identity-scoped; `clear` is the point-wide removal.
+        mgr.clear("middleware").unwrap();
+        assert_eq!(mgr.count("middleware"), Some(0));
+    }
+
+    #[test]
+    fn test_unregister_handle_removes_exactly_one_registration() {
+        // D-91: the manager owns its extensions, so the handle `register`
+        // returns is the identity a host can hold independently. A positive
+        // removal from outside the manager must be expressible.
+        let mut mgr = ExtensionManager::new();
+        let keep = mgr
+            .register(
+                "middleware",
+                ExtensionKind::Middleware(Arc::new(TestMiddleware("keep"))),
+            )
+            .unwrap();
+        let drop_me = mgr
+            .register(
+                "middleware",
+                ExtensionKind::Middleware(Arc::new(TestMiddleware("drop"))),
+            )
+            .unwrap();
+        assert_eq!(mgr.count("middleware"), Some(2));
+
+        assert!(mgr.unregister_handle(drop_me));
+        assert_eq!(mgr.count("middleware"), Some(1));
+        let remaining: Vec<&str> = mgr
+            .get_all("middleware")
+            .iter()
+            .map(|e| match e {
+                ExtensionKind::Middleware(m) => m.name(),
+                _ => panic!("expected middleware"),
+            })
+            .collect();
+        assert_eq!(remaining, vec!["keep"]);
+
+        // A second removal of the same handle is a silent `false`.
+        assert!(!mgr.unregister_handle(drop_me));
+
+        assert!(mgr.unregister_handle(keep));
+        assert_eq!(mgr.count("middleware"), Some(0));
+    }
+
+    #[test]
+    fn test_unregister_by_identity_is_expressible_from_outside() {
+        // D-91, identity form: `ExtensionKind` holds `Arc`s, so a caller can
+        // keep the handle, register a clone, and hand another clone back.
+        let mut mgr = ExtensionManager::new();
+        let mw: Arc<dyn crate::middleware::base::Middleware> = Arc::new(TestMiddleware("mine"));
+        mgr.register("middleware", ExtensionKind::Middleware(Arc::clone(&mw)))
+            .unwrap();
+        assert_eq!(mgr.count("middleware"), Some(1));
+
+        assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(mw)));
+        assert_eq!(mgr.count("middleware"), Some(0));
     }
 
     #[test]

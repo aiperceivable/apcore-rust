@@ -44,6 +44,8 @@ mod context_serialization_test;
 mod core_executor_spec;
 #[path = "decorator_bindings_spec.rs"]
 mod decorator_bindings_spec;
+#[path = "deep_chain_v150_spec.rs"]
+mod deep_chain_v150_spec;
 #[path = "error_formatter_registry.rs"]
 mod error_formatter_registry;
 #[path = "error_system_spec.rs"]
@@ -124,6 +126,9 @@ mod test_approval;
 mod test_approval_callback_handler;
 #[path = "test_approval_decision_event.rs"]
 mod test_approval_decision_event;
+#[path = "test_approval_gate_decides_from_live_module.rs"]
+mod test_approval_gate_decides_from_live_module;
+
 #[path = "test_approval_request_caller_id_action.rs"]
 mod test_approval_request_caller_id_action;
 #[path = "test_approval_request_fields_conformance.rs"]
@@ -138,6 +143,8 @@ mod test_async_task_cancellation_conformance;
 mod test_async_task_evolution_conformance;
 #[path = "test_async_task_hardening.rs"]
 mod test_async_task_hardening;
+#[path = "test_binding_declarations_survive_registration.rs"]
+mod test_binding_declarations_survive_registration;
 #[path = "test_bindings.rs"]
 mod test_bindings;
 #[path = "test_builtin_steps.rs"]
@@ -285,6 +292,10 @@ mod test_redaction_config_keys;
 mod test_redaction_default_keys;
 #[path = "test_redaction_regex_value_types.rs"]
 mod test_redaction_regex_value_types;
+#[path = "test_ref_fallback_is_document_scoped.rs"]
+mod test_ref_fallback_is_document_scoped;
+#[path = "test_ref_sibling_keys_preserved.rs"]
+mod test_ref_sibling_keys_preserved;
 #[path = "test_register_module_annotations.rs"]
 mod test_register_module_annotations;
 #[path = "test_registry.rs"]

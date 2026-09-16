@@ -8,10 +8,13 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::context::Context;
-use crate::errors::{ErrorCode, ModuleError};
+use crate::errors::ModuleError;
 use crate::module::Module;
 use crate::observability::error_history::ErrorHistory;
-use crate::observability::metrics::{estimate_p99_from_histogram, MetricsCollector};
+use crate::observability::metrics::{
+    extract_module_call_counts, extract_module_latency_stats, MetricsCollector, ModuleCallCounts,
+    ModuleLatencyStats,
+};
 use crate::registry::registry::Registry;
 
 // NOTE: `registry` is now a plain `Arc<Registry>` — interior mutability via
@@ -28,6 +31,29 @@ fn classify_health(error_rate: f64, total_calls: u64, threshold: f64) -> &'stati
     } else {
         "error"
     }
+}
+
+/// The module's most frequently recorded error, or `None` when it has none.
+///
+/// SYS-4: `top_error` names a frequency, not a recency. `ErrorHistory::get`
+/// returns entries sorted by `last_occurred` descending, so taking the head
+/// reported the most RECENT error — a single one-off failure hid the recurring
+/// one. apcore-python resolves it with `max(entries, key=lambda e: e.count)`.
+///
+/// Ties resolve to the more recently seen entry: the scan keeps the first
+/// strict maximum of the `last_occurred`-descending list, which is what
+/// Python's `max` returns over the same ordering.
+fn most_frequent_error(
+    history: &ErrorHistory,
+    module_id: &str,
+) -> Option<crate::observability::error_history::ErrorEntry> {
+    let mut best: Option<crate::observability::error_history::ErrorEntry> = None;
+    for entry in history.get(module_id, None) {
+        if best.as_ref().is_none_or(|b| entry.count > b.count) {
+            best = Some(entry);
+        }
+    }
+    best
 }
 
 /// system.health.summary — Aggregated health overview of all registered modules.
@@ -70,8 +96,59 @@ impl Module for HealthSummaryModule {
         })
     }
 
+    // PROTOCOL_SPEC §6.7.1.6 (SYS-24): the full field contract, transcribed
+    // from apcore/schemas/sys-health-summary.schema.json the way `usage.rs`
+    // already does. A bare `{"type": "object"}` tells a caller nothing and
+    // tells a schema-driven adapter less.
     fn output_schema(&self) -> serde_json::Value {
-        json!({ "type": "object" })
+        json!({
+            "type": "object",
+            "required": ["project", "summary", "modules"],
+            "properties": {
+                "project": {
+                    "type": "object",
+                    "description": "Project metadata",
+                    "properties": {
+                        "name": {"type": "string", "description": "Project name"},
+                        "version": {"type": ["string", "null"], "description": "Project version"}
+                    }
+                },
+                "summary": {
+                    "type": "object",
+                    "description": "Aggregate health statistics",
+                    "properties": {
+                        "total_modules": {"type": "integer", "description": "Total number of registered modules"},
+                        "healthy": {"type": "integer", "description": "Number of healthy modules"},
+                        "degraded": {"type": "integer", "description": "Number of degraded modules"},
+                        "error": {"type": "integer", "description": "Number of modules in the `error` tier"},
+                        "unknown": {"type": "integer", "description": "Number of modules that have recorded no calls yet"}
+                    }
+                },
+                "modules": {
+                    "type": "array",
+                    "description": "Per-module health status entries",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "module_id": {"type": "string", "description": "Canonical module ID"},
+                            "status": {"type": "string", "enum": ["healthy", "degraded", "error", "unknown"], "description": "Health status; `unknown` means no calls recorded yet"},
+                            "error_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Failed calls over total calls, 0.0-1.0"},
+                            "top_error": {
+                                "type": ["object", "null"],
+                                "description": "The module's most frequent recorded error, or null when it has none",
+                                "required": ["code", "message", "count"],
+                                "properties": {
+                                    "code": {"type": "string", "description": "Canonical error code"},
+                                    "message": {"type": "string", "description": "Error message"},
+                                    "ai_guidance": {"type": ["string", "null"], "description": "Remediation guidance for an AI caller, when the error carries one"},
+                                    "count": {"type": "integer", "minimum": 1, "description": "How many times this error was recorded"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 
     async fn execute(
@@ -106,15 +183,13 @@ impl Module for HealthSummaryModule {
         let (mut healthy, mut degraded, mut error_count, mut unknown) = (0u32, 0u32, 0u32, 0u32);
 
         for mid in &module_ids {
-            let (total_calls, errors) = snapshot
+            let counts = snapshot
                 .as_ref()
-                .map_or((0, 0), |s| extract_call_counts(s, mid.as_str()));
-            #[allow(clippy::cast_precision_loss)] // metrics ratio: precision loss acceptable
-            let error_rate = if total_calls > 0 {
-                errors as f64 / total_calls as f64
-            } else {
-                0.0
-            };
+                .map_or_else(ModuleCallCounts::default, |s| {
+                    extract_module_call_counts(s, mid.as_str())
+                });
+            let total_calls = counts.total;
+            let error_rate = counts.error_rate();
             let status = classify_health(error_rate, total_calls, threshold);
 
             match status {
@@ -128,18 +203,21 @@ impl Module for HealthSummaryModule {
                 continue;
             }
 
-            let top_error = self
-                .error_history
-                .get(mid.as_str(), Some(1))
-                .first()
-                .map(|e| {
-                    json!({
-                        "code": e.error_code,
-                        "message": e.message,
-                        "ai_guidance": e.ai_guidance,
-                        "count": e.count,
-                    })
-                });
+            // SYS-4: the most FREQUENT error, not the most recent — the field
+            // is named `top_error`, and apcore-python resolves it with
+            // `max(entries, key=lambda e: e.count)`. Reading `get(.., Some(1))`
+            // took the head of a `last_occurred`-descending list, so a one-off
+            // failure displaced the recurring one the operator needs to see.
+            // Ties keep the more recent entry, matching Python's `max`, which
+            // returns the first maximal element of that same ordering.
+            let top_error = most_frequent_error(&self.error_history, mid.as_str()).map(|e| {
+                json!({
+                    "code": e.error_code,
+                    "message": e.message,
+                    "ai_guidance": e.ai_guidance,
+                    "count": e.count,
+                })
+            });
 
             modules.push(json!({
                 "module_id": mid,
@@ -201,8 +279,37 @@ impl Module for HealthModule {
         })
     }
 
+    // PROTOCOL_SPEC §6.7.1.6 (SYS-24). Canonical shape:
+    // apcore/schemas/sys-health-module.schema.json.
     fn output_schema(&self) -> serde_json::Value {
-        json!({ "type": "object" })
+        json!({
+            "type": "object",
+            "required": ["module_id", "status", "total_calls", "error_count", "error_rate"],
+            "properties": {
+                "module_id": {"type": "string", "description": "Canonical module ID"},
+                "status": {"type": "string", "enum": ["healthy", "degraded", "error", "unknown"], "description": "Health status; `unknown` means no calls recorded yet"},
+                "total_calls": {"type": "integer", "description": "Total number of calls to this module"},
+                "error_count": {"type": "integer", "description": "Total number of errors from this module"},
+                "error_rate": {"type": "number", "description": "Error rate as a decimal (0.0 to 1.0)"},
+                "avg_latency_ms": {"type": "number", "description": "Average execution latency in milliseconds"},
+                "p99_latency_ms": {"type": "number", "description": "99th percentile execution latency in milliseconds"},
+                "recent_errors": {
+                    "type": "array",
+                    "description": "Recent error entries, most recent first",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string", "description": "Canonical error code"},
+                            "message": {"type": "string", "description": "Error message"},
+                            "ai_guidance": {"type": ["string", "null"], "description": "Remediation guidance for an AI caller, when the error carries one"},
+                            "count": {"type": "integer", "description": "Number of occurrences"},
+                            "first_occurred": {"type": "string", "description": "RFC 3339 timestamp of the first occurrence"},
+                            "last_occurred": {"type": "string", "description": "RFC 3339 timestamp of the most recent occurrence"}
+                        }
+                    }
+                }
+            }
+        })
     }
 
     async fn execute(
@@ -223,25 +330,20 @@ impl Module for HealthModule {
             .unwrap_or(10) as usize;
 
         if !self.registry.has(module_id) {
-            return Err(ModuleError::new(
-                ErrorCode::ModuleNotFound,
-                format!("Module '{module_id}' not found"),
-            ));
+            return Err(ModuleError::module_not_found(module_id));
         }
 
         let snapshot = self
             .metrics
             .as_ref()
             .map(super::super::observability::metrics::MetricsCollector::snapshot);
-        let (total_calls, errors) = snapshot
+        let counts = snapshot
             .as_ref()
-            .map_or((0, 0), |s| extract_call_counts(s, module_id));
-        #[allow(clippy::cast_precision_loss)] // metrics ratio: precision loss acceptable
-        let error_rate = if total_calls > 0 {
-            errors as f64 / total_calls as f64
-        } else {
-            0.0
-        };
+            .map_or_else(ModuleCallCounts::default, |s| {
+                extract_module_call_counts(s, module_id)
+            });
+        let (total_calls, errors) = (counts.total, counts.errors);
+        let error_rate = counts.error_rate();
         let status = classify_health(error_rate, total_calls, 0.01);
 
         let recent_errors: Vec<serde_json::Value> = self
@@ -260,9 +362,15 @@ impl Module for HealthModule {
             })
             .collect();
 
-        let (avg_latency_ms, p99_latency_ms) = snapshot
+        let ModuleLatencyStats {
+            avg_ms: avg_latency_ms,
+            p99_ms: p99_latency_ms,
+            ..
+        } = snapshot
             .as_ref()
-            .map_or((0.0, 0.0), |s| extract_latency_stats(s, module_id));
+            .map_or_else(ModuleLatencyStats::default, |s| {
+                extract_module_latency_stats(s, module_id)
+            });
 
         Ok(json!({
             "module_id": module_id,
@@ -277,61 +385,6 @@ impl Module for HealthModule {
     }
 }
 
-/// Extract call counts from a `MetricsCollector` snapshot.
-fn extract_call_counts(snapshot: &serde_json::Value, module_id: &str) -> (u64, u64) {
-    let Some(counters) = snapshot.get("counters").and_then(|c| c.as_object()) else {
-        return (0, 0);
-    };
-    let mut total: u64 = 0;
-    let mut errors: u64 = 0;
-    let success_key = format!("apcore_module_calls_total|module_id={module_id},status=success");
-    let error_key = format!("apcore_module_calls_total|module_id={module_id},status=error");
-    if let Some(v) = counters
-        .get(&success_key)
-        .and_then(serde_json::Value::as_u64)
-    {
-        total += v;
-    }
-    if let Some(v) = counters.get(&error_key).and_then(serde_json::Value::as_u64) {
-        total += v;
-        errors = v;
-    }
-    (total, errors)
-}
-
-/// Extract latency statistics (`avg_ms`, `p99_ms`) from a `MetricsCollector` snapshot.
-///
-/// Reads the histogram key `apcore_module_duration_seconds|module_id=<id>`.
-/// Returns (`avg_latency_ms`, `p99_latency_ms`).
-fn extract_latency_stats(snapshot: &serde_json::Value, module_id: &str) -> (f64, f64) {
-    let Some(histograms) = snapshot.get("histograms").and_then(|h| h.as_object()) else {
-        return (0.0, 0.0);
-    };
-    let hist_key = format!("apcore_module_duration_seconds|module_id={module_id}");
-    let Some(data) = histograms.get(&hist_key) else {
-        return (0.0, 0.0);
-    };
-    let sum = data
-        .get("sum")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
-    let count = data
-        .get("count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    #[allow(clippy::cast_precision_loss)] // latency avg: precision loss acceptable
-    let avg_ms = if count > 0 {
-        (sum / count as f64) * 1000.0
-    } else {
-        0.0
-    };
-
-    // Estimate p99 from histogram buckets.
-    let p99_ms = if let Some(buckets) = data.get("buckets").and_then(|b| b.as_array()) {
-        estimate_p99_from_histogram(buckets, count)
-    } else {
-        0.0
-    };
-
-    (avg_ms, p99_ms)
-}
+// Snapshot extraction lives in `observability::metrics`
+// (`extract_module_call_counts` / `extract_module_latency_stats`) so this module
+// and `PlatformNotifyMiddleware` cannot drift apart on the label spelling again.

@@ -91,9 +91,17 @@ fn default_enabled() -> bool {
 }
 
 /// Dependency information for a module.
+///
+/// **Wire name (SYS-12):** the constraint is serialized as `version`, which is
+/// how the metadata YAML input spells it ([`DepInfo::version`]) and how
+/// apcore-python and apcore-typescript emit it from `system.manifest.module` /
+/// `system.manifest.full`. The Rust field keeps the more explicit
+/// `version_constraint` name; only the wire form is renamed, so a manifest
+/// consumer reading `dependencies[].version` gets an answer on all three SDKs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyInfo {
     pub module_id: String,
+    #[serde(rename = "version")]
     pub version_constraint: String,
     #[serde(default)]
     pub optional: bool,
@@ -131,7 +139,7 @@ impl From<DepInfo> for DependencyInfo {
 /// A `dependencies` value that is not an array means "none declared" rather
 /// than an error: nothing validates this key (no schema describes it), so a
 /// scalar can arrive here from hand-written YAML or a hand-built metadata map.
-fn dependencies_from_metadata(
+pub(crate) fn dependencies_from_metadata(
     metadata: &HashMap<String, serde_json::Value>,
 ) -> Vec<DependencyInfo> {
     metadata
@@ -304,6 +312,17 @@ pub mod registry_events {
 
     /// Fired before a module is removed from the registry.
     pub const UNREGISTER: &str = "unregister";
+
+    /// Every event name this implementation can emit, and therefore the exact
+    /// set [`Registry::on`](crate::registry::Registry::on) accepts (D-80).
+    ///
+    /// The spec's closed set is `register`, `unregister`, and a **conditional**
+    /// `file_changed`. `file_changed` exists only for implementations whose
+    /// `watch()` is notify-only; apcore-rust's `watch()` re-runs discovery and
+    /// already emits `unregister`/`register` for the change, so per requirement
+    /// 3 it MUST NOT additionally emit `file_changed` — and, by requirement 2
+    /// read the other way, must not advertise a name it never fires.
+    pub const ALL: [&str; 2] = [REGISTER, UNREGISTER];
 }
 
 /// Container for the standard registry event names.
@@ -317,6 +336,8 @@ pub struct RegistryEvents;
 impl RegistryEvents {
     pub const REGISTER: &'static str = registry_events::REGISTER;
     pub const UNREGISTER: &'static str = registry_events::UNREGISTER;
+    /// The closed set of names `Registry::on` accepts (D-80).
+    pub const ALL: [&'static str; 2] = registry_events::ALL;
 }
 
 /// Singleton value of [`RegistryEvents`], kept so the name `REGISTRY_EVENTS`
@@ -451,10 +472,13 @@ pub struct Registry {
     callbacks: RwLock<CallbackMap>,
     /// Monotonically increasing counter for callback handle IDs.
     callback_counter: AtomicU64,
+    /// D-89: `(module_id, version)` pairs whose deprecation warning has already
+    /// been emitted by THIS registry instance.
+    deprecation_warned: ParkingLotMutex<HashSet<(String, String)>>,
     /// Drain completion notification — signaled when a draining module reaches zero refs.
     drain_events: RwLock<HashMap<String, Arc<tokio::sync::Notify>>>,
     /// Optional discoverer for module discovery.
-    discoverer: RwLock<Option<Box<dyn Discoverer>>>,
+    discoverer: RwLock<Option<Arc<dyn Discoverer>>>,
     /// Optional validator for module validation.
     ///
     /// Stored as `Arc` (not `Box`) so the validator can be cloned out of the
@@ -500,8 +524,8 @@ pub struct Registry {
 /// `.await`, that new one wins — the guard only restores when the slot is
 /// still `None`.
 struct DiscovererRestoreGuard<'a> {
-    slot: &'a RwLock<Option<Box<dyn Discoverer>>>,
-    discoverer: Option<Box<dyn Discoverer>>,
+    slot: &'a RwLock<Option<Arc<dyn Discoverer>>>,
+    discoverer: Option<Arc<dyn Discoverer>>,
 }
 
 impl Drop for DiscovererRestoreGuard<'_> {
@@ -564,6 +588,7 @@ impl Registry {
             core: RwLock::new(RegistryCore::new()),
             callbacks: RwLock::new(HashMap::new()),
             callback_counter: AtomicU64::new(1),
+            deprecation_warned: ParkingLotMutex::new(HashSet::new()),
             drain_events: RwLock::new(HashMap::new()),
             discoverer: RwLock::new(None),
             validator: RwLock::new(None),
@@ -676,14 +701,35 @@ impl Registry {
     /// When you need a custom descriptor, use
     /// [`register`](Self::register) (the three-argument extended form).
     pub fn register_module(&self, name: &str, module: Box<dyn Module>) -> Result<(), ModuleError> {
+        // Read the module's declarations ONCE: `metadata` also feeds
+        // `dependencies` below, and `register_core` derives `sunset_date` from
+        // `metadata["x-deprecation"]`.
+        let metadata = module.metadata();
         let descriptor = ModuleDescriptor {
             module_id: name.to_string(),
             name: None,
             description: module.description().to_string(),
-            documentation: None,
+            // Sourced from the module rather than hardcoded to `None`: a
+            // declaration the module carries (a `*.binding.yaml`
+            // `documentation:` block reaches `FunctionModule.documentation`)
+            // was otherwise discarded here. Matches apcore-python
+            // (`registry/metadata.py`) and apcore-typescript
+            // (`registry/metadata-pure.ts`).
+            documentation: module.documentation().map(ToString::to_string),
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
-            version: DEFAULT_MODULE_VERSION.to_string(),
+            // Sourced from the module for the same reason as `documentation`
+            // and `metadata`: D-97 gave `annotations` / `tags` /
+            // `documentation` / `metadata` trait accessors and left `version`
+            // and `examples` as `FunctionModule` fields no accessor reached, so
+            // a `*.binding.yaml` `version:` was **validated** against
+            // `validation.binding.version_require_semver` and then discarded —
+            // the module registered as 1.0.0 and no version hint could find it.
+            version: module
+                .version()
+                .filter(|v| !v.is_empty())
+                .unwrap_or(DEFAULT_MODULE_VERSION)
+                .to_string(),
             // A-D-017: populate tags from module.tags() like register_versioned,
             // instead of dropping them. Matches Python/TS register().
             tags: module.tags(),
@@ -693,17 +739,25 @@ impl Registry {
             // (`register` merges the module's annotations), so declarations like
             // `requires_approval` survive the two-argument register path.
             annotations: Some(module.annotations()),
-            examples: vec![],
-            metadata: HashMap::new(),
+            // The second half of the same gap as `version` above: stored on the
+            // module, reachable through no accessor, replaced with an empty Vec
+            // here. Both peers merge the module's examples into the descriptor.
+            examples: module.examples(),
+            // Sourced from the module for the same reason as `documentation`
+            // above: the binding loader computes a `display:` block into
+            // `FunctionModule.metadata["apcore.display"]`, and an empty map
+            // here overwrote it.
+            metadata: metadata.clone(),
             display: None,
+            // Derived from `metadata["x-deprecation"].sunset_date` by
+            // `register_core`, which reads `descriptor.metadata` — now that the
+            // module's metadata reaches the descriptor, that derivation has a
+            // source on this path too.
             sunset_date: None,
-            // No source to populate from: the two-argument form takes no
-            // metadata, and the `Module` trait has no `dependencies()` method
-            // to derive from the way `tags()` and `annotations()` above are.
-            // Declare dependencies through `register_versioned`'s `metadata`
-            // (`{"dependencies": [{"module_id": …}]}`) or the three-argument
-            // `register` with an explicit descriptor.
-            dependencies: vec![],
+            // Parsed from the module's own metadata, the same shape
+            // `register_versioned` accepts (`{"dependencies": [{"module_id":
+            // …}]}`). Empty when the module declares none.
+            dependencies: dependencies_from_metadata(&metadata),
             enabled: true,
         };
         self.register(name, module, descriptor)
@@ -751,24 +805,48 @@ impl Registry {
         // descriptor form could declare an edge, and `ReloadModule::topo_sort_modules`
         // reads that accessor — so a `path_filter` reload of modules registered this
         // way sorted an empty graph and degenerated to alphabetical order.
-        let dependencies = dependencies_from_metadata(&metadata);
+        // The `metadata` ARGUMENT first, then the module's own declaration.
+        // Parsing only the argument left a module that declares dependencies on
+        // ITSELF — which is how apcore-python (`getattr(module,
+        // "dependencies", [])`) and apcore-typescript read them — registered
+        // with an empty graph, and `ReloadModule::topo_sort_modules` reads that
+        // accessor, so a `path_filter` reload of such modules degenerated to
+        // alphabetical order.
+        let mut dependencies = dependencies_from_metadata(&metadata);
+        if dependencies.is_empty() {
+            dependencies = module.dependencies();
+        }
         let descriptor = ModuleDescriptor {
             module_id: name.to_string(),
             name: None,
             description: module.description().to_string(),
-            documentation: None,
+            // The canonical four-argument form dropped the module's own
+            // `documentation` / `version` / `examples` exactly as
+            // `register_module` did before D-97 — and this is the path
+            // registry-system.md names as the cross-language-symmetric one, so
+            // the peers' `register(id, module, version?, metadata?)` carried
+            // all three while this carried none.
+            documentation: module.documentation().map(ToString::to_string),
             input_schema: module.input_schema(),
             output_schema: module.output_schema(),
+            // Explicit argument > module declaration > default, matching
+            // apcore-python's `meta.get("version") or code_version or "1.0.0"`
+            // and apcore-typescript's `mergeModuleMetadata`.
             version: version
-                .map_or_else(|| DEFAULT_MODULE_VERSION.to_string(), ToString::to_string),
+                .filter(|v| !v.is_empty())
+                .or_else(|| module.version().filter(|v| !v.is_empty()))
+                .unwrap_or(DEFAULT_MODULE_VERSION)
+                .to_string(),
             tags: module.tags(),
             // Derive annotations from the module's `annotations()` trait method
             // (matches Python/TS register), so `requires_approval` and other
             // declarations are not silently dropped.
             annotations: Some(module.annotations()),
-            examples: vec![],
+            examples: module.examples(),
             metadata,
             display: None,
+            // Derived from `metadata["x-deprecation"].sunset_date` by
+            // `register_core`, which also logs the deprecation warning.
             sunset_date: None,
             dependencies,
             enabled: true,
@@ -1022,11 +1100,18 @@ impl Registry {
     /// Per the apcore ephemeral-modules RFC pilot, agent-synthesized modules
     /// SHOULD declare `requires_approval: true` so a human gates execution.
     /// The registry only warns; it does not refuse the registration.
-    fn warn_if_missing_approval(name: &str, descriptor: &ModuleDescriptor) {
-        let requires_approval = descriptor
-            .annotations
-            .as_ref()
-            .is_some_and(|a| a.requires_approval);
+    ///
+    /// The two sources are unioned (PROTOCOL_SPEC §7.4, D-96) because that is
+    /// what the approval gate reads. Reading the descriptor alone — which this
+    /// did, while apcore-python and apcore-typescript read the instance — made
+    /// the same registration warn on one SDK and stay silent on another, and
+    /// advised an author to set something they had already set on the module.
+    fn warn_if_missing_approval(name: &str, module: &dyn Module, descriptor: &ModuleDescriptor) {
+        let requires_approval = crate::module::ModuleAnnotations::governance_union(
+            Some(&module.annotations()),
+            descriptor.annotations.as_ref(),
+        )
+        .is_some_and(|a| a.requires_approval);
         if !requires_approval {
             tracing::warn!(
                 module_id = %name,
@@ -1035,6 +1120,92 @@ impl Registry {
                  setting ModuleAnnotations {{ requires_approval: true, .. }} so \
                  agent-synthesized code does not run unattended."
             );
+        }
+    }
+
+    /// Metadata key carrying a module's deprecation block.
+    ///
+    /// Cross-language shape (apcore-python `Registry.get_definition`,
+    /// apcore-typescript `Registry.getDefinition`):
+    /// `{"x-deprecation": {"deprecated_since": "…", "sunset_version": "…",
+    /// "sunset_date": "…", "migration_guide": "…"}}`.
+    const DEPRECATION_METADATA_KEY: &'static str = "x-deprecation";
+
+    /// Log the deprecation warning for a module carrying `x-deprecation`.
+    ///
+    /// Wording mirrors apcore-python `Registry._log_deprecation_warning`,
+    /// including the `"unknown"` fallbacks and the optional migration clause.
+    fn log_deprecation_warning(
+        name: &str,
+        version: &str,
+        deprecation: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        let field = |key: &str| -> String {
+            deprecation
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        let mut message = format!(
+            "Module '{}' v{} is deprecated (since {}, sunset in {}).",
+            name,
+            version,
+            field("deprecated_since"),
+            field("sunset_version")
+        );
+        if let Some(guide) = deprecation
+            .get("migration_guide")
+            .and_then(serde_json::Value::as_str)
+            .filter(|g| !g.is_empty())
+        {
+            use std::fmt::Write as _;
+            let _ = write!(message, " Migration: {guide}");
+        }
+        tracing::warn!(module_id = %name, "{}", message);
+    }
+
+    /// Derive `descriptor.sunset_date` from `metadata["x-deprecation"]` and log
+    /// the deprecation warning.
+    ///
+    /// `sunset_date` is DERIVED, not hand-set: apcore-python reads it out of the
+    /// `x-deprecation` block in `get_definition`, while every Rust descriptor
+    /// builder hard-coded `None` and `x-deprecation` appeared nowhere in this
+    /// crate — so a deprecated module registered here reported no sunset date
+    /// and logged no warning. Doing it in the shared registration core covers
+    /// `register`, `register_module` and `register_versioned` at once. An
+    /// explicit descriptor value wins, so a caller may still set it directly.
+    ///
+    /// # Warning cadence (D-89)
+    ///
+    /// At most once per `(module_id, version)` per registry instance. Deriving
+    /// at registration rather than on every `get_definition` read already keeps
+    /// the warning off the read path — `get_definition` is a read hosts call in
+    /// loops, and warning per read is spam proportional to traffic, which is how
+    /// operators learn to filter it out. The dedupe set closes the remaining
+    /// gap: `watch()` re-runs discovery, which unregisters and re-registers
+    /// every module, so without it a hot reload re-warned for each one.
+    fn apply_deprecation_metadata(&self, name: &str, descriptor: &mut ModuleDescriptor) {
+        let Some(deprecation) = descriptor
+            .metadata
+            .get(Self::DEPRECATION_METADATA_KEY)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+        else {
+            return;
+        };
+        let first_sighting = self
+            .deprecation_warned
+            .lock()
+            .insert((name.to_string(), descriptor.version.clone()));
+        if first_sighting {
+            Self::log_deprecation_warning(name, &descriptor.version, &deprecation);
+        }
+        if descriptor.sunset_date.is_none() {
+            descriptor.sunset_date = deprecation
+                .get("sunset_date")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
         }
     }
 
@@ -1073,11 +1244,14 @@ impl Registry {
     ) -> Result<(), ModuleError> {
         validate_module_id(name, allow_reserved)?;
 
+        let mut descriptor = descriptor;
+        self.apply_deprecation_metadata(name, &mut descriptor);
+
         // Ephemeral RFC pilot: emit a soft tracing::warn when an ephemeral.*
         // module lacks requires_approval=true. Does NOT fail the registration —
         // the audit-emit single-emit rule fires later via the sys_modules bridge.
         if is_ephemeral_module_id(name) {
-            Self::warn_if_missing_approval(name, &descriptor);
+            Self::warn_if_missing_approval(name, module.as_ref(), &descriptor);
         }
 
         // Issue #62: if annotations declare streaming=true, the module MUST implement
@@ -1277,12 +1451,10 @@ impl Registry {
     pub fn describe(&self, name: &str) -> Result<String, ModuleError> {
         let override_text = {
             let core = self.core.read();
-            let module = core.modules.get(name).ok_or_else(|| {
-                ModuleError::new(
-                    crate::errors::ErrorCode::ModuleNotFound,
-                    format!("Module '{name}' not found"),
-                )
-            })?;
+            let module = core
+                .modules
+                .get(name)
+                .ok_or_else(|| ModuleError::module_not_found(name))?;
             match module.describe() {
                 serde_json::Value::String(s) => Some(s),
                 _ => None,
@@ -1425,12 +1597,11 @@ impl Registry {
                 format!("Module '{name}' is draining"),
             ));
         }
-        let module = core.modules.get(name).cloned().ok_or_else(|| {
-            ModuleError::new(
-                crate::errors::ErrorCode::ModuleNotFound,
-                format!("Module '{name}' not found"),
-            )
-        })?;
+        let module = core
+            .modules
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ModuleError::module_not_found(name))?;
         *core.ref_counts.entry(name.to_string()).or_insert(0) += 1;
         Ok(module)
     }
@@ -1495,19 +1666,47 @@ impl Registry {
     ///
     /// Returns a `u64` handle that can be passed to [`off`](Self::off) to
     /// remove the callback.
-    pub fn on(&self, event: &str, callback: Box<ModuleCallbackFn>) -> u64 {
+    ///
+    /// The event set is CLOSED (D-80): only the names in
+    /// [`registry_events::ALL`] are accepted. Accepting anything else and
+    /// handing back a valid-looking handle turns a typo into a permanently
+    /// silent subscription — the callback never fires and nothing says so.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::GeneralInvalidInput`](crate::errors::ErrorCode::GeneralInvalidInput)
+    /// when `event` is not one of [`registry_events::ALL`].
+    pub fn on(&self, event: &str, callback: Box<ModuleCallbackFn>) -> Result<u64, ModuleError> {
+        if !registry_events::ALL.contains(&event) {
+            return Err(ModuleError::invalid_input(format!(
+                "Unknown registry event: '{}'. Valid events: {}",
+                event,
+                registry_events::ALL.join(", ")
+            ))
+            .with_ai_guidance(format!(
+                "'{}' is not a registry event. Subscribe to one of: {}.",
+                event,
+                registry_events::ALL.join(", ")
+            )));
+        }
         let id = self.callback_counter.fetch_add(1, Ordering::Relaxed);
         self.callbacks
             .write()
             .entry(event.to_string())
             .or_default()
             .push((id, Arc::from(callback)));
-        id
+        Ok(id)
     }
 
     /// Remove a previously registered event callback by handle ID.
     ///
     /// Returns `true` if the callback was found and removed, `false` otherwise.
+    ///
+    /// D-80 requires `off` to reject an out-of-set event name too. Rust's `off`
+    /// takes only the handle [`on`](Self::on) issued and no event name, so
+    /// there is no name here to reject: an unknown name cannot reach this
+    /// method because `on` refused to issue a handle for it. A miss stays a
+    /// silent `false`, as before.
     pub fn off(&self, handle_id: u64) -> bool {
         let mut callbacks = self.callbacks.write();
         for entries in callbacks.values_mut() {
@@ -1896,6 +2095,16 @@ impl Registry {
 
     /// Set the discoverer.
     pub fn set_discoverer(&self, discoverer: Box<dyn Discoverer>) {
+        self.set_discoverer_shared(Arc::from(discoverer));
+    }
+
+    /// Install an already-shared discoverer handle.
+    ///
+    /// The counterpart to [`Self::set_discoverer`] for callers that keep their
+    /// own reference — [`ExtensionManager::apply`](crate::extensions::ExtensionManager::apply)
+    /// retains its registrations (D-78), so it wires a clone rather than the
+    /// only copy.
+    pub fn set_discoverer_shared(&self, discoverer: Arc<dyn Discoverer>) {
         *self.discoverer.write() = Some(discoverer);
     }
 
@@ -1966,7 +2175,15 @@ impl Registry {
 
     /// Set the validator.
     pub fn set_validator(&self, validator: Box<dyn ModuleValidator>) {
-        *self.validator.write() = Some(validator.into());
+        self.set_validator_shared(validator.into());
+    }
+
+    /// Install an already-shared validator handle.
+    ///
+    /// The counterpart to [`Self::set_validator`] for callers that keep their
+    /// own reference (D-78).
+    pub fn set_validator_shared(&self, validator: Arc<dyn ModuleValidator>) {
+        *self.validator.write() = Some(validator);
     }
 
     /// Return count of registered modules.
@@ -2198,5 +2415,178 @@ mod extension_roots_from_config_tests {
             registry.extension_roots(),
             vec!["./a".to_string(), "./b".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod deprecation_metadata_tests {
+    use super::Registry;
+    use crate::context::Context;
+    use crate::errors::ModuleError;
+    use crate::module::Module;
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    struct Noop;
+
+    #[async_trait]
+    impl Module for Noop {
+        fn input_schema(&self) -> Value {
+            json!({})
+        }
+        fn output_schema(&self) -> Value {
+            json!({})
+        }
+        fn description(&self) -> &'static str {
+            "noop"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, ModuleError> {
+            Ok(json!({}))
+        }
+    }
+
+    fn deprecation_metadata() -> HashMap<String, Value> {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "x-deprecation".to_string(),
+            json!({
+                "deprecated_since": "0.9.0",
+                "sunset_version": "1.0.0",
+                "sunset_date": "2027-01-31",
+                "migration_guide": "Use executor.email.send_email_v2",
+            }),
+        );
+        metadata
+    }
+
+    #[test]
+    fn sunset_date_is_derived_from_x_deprecation() {
+        // apcore-python reads `sunset_date` out of the `x-deprecation` block;
+        // every Rust descriptor builder used to hard-code `None`, so a
+        // deprecated module reported no sunset date at all.
+        let registry = Registry::new();
+        registry
+            .register_versioned(
+                "executor.email.send_email",
+                Box::new(Noop),
+                Some("0.9.0"),
+                Some(deprecation_metadata()),
+            )
+            .expect("register");
+
+        let desc = registry
+            .get_definition("executor.email.send_email")
+            .expect("get_definition")
+            .expect("descriptor");
+        assert_eq!(desc.sunset_date.as_deref(), Some("2027-01-31"));
+    }
+
+    #[test]
+    fn sunset_date_stays_none_without_x_deprecation() {
+        let registry = Registry::new();
+        registry
+            .register_versioned("executor.email.send", Box::new(Noop), None, None)
+            .expect("register");
+
+        let desc = registry
+            .get_definition("executor.email.send")
+            .expect("get_definition")
+            .expect("descriptor");
+        assert!(desc.sunset_date.is_none());
+    }
+
+    #[test]
+    fn an_explicit_sunset_date_is_not_overwritten() {
+        let registry = Registry::new();
+        let descriptor = crate::registry::registry::ModuleDescriptor {
+            module_id: "executor.email.legacy".to_string(),
+            name: None,
+            description: "noop".to_string(),
+            documentation: None,
+            input_schema: json!({}),
+            output_schema: json!({}),
+            version: "0.9.0".to_string(),
+            tags: vec![],
+            annotations: None,
+            examples: vec![],
+            metadata: deprecation_metadata(),
+            display: None,
+            sunset_date: Some("2026-12-01".to_string()),
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("executor.email.legacy", Box::new(Noop), descriptor)
+            .expect("register");
+
+        let desc = registry
+            .get_definition("executor.email.legacy")
+            .expect("get_definition")
+            .expect("descriptor");
+        assert_eq!(desc.sunset_date.as_deref(), Some("2026-12-01"));
+    }
+
+    #[test]
+    fn deprecation_warning_fires_once_per_module_and_version() {
+        // D-89: at most once per (module_id, version) per registry instance.
+        // `get_definition` is a read hosts call in loops, so the warning must
+        // not ride on it; and `watch()` re-runs discovery (unregister +
+        // re-register), so registration alone is not once either.
+        let registry = Registry::new();
+        let key = ("executor.email.send_email".to_string(), "0.9.0".to_string());
+
+        registry
+            .register_versioned(
+                "executor.email.send_email",
+                Box::new(Noop),
+                Some("0.9.0"),
+                Some(deprecation_metadata()),
+            )
+            .expect("register");
+        assert!(registry.deprecation_warned.lock().contains(&key));
+        assert_eq!(registry.deprecation_warned.lock().len(), 1);
+
+        // Reads never add a marker — the warning does not live on the read path.
+        for _ in 0..5 {
+            let _ = registry.get_definition("executor.email.send_email");
+        }
+        assert_eq!(registry.deprecation_warned.lock().len(), 1);
+
+        // A hot reload (unregister + re-register) does not re-warn.
+        registry
+            .unregister("executor.email.send_email")
+            .expect("unregister");
+        registry
+            .register_versioned(
+                "executor.email.send_email",
+                Box::new(Noop),
+                Some("0.9.0"),
+                Some(deprecation_metadata()),
+            )
+            .expect("re-register");
+        assert_eq!(
+            registry.deprecation_warned.lock().len(),
+            1,
+            "the same (module_id, version) must not be recorded twice"
+        );
+
+        // A DIFFERENT version is a different deprecation notice.
+        registry
+            .unregister("executor.email.send_email")
+            .expect("unregister");
+        registry
+            .register_versioned(
+                "executor.email.send_email",
+                Box::new(Noop),
+                Some("0.10.0"),
+                Some(deprecation_metadata()),
+            )
+            .expect("register 0.10.0");
+        assert_eq!(registry.deprecation_warned.lock().len(), 2);
     }
 }

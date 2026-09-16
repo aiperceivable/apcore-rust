@@ -203,12 +203,14 @@ fn assert_dependencies_survived(
 async fn observe_reload_order(registry: &Arc<Registry>, input: Value) -> Vec<String> {
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let recorder = Arc::clone(&recorded);
-    registry.on(
-        RegistryEvents::UNREGISTER,
-        Box::new(move |name: &str, _module: &dyn Module| {
-            recorder.lock().unwrap().push(name.to_string());
-        }),
-    );
+    registry
+        .on(
+            RegistryEvents::UNREGISTER,
+            Box::new(move |name: &str, _module: &dyn Module| {
+                recorder.lock().unwrap().push(name.to_string());
+            }),
+        )
+        .expect("valid registry event");
 
     let module = ReloadModule::new(Arc::clone(registry), Arc::new(EventEmitter::new()));
     let out = module

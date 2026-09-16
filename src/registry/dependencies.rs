@@ -53,17 +53,7 @@ pub fn resolve_dependencies(
                     );
                     continue;
                 }
-                let mut details: HashMap<String, serde_json::Value> = HashMap::new();
-                details.insert("module_id".to_string(), json!(module_id));
-                details.insert("dependency_id".to_string(), json!(dep.module_id));
-                return Err(ModuleError::new(
-                    ErrorCode::DependencyNotFound,
-                    format!(
-                        "Module '{}' has unsatisfied required dependency '{}'",
-                        module_id, dep.module_id
-                    ),
-                )
-                .with_details(details));
+                return Err(ModuleError::dependency_not_found(module_id, &dep.module_id));
             }
             match check_version_constraint(module_id, dep, module_versions) {
                 VersionCheck::Ok => {}
@@ -104,25 +94,55 @@ pub fn resolve_dependencies(
         }
     }
 
-    // Check for cycles
     if load_order.len() < modules.len() {
-        let ordered_set: HashSet<&String> = load_order.iter().collect();
-        let remaining: HashSet<String> = modules
-            .iter()
-            .filter(|(id, _)| !ordered_set.contains(id))
-            .map(|(id, _)| id.clone())
-            .collect();
-        let cycle_path = extract_cycle(modules, &remaining);
-        let mut details: HashMap<String, serde_json::Value> = HashMap::new();
-        details.insert("cycle_path".to_string(), json!(cycle_path));
-        return Err(ModuleError::new(
-            ErrorCode::CircularDependency,
-            format!("Circular dependency detected: {}", cycle_path.join(" -> ")),
-        )
-        .with_details(details));
+        return Err(classify_stall(modules, &load_order));
     }
 
     Ok(load_order)
+}
+
+/// Report a stalled Kahn's sort (D-79).
+///
+/// When the sort terminates with nodes remaining there are two causes, and
+/// they need opposite fixes — break an edge, versus add a missing module to
+/// the batch — so they are reported differently. Only a real back edge is a
+/// `CIRCULAR_DEPENDENCY`; a stall with no back edge is a `MODULE_LOAD_ERROR`
+/// naming the blocked modules, and MUST NOT carry a fabricated `cycle_path`.
+/// Reporting a loop that does not exist sends the author looking for something
+/// that is not there.
+fn classify_stall(modules: &[(String, Vec<DepInfo>)], load_order: &[String]) -> ModuleError {
+    let ordered_set: HashSet<&String> = load_order.iter().collect();
+    let remaining: HashSet<String> = modules
+        .iter()
+        .filter(|(id, _)| !ordered_set.contains(id))
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    if let Some(cycle_path) = find_back_edge_cycle(modules, &remaining) {
+        let mut details: HashMap<String, serde_json::Value> = HashMap::new();
+        details.insert("cycle_path".to_string(), json!(cycle_path));
+        return ModuleError::new(
+            ErrorCode::CircularDependency,
+            format!("Circular dependency detected: {}", cycle_path.join(" -> ")),
+        )
+        .with_details(details);
+    }
+
+    let mut blocked: Vec<String> = remaining.into_iter().collect();
+    blocked.sort();
+    let mut details: HashMap<String, serde_json::Value> = HashMap::new();
+    details.insert("module_id".to_string(), json!(blocked.join(",")));
+    details.insert("blocked_modules".to_string(), json!(blocked));
+    ModuleError::new(
+        ErrorCode::ModuleLoadError,
+        format!(
+            "{} module(s) could not be loaded — blocked by unresolved required \
+             dependencies: {:?}",
+            blocked.len(),
+            blocked
+        ),
+    )
+    .with_details(details)
 }
 
 enum VersionCheck {
@@ -163,31 +183,28 @@ fn check_version_constraint(
         );
         return VersionCheck::SkipOptional;
     }
-    let mut details: HashMap<String, serde_json::Value> = HashMap::new();
-    details.insert("module_id".to_string(), json!(module_id));
-    details.insert("dependency_id".to_string(), json!(dep.module_id));
-    details.insert("required".to_string(), json!(constraint));
-    details.insert("actual".to_string(), json!(actual));
-    VersionCheck::Err(
-        ModuleError::new(
-            ErrorCode::DependencyVersionMismatch,
-            format!(
-                "Module '{}' requires dependency '{}' version '{}', \
-                 but registered version is '{}'",
-                module_id, dep.module_id, constraint, actual
-            ),
-        )
-        .with_details(details),
-    )
+    VersionCheck::Err(ModuleError::dependency_version_mismatch(
+        module_id,
+        &dep.module_id,
+        constraint,
+        actual,
+    ))
 }
 
-/// Extract a cycle path from the remaining unprocessed modules.
+/// Return a back-edge cycle `[n0, n1, ..., nk, n0]` if one exists among the
+/// remaining unprocessed modules, else `None`.
 ///
-/// Runs DFS from each remaining node (sorted for determinism) until a back-edge
-/// is found, returning `[n0, n1, ..., nk, n0]`. Falls back to the sorted
-/// remaining set if no back-edge exists (e.g., nodes blocked on an external
-/// dependency rather than a true cycle).
-fn extract_cycle(modules: &[(String, Vec<DepInfo>)], remaining: &HashSet<String>) -> Vec<String> {
+/// Runs DFS from each remaining node (sorted for determinism) until a back edge
+/// is found. Returning `None` rather than the sorted remaining set is what lets
+/// the caller tell a true cycle from a stall (D-79); the previous fallback
+/// turned a module blocked on a dependency outside the batch into a
+/// one-element "cycle" reported as `CIRCULAR_DEPENDENCY`.
+///
+/// Mirrors `apcore-python._find_back_edge_cycle`.
+fn find_back_edge_cycle(
+    modules: &[(String, Vec<DepInfo>)],
+    remaining: &HashSet<String>,
+) -> Option<Vec<String>> {
     let mut dep_map: HashMap<String, Vec<String>> = HashMap::new();
     for (mod_id, deps) in modules {
         if remaining.contains(mod_id) {
@@ -207,11 +224,11 @@ fn extract_cycle(modules: &[(String, Vec<DepInfo>)], remaining: &HashSet<String>
 
     for start in &sorted_remaining {
         if let Some(cycle) = dfs_find_cycle(&dep_map, start) {
-            return cycle;
+            return Some(cycle);
         }
     }
 
-    sorted_remaining
+    None
 }
 
 /// Iterative DFS that returns a back-edge cycle `[n0, ..., n0]` or `None`.
@@ -416,7 +433,7 @@ mod tests {
         // Reach into the private extractor directly — it receives the exact
         // `remaining` set that resolve_dependencies would compute (all three IDs).
         let remaining: HashSet<String> = ["A", "B", "C"].iter().map(|s| (*s).to_string()).collect();
-        let path = extract_cycle(&modules, &remaining);
+        let path = find_back_edge_cycle(&modules, &remaining).expect("a real A->B->A cycle");
         // Sanity check: resolve_dependencies itself still fails with a cycle error.
         assert!(resolve_dependencies(&modules, Some(&known_ids), None).is_err());
         // cycle_path must start and end at the same node
@@ -431,6 +448,74 @@ mod tests {
             interior,
             ["A", "B"].into_iter().collect::<HashSet<&str>>(),
             "cycle should span {{A,B}}, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn test_genuine_cycle_reports_circular_dependency() {
+        // D-79, branch 1: a real A -> B -> A back edge IS a cycle.
+        let modules = vec![
+            (
+                "a".to_string(),
+                vec![DepInfo {
+                    module_id: "b".to_string(),
+                    version: None,
+                    optional: false,
+                }],
+            ),
+            (
+                "b".to_string(),
+                vec![DepInfo {
+                    module_id: "a".to_string(),
+                    version: None,
+                    optional: false,
+                }],
+            ),
+        ];
+        let err = resolve_dependencies(&modules, None, None).expect_err("cycle must fail");
+        assert_eq!(err.code, ErrorCode::CircularDependency);
+        let cycle = err
+            .details
+            .get("cycle_path")
+            .and_then(|v| v.as_array())
+            .expect("a real cycle carries cycle_path");
+        assert!(cycle.len() >= 3, "cycle_path: {cycle:?}");
+    }
+
+    #[test]
+    fn test_stall_without_cycle_reports_module_load_error() {
+        // D-79, branch 2: `b` is registered but is NOT in this batch, so `a`
+        // never reaches in-degree zero. That is a blocked load, not a cycle —
+        // the two need opposite fixes, so reporting CIRCULAR_DEPENDENCY with a
+        // one-element cycle_path sent the author looking for a loop that does
+        // not exist.
+        let modules = vec![(
+            "a".to_string(),
+            vec![DepInfo {
+                module_id: "b".to_string(),
+                version: None,
+                optional: false,
+            }],
+        )];
+        let known_ids: HashSet<String> = ["a", "b"].into_iter().map(String::from).collect();
+        let err = resolve_dependencies(&modules, Some(&known_ids), None)
+            .expect_err("a blocked batch member must fail");
+        assert_eq!(err.code, ErrorCode::ModuleLoadError);
+        assert!(
+            !err.details.contains_key("cycle_path"),
+            "a stall with no cycle must NOT fabricate a cycle_path: {:?}",
+            err.details
+        );
+        assert!(
+            err.message.contains('a'),
+            "the blocked module must be named: {}",
+            err.message
+        );
+        assert_eq!(
+            err.details.get("blocked_modules"),
+            Some(&json!(["a"])),
+            "details: {:?}",
+            err.details
         );
     }
 

@@ -47,7 +47,7 @@ use apcore::{Config, Context, Executor, Registry};
 // ---------------------------------------------------------------------------
 
 fn make_acl() -> ExtensionKind {
-    ExtensionKind::Acl(ACL::new(vec![], "deny", None))
+    ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None)))
 }
 
 fn make_executor() -> Executor {
@@ -75,8 +75,8 @@ struct NamedMiddleware {
 }
 
 impl NamedMiddleware {
-    fn boxed(name: &str) -> Box<dyn Middleware> {
-        Box::new(NamedMiddleware {
+    fn boxed(name: &str) -> Arc<dyn Middleware> {
+        Arc::new(NamedMiddleware {
             name: name.to_string(),
         })
     }
@@ -209,12 +209,15 @@ fn register_error_extension_type_error() {
 // clause: extension_system.register.property.async.false
 #[test]
 fn register_property_async_false() {
-    // async=false. register() is a plain synchronous fn returning Result<()>;
-    // callable without an async runtime and resolving to () on success.
+    // async=false. register() is a plain synchronous fn returning a Result;
+    // callable without an async runtime. Since D-91 the success value is the
+    // `ExtensionHandle` that makes an outside-the-manager removal expressible,
+    // not `()`.
     let mut mgr = ExtensionManager::new();
-    let result: Result<(), ModuleError> = mgr.register("acl", make_acl());
+    let result: Result<_, ModuleError> = mgr.register("acl", make_acl());
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), ());
+    let handle = result.unwrap();
+    assert!(mgr.unregister_handle(handle));
 }
 
 // clause: extension_system.register.property.idempotent.single_replaces
@@ -411,10 +414,12 @@ async fn get_all_property_thread_safe_concurrent_reads() {
 // ===========================================================================
 // Contract: ExtensionManager.unregister
 //
-// Rust exposes NO identity-based `unregister(point, ext)` method (contract gap).
-// The removal surface is `clear(point)` (removes ALL at a point) and
-// `clear_all()`. Identity-removal clauses are marked #[ignore]; the
-// async/pure/no-op INTENT is exercised against `clear()` where meaningful.
+// Since D-91 Rust has a REACHABLE identity-based removal. `ExtensionKind`
+// holds `Arc`s, so a host keeps the handle, registers a clone, and hands
+// another clone to `unregister(point, ext)`; `unregister_handle(handle)` is the
+// same removal keyed on the token `register` returns, for callers who would
+// rather not keep the object. `clear(point)` / `clear_all()` remain the
+// point-wide removals.
 // ===========================================================================
 
 // clause: extension_system.unregister.property.async.false
@@ -433,23 +438,66 @@ fn unregister_property_async_false() {
 }
 
 // clause: extension_system.unregister.removes.identity
-#[ignore = "extension_system.unregister.removes.identity: missing symbol ExtensionManager::unregister(point, ext) (contract gap); Rust only has clear(point) which removes ALL extensions, not a specific identity"]
 #[test]
 fn unregister_removes_identity() {
-    // Python removes the exact extension object by identity, leaving the others.
-    // Rust has no per-identity unregister; clear() drops every extension at the
-    // point, so the "remove one, keep the rest" semantic cannot be expressed.
-    panic!("ExtensionManager::unregister(point, ext) does not exist");
+    // D-91: remove the exact extension object, leaving the others. The caller
+    // holds the `Arc` it registered a clone of — the removal path that made
+    // this expressible from outside the manager.
+    let mut mgr = ExtensionManager::new();
+    let keep = NamedMiddleware::boxed("keep");
+    let drop_me = NamedMiddleware::boxed("drop");
+    mgr.register("middleware", ExtensionKind::Middleware(Arc::clone(&keep)))
+        .expect("register keep");
+    mgr.register(
+        "middleware",
+        ExtensionKind::Middleware(Arc::clone(&drop_me)),
+    )
+    .expect("register drop");
+    assert_eq!(mgr.count("middleware"), Some(2));
+
+    assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(drop_me)));
+    assert_eq!(mgr.count("middleware"), Some(1));
+
+    // The survivor is the one that was not named.
+    let survivors: Vec<&str> = mgr
+        .get_all("middleware")
+        .iter()
+        .map(|e| match e {
+            ExtensionKind::Middleware(m) => m.name(),
+            _ => panic!("expected middleware"),
+        })
+        .collect();
+    assert_eq!(survivors, vec!["keep"]);
+
+    // And the handle form removes exactly one too.
+    assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(keep)));
+    assert_eq!(mgr.count("middleware"), Some(0));
 }
 
 // clause: extension_system.unregister.error.missing_is_silent_no_op
-#[ignore = "extension_system.unregister.error.missing_is_silent_no_op: missing symbol ExtensionManager::unregister(point, ext) (contract gap); no identity-based removal whose 'not found => false' no-op could be observed"]
 #[test]
 fn unregister_error_missing_is_silent_no_op() {
-    // Python: unregistering a never-registered extension returns False (silent
-    // no-op) and leaves state intact. Rust has no identity-based unregister to
-    // exercise this no-op.
-    panic!("ExtensionManager::unregister(point, ext) does not exist");
+    // Unregistering a never-registered extension returns false (silent no-op)
+    // and leaves state intact.
+    let mut mgr = ExtensionManager::new();
+    let registered = NamedMiddleware::boxed("registered");
+    let handle = mgr
+        .register("middleware", ExtensionKind::Middleware(registered))
+        .expect("register");
+
+    let stranger = NamedMiddleware::boxed("stranger");
+    assert!(!mgr.unregister(
+        "middleware",
+        &ExtensionKind::Middleware(Arc::clone(&stranger))
+    ));
+    assert_eq!(mgr.count("middleware"), Some(1));
+
+    // Unknown point: also a silent false, not an error.
+    assert!(!mgr.unregister("nonexistent", &ExtensionKind::Middleware(stranger)));
+
+    // A handle already spent is a silent false on the second call.
+    assert!(mgr.unregister_handle(handle));
+    assert!(!mgr.unregister_handle(handle));
 }
 
 // clause: extension_system.unregister.property.pure.false
@@ -472,9 +520,11 @@ fn unregister_property_pure_false() {
 // ===========================================================================
 // Contract: ExtensionManager.apply
 //
-// Rust `apply(&Registry, &mut Executor)` wires extensions and DRAINS the store.
+// Rust `apply(&Registry, &mut Executor)` wires extensions and RETAINS the
+// store (D-78 Postconditions): each registration is wired as a shared `Arc`
+// clone, so one manager can be applied to several registry/executor pairs.
 // Side-effects 1-4 (discoverer/validator/acl/approval) are NOT observable via
-// public getters, so they are asserted indirectly (apply() Ok + store drained).
+// public getters, so they are asserted indirectly (apply() Ok + store intact).
 // Side-effect 5 (middleware) and side-effect 6 (span exporters) ARE observable
 // via `executor.middlewares()`.
 // ===========================================================================
@@ -497,14 +547,10 @@ fn apply_property_async_false() {
 fn apply_side_effect_1_set_discoverer() {
     // Python observes registry.set_discoverer(ext) via a mock. Rust's Registry
     // exposes no discoverer getter, so we assert the observable contract: apply()
-    // succeeds and the discoverer is consumed (drained) from the manager store.
+    // succeeds and the discoverer point is left as it was found.
     // (Cross-language note: direct call-observation requires a mock surface Rust
     // does not provide.)
     let mut mgr = ExtensionManager::new();
-    // Discoverer registration also requires a Box<dyn Discoverer>; use the wiring
-    // path through a real Registry. We register via a Discoverer-shaped stub is
-    // unnecessary here because the side effect we can observe is the drain after
-    // apply on an empty discoverer point: apply must not raise.
     let registry = Arc::new(Registry::new());
     let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
     assert!(mgr.apply(&registry, &mut executor).is_ok());
@@ -516,8 +562,8 @@ fn apply_side_effect_1_set_discoverer() {
 #[test]
 fn apply_side_effect_2_set_validator() {
     // Python observes registry.set_validator(ext) via a mock. Rust's Registry
-    // exposes no validator getter; assert apply() succeeds and the module_validator
-    // point is consumed/empty after apply.
+    // exposes no validator getter; assert apply() succeeds and leaves the
+    // module_validator point as it was found.
     let mut mgr = ExtensionManager::new();
     let registry = Arc::new(Registry::new());
     let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
@@ -529,15 +575,15 @@ fn apply_side_effect_2_set_validator() {
 #[test]
 fn apply_side_effect_3_set_acl() {
     // Python observes executor.set_acl(ext). Rust's Executor exposes no acl
-    // getter; we assert the observable contract: apply() consumes the registered
-    // acl (count goes to 0) and succeeds without error.
+    // getter; we assert the observable contract: apply() succeeds and (D-78)
+    // the registered acl is still registered afterwards.
     let mut mgr = ExtensionManager::new();
     mgr.register("acl", make_acl()).expect("register acl");
     assert_eq!(mgr.count("acl"), Some(1));
     let registry = Arc::new(Registry::new());
     let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
     mgr.apply(&registry, &mut executor).expect("apply");
-    assert_eq!(mgr.count("acl"), Some(0));
+    assert_eq!(mgr.count("acl"), Some(1), "apply must not drain the store");
 }
 
 // clause: extension_system.apply.side_effect.4.set_approval_handler
@@ -594,7 +640,7 @@ fn apply_side_effect_6_single_span_exporter_direct() {
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
     )
     .expect("register exporter");
     let registry = Arc::new(Registry::new());
@@ -624,12 +670,12 @@ async fn apply_side_effect_6_multiple_span_exporters_composite() {
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(FailingExporter)),
+        ExtensionKind::SpanExporter(Arc::new(FailingExporter)),
     )
     .expect("register failing exporter");
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
     )
     .expect("register good exporter");
     assert_eq!(mgr.count("span_exporter"), Some(2));
@@ -679,7 +725,7 @@ fn apply_side_effect_6_no_tracing_middleware_no_raise() {
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
     )
     .expect("register exporter");
     let registry = Arc::new(Registry::new());
@@ -697,10 +743,9 @@ fn apply_side_effect_6_no_tracing_middleware_no_raise() {
 // clause: extension_system.apply.property.idempotent.false
 #[test]
 fn apply_property_idempotent_false() {
-    // idempotent=false. Python: a second apply() STACKS middleware. Rust DRAINS
-    // the store on apply (std::mem::take), so the registered middleware is wired
-    // exactly once across two apply() calls — the second apply is a no-op.
-    // Cross-language DIVERGENCE recorded in the report; assert ACTUAL Rust here.
+    // idempotent=false: a second apply() STACKS middleware (D-78). Only a
+    // non-consuming implementation can produce that observable, which is why
+    // the Postconditions section forbids draining.
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "middleware",
@@ -714,16 +759,52 @@ fn apply_property_idempotent_false() {
     mgr.apply(&registry, &mut executor).expect("second apply");
 
     let count = executor.middlewares().iter().filter(|n| *n == "mw").count();
-    // Rust drains on apply => wired exactly once (NOT stacked twice).
-    assert_eq!(
-        count, 1,
-        "Rust drains the store on apply (cross-language divergence)"
+    assert_eq!(count, 2, "a second apply must stack the middleware");
+    assert_eq!(mgr.count("middleware"), Some(1), "store intact after apply");
+}
+
+// clause: extension_system.apply.postcondition.store_retained
+#[test]
+fn apply_postcondition_store_retained() {
+    // D-78: applying ONE manager to TWO registry/executor pairs wires both.
+    // Before the fix the second pair got nothing, silently.
+    let mut mgr = ExtensionManager::new();
+    mgr.register("acl", make_acl()).expect("register acl");
+    mgr.register(
+        "middleware",
+        ExtensionKind::Middleware(NamedMiddleware::boxed("mw")),
+    )
+    .expect("register mw");
+    mgr.register(
+        "span_exporter",
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
+    )
+    .expect("register exporter");
+
+    let registry_a = Arc::new(Registry::new());
+    let mut executor_a = Executor::new(Arc::clone(&registry_a), Arc::new(Config::default()));
+    let registry_b = Arc::new(Registry::new());
+    let mut executor_b = Executor::new(Arc::clone(&registry_b), Arc::new(Config::default()));
+
+    mgr.apply(&registry_a, &mut executor_a).expect("apply a");
+    mgr.apply(&registry_b, &mut executor_b).expect("apply b");
+
+    assert!(
+        executor_a.middlewares().contains(&"mw".to_string()),
+        "first executor must be wired"
     );
-    assert_eq!(
-        mgr.count("middleware"),
-        Some(0),
-        "store drained after apply"
+    assert!(
+        executor_b.middlewares().contains(&"mw".to_string()),
+        "second executor must be wired from the same manager"
     );
+
+    // count() is unchanged at every point after apply.
+    assert_eq!(mgr.count("acl"), Some(1));
+    assert_eq!(mgr.count("middleware"), Some(1));
+    assert_eq!(mgr.count("span_exporter"), Some(1));
+    // And the entries are still readable, not just counted.
+    assert!(matches!(mgr.get("acl"), Some(ExtensionKind::Acl(_))));
+    assert_eq!(mgr.get_all("middleware").len(), 1);
 }
 
 // clause: extension_system.apply.side_effect.ordered.full_sequence
@@ -733,7 +814,8 @@ fn apply_side_effect_ordered_full_sequence() {
     // acl -> approval_handler -> middleware -> span exporters via a shared
     // recorder of mock calls. Rust exposes no cross-target getters/mocks, so the
     // full ordered sequence cannot be observed. We assert the observable subset:
-    // apply() wires acl + middleware together without error and drains the store.
+    // apply() wires acl + middleware together without error and (D-78) leaves
+    // the store intact.
     let mut mgr = ExtensionManager::new();
     mgr.register("acl", make_acl()).expect("register acl");
     mgr.register(
@@ -747,7 +829,7 @@ fn apply_side_effect_ordered_full_sequence() {
     mgr.apply(&registry, &mut executor).expect("apply");
 
     assert!(executor.middlewares().contains(&"mw".to_string()));
-    assert_eq!(mgr.count("acl"), Some(0), "acl consumed");
-    assert_eq!(mgr.count("middleware"), Some(0), "middleware consumed");
+    assert_eq!(mgr.count("acl"), Some(1), "acl retained");
+    assert_eq!(mgr.count("middleware"), Some(1), "middleware retained");
     let _ = make_executor(); // keep helper exercised / referenced
 }

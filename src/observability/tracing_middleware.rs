@@ -92,7 +92,17 @@ impl TracingMiddleware {
     /// the executor's middleware chain (sync finding A-D-18). Mirrors
     /// apcore-python `TracingMiddleware.set_exporter`.
     pub fn set_exporter(&self, exporter: Box<dyn SpanExporter>) {
-        *self.exporter.lock() = Arc::from(exporter);
+        self.set_exporter_shared(Arc::from(exporter));
+    }
+
+    /// Install an already-shared exporter handle.
+    ///
+    /// The counterpart to [`Self::set_exporter`] for callers that keep their
+    /// own reference — [`ExtensionManager::apply`](crate::extensions::ExtensionManager::apply)
+    /// retains its registrations (D-78), so it wires a clone rather than the
+    /// only copy.
+    pub fn set_exporter_shared(&self, exporter: Arc<dyn SpanExporter>) {
+        *self.exporter.lock() = exporter;
     }
 
     /// Snapshot the current exporter handle (clones the `Arc`, not the
@@ -266,9 +276,15 @@ impl Middleware for TracingMiddleware {
                 .map_or(0.0, |e| (e - span.start_time) * 1000.0);
             span.set_attribute("duration_ms".to_string(), serde_json::json!(duration_ms));
             span.set_attribute("success".to_string(), serde_json::json!(false));
+            // ERR-001: the canonical SCREAMING_SNAKE wire code, never the Rust
+            // enum's PascalCase `Debug` name. apcore-python (`tracing.py`:
+            // `getattr(error, "code", ...)`) and apcore-typescript
+            // (`tracing.ts`: `error['code']`) both write the protocol code
+            // here, so an OTLP query or alert rule keyed on it matched two SDKs
+            // and never this one.
             span.set_attribute(
                 "error_code".to_string(),
-                serde_json::json!(format!("{:?}", error.code)),
+                serde_json::json!(error.code.wire_str()),
             );
             span.set_attribute(
                 "error.message".to_string(),

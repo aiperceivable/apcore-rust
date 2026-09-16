@@ -83,7 +83,10 @@ fn test_check_returns_typed_execution_cancelled_error() {
             ref module_id,
         }) => {
             assert!(!message.is_empty());
-            assert!(!module_id.is_empty());
+            // A bare `check()` knows no module, so it reports none rather than
+            // fabricating the "@unknown" sentinel. Parity with apcore-python
+            // and apcore-typescript, whose `check()` produces `details == {}`.
+            assert!(module_id.is_none());
         }
         Ok(()) => panic!("expected typed cancel error after cancel()"),
     }
@@ -101,5 +104,30 @@ fn test_check_for_carries_module_id() {
     let token = CancelToken::new();
     token.cancel();
     let err: ExecutionCancelledError = token.check_for("ns.target").unwrap_err();
-    assert_eq!(err.module_id, "ns.target");
+    assert_eq!(err.module_id.as_deref(), Some("ns.target"));
+}
+
+#[test]
+fn test_check_produces_no_module_id_detail() {
+    // PROTOCOL_SPEC names no "@unknown" module. `check()` used to invent it and
+    // write it into `details`, so an external caller following the spec's own
+    // Rust example emitted a wire payload no other SDK emits — apcore-python and
+    // apcore-typescript both produce `details == {}` here.
+    use apcore::errors::ModuleError;
+
+    let token = CancelToken::new();
+    token.cancel();
+    let err: ModuleError = token.check().unwrap_err().into();
+    assert!(
+        err.details.is_empty(),
+        "check() must not fabricate a module_id: {:?}",
+        err.details
+    );
+
+    // check_for() still carries it.
+    let err: ModuleError = token.check_for("ns.target").unwrap_err().into();
+    assert_eq!(
+        err.details.get("module_id").and_then(|v| v.as_str()),
+        Some("ns.target")
+    );
 }

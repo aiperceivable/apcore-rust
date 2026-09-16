@@ -4,7 +4,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng as serde_yaml;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
@@ -1141,6 +1141,17 @@ pub struct ACL {
     audit_config: Option<AuditConfig>,
     /// §6.3.2 requirement 1: one effective sink, never two.
     audit_sink: AuditSink,
+    /// D-88: dedupe for the §6.5 "conditions present but no context" warning,
+    /// keyed by `(rule index, effect)` exactly as apcore-python and
+    /// apcore-typescript key it.
+    ///
+    /// `check()` takes `&self`, so the set needs interior mutability. Every
+    /// operation that inserts, removes or reorders rules MUST clear it — the
+    /// key is an INDEX, and `add_rule` inserts at 0 and shifts every existing
+    /// rule, so a retained entry would suppress the warning for a different
+    /// rule than the one it was recorded for, and specifically for the rule the
+    /// operator just added.
+    warned_missing_context: parking_lot::Mutex<HashSet<(usize, String)>>,
 }
 
 impl std::fmt::Debug for ACL {
@@ -1152,7 +1163,7 @@ impl std::fmt::Debug for ACL {
             .field("audit_logger", &self.audit_logger.as_ref().map(|_| "..."))
             .field("audit_config", &self.audit_config)
             .field("audit_sink", &self.audit_sink)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1165,6 +1176,11 @@ impl Clone for ACL {
             audit_logger: self.audit_logger.clone(),
             audit_config: self.audit_config.clone(),
             audit_sink: self.audit_sink.clone(),
+            // A clone starts with a clean dedupe set. Carrying the markers
+            // across would suppress a warning on the new instance for a rule
+            // it has never evaluated; starting fresh can only warn more, never
+            // less.
+            warned_missing_context: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 }
@@ -1259,6 +1275,7 @@ impl ACL {
             audit_sink: AuditSink::new(audit_logger.clone(), None),
             audit_config: None,
             audit_logger,
+            warned_missing_context: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -1424,6 +1441,34 @@ impl ACL {
                 );
             }
         }
+    }
+
+    /// Attach (or clear) the ACL file's `audit:` block on an ACL that was built
+    /// directly rather than loaded from a file.
+    ///
+    /// `new` / `try_new` take three arguments and leave `audit_config` at
+    /// `None`, and only `load` / `reload` ever populated it — so a deployment
+    /// that builds its rules in code could not declare an audit block at all,
+    /// while apcore-python (`ACL(..., audit_config=...)`) and apcore-typescript
+    /// both accept one as an optional fourth constructor parameter. This keeps
+    /// the existing three-argument arity intact and supplies the setting
+    /// separately.
+    pub fn set_audit_config(&mut self, audit_config: Option<AuditConfig>) {
+        self.audit_config = audit_config;
+        // §6.3.2 requirement 1: one effective sink, rebuilt from the new
+        // configuration — the same rule `set_audit_logger` follows, and what
+        // scopes requirement 5's once-per-failure suppression to this
+        // configuration rather than to the ACL's lifetime.
+        self.audit_sink = AuditSink::new(self.audit_logger.clone(), self.audit_config.clone());
+        warn_audit_block_overridden(self.audit_logger.as_ref(), self.audit_config.as_ref());
+    }
+
+    /// Builder form of [`Self::set_audit_config`], for chaining off
+    /// [`ACL::new`] / [`ACL::try_new`].
+    #[must_use]
+    pub fn with_audit_config(mut self, audit_config: Option<AuditConfig>) -> Self {
+        self.set_audit_config(audit_config);
+        self
     }
 
     /// Set the audit logger callback.
@@ -1644,6 +1689,8 @@ impl ACL {
         Self::validate_rule(0, &rule)?;
         Self::warn_rule_faults(std::slice::from_ref(&rule), 0);
         self.rules.insert(0, rule);
+        // D-88: insertion at index 0 shifts every existing rule down by one.
+        self.clear_missing_context_warnings();
         Ok(())
     }
 
@@ -1771,6 +1818,8 @@ impl ACL {
             }
         }) {
             self.rules.remove(pos);
+            // D-88: removing rule `pos` shifts every rule after it up by one.
+            self.clear_missing_context_warnings();
             true
         } else {
             false
@@ -1884,7 +1933,7 @@ impl ACL {
 
         for (idx, rule) in rules.iter().enumerate() {
             let paths_before = crate::acl_handlers::reported_condition_paths();
-            match self.matches_rule(rule, caller, target_id, ctx) {
+            match self.matches_rule(idx, rule, caller, target_id, ctx) {
                 RuleMatch::Match => {
                     return self.finalize_rule_match(
                         idx,
@@ -2244,6 +2293,8 @@ impl ACL {
         self.audit_config = reloaded.audit_config;
         self.audit_sink = AuditSink::new(self.audit_logger.clone(), self.audit_config.clone());
         warn_audit_block_overridden(self.audit_logger.as_ref(), self.audit_config.as_ref());
+        // D-88: the reload may have repointed every index at a different rule.
+        self.clear_missing_context_warnings();
         // `self.yaml_path` is intentionally left untouched: reload re-reads the
         // *stored* path, so reassigning it is a no-op (reloaded.yaml_path always
         // equals the existing path). Matches apcore-python / apcore-typescript,
@@ -2368,6 +2419,7 @@ impl ACL {
     /// consulted (PROTOCOL_SPEC §6.1.1).
     fn matches_rule(
         &self,
+        rule_index: usize,
         rule: &ACLRule,
         caller: &str,
         target: &str,
@@ -2390,7 +2442,7 @@ impl ACL {
 
         // Conditions check.
         if let Some(ref conditions) = rule.conditions {
-            return match self.check_conditions(conditions, ctx) {
+            return match self.check_conditions(rule_index, rule, conditions, ctx) {
                 ConditionOutcome::Satisfied => RuleMatch::Match,
                 ConditionOutcome::Unsatisfied => RuleMatch::NoMatch,
                 ConditionOutcome::Unevaluable => RuleMatch::Unevaluable,
@@ -2398,6 +2450,39 @@ impl ACL {
         }
 
         RuleMatch::Match
+    }
+
+    /// Warn ONCE per `(rule index, effect)` that a conditional rule was skipped
+    /// for want of a context (§6.5, D-88).
+    ///
+    /// The dedupe key is the rule INDEX, so
+    /// [`clear_missing_context_warnings`](Self::clear_missing_context_warnings)
+    /// must run on every mutation that shifts indices. Word-for-word the
+    /// message apcore-python and apcore-typescript emit.
+    fn warn_conditional_rule_without_context(&self, rule_index: usize, effect: &str) {
+        {
+            let mut warned = self.warned_missing_context.lock();
+            if !warned.insert((rule_index, effect.to_string())) {
+                return;
+            }
+        }
+        tracing::warn!(
+            rule_index,
+            effect,
+            "ACL rule {rule_index} (effect={effect}) has conditions but the check supplied no \
+             context, so the rule does not match (PROTOCOL_SPEC §6.5). A conditional 'deny' rule \
+             is therefore not a backstop for context-less callers — express a backstop as an \
+             unconditional 'deny' rule or as default_effect: deny."
+        );
+    }
+
+    /// Drop every §6.5 warning marker (D-88).
+    ///
+    /// Called by every operation that inserts, removes or reorders rules. The
+    /// markers are keyed by index; once the indices move, a retained marker
+    /// suppresses the warning for a rule it was never recorded for.
+    fn clear_missing_context_warnings(&self) {
+        self.warned_missing_context.lock().clear();
     }
 
     /// Run PROTOCOL_SPEC §6.1.4's precheck and report any faults into the
@@ -2541,9 +2626,10 @@ impl ACL {
     /// shape for external entry points rather than a misconfiguration. Treating
     /// it as an evaluation failure would flip the decision for every
     /// `@external` call that meets a conditional `deny` rule.
-    #[allow(clippy::unused_self)] // method must be on `&self` for trait-object dispatch consistency
     fn check_conditions(
         &self,
+        rule_index: usize,
+        rule: &ACLRule,
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> ConditionOutcome {
@@ -2553,7 +2639,11 @@ impl ACL {
         }
 
         let Some(ctx) = ctx else {
-            return ConditionOutcome::Unsatisfied; // §6.5: conditions require context
+            // §6.5: conditions require context. Warn so the consequence is
+            // visible — a well-formed conditional `deny` rule is not a backstop
+            // for context-less callers.
+            self.warn_conditional_rule_without_context(rule_index, &rule.effect);
+            return ConditionOutcome::Unsatisfied;
         };
 
         // The precheck already established that `conditions` is a mapping.
@@ -2570,9 +2660,10 @@ impl ACL {
     /// Async counterpart to `check_conditions`. Drives async condition handlers
     /// via `evaluate_conditions_async_outcome` so handlers that genuinely
     /// suspend are awaited rather than reported unevaluable.
-    #[allow(clippy::unused_self)] // method must be on `&self` for trait-object dispatch consistency
     async fn check_conditions_async(
         &self,
+        rule_index: usize,
+        rule: &ACLRule,
         conditions: &serde_json::Value,
         ctx: Option<&Context<serde_json::Value>>,
     ) -> ConditionOutcome {
@@ -2582,7 +2673,9 @@ impl ACL {
         }
 
         let Some(ctx) = ctx else {
-            return ConditionOutcome::Unsatisfied; // §6.5
+            // §6.5, as in the sync twin.
+            self.warn_conditional_rule_without_context(rule_index, &rule.effect);
+            return ConditionOutcome::Unsatisfied;
         };
 
         // The precheck already established that `conditions` is a mapping.
@@ -2827,7 +2920,10 @@ impl ACL {
 
         for (idx, rule) in rules.iter().enumerate() {
             let paths_before = crate::acl_handlers::reported_condition_paths();
-            match self.matches_rule_async(rule, caller, target_id, ctx).await {
+            match self
+                .matches_rule_async(idx, rule, caller, target_id, ctx)
+                .await
+            {
                 RuleMatch::Match => {
                     return self.finalize_rule_match(
                         idx,
@@ -2870,6 +2966,7 @@ impl ACL {
     /// rather than polled-once.
     async fn matches_rule_async(
         &self,
+        rule_index: usize,
         rule: &ACLRule,
         caller: &str,
         target: &str,
@@ -2892,7 +2989,10 @@ impl ACL {
         }
 
         if let Some(ref conditions) = rule.conditions {
-            return match self.check_conditions_async(conditions, ctx).await {
+            return match self
+                .check_conditions_async(rule_index, rule, conditions, ctx)
+                .await
+            {
                 ConditionOutcome::Satisfied => RuleMatch::Match,
                 ConditionOutcome::Unsatisfied => RuleMatch::NoMatch,
                 ConditionOutcome::Unevaluable => RuleMatch::Unevaluable,
@@ -3328,5 +3428,59 @@ mod pattern_arity_backstop_tests {
         assert!(!acl.check(Some("api.gateway"), "cli.rm", None));
         assert!(handler_error_paths(&captured).is_empty());
         assert!(finding_paths(&acl).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod direct_audit_config_tests {
+    //! PROTOCOL_SPEC §6.3.2 requirement 2 — an ACL built in code must be able
+    //! to declare an `audit:` block, the way apcore-python and
+    //! apcore-typescript accept one as a constructor parameter. Only
+    //! `load` / `reload` could populate it here, and `new` / `try_new` hard-coded
+    //! `None`.
+    use super::*;
+
+    #[test]
+    fn with_audit_config_sets_the_block_and_rebuilds_the_sink() {
+        let acl = ACL::new(vec![], "deny", None);
+        assert!(acl.audit_config.is_none(), "no block by default");
+        assert!(
+            !acl.audit_sink.is_active(),
+            "without a callback or a declared block there is no sink"
+        );
+
+        let config = AuditConfig {
+            enabled: true,
+            include_denied: false,
+            log_level: "debug".to_string(),
+        };
+        let acl = acl.with_audit_config(Some(config.clone()));
+        assert_eq!(acl.audit_config.as_ref(), Some(&config));
+        assert!(
+            acl.audit_sink.is_active(),
+            "the sink must be rebuilt from the new block, not left on the old one"
+        );
+    }
+
+    #[test]
+    fn set_audit_config_none_clears_the_block() {
+        let mut acl =
+            ACL::new(vec![], "deny", None).with_audit_config(Some(AuditConfig::default()));
+        assert!(acl.audit_sink.is_active());
+
+        acl.set_audit_config(None);
+        assert!(acl.audit_config.is_none());
+        assert!(!acl.audit_sink.is_active());
+    }
+
+    #[test]
+    fn a_declared_block_that_is_disabled_leaves_the_sink_inactive() {
+        // Requirement 2: DECLARATION activates the default sink, never the
+        // default value — a declared `enabled: false` stays off.
+        let acl = ACL::new(vec![], "deny", None).with_audit_config(Some(AuditConfig {
+            enabled: false,
+            ..AuditConfig::default()
+        }));
+        assert!(!acl.audit_sink.is_active());
     }
 }

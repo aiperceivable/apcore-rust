@@ -269,7 +269,10 @@ async fn case_retry_scheduled_on_failure() {
     // we have a long observation window.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
-        let info = mgr.get_status(&task_id).expect("task present");
+        let info = mgr
+            .get_status(&task_id)
+            .expect("store read")
+            .expect("task present");
         if info.retry_count >= 1 {
             assert_eq!(
                 info.status,
@@ -321,7 +324,10 @@ async fn case_max_retries_exhausted_becomes_failed() {
     // per fixture, so 3 attempts complete well within 2s.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let info = mgr.get_status(&task_id).expect("task present");
+        let info = mgr
+            .get_status(&task_id)
+            .expect("store read")
+            .expect("task present");
         if info.status == TaskStatus::Failed {
             let expected = &case["expected"];
             assert_eq!(

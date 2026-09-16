@@ -32,8 +32,27 @@ use apcore::{ExecutionPolicy, PolicyRule};
 // Test module + harness
 // ---------------------------------------------------------------------------
 
+/// Governance is declared on the INSTANCE, mirroring the Python fixture this
+/// registry copies: `getattr(module, "annotations")` is what apcore-python
+/// resolves, and PROTOCOL_SPEC §7.4 Step 5 binds `annotations =
+/// module.annotations`. `descriptor()` below carries the same values so
+/// registry introspection still reports them.
 #[derive(Debug)]
-struct EchoModule;
+struct EchoModule {
+    annotations: ModuleAnnotations,
+}
+
+impl EchoModule {
+    fn new(requires_approval: bool, destructive: bool) -> Self {
+        Self {
+            annotations: ModuleAnnotations {
+                requires_approval,
+                destructive,
+                ..ModuleAnnotations::default()
+            },
+        }
+    }
+}
 
 #[async_trait]
 impl Module for EchoModule {
@@ -45,6 +64,9 @@ impl Module for EchoModule {
     }
     fn description(&self) -> &'static str {
         "echo module"
+    }
+    fn annotations(&self) -> ModuleAnnotations {
+        self.annotations.clone()
     }
     async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         Ok(json!({"status": "executed"}))
@@ -83,19 +105,19 @@ fn make_registry() -> Arc<Registry> {
     let reg = Arc::new(Registry::new());
     reg.register(
         "orders.list_orders",
-        Box::new(EchoModule),
+        Box::new(EchoModule::new(false, false)),
         descriptor("orders.list_orders", false, false),
     )
     .unwrap();
     reg.register(
         "orders.delete_order",
-        Box::new(EchoModule),
+        Box::new(EchoModule::new(false, true)),
         descriptor("orders.delete_order", false, true),
     )
     .unwrap();
     reg.register(
         "admin.reset",
-        Box::new(EchoModule),
+        Box::new(EchoModule::new(true, false)),
         descriptor("admin.reset", true, false),
     )
     .unwrap();

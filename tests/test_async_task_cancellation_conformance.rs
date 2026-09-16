@@ -153,7 +153,7 @@ async fn submit_over_capacity_raises_task_limit_exceeded() {
     );
 
     // Tidy up the long-running background task.
-    mgr.shutdown().await;
+    mgr.shutdown().await.expect("store shutdown");
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +221,7 @@ async fn cancel_during_backoff_stops_further_retries() {
     // task is in backoff (retry_delay_ms is large enough to guarantee the
     // window is still open).
     let attempts_at_cancel = attempts.load(Ordering::SeqCst);
-    let cancelled = mgr.cancel(&task_id).await;
+    let cancelled = mgr.cancel(&task_id).await.expect("store write");
     assert!(cancelled, "cancel() must report success for an active task");
 
     // Give the runtime ample time to honor the cancel and (in a buggy SDK)
@@ -238,6 +238,7 @@ async fn cancel_during_backoff_stops_further_retries() {
 
     let info = mgr
         .get_status(&task_id)
+        .expect("store read")
         .expect("task status must be retrievable");
     assert_eq!(
         info.status,

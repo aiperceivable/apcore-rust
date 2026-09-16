@@ -166,7 +166,7 @@ fn code_str(err: &ModuleError) -> String {
 async fn drain(manager: &AsyncTaskManager, task_id: &str, timeout: Duration) -> TaskInfo {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(info) = manager.get_status(task_id) {
+        if let Some(info) = manager.get_status(task_id).expect("store read") {
             if matches!(
                 info.status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
@@ -242,7 +242,7 @@ async fn async_tasks_submit_error_task_limit_exceeded() {
         .expect_err("second submit at the cap must fail");
     assert_eq!(err.code, ErrorCode::TaskLimitExceeded);
     assert_eq!(code_str(&err), "TASK_LIMIT_EXCEEDED");
-    limited.shutdown().await;
+    limited.shutdown().await.expect("store shutdown");
 }
 
 // clause: async_tasks.submit.property.async
@@ -312,6 +312,7 @@ async fn async_tasks_submit_property_idempotent_false() {
     assert_ne!(first, second);
     let ids: std::collections::HashSet<String> = manager
         .list_tasks(None)
+        .expect("store list")
         .into_iter()
         .map(|t| t.task_id)
         .collect();
@@ -333,9 +334,12 @@ async fn async_tasks_cancel_property_async() {
         .await
         .expect("submit");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let result = manager.cancel(&task_id).await;
+    let result = manager.cancel(&task_id).await.expect("store write");
     assert!(result, "cancel of an active task returns true");
-    let info = manager.get_status(&task_id).expect("status present");
+    let info = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("status present");
     assert_eq!(info.status, TaskStatus::Cancelled);
 }
 
@@ -344,7 +348,7 @@ async fn async_tasks_cancel_property_async() {
 async fn async_tasks_cancel_return_unknown_task_false() {
     // Cancelling a non-existent task id returns false (no error raised).
     let manager = make_manager();
-    let result = manager.cancel("does-not-exist").await;
+    let result = manager.cancel("does-not-exist").await.expect("store write");
     assert!(!result);
 }
 
@@ -370,16 +374,21 @@ async fn async_tasks_cancel_property_thread_safe() {
     for tid in &task_ids {
         let mgr = Arc::clone(&manager);
         let tid = tid.clone();
-        handles.push(tokio::spawn(async move { mgr.cancel(&tid).await }));
+        handles.push(tokio::spawn(async move {
+            mgr.cancel(&tid).await.expect("store write")
+        }));
     }
     for h in handles {
         assert!(h.await.expect("cancel task did not panic"));
     }
     for tid in &task_ids {
-        let info = manager.get_status(tid).expect("status present");
+        let info = manager
+            .get_status(tid)
+            .expect("store read")
+            .expect("status present");
         assert_eq!(info.status, TaskStatus::Cancelled);
     }
-    manager.shutdown().await;
+    manager.shutdown().await.expect("store shutdown");
 }
 
 // clause: async_tasks.cancel.property.idempotent
@@ -393,11 +402,14 @@ async fn async_tasks_cancel_property_idempotent() {
         .await
         .expect("submit");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let first = manager.cancel(&task_id).await;
-    let second = manager.cancel(&task_id).await;
+    let first = manager.cancel(&task_id).await.expect("store write");
+    let second = manager.cancel(&task_id).await.expect("store write");
     assert!(first);
     assert!(!second);
-    let info = manager.get_status(&task_id).expect("status present");
+    let info = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("status present");
     assert_eq!(info.status, TaskStatus::Cancelled);
 }
 
@@ -415,7 +427,7 @@ async fn async_tasks_get_status_property_async_false() {
         .submit("test.echo", json!({"x": 1}), None)
         .await
         .expect("submit");
-    let info: Option<TaskInfo> = manager.get_status(&task_id);
+    let info: Option<TaskInfo> = manager.get_status(&task_id).expect("store read");
     let info = info.expect("known task returns Some");
     assert_eq!(info.task_id, task_id);
 }
@@ -430,9 +442,15 @@ async fn async_tasks_get_status_return_shallow_copy() {
         .submit("test.echo", json!({"x": 1}), None)
         .await
         .expect("submit");
-    let mut info = manager.get_status(&task_id).expect("status present");
+    let mut info = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("status present");
     info.module_id = "tampered".to_string();
-    let again = manager.get_status(&task_id).expect("status present");
+    let again = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("status present");
     assert_eq!(again.module_id, "test.echo");
 }
 
@@ -447,8 +465,14 @@ async fn async_tasks_get_status_property_idempotent() {
         .await
         .expect("submit");
     drain(&manager, &task_id, DRAIN_TIMEOUT).await;
-    let a = manager.get_status(&task_id).expect("a");
-    let b = manager.get_status(&task_id).expect("b");
+    let a = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("a");
+    let b = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("b");
     assert_eq!(a.task_id, b.task_id);
     assert_eq!(a.status, b.status);
     assert_eq!(a.result, b.result);
@@ -459,7 +483,7 @@ async fn async_tasks_get_status_property_idempotent() {
 async fn async_tasks_get_status_return_unknown_none() {
     // An unknown task id returns None rather than panicking.
     let manager = make_manager();
-    assert!(manager.get_status("nope").is_none());
+    assert!(manager.get_status("nope").expect("store read").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +525,7 @@ async fn async_tasks_get_result_error_not_completed() {
         "got: {}",
         err.message
     );
-    manager.cancel(&task_id).await;
+    manager.cancel(&task_id).await.expect("store write");
 }
 
 // clause: async_tasks.get_result.return.completed_result
@@ -556,6 +580,7 @@ async fn async_tasks_list_tasks_input_status_filter() {
 
     let completed: Vec<String> = manager
         .list_tasks(Some(TaskStatus::Completed))
+        .expect("store list")
         .into_iter()
         .map(|t| t.task_id)
         .collect();
@@ -563,11 +588,12 @@ async fn async_tasks_list_tasks_input_status_filter() {
 
     let running: std::collections::HashSet<String> = manager
         .list_tasks(Some(TaskStatus::Running))
+        .expect("store list")
         .into_iter()
         .map(|t| t.task_id)
         .collect();
     assert!(running.contains(&running_id));
-    manager.cancel(&running_id).await;
+    manager.cancel(&running_id).await.expect("store write");
 }
 
 // clause: async_tasks.list_tasks.return.shallow_copy
@@ -581,10 +607,13 @@ async fn async_tasks_list_tasks_return_shallow_copy() {
         .await
         .expect("submit");
     drain(&manager, &task_id, DRAIN_TIMEOUT).await;
-    let mut listed = manager.list_tasks(None);
+    let mut listed = manager.list_tasks(None).expect("store list");
     assert!(!listed.is_empty());
     listed[0].module_id = "tampered".to_string();
-    let again = manager.get_status(&task_id).expect("status present");
+    let again = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("status present");
     assert_eq!(again.module_id, "test.echo");
 }
 
@@ -607,11 +636,13 @@ async fn async_tasks_list_tasks_property_idempotent() {
     }
     let first: std::collections::HashSet<String> = manager
         .list_tasks(None)
+        .expect("store list")
         .into_iter()
         .map(|t| t.task_id)
         .collect();
     let second: std::collections::HashSet<String> = manager
         .list_tasks(None)
+        .expect("store list")
         .into_iter()
         .map(|t| t.task_id)
         .collect();
@@ -641,11 +672,14 @@ async fn async_tasks_cleanup_eligible_terminal_only() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // max_age_seconds=0 makes every terminal task eligible immediately.
-    let removed = manager.cleanup(0.0);
+    let removed = manager.cleanup(0.0).expect("store sweep");
     assert_eq!(removed, 1);
-    assert!(manager.get_status(&done_id).is_none());
-    assert!(manager.get_status(&running_id).is_some());
-    manager.cancel(&running_id).await;
+    assert!(manager.get_status(&done_id).expect("store read").is_none());
+    assert!(manager
+        .get_status(&running_id)
+        .expect("store read")
+        .is_some());
+    manager.cancel(&running_id).await.expect("store write");
 }
 
 // clause: async_tasks.cleanup.property.idempotent_false
@@ -659,8 +693,8 @@ async fn async_tasks_cleanup_property_idempotent_false() {
         .await
         .expect("submit");
     drain(&manager, &done_id, DRAIN_TIMEOUT).await;
-    let first = manager.cleanup(0.0);
-    let second = manager.cleanup(0.0);
+    let first = manager.cleanup(0.0).expect("store sweep");
+    let second = manager.cleanup(0.0).expect("store sweep");
     assert_eq!(first, 1);
     assert_eq!(second, 0);
 }
@@ -672,9 +706,10 @@ async fn async_tasks_cleanup_property_idempotent_false() {
 // clause: async_tasks.shutdown.property.async
 #[tokio::test(flavor = "multi_thread")]
 async fn async_tasks_shutdown_property_async() {
-    // shutdown is awaitable and resolves to () (None equivalent).
+    // shutdown is awaitable and resolves to () (None equivalent) — wrapped in
+    // a Result since D-81 so a store outage reaches the caller.
     let manager = make_manager();
-    let out: () = manager.shutdown().await;
+    let out: () = manager.shutdown().await.expect("store shutdown");
     assert_eq!(out, ());
 }
 
@@ -694,9 +729,12 @@ async fn async_tasks_shutdown_side_effect_1_cancel_active() {
         );
     }
     tokio::time::sleep(Duration::from_millis(80)).await;
-    manager.shutdown().await;
+    manager.shutdown().await.expect("store shutdown");
     for tid in &ids {
-        let info = manager.get_status(tid).expect("status present");
+        let info = manager
+            .get_status(tid)
+            .expect("store read")
+            .expect("status present");
         assert_eq!(info.status, TaskStatus::Cancelled);
     }
 }
@@ -712,10 +750,16 @@ async fn async_tasks_shutdown_property_idempotent() {
         .await
         .expect("submit");
     tokio::time::sleep(Duration::from_millis(80)).await;
-    manager.shutdown().await;
-    let before = manager.get_status(&task_id).expect("status present");
-    manager.shutdown().await;
-    let after = manager.get_status(&task_id).expect("status present");
+    manager.shutdown().await.expect("store shutdown");
+    let before = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("status present");
+    manager.shutdown().await.expect("store shutdown");
+    let after = manager
+        .get_status(&task_id)
+        .expect("store read")
+        .expect("status present");
     assert_eq!(before.status, TaskStatus::Cancelled);
     assert_eq!(after.status, TaskStatus::Cancelled);
 }
@@ -1115,8 +1159,252 @@ async fn async_tasks_list_expired_property_idempotent() {
     assert_eq!(store.list(None).await.expect("list").len(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// "Store errors reach the caller" (D-81) and insertion order (D-82)
+// ---------------------------------------------------------------------------
+
+/// A store that answers every call with `TASK_STORE_UNAVAILABLE`, except the
+/// `save` that admits a task (so a task can exist before the store goes down).
+struct FlakyStore {
+    inner: InMemoryTaskStore,
+    down: std::sync::atomic::AtomicBool,
+}
+
+impl FlakyStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryTaskStore::new(),
+            down: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn go_down(&self) {
+        self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn outage(&self) -> Result<(), ModuleError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                "TASK_STORE_UNAVAILABLE: backing store is unreachable",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TaskStore for FlakyStore {
+    async fn save(&self, task: &TaskInfo) -> Result<(), ModuleError> {
+        self.outage()?;
+        self.inner.save(task).await
+    }
+    async fn get(&self, id: &str) -> Result<Option<TaskInfo>, ModuleError> {
+        self.outage()?;
+        self.inner.get(id).await
+    }
+    async fn list(&self, status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError> {
+        self.outage()?;
+        self.inner.list(status).await
+    }
+    async fn delete(&self, id: &str) -> Result<(), ModuleError> {
+        self.outage()?;
+        self.inner.delete(id).await
+    }
+    async fn list_expired(&self, before: f64) -> Result<Vec<TaskInfo>, ModuleError> {
+        self.outage()?;
+        self.inner.list_expired(before).await
+    }
+    fn store_type_name(&self) -> &'static str {
+        "FlakyStore"
+    }
+}
+
+// clause: async_tasks.store_error.reaches_the_caller
+#[tokio::test(flavor = "multi_thread")]
+async fn async_tasks_store_error_reaches_the_caller() {
+    // D-81: a store outage must NOT be absorbed into `false` / `None` / an
+    // empty list. Before this, a store outage reported "task not found" and
+    // "no tasks" — and, worst of all, cancel() returned true after a save that
+    // never landed.
+    let store = Arc::new(FlakyStore::new());
+    let manager = AsyncTaskManager::with_store(
+        make_executor(),
+        4,
+        100,
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+    );
+    let task_id = manager
+        .submit("test.slow", json!({"delay": 1.0}), None)
+        .await
+        .expect("submit while the store is healthy");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    store.go_down();
+
+    assert!(
+        manager.get_status(&task_id).is_err(),
+        "an unreachable store must not read as 'task not found'"
+    );
+    assert!(manager.get_result(&task_id).is_err());
+    assert!(
+        manager.list_tasks(None).is_err(),
+        "an unreachable store must not read as 'no tasks'"
+    );
+    assert!(manager.task_count().is_err());
+    assert!(manager.cleanup(0.0).is_err());
+    assert!(
+        manager.cancel(&task_id).await.is_err(),
+        "cancel must not report success for a save that never landed"
+    );
+    assert!(manager.shutdown().await.is_err());
+}
+
+// clause: async_tasks.list_tasks.return.insertion_order
+#[tokio::test(flavor = "multi_thread")]
+async fn async_tasks_list_tasks_return_insertion_order() {
+    // D-82: list order is submission order. The store used to sort on
+    // `task_id` — a UUID v4, hence random with respect to submission — so
+    // `list_tasks()[0]` returned the lexicographically smallest UUID.
+    let manager = make_manager();
+    let mut submitted = Vec::new();
+    for i in 0..12 {
+        submitted.push(
+            manager
+                .submit("test.slow", json!({"delay": 1.0, "i": i}), None)
+                .await
+                .expect("submit"),
+        );
+    }
+
+    let listed: Vec<String> = manager
+        .list_tasks(None)
+        .expect("store list")
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    assert_eq!(listed, submitted, "list_tasks must be in submission order");
+
+    // A `task_id` sort does not satisfy it: assert the two orders actually
+    // differ, so this test would fail against the old implementation.
+    let mut by_id = submitted.clone();
+    by_id.sort();
+    assert_ne!(
+        by_id, submitted,
+        "12 UUIDs should not happen to be submitted in sorted order"
+    );
+
+    // A status transition is not a re-submission: the order survives one.
+    manager
+        .cancel(&submitted[0])
+        .await
+        .expect("cancel the first task");
+    let after: Vec<String> = manager
+        .list_tasks(None)
+        .expect("store list")
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    assert_eq!(after, submitted, "an overwrite must keep its position");
+
+    manager.shutdown().await.expect("store shutdown");
+}
+
 // Silence unused-import lint if HashMap ends up unreferenced in some builds.
 #[allow(dead_code)]
 fn _unused_hashmap_marker() -> HashMap<String, Value> {
     HashMap::new()
+}
+
+// ---------------------------------------------------------------------------
+// D-122 — shutdown() attempts every cancellation before it reports
+// ---------------------------------------------------------------------------
+
+/// Fails the CANCELLED write for exactly one task id; healthy for every other.
+///
+/// The interesting failure mode is NOT a total outage — there, stopping at the
+/// first error and attempting all reach the same place, because every
+/// cancellation fails. It is a PER-TASK failure (a conditional-write conflict,
+/// a corrupted record), where stopping strands every task after it.
+struct OneBadRecordStore {
+    inner: InMemoryTaskStore,
+    bad_id: String,
+}
+
+#[async_trait]
+impl TaskStore for OneBadRecordStore {
+    async fn save(&self, task: &TaskInfo) -> Result<(), ModuleError> {
+        if task.task_id == self.bad_id && task.status == TaskStatus::Cancelled {
+            return Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                "TASK_STORE_UNAVAILABLE: conditional write conflict",
+            ));
+        }
+        self.inner.save(task).await
+    }
+    async fn get(&self, id: &str) -> Result<Option<TaskInfo>, ModuleError> {
+        self.inner.get(id).await
+    }
+    async fn list(&self, status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError> {
+        self.inner.list(status).await
+    }
+    async fn delete(&self, id: &str) -> Result<(), ModuleError> {
+        self.inner.delete(id).await
+    }
+    async fn list_expired(&self, before: f64) -> Result<Vec<TaskInfo>, ModuleError> {
+        self.inner.list_expired(before).await
+    }
+    fn store_type_name(&self) -> &'static str {
+        "OneBadRecordStore"
+    }
+}
+
+// clause: async_tasks.shutdown.attempts_every_cancellation
+#[tokio::test(flavor = "multi_thread")]
+async fn async_tasks_shutdown_attempts_every_cancellation() {
+    // D-122: a per-task store failure must not strand the tasks after it. An
+    // uncancelled task in a shared store holds a `max_tasks` slot for every
+    // manager sharing it and outlives the process that could have cancelled it,
+    // while a slower shutdown is transient.
+    let store = Arc::new(OneBadRecordStore {
+        inner: InMemoryTaskStore::new(),
+        bad_id: "t2".to_string(),
+    });
+    for id in ["t1", "t2", "t3"] {
+        let info = make_task_info(id, "m.probe", TaskStatus::Pending, 0.0, None, None);
+        store.inner.save(&info).await.expect("seed");
+    }
+
+    let manager = AsyncTaskManager::with_store(
+        make_executor(),
+        8,
+        100,
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+    );
+
+    let outcome = manager.shutdown().await;
+    assert!(
+        outcome.is_err(),
+        "the failing cancellation MUST still be reported"
+    );
+
+    let by_id: std::collections::HashMap<String, TaskStatus> = store
+        .inner
+        .list(None)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|i| (i.task_id, i.status))
+        .collect();
+    assert_eq!(
+        by_id.get("t1"),
+        Some(&TaskStatus::Cancelled),
+        "the task before the failure must be cancelled"
+    );
+    assert_eq!(
+        by_id.get("t3"),
+        Some(&TaskStatus::Cancelled),
+        "the task AFTER the failure must be cancelled too — stopping at the \
+         first failure strands it holding a max_tasks slot (D-122)"
+    );
 }

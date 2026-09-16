@@ -11,22 +11,27 @@
 // that exact string. The fn name is the clause id flattened to snake_case.
 // Tests only — production source is never modified here.
 //
-// SIGNATURE DIVERGENCE (Rust vs Python):
-//   The contract ### Inputs block lists a `context` (Context) input plus the
-//   limit params `max_depth` / `max_repeat`. The REAL apcore-rust surface is
+// SIGNATURE (resolved by D-83, spec v1.49.0):
+//   The contract's ### Inputs block lists `module_id`, `call_chain`,
+//   `max_call_depth` and `max_module_repeat` — there is NO `context` input; the
+//   guard takes the chain directly. apcore-rust now publishes exactly that:
+//     guard_call_chain(module_id: &str, call_chain: &[String],
+//                      max_call_depth: usize, max_module_repeat: usize)
+//   The crate previously shipped only
 //     guard_call_chain(ctx: &Context<Value>, module_name: &str, max_depth: u32)
-//     guard_call_chain_with_repeat(ctx, module_name, max_depth, max_module_repeat)
-//   i.e. Rust DOES take a `Context` (the call chain lives on `ctx.call_chain`)
-//   — unlike Python, which takes the chain directly. The repeat limit is only
-//   reachable through `guard_call_chain_with_repeat`; the base `guard_call_chain`
-//   pins it to DEFAULT_MAX_MODULE_REPEAT. Limit floors (max_depth >= 1,
-//   max_repeat >= 1) ARE validated in Rust (resolved T-B-005): a non-positive
-//   limit is rejected with GENERAL_INVALID_INPUT, matching the Python/TS guards.
+//   which the spec's own Rust tab did not compile against, and which — because
+//   `Context<T>` is generic — no host whose services type differed from
+//   `serde_json::Value` could call at all. Two Context-taking wrappers remain,
+//   now generic over that type parameter: `guard_call_chain_for_context`
+//   (applies DEFAULT_MAX_CALL_DEPTH / DEFAULT_MAX_MODULE_REPEAT) and
+//   `guard_call_chain_with_repeat` (explicit limits — what the executor's
+//   pipeline step uses). Limit floors (max_call_depth >= 1, max_module_repeat
+//   >= 1) are validated with GENERAL_INVALID_INPUT, matching Python/TS (D-84).
 
 use apcore::errors::{ErrorCode, ModuleError};
 use apcore::utils::{
-    guard_call_chain, guard_call_chain_with_repeat, DEFAULT_MAX_CALL_DEPTH,
-    DEFAULT_MAX_MODULE_REPEAT,
+    guard_call_chain, guard_call_chain_for_context, guard_call_chain_with_repeat,
+    DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_MODULE_REPEAT,
 };
 use apcore::Context;
 
@@ -66,11 +71,13 @@ fn input_max_depth_below_one_rejected() {
     // GENERAL_INVALID_INPUT. The rejection is unconditional — it fires even on
     // an empty chain where the depth check would otherwise pass.
     let empty = Context::<serde_json::Value>::anonymous();
-    let err = guard_call_chain(&empty, "a", 0).expect_err("max_depth=0 is invalid input");
+    let err = guard_call_chain_with_repeat(&empty, "a", 0, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("max_depth=0 is invalid input");
     assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
 
     let ctx = ctx_with_chain(&["a"]);
-    let err = guard_call_chain(&ctx, "a", 0).expect_err("max_depth=0 is invalid input");
+    let err = guard_call_chain_with_repeat(&ctx, "a", 0, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("max_depth=0 is invalid input");
     assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
 }
 
@@ -95,25 +102,131 @@ fn input_module_id_required() {
     // required argument is honoured: a valid module_name produces a defined
     // outcome on a well-formed chain (no panic, Ok).
     let ctx = ctx_with_chain(&["a", "b", "c"]);
-    let max_depth = u32::try_from(DEFAULT_MAX_CALL_DEPTH).expect("DEFAULT_MAX_CALL_DEPTH fits u32");
-    let result = guard_call_chain(&ctx, "c", max_depth);
+    let max_depth = DEFAULT_MAX_CALL_DEPTH;
+    let result = guard_call_chain_with_repeat(&ctx, "c", max_depth, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_ok(), "valid required module_name -> Ok");
+}
+
+// clause: call_chain_guard.guard_call_chain.input.call_chain.required
+#[test]
+fn input_call_chain_required() {
+    // D-83: the published signature takes the chain directly, with no
+    // `Context` and no type parameter. Assert the chain is genuinely
+    // consulted: two different chains yield different outcomes for the same
+    // module_id.
+    let ok_chain: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_string()).collect();
+    assert!(guard_call_chain(
+        "c",
+        &ok_chain,
+        DEFAULT_MAX_CALL_DEPTH,
+        DEFAULT_MAX_MODULE_REPEAT
+    )
+    .is_ok());
+
+    let cyclic: Vec<String> = ["c", "b", "c"].iter().map(|s| (*s).to_string()).collect();
+    let err = guard_call_chain(
+        "c",
+        &cyclic,
+        DEFAULT_MAX_CALL_DEPTH,
+        DEFAULT_MAX_MODULE_REPEAT,
+    )
+    .expect_err("c -> b -> c is a cycle");
+    assert_eq!(err.code, ErrorCode::CircularCall);
+}
+
+// clause: call_chain_guard.guard_call_chain.input.generic_free_entry_point
+#[test]
+fn input_generic_free_entry_point() {
+    // D-83: the whole point of the chain-taking form is that a host whose
+    // services type is NOT serde_json::Value can reach the guard. Drive it
+    // from such a context to prove the reachability the old signature denied.
+    #[derive(Clone, Default)]
+    struct HostServices {
+        _db: &'static str,
+    }
+
+    let mut ctx = Context::<HostServices>::create(
+        None,
+        None,
+        None,
+        None,
+        HostServices { _db: "postgres" },
+        None,
+    );
+    ctx.call_chain = ["a", "b", "a"].iter().map(|s| (*s).to_string()).collect();
+
+    // Directly, via the published signature...
+    let err = guard_call_chain(
+        "a",
+        &ctx.call_chain,
+        DEFAULT_MAX_CALL_DEPTH,
+        DEFAULT_MAX_MODULE_REPEAT,
+    )
+    .expect_err("a -> b -> a is a cycle");
+    assert_eq!(err.code, ErrorCode::CircularCall);
+
+    // ...and through the Context wrappers, which are generic over T.
+    assert_eq!(
+        guard_call_chain_for_context(&ctx, "a")
+            .expect_err("wrapper sees the same cycle")
+            .code,
+        ErrorCode::CircularCall
+    );
+    assert_eq!(
+        guard_call_chain_with_repeat(&ctx, "a", DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_MODULE_REPEAT)
+            .expect_err("wrapper sees the same cycle")
+            .code,
+        ErrorCode::CircularCall
+    );
+}
+
+// clause: call_chain_guard.guard_call_chain.input.defaults_applied
+#[test]
+fn input_defaults_applied() {
+    // D-83: DEFAULT_MAX_CALL_DEPTH was a `pub const` the guard never
+    // consulted. `guard_call_chain_for_context` is the form that applies it,
+    // so the documented default is now the enforced one.
+    assert_eq!(DEFAULT_MAX_CALL_DEPTH, 32);
+
+    let mut ok = Context::<serde_json::Value>::anonymous();
+    ok.call_chain = (0..32).map(|i| format!("mod.{i}")).collect();
+    assert!(guard_call_chain_for_context(&ok, "mod.31").is_ok());
+
+    let mut over = Context::<serde_json::Value>::anonymous();
+    over.call_chain = (0..33).map(|i| format!("mod.{i}")).collect();
+    assert_eq!(
+        guard_call_chain_for_context(&over, "mod.32")
+            .expect_err("33 > DEFAULT_MAX_CALL_DEPTH")
+            .code,
+        ErrorCode::CallDepthExceeded
+    );
+
+    // And DEFAULT_MAX_MODULE_REPEAT likewise.
+    assert_eq!(DEFAULT_MAX_MODULE_REPEAT, 3);
+    let mut repeated = Context::<serde_json::Value>::anonymous();
+    repeated.call_chain = (0..4).map(|_| "mod.a".to_string()).collect();
+    assert_eq!(
+        guard_call_chain_for_context(&repeated, "mod.a")
+            .expect_err("4 > DEFAULT_MAX_MODULE_REPEAT")
+            .code,
+        ErrorCode::CallFrequencyExceeded
+    );
 }
 
 // clause: call_chain_guard.guard_call_chain.input.context.required
 #[test]
 fn input_context_required() {
-    // Python records this as a contract gap (no `context` binding). Rust's
-    // surface DOES take a required `ctx: &Context` — the call chain lives on
-    // `ctx.call_chain`. Assert the context is genuinely consulted: two
-    // different contexts yield different outcomes for the same module_name.
+    // The Context-taking wrappers remain, and read their decision from the
+    // supplied context: two different contexts yield different outcomes for
+    // the same module_id.
     let ok_ctx = ctx_with_chain(&["a", "b", "c"]);
-    assert!(guard_call_chain(&ok_ctx, "c", 100).is_ok());
+    assert!(guard_call_chain_with_repeat(&ok_ctx, "c", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 
     // A circular context for the same module_name now fails -> proves the
     // guard reads its decision from the supplied context.
     let circular_ctx = ctx_with_chain(&["c", "b", "c"]);
-    let err = guard_call_chain(&circular_ctx, "c", 100).expect_err("cycle via context");
+    let err = guard_call_chain_with_repeat(&circular_ctx, "c", 100, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("cycle via context");
     assert_eq!(err.code, ErrorCode::CircularCall);
 }
 
@@ -128,7 +241,8 @@ fn error_call_depth_exceeded() {
     let chain: Vec<String> = (0..6).map(|i| format!("mod.{i}")).collect();
     let mut ctx = Context::<serde_json::Value>::anonymous();
     ctx.call_chain = chain;
-    let err = guard_call_chain(&ctx, "mod.5", 5).expect_err("len 6 > max_depth 5");
+    let err = guard_call_chain_with_repeat(&ctx, "mod.5", 5, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("len 6 > max_depth 5");
     assert_eq!(err.code, ErrorCode::CallDepthExceeded);
     assert_eq!(wire_code(&err), "CALL_DEPTH_EXCEEDED");
     // Rust carries the depth/limit in the message rather than typed `details`
@@ -142,7 +256,8 @@ fn error_call_depth_exceeded() {
 fn error_circular_call() {
     // A strict cycle of length >= 2 (A->B->A) -> CircularCall with exact code.
     let ctx = ctx_with_chain(&["a", "b", "a"]);
-    let err = guard_call_chain(&ctx, "a", 100).expect_err("A->B->A cycle");
+    let err = guard_call_chain_with_repeat(&ctx, "a", 100, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("A->B->A cycle");
     assert_eq!(err.code, ErrorCode::CircularCall);
     assert_eq!(wire_code(&err), "CIRCULAR_CALL");
     // The offending module_id is surfaced in the message.
@@ -176,7 +291,8 @@ fn side_effect_1_depth_before_circular() {
     // ["a","b","a"] is circular AND exceeds max_depth=2 (length 3). Depth is
     // checked first, so CallDepthExceeded must win.
     let ctx = ctx_with_chain(&["a", "b", "a"]);
-    let err = guard_call_chain(&ctx, "a", 2).expect_err("depth+circular both violated");
+    let err = guard_call_chain_with_repeat(&ctx, "a", 2, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("depth+circular both violated");
     assert_eq!(err.code, ErrorCode::CallDepthExceeded);
     assert_eq!(wire_code(&err), "CALL_DEPTH_EXCEEDED");
 }
@@ -204,7 +320,8 @@ fn property_async() {
     // function returning Result<(), ModuleError> with no .await; calling it
     // directly (no executor/runtime) resolves to Ok(()) on a valid chain.
     let ctx = ctx_with_chain(&["a", "b", "c"]);
-    let result: Result<(), ModuleError> = guard_call_chain(&ctx, "c", 100);
+    let result: Result<(), ModuleError> =
+        guard_call_chain_with_repeat(&ctx, "c", 100, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_ok(), "sync call returns Ok(()) with no awaiting");
 }
 
@@ -220,7 +337,12 @@ async fn property_thread_safe() {
             let chain: Vec<String> = (0..3).map(|j| format!("mod.{idx}.{j}")).collect();
             let mut ctx = Context::<serde_json::Value>::anonymous();
             ctx.call_chain = chain;
-            guard_call_chain(&ctx, &format!("mod.{idx}.2"), 100)
+            guard_call_chain_with_repeat(
+                &ctx,
+                &format!("mod.{idx}.2"),
+                100,
+                DEFAULT_MAX_MODULE_REPEAT,
+            )
         }));
     }
 
@@ -245,14 +367,14 @@ fn property_pure() {
     let ctx = ctx_with_chain(&["a", "b", "c"]);
     let snapshot = ctx.call_chain.clone();
 
-    assert!(guard_call_chain(&ctx, "c", 100).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "c", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok());
     assert_eq!(
         ctx.call_chain, snapshot,
         "guard must not mutate the call chain"
     );
 
     // Second call on identical state -> identical observable outcome.
-    assert!(guard_call_chain(&ctx, "c", 100).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "c", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok());
     assert_eq!(ctx.call_chain, snapshot);
 }
 
@@ -266,7 +388,8 @@ fn property_idempotent() {
 
     let mut codes = Vec::new();
     for _ in 0..2 {
-        let err = guard_call_chain(&ctx, "a", 100).expect_err("A->B->A cycle");
+        let err = guard_call_chain_with_repeat(&ctx, "a", 100, DEFAULT_MAX_MODULE_REPEAT)
+            .expect_err("A->B->A cycle");
         codes.push(wire_code(&err));
     }
 
@@ -287,17 +410,19 @@ fn input_max_depth_default() {
     let ok_chain: Vec<String> = (0..32).map(|i| format!("mod.{i}")).collect();
     let mut ok_ctx = Context::<serde_json::Value>::anonymous();
     ok_ctx.call_chain = ok_chain;
-    let max_depth = u32::try_from(DEFAULT_MAX_CALL_DEPTH).expect("DEFAULT_MAX_CALL_DEPTH fits u32");
+    let max_depth = DEFAULT_MAX_CALL_DEPTH;
     assert!(
-        guard_call_chain(&ok_ctx, "mod.31", max_depth).is_ok(),
+        guard_call_chain_with_repeat(&ok_ctx, "mod.31", max_depth, DEFAULT_MAX_MODULE_REPEAT)
+            .is_ok(),
         "chain of exactly 32 is at the limit -> Ok"
     );
 
     let over_chain: Vec<String> = (0..33).map(|i| format!("mod.{i}")).collect();
     let mut over_ctx = Context::<serde_json::Value>::anonymous();
     over_ctx.call_chain = over_chain;
-    let err = guard_call_chain(&over_ctx, "mod.32", max_depth)
-        .expect_err("chain of 33 exceeds default depth");
+    let err =
+        guard_call_chain_with_repeat(&over_ctx, "mod.32", max_depth, DEFAULT_MAX_MODULE_REPEAT)
+            .expect_err("chain of 33 exceeds default depth");
     assert_eq!(err.code, ErrorCode::CallDepthExceeded);
 }
 
@@ -311,11 +436,12 @@ fn input_max_repeat_default() {
     // "a" appears 3 times via self-calls (no cycle) -> at limit, Ok.
     let at_limit = ctx_with_chain(&["a", "a", "a"]);
     assert!(
-        guard_call_chain(&at_limit, "a", 100).is_ok(),
+        guard_call_chain_with_repeat(&at_limit, "a", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok(),
         "3 self-calls at the default repeat limit -> Ok"
     );
 
     let over = ctx_with_chain(&["a", "a", "a", "a"]);
-    let err = guard_call_chain(&over, "a", 100).expect_err("4 self-calls exceeds default");
+    let err = guard_call_chain_with_repeat(&over, "a", 100, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("4 self-calls exceeds default");
     assert_eq!(err.code, ErrorCode::CallFrequencyExceeded);
 }

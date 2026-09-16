@@ -40,17 +40,24 @@ pub const MAX_MODULE_ID_LEN: usize = MAX_MODULE_ID_LENGTH;
 
 /// Configuration controlling discovery-time behavior.
 ///
-/// Aligned with `apcore-python.DiscoveryConfig` (extension config) and
-/// `extensions.multi_class_discovery` in `apcore.yaml`.
+/// **This no longer gates multi-class discovery (D-107, spec v1.50.0).** The
+/// `multi_class` flag was a FILE-LEVEL toggle whose doc comment cited
+/// `extensions.multi_class_discovery` — a config key
+/// [decision-log D-06](https://apcore.aiperceivable.com/spec/2026-05-decision-log/)
+/// removed, and which no SDK ever implemented. Per-class markers are the only
+/// opt-in path: see [`DiscoveredClass::with_multi_class`]. The type and its
+/// field are retained so existing call sites keep compiling; nothing reads the
+/// flag.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryConfig {
-    /// Whether multi-class discovery is enabled.  Off by default; existing
-    /// single-class files are unaffected and produce identical IDs regardless.
+    /// Retained for source compatibility. **Inert** — a file-level toggle
+    /// cannot express the case the feature exists for (two participating
+    /// classes beside a helper class that must not become a module).
     pub multi_class: bool,
 }
 
 impl DiscoveryConfig {
-    /// Construct a config with multi-class discovery explicitly enabled.
+    /// Construct a config with the (inert) multi-class flag set.
     #[must_use]
     pub fn with_multi_class() -> Self {
         Self { multi_class: true }
@@ -62,10 +69,36 @@ impl DiscoveryConfig {
 /// `name` is the original (PascalCase) class/struct name; `implements_module`
 /// is `true` when the class implements the [`Module`] trait.  Non-qualifying
 /// classes are filtered out before ID derivation.
-#[derive(Debug, Clone)]
+///
+/// `multi_class` is the **per-class marker** — the Rust equivalent of Python's
+/// `@multi_class` decorator and TypeScript's `@multiClass()`
+/// (`multi-module-discovery.md`, D-107). A file opts in when at least one of
+/// its qualifying classes carries it, mirroring apcore-typescript's
+/// `classes.some(c => c.multiClass)`.
+#[derive(Debug, Clone, Default)]
 pub struct DiscoveredClass {
     pub name: String,
     pub implements_module: bool,
+    pub multi_class: bool,
+}
+
+impl DiscoveredClass {
+    /// A class candidate with no multi-class marker.
+    #[must_use]
+    pub fn new(name: impl Into<String>, implements_module: bool) -> Self {
+        Self {
+            name: name.into(),
+            implements_module,
+            multi_class: false,
+        }
+    }
+
+    /// Set the per-class multi-class marker (D-107).
+    #[must_use]
+    pub fn with_multi_class(mut self, multi_class: bool) -> Self {
+        self.multi_class = multi_class;
+        self
+    }
 }
 
 /// Convert a class/struct name to a snake_case ID segment per
@@ -197,14 +230,18 @@ fn canonical_id_pattern() -> &'static Regex {
 /// - **Empty / no qualifying classes** → returns `Ok(vec![])`.
 /// - **Exactly one qualifying class** → returns `Ok(vec![base_id])` regardless
 ///   of `config.multi_class` (single-class identity guarantee).
-/// - **Multiple qualifying classes with `multi_class == false`** → returns
-///   `Ok(vec![base_id])` (only the first class is loaded; the file is treated
-///   as single-class per backward-compat policy).
-/// - **Multiple qualifying classes with `multi_class == true`** → derives one
-///   ID per class as `base_id.class_segment`.  Conflicts (two classes mapping
-///   to the same segment) raise [`ErrorCode::ModuleIdConflict`].  Invalid
-///   segments raise [`ErrorCode::InvalidSegment`]; over-length IDs raise
+/// - **Multiple qualifying classes, none carrying the per-class marker** →
+///   returns `Ok(vec![base_id])` (only the first class is loaded; the file is
+///   treated as single-class per backward-compat policy).
+/// - **Multiple qualifying classes, at least one carrying the marker** →
+///   derives one ID per class as `base_id.class_segment`.  Conflicts (two
+///   classes mapping to the same segment) raise
+///   [`ErrorCode::ModuleIdConflict`].  Invalid segments raise
+///   [`ErrorCode::InvalidSegment`]; over-length IDs raise
 ///   [`ErrorCode::IdTooLong`].
+///
+/// `config` is accepted for source compatibility and is **not** read: D-107
+/// makes the per-class marker the only opt-in path.
 ///
 /// [`ErrorCode::ModuleIdConflict`]: crate::errors::ErrorCode::ModuleIdConflict
 /// [`ErrorCode::InvalidSegment`]: crate::errors::ErrorCode::InvalidSegment
@@ -213,7 +250,7 @@ pub fn derive_module_ids(
     file_path: &Path,
     extensions_root: &str,
     classes: &[DiscoveredClass],
-    config: &DiscoveryConfig,
+    _config: &DiscoveryConfig,
 ) -> Result<Vec<String>, ModuleError> {
     let qualifying: Vec<&DiscoveredClass> =
         classes.iter().filter(|c| c.implements_module).collect();
@@ -230,10 +267,17 @@ pub fn derive_module_ids(
         return Ok(vec![base_id]);
     }
 
-    // Multi-class disabled: file treated as single-class; only base_id is
-    // returned (first qualifying class wins).  Mirrors the `disabled_by_default`
-    // fixture case.
-    if !config.multi_class {
+    // D-107: the opt-in is resolved from the PER-CLASS markers, never from a
+    // file-level toggle. `DiscoveryConfig::multi_class` cited a config key
+    // decision-log D-06 removed and could not express the case the feature
+    // exists for — two participating classes beside a helper class that must
+    // not become a module. Mirrors apcore-typescript's
+    // `Registry.discoverMultiClass` (`classes.some(c => c.multiClass)`) and
+    // apcore-python, which honours a per-class marker and nothing else.
+    //
+    // No marker on any qualifying class: the file is treated as single-class
+    // and only base_id is returned (first qualifying class wins).
+    if !qualifying.iter().any(|c| c.multi_class) {
         return Ok(vec![base_id]);
     }
 
@@ -290,9 +334,17 @@ pub fn derive_module_ids(
 
 /// A class candidate paired with a live [`Module`] instance, used when
 /// registering a multi-class file with [`Registry::register_multi_class`].
+///
+/// `multi_class` is the same per-class marker [`DiscoveredClass`] carries
+/// (D-107): a file registers one module per entry only when at least one entry
+/// carries it. [`Self::new`] leaves it unset, so a batch that means to register
+/// several classes from one file must say so — with
+/// [`Self::with_multi_class`] — exactly as a Python `@multi_class` decorator or
+/// a TypeScript `@multiClass()` does.
 pub struct MultiClassEntry {
     pub class_name: String,
     pub module: Box<dyn Module>,
+    pub multi_class: bool,
 }
 
 impl MultiClassEntry {
@@ -300,7 +352,15 @@ impl MultiClassEntry {
         Self {
             class_name: class_name.into(),
             module,
+            multi_class: false,
         }
+    }
+
+    /// Set the per-class multi-class marker (D-107).
+    #[must_use]
+    pub fn with_multi_class(mut self, multi_class: bool) -> Self {
+        self.multi_class = multi_class;
+        self
     }
 }
 
@@ -331,6 +391,7 @@ impl Registry {
             .map(|e| DiscoveredClass {
                 name: e.class_name.clone(),
                 implements_module: true,
+                multi_class: e.multi_class,
             })
             .collect();
 
@@ -443,10 +504,7 @@ mod tests {
     #[test]
     fn test_derive_single_class_returns_base_id_unchanged() {
         let p = PathBuf::from("extensions/math/math_ops.py");
-        let classes = vec![DiscoveredClass {
-            name: "MathOps".to_string(),
-            implements_module: true,
-        }];
+        let classes = vec![DiscoveredClass::new("MathOps", true)];
         let config = DiscoveryConfig::with_multi_class();
         let ids = derive_module_ids(&p, "extensions", &classes, &config).unwrap();
         assert_eq!(ids, vec!["math.math_ops"]);
@@ -455,17 +513,12 @@ mod tests {
     #[test]
     fn test_derive_two_classes_distinct_ids() {
         let p = PathBuf::from("extensions/math/math_ops.py");
+        // D-107: the per-class marker is what opts the file in.
         let classes = vec![
-            DiscoveredClass {
-                name: "Addition".to_string(),
-                implements_module: true,
-            },
-            DiscoveredClass {
-                name: "Subtraction".to_string(),
-                implements_module: true,
-            },
+            DiscoveredClass::new("Addition", true).with_multi_class(true),
+            DiscoveredClass::new("Subtraction", true).with_multi_class(true),
         ];
-        let config = DiscoveryConfig::with_multi_class();
+        let config = DiscoveryConfig::default();
         let ids = derive_module_ids(&p, "extensions", &classes, &config).unwrap();
         assert_eq!(
             ids,
@@ -477,16 +530,10 @@ mod tests {
     fn test_derive_conflict_raises_module_id_conflict() {
         let p = PathBuf::from("extensions/math/math_ops.py");
         let classes = vec![
-            DiscoveredClass {
-                name: "MyModule".to_string(),
-                implements_module: true,
-            },
-            DiscoveredClass {
-                name: "My_Module".to_string(),
-                implements_module: true,
-            },
+            DiscoveredClass::new("MyModule", true).with_multi_class(true),
+            DiscoveredClass::new("My_Module", true).with_multi_class(true),
         ];
-        let config = DiscoveryConfig::with_multi_class();
+        let config = DiscoveryConfig::default();
         let err = derive_module_ids(&p, "extensions", &classes, &config).unwrap_err();
         assert_eq!(err.code, crate::errors::ErrorCode::ModuleIdConflict);
         assert_eq!(
@@ -498,19 +545,15 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_disabled_multi_class_returns_only_base_id() {
+    fn test_derive_without_a_per_class_marker_returns_only_base_id() {
+        // D-107: no marker on any qualifying class -> the file is single-class,
+        // and the retired file-level toggle cannot opt it in.
         let p = PathBuf::from("extensions/math/math_ops.py");
         let classes = vec![
-            DiscoveredClass {
-                name: "Addition".to_string(),
-                implements_module: true,
-            },
-            DiscoveredClass {
-                name: "Subtraction".to_string(),
-                implements_module: true,
-            },
+            DiscoveredClass::new("Addition", true),
+            DiscoveredClass::new("Subtraction", true),
         ];
-        let config = DiscoveryConfig::default();
+        let config = DiscoveryConfig::with_multi_class();
         let ids = derive_module_ids(&p, "extensions", &classes, &config).unwrap();
         assert_eq!(ids, vec!["math.math_ops"]);
     }
@@ -518,10 +561,7 @@ mod tests {
     #[test]
     fn test_derive_full_id_grammar_valid() {
         let p = PathBuf::from("extensions/executor/math/arithmetic.py");
-        let classes = vec![DiscoveredClass {
-            name: "Addition".to_string(),
-            implements_module: true,
-        }];
+        let classes = vec![DiscoveredClass::new("Addition", true)];
         let config = DiscoveryConfig::with_multi_class();
         let ids = derive_module_ids(&p, "extensions", &classes, &config).unwrap();
         assert_eq!(ids, vec!["executor.math.arithmetic"]);
@@ -532,14 +572,8 @@ mod tests {
     fn test_derive_filters_non_qualifying_classes() {
         let p = PathBuf::from("extensions/math/math_ops.py");
         let classes = vec![
-            DiscoveredClass {
-                name: "Addition".to_string(),
-                implements_module: true,
-            },
-            DiscoveredClass {
-                name: "InternalHelper".to_string(),
-                implements_module: false,
-            },
+            DiscoveredClass::new("Addition", true),
+            DiscoveredClass::new("InternalHelper", false),
         ];
         let config = DiscoveryConfig::with_multi_class();
         let ids = derive_module_ids(&p, "extensions", &classes, &config).unwrap();
@@ -550,10 +584,7 @@ mod tests {
     #[test]
     fn test_derive_no_qualifying_classes_returns_empty() {
         let p = PathBuf::from("extensions/math/math_ops.py");
-        let classes = vec![DiscoveredClass {
-            name: "InternalHelper".to_string(),
-            implements_module: false,
-        }];
+        let classes = vec![DiscoveredClass::new("InternalHelper", false)];
         let config = DiscoveryConfig::with_multi_class();
         let ids = derive_module_ids(&p, "extensions", &classes, &config).unwrap();
         assert!(ids.is_empty());
@@ -568,16 +599,10 @@ mod tests {
         let path_str = format!("extensions/{long_segment}.py");
         let p = PathBuf::from(&path_str);
         let classes = vec![
-            DiscoveredClass {
-                name: "Addition".to_string(),
-                implements_module: true,
-            },
-            DiscoveredClass {
-                name: "Subtraction".to_string(),
-                implements_module: true,
-            },
+            DiscoveredClass::new("Addition", true).with_multi_class(true),
+            DiscoveredClass::new("Subtraction", true).with_multi_class(true),
         ];
-        let config = DiscoveryConfig::with_multi_class();
+        let config = DiscoveryConfig::default();
         let err = derive_module_ids(&p, "extensions", &classes, &config).unwrap_err();
         assert_eq!(err.code, crate::errors::ErrorCode::IdTooLong);
     }

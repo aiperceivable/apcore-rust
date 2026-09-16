@@ -125,7 +125,7 @@ async fn error_threshold_emits_canonical_only() {
     // Pre-populate metrics so error rate > 0.5
     let metrics = MetricsCollector::new();
     let mut labels = HashMap::new();
-    labels.insert("module".to_string(), "mod.a".to_string());
+    labels.insert("module_id".to_string(), "mod.a".to_string());
     labels.insert("status".to_string(), "error".to_string());
     metrics.increment("apcore_module_calls_total", labels.clone(), 10.0);
 
@@ -440,7 +440,7 @@ async fn update_config_audit_event_includes_caller_id_from_context() {
 async fn platform_notify_emits_onto_the_shared_bus() {
     let metrics = MetricsCollector::new();
     let mut labels = HashMap::new();
-    labels.insert("module".to_string(), "mod.shared".to_string());
+    labels.insert("module_id".to_string(), "mod.shared".to_string());
     labels.insert("status".to_string(), "error".to_string());
     metrics.increment("apcore_module_calls_total", labels, 10.0);
 

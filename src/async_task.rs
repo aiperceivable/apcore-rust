@@ -117,9 +117,22 @@ pub trait TaskStore: Send + Sync {
 
 /// Default in-memory [`TaskStore`] backed by [`DashMap`] for lock-free
 /// concurrent access.
+///
+/// # Insertion order (D-82)
+///
+/// `list` and `list_expired` return records in **submission order**. `DashMap`
+/// has no insertion order of its own, so each record is stamped with a
+/// monotonic sequence number on first save and the listings sort on that.
+/// Sorting on `task_id` — which this store used to do — is not a substitute:
+/// the id is a UUID v4, so it is random with respect to submission, and
+/// `list_tasks()[0]` returned the lexicographically smallest UUID rather than
+/// the first-submitted task.
 #[derive(Default)]
 pub struct InMemoryTaskStore {
-    tasks: DashMap<String, TaskInfo>,
+    /// `task_id -> (insertion sequence, record)`.
+    tasks: DashMap<String, (u64, TaskInfo)>,
+    /// Monotonic counter stamped onto each record the first time it is saved.
+    next_seq: std::sync::atomic::AtomicU64,
 }
 
 impl InMemoryTaskStore {
@@ -131,27 +144,40 @@ impl InMemoryTaskStore {
 #[async_trait]
 impl TaskStore for InMemoryTaskStore {
     async fn save(&self, task: &TaskInfo) -> Result<(), ModuleError> {
-        self.tasks.insert(task.task_id.clone(), task.clone());
+        use dashmap::mapref::entry::Entry;
+        match self.tasks.entry(task.task_id.clone()) {
+            // An overwrite keeps the record's original position: a status
+            // transition is not a re-submission.
+            Entry::Occupied(mut occupied) => {
+                occupied.get_mut().1 = task.clone();
+            }
+            Entry::Vacant(vacant) => {
+                let seq = self
+                    .next_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vacant.insert((seq, task.clone()));
+            }
+        }
         Ok(())
     }
 
     async fn get(&self, id: &str) -> Result<Option<TaskInfo>, ModuleError> {
-        Ok(self.tasks.get(id).map(|entry| entry.clone()))
+        Ok(self.tasks.get(id).map(|entry| entry.value().1.clone()))
     }
 
     async fn list(&self, status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError> {
-        let mut out: Vec<TaskInfo> = self
+        let mut out: Vec<(u64, TaskInfo)> = self
             .tasks
             .iter()
             .filter(|entry| match status {
-                Some(s) => entry.value().status == s,
+                Some(s) => entry.value().1.status == s,
                 None => true,
             })
             .map(|entry| entry.value().clone())
             .collect();
-        // Stable order is helpful for deterministic tests; sort by task_id.
-        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
-        Ok(out)
+        // D-82: insertion (submission) order is normative.
+        out.sort_by_key(|(seq, _)| *seq);
+        Ok(out.into_iter().map(|(_, info)| info).collect())
     }
 
     async fn delete(&self, id: &str) -> Result<(), ModuleError> {
@@ -160,11 +186,11 @@ impl TaskStore for InMemoryTaskStore {
     }
 
     async fn list_expired(&self, before_timestamp: f64) -> Result<Vec<TaskInfo>, ModuleError> {
-        let mut out: Vec<TaskInfo> = self
+        let mut out: Vec<(u64, TaskInfo)> = self
             .tasks
             .iter()
             .filter(|entry| {
-                let info = entry.value();
+                let info = &entry.value().1;
                 if !info.status.is_terminal() {
                     return false;
                 }
@@ -175,8 +201,8 @@ impl TaskStore for InMemoryTaskStore {
             })
             .map(|entry| entry.value().clone())
             .collect();
-        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
-        Ok(out)
+        out.sort_by_key(|(seq, _)| *seq);
+        Ok(out.into_iter().map(|(_, info)| info).collect())
     }
 
     fn store_type_name(&self) -> &'static str {
@@ -300,17 +326,25 @@ impl Default for ReaperConfig {
 }
 
 /// Handle returned by [`AsyncTaskManager::start_reaper`] to control the
-/// background reaper task. Drop the handle to detach (the reaper continues to
-/// run); call [`ReaperHandle::stop`] to gracefully signal cancellation and
-/// await termination.
+/// background reaper task.
+///
+/// Call [`ReaperHandle::stop`] to signal cancellation and await termination.
+/// Dropping the handle DETACHES the reaper: the sweep loop keeps running, so
+/// the manager's single-reaper guard deliberately stays set — dropping a handle
+/// is not a way to stop a reaper, and must not let a second sweep loop start
+/// alongside the first. [`AsyncTaskManager::stop_reaper`] (which
+/// [`AsyncTaskManager::shutdown`] calls) stops a detached reaper.
 #[derive(Debug)]
 pub struct ReaperHandle {
     handle: Option<JoinHandle<()>>,
     stop_tx: watch::Sender<bool>,
     /// Shared `running` flag owned by the [`AsyncTaskManager`] that spawned
-    /// this reaper. Cleared on `stop()` (and via the `Drop` fallback) so a
-    /// subsequent `start_reaper` call succeeds.
+    /// this reaper. Cleared on `stop()` so a subsequent `start_reaper` call
+    /// succeeds. NOT cleared on drop — see the type docs.
     running_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// The manager's slot holding this reaper's stop sender, cleared by
+    /// `stop()` so the manager does not keep signalling a dead reaper.
+    stop_slot: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
 impl ReaperHandle {
@@ -327,20 +361,19 @@ impl ReaperHandle {
                 }
             }
         }
+        self.stop_slot.lock().take();
         self.running_flag
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-impl Drop for ReaperHandle {
-    fn drop(&mut self) {
-        // Detached / aborted handles also release the running flag so the
-        // manager can spawn a new reaper afterwards. `stop()` performs an
-        // explicit clear before this runs, so the double-clear is harmless.
-        self.running_flag
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
+// No `Drop` impl on purpose. Clearing `running_flag` here without signalling
+// `stop_tx` was the defect: the sweep loop kept running while the guard it was
+// holding was released, so the next `start_reaper` won its compare_exchange and
+// a SECOND sweep loop ran alongside the first, both deleting from the same
+// store. Dropping a handle detaches — and a detached reaper is still running,
+// so the flag stays set. Use `ReaperHandle::stop` or
+// `AsyncTaskManager::stop_reaper` to actually stop one.
 
 // ---------------------------------------------------------------------------
 // AsyncTaskManager
@@ -375,6 +408,12 @@ pub struct AsyncTaskManager {
     /// already set. Cleared by `ReaperHandle::stop` (and on drop) so a
     /// caller can `stop()` then `start_reaper()` again.
     reaper_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Stop sender for the reaper this manager started, retained so
+    /// [`Self::shutdown`] can stop it even when the [`ReaperHandle`] was
+    /// dropped (detached). `shutdown` used to leave the reaper sweeping
+    /// forever, while apcore-python (`stop_reaper`) and apcore-typescript both
+    /// stop theirs.
+    reaper_stop: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
 impl AsyncTaskManager {
@@ -409,6 +448,7 @@ impl AsyncTaskManager {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reaper_stop: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -487,6 +527,23 @@ impl AsyncTaskManager {
         let mid = module_id.to_string();
         let tid = task_id.clone();
 
+        // The spawned task can finish BEFORE the parent registers its
+        // `JoinHandle` — a fast failure such as MODULE_NOT_FOUND, with a free
+        // semaphore permit and an immediately-ready `InMemoryTaskStore`, reaches
+        // the `remove` below while this thread is still between `spawn` and
+        // `insert` on a multi-threaded runtime. The removal then found nothing
+        // and a stale handle was inserted for an already-terminal task, so
+        // `cancel()` would later `abort()` a finished task and `handles` grew
+        // without bound.
+        //
+        // `finished` closes the window: the task sets it BEFORE taking the
+        // `handles` lock, and the parent reads it while HOLDING that lock. So
+        // either the parent observes the flag and never inserts, or its insert
+        // is ordered before the task's remove. Neither interleaving leaves a
+        // stale entry.
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_in_task = Arc::clone(&finished);
+
         let handle = tokio::spawn(async move {
             run_task(
                 tid.clone(),
@@ -499,10 +556,19 @@ impl AsyncTaskManager {
                 store_for_run,
             )
             .await;
+            finished_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
             handles.lock().remove(&tid);
         });
 
-        self.handles.lock().insert(task_id.clone(), handle);
+        {
+            let mut registered = self.handles.lock();
+            if finished.load(std::sync::atomic::Ordering::SeqCst) {
+                // Already terminal: registering now would strand the entry.
+                drop(handle);
+            } else {
+                registered.insert(task_id.clone(), handle);
+            }
+        }
 
         Ok(task_id)
     }
@@ -511,21 +577,42 @@ impl AsyncTaskManager {
     ///
     /// This is the synchronous wrapper used by the existing public API. For
     /// network-backed stores, prefer [`Self::get_status_async`].
-    pub fn get_status(&self, task_id: &str) -> Option<TaskInfo> {
-        block_on_local(self.store.get(task_id)).ok().flatten()
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81). `Ok(None)` means the store
+    /// answered and has no such task; a store outage is an `Err`, never a
+    /// "not found".
+    pub fn get_status(&self, task_id: &str) -> Result<Option<TaskInfo>, ModuleError> {
+        block_on_local(self.store.get(task_id))
     }
 
     /// Async variant of [`Self::get_status`] for network-backed stores.
-    pub async fn get_status_async(&self, task_id: &str) -> Option<TaskInfo> {
-        self.store.get(task_id).await.ok().flatten()
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81).
+    pub async fn get_status_async(&self, task_id: &str) -> Result<Option<TaskInfo>, ModuleError> {
+        self.store.get(task_id).await
     }
 
-    /// Return the result of a completed task or an error if not found / not completed.
+    /// Return the result of a completed task or an error if not found / not
+    /// completed.
+    ///
+    /// # Errors
+    ///
+    /// The store's own error is propagated unchanged (D-81); a task that is
+    /// absent or not yet complete is reported as
+    /// [`ErrorCode::GeneralInternalError`].
     pub fn get_result(&self, task_id: &str) -> Result<serde_json::Value, ModuleError> {
         block_on_local(self.get_result_async(task_id))
     }
 
     /// Async variant of [`Self::get_result`] for network-backed stores.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_result`].
     pub async fn get_result_async(&self, task_id: &str) -> Result<serde_json::Value, ModuleError> {
         let info = self.store.get(task_id).await?.ok_or_else(|| {
             ModuleError::new(
@@ -548,12 +635,20 @@ impl AsyncTaskManager {
     /// method async. Python (`async def cancel`) and TypeScript
     /// (`async cancel`) already comply; Rust now matches via
     /// `pub async fn cancel`. Drain semantics typically require await.
-    pub async fn cancel(&self, task_id: &str) -> bool {
-        let Some(info) = self.store.get(task_id).await.ok().flatten() else {
-            return false;
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81). This is the case the decision
+    /// calls out as worst: this method used to swallow a failed `save` and
+    /// still return `true`, telling the caller the task was terminated while
+    /// it kept running. The cancellation OUTCOME is still the boolean —
+    /// `Ok(false)` for an unknown or already-terminal task.
+    pub async fn cancel(&self, task_id: &str) -> Result<bool, ModuleError> {
+        let Some(info) = self.store.get(task_id).await? else {
+            return Ok(false);
         };
         if !info.status.is_active() {
-            return false;
+            return Ok(false);
         }
 
         if let Some(handle) = self.handles.lock().remove(task_id) {
@@ -565,38 +660,101 @@ impl AsyncTaskManager {
         if updated.status.is_active() {
             updated.status = TaskStatus::Cancelled;
             updated.completed_at = Some(now_secs());
-            let _ = self.store.save(&updated).await;
+            self.store.save(&updated).await?;
         }
-        true
+        Ok(true)
     }
 
-    /// Cancel all pending and running tasks.
-    pub async fn shutdown(&self) {
+    /// Signal this manager's reaper to stop and release the single-reaper
+    /// guard, whether or not its [`ReaperHandle`] is still held.
+    ///
+    /// Returns `true` when a reaper was running. Idempotent. Mirrors
+    /// apcore-python `AsyncTaskManager.stop_reaper`; apcore-typescript stops
+    /// its sweep timer in the same place.
+    ///
+    /// Does not await the sweep loop's final iteration — hold the
+    /// [`ReaperHandle`] and call [`ReaperHandle::stop`] when that matters.
+    pub fn stop_reaper(&self) -> bool {
+        let sender = self.reaper_stop.lock().take();
+        let was_running = sender.is_some();
+        if let Some(stop_tx) = sender {
+            // Receivers may already be gone — ignore the send error.
+            let _ = stop_tx.send(true);
+        }
+        self.reaper_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        was_running
+    }
+
+    /// Cancel all pending and running tasks, and stop the reaper.
+    ///
+    /// The reaper stop is what apcore-python's `shutdown` does first
+    /// (`await self.stop_reaper()`) and what apcore-typescript's clears; this
+    /// SDK left a started reaper sweeping after `shutdown()` returned.
+    ///
+    /// Every active task is attempted even after one cancellation fails, and the
+    /// first failure is returned once they all have been (D-122). The two
+    /// failure modes are not symmetric: if the store is unreachable every
+    /// cancellation fails and stopping early reaches the same outcome sooner,
+    /// but if ONE task fails, stopping leaves every remaining task uncancelled
+    /// when they could have been cancelled. An uncancelled task in a shared
+    /// store is a lasting cost — it holds a `max_tasks` slot for every manager
+    /// sharing that store, and outlives the process that could have cancelled
+    /// it — while a slower shutdown is transient. This method is already an
+    /// unbounded wait by contract and takes no timeout, so a caller needing a
+    /// bound already imposes one.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81): the `list` failure immediately, or
+    /// the first `cancel` failure after every active task has been attempted.
+    /// The reaper is stopped before the store is touched, so a store outage
+    /// still leaves the reaper stopped.
+    pub async fn shutdown(&self) -> Result<(), ModuleError> {
+        self.stop_reaper();
+
         let task_ids: Vec<String> = self
             .store
             .list(None)
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .filter_map(|info| info.status.is_active().then_some(info.task_id))
             .collect();
 
+        let mut first_error: Option<ModuleError> = None;
         for task_id in task_ids {
-            self.cancel(&task_id).await;
+            if let Err(err) = self.cancel(&task_id).await {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Return all tasks, optionally filtered by status. Synchronous wrapper.
-    pub fn list_tasks(&self, status: Option<TaskStatus>) -> Vec<TaskInfo> {
-        block_on_local(self.store.list(status)).unwrap_or_default()
+    ///
+    /// The list is in submission order (D-82). An empty `Ok` list means the
+    /// store answered and nothing matched.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81) rather than reporting "no tasks"
+    /// for a store that is merely unreachable.
+    pub fn list_tasks(&self, status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError> {
+        block_on_local(self.store.list(status))
     }
 
     /// Remove terminal-state tasks older than `max_age_seconds`. Returns the
     /// count of removed tasks.
-    pub fn cleanup(&self, max_age_seconds: f64) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81). A failed `delete` aborts the sweep
+    /// rather than being counted as a removal that never happened.
+    pub fn cleanup(&self, max_age_seconds: f64) -> Result<usize, ModuleError> {
         let now = now_secs();
-        let to_remove: Vec<String> = block_on_local(self.store.list(None))
-            .unwrap_or_default()
+        let to_remove: Vec<String> = block_on_local(self.store.list(None))?
             .into_iter()
             .filter(|info| info.status.is_terminal())
             .filter(|info| {
@@ -608,15 +766,20 @@ impl AsyncTaskManager {
 
         let count = to_remove.len();
         for id in &to_remove {
-            let _ = block_on_local(self.store.delete(id));
+            block_on_local(self.store.delete(id))?;
             self.handles.lock().remove(id);
         }
-        count
+        Ok(count)
     }
 
     /// Total tracked task count across all states.
-    pub fn task_count(&self) -> usize {
-        block_on_local(self.store.list(None)).map_or(0, |v| v.len())
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81) rather than reporting `0` for a
+    /// store that is merely unreachable.
+    pub fn task_count(&self) -> Result<usize, ModuleError> {
+        Ok(block_on_local(self.store.list(None))?.len())
     }
 
     /// Start the opt-in background reaper. Returns a [`ReaperHandle`] used to
@@ -695,10 +858,15 @@ impl AsyncTaskManager {
             }
         });
 
+        // Retain the sender so `shutdown` / `stop_reaper` can stop this reaper
+        // even after the handle below is dropped (detached).
+        *self.reaper_stop.lock() = Some(stop_tx.clone());
+
         Ok(ReaperHandle {
             handle: Some(handle),
             stop_tx,
             running_flag: Arc::clone(&self.reaper_running),
+            stop_slot: Arc::clone(&self.reaper_stop),
         })
     }
 }
@@ -802,7 +970,9 @@ async fn run_task(
                         // it captures the wall-clock of the first execution and
                         // matches the Python reference behaviour so cross-language
                         // TaskInfo snapshots remain comparable mid-retry.
-                        let _ = store.save(&info).await;
+                        if let Err(e) = store.save(&info).await {
+                            warn!(task_id = %task_id, "retry state save failed: {e}");
+                        }
                         debug!(
                             task_id = %task_id,
                             attempt = info.retry_count,
@@ -843,7 +1013,11 @@ pub(crate) async fn save_terminal_if_not_cancelled(
             return;
         }
     }
-    let _ = store.save(info).await;
+    // Background task: there is no caller to propagate to (D-81 governs the
+    // manager surface), so a store failure is logged rather than dropped.
+    if let Err(e) = store.save(info).await {
+        warn!(task_id = %task_id, "terminal state save failed: {e}");
+    }
 }
 
 async fn mark_cancelled(store: &Arc<dyn TaskStore>, task_id: &str) {
@@ -851,7 +1025,10 @@ async fn mark_cancelled(store: &Arc<dyn TaskStore>, task_id: &str) {
         if info.status.is_active() {
             info.status = TaskStatus::Cancelled;
             info.completed_at = Some(now_secs());
-            let _ = store.save(&info).await;
+            // Background task: no caller to propagate to; log instead.
+            if let Err(e) = store.save(&info).await {
+                warn!(task_id = %task_id, "cancelled state save failed: {e}");
+            }
         }
     }
 }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 fn make_acl() -> ExtensionKind {
-    ExtensionKind::Acl(ACL::new(vec![], "deny", None))
+    ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None)))
 }
 
 // ---------------------------------------------------------------------------
@@ -96,12 +96,12 @@ fn test_register_multiple_middleware_accumulates() {
 
     mgr.register(
         "middleware",
-        ExtensionKind::Middleware(Box::new(LoggingMiddleware::default())),
+        ExtensionKind::Middleware(Arc::new(LoggingMiddleware::default())),
     )
     .unwrap();
     mgr.register(
         "middleware",
-        ExtensionKind::Middleware(Box::new(LoggingMiddleware::default())),
+        ExtensionKind::Middleware(Arc::new(LoggingMiddleware::default())),
     )
     .unwrap();
 
@@ -138,7 +138,7 @@ fn test_clear_all_removes_everything() {
     mgr.register("acl", make_acl()).unwrap();
     mgr.register(
         "middleware",
-        ExtensionKind::Middleware(Box::new(LoggingMiddleware::default())),
+        ExtensionKind::Middleware(Arc::new(LoggingMiddleware::default())),
     )
     .unwrap();
     mgr.clear_all();
@@ -229,7 +229,8 @@ fn test_apply_wires_acl_into_executor() {
         "deny",
         None,
     );
-    mgr.register("acl", ExtensionKind::Acl(acl)).unwrap();
+    mgr.register("acl", ExtensionKind::Acl(Arc::new(acl)))
+        .unwrap();
 
     let registry = Arc::new(Registry::new());
     let config = Arc::new(apcore::Config::default());
@@ -255,12 +256,12 @@ fn test_apply_wires_multiple_middleware() {
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "middleware",
-        ExtensionKind::Middleware(Box::new(LoggingMiddleware::default())),
+        ExtensionKind::Middleware(Arc::new(LoggingMiddleware::default())),
     )
     .unwrap();
     mgr.register(
         "middleware",
-        ExtensionKind::Middleware(Box::new(LoggingMiddleware::default())),
+        ExtensionKind::Middleware(Arc::new(LoggingMiddleware::default())),
     )
     .unwrap();
 
@@ -269,8 +270,17 @@ fn test_apply_wires_multiple_middleware() {
     let mut executor = Executor::new(Arc::clone(&registry), config);
 
     assert!(mgr.apply(&registry, &mut executor).is_ok());
-    // After apply, the middleware vec is drained
-    assert_eq!(mgr.count("middleware"), Some(0));
+    // D-78: apply retains the store, so the same manager can wire a second
+    // registry/executor pair.
+    assert_eq!(mgr.count("middleware"), Some(2));
+    assert_eq!(
+        executor
+            .middlewares()
+            .iter()
+            .filter(|n| *n == "logging")
+            .count(),
+        2
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -298,12 +308,12 @@ fn test_apply_wires_two_span_exporters_via_composite() {
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
     )
     .unwrap();
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
     )
     .unwrap();
     assert_eq!(mgr.count("span_exporter"), Some(2));
@@ -349,7 +359,7 @@ fn test_apply_span_exporter_does_not_add_second_tracing_middleware() {
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
     )
     .unwrap();
     mgr.apply(&registry, &mut executor)
@@ -379,7 +389,7 @@ fn test_apply_span_exporter_without_tracing_middleware_warns_and_adds_nothing() 
     let mut mgr = ExtensionManager::new();
     mgr.register(
         "span_exporter",
-        ExtensionKind::SpanExporter(Box::new(InMemoryExporter::new())),
+        ExtensionKind::SpanExporter(Arc::new(InMemoryExporter::new())),
     )
     .unwrap();
     mgr.apply(&registry, &mut executor)

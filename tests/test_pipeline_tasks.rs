@@ -242,6 +242,43 @@ fn test_register_and_list_strategies() {
 }
 
 #[test]
+fn test_executor_list_strategies_includes_the_current_strategy() {
+    // The module-level `list_strategies()` reports the global registry, which
+    // is not pre-seeded with the built-ins — so before this fix a default
+    // executor answered the AI-strategy-selection query with an empty menu.
+    // `core-executor.md` requires "the executor's current strategy plus one
+    // for every strategy registered".
+    let registry = Registry::new();
+    let config = Config::default();
+    let executor = Executor::new(registry, config);
+
+    let all = executor.list_strategies();
+    assert!(
+        !all.is_empty(),
+        "a default executor must report at least its own strategy"
+    );
+    assert_eq!(
+        all[0].name,
+        executor.strategy().info().name,
+        "the current strategy must come first"
+    );
+
+    // A registered strategy joins it, without displacing the current one.
+    register_strategy(build_internal_strategy().info());
+    let all = executor.list_strategies();
+    assert_eq!(all[0].name, executor.strategy().info().name);
+    assert!(all.iter().any(|s| s.name == "internal"));
+
+    // Names are unique — the current strategy is not repeated when it is also
+    // present in the registry.
+    let mut names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+    let before = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(before, names.len(), "strategy names must be deduped");
+}
+
+#[test]
 fn test_describe_pipeline() {
     let strategy = build_standard_strategy();
     let info = strategy.info();

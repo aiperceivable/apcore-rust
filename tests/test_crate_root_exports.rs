@@ -192,10 +192,10 @@ fn test_execution_cancelled_error_at_crate_root() {
     // matching apcore-python's ExecutionCancelledError(Exception) class.
     use apcore::ExecutionCancelledError;
     let err = ExecutionCancelledError {
-        module_id: "executor.email.send_email".to_string(),
+        module_id: Some("executor.email.send_email".to_string()),
         message: "Cancelled by user request".to_string(),
     };
-    assert_eq!(err.module_id, "executor.email.send_email");
+    assert_eq!(err.module_id.as_deref(), Some("executor.email.send_email"));
     // Verify Display (thiserror) is implemented.
     let display = format!("{err}");
     assert!(!display.is_empty());

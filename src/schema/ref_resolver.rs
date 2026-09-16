@@ -34,6 +34,37 @@ fn root_ref_aliases(document: &serde_json::Value) -> HashSet<String> {
     aliases
 }
 
+/// The document a node is being resolved in.
+///
+/// Root, file and D-104 fallback travel together because all three are
+/// properties of ONE document, and `$ref` resolution rebases all three on every
+/// cross-document hop. They used to be two parameters plus a resolver field,
+/// and the field is the one that did not rebase: `node_fallback` was consulted
+/// for a local pointer no matter which document resolution had reached, so an
+/// external schema's unresolvable `#/$defs/X` fell back to the *calling*
+/// interface schema's `$defs` and silently resolved to an unrelated definition
+/// where it owes the caller `SCHEMA_NOT_FOUND`. That changes what gets
+/// validated, and — since §10.6 reads `x-sensitive` off the resolved schema —
+/// what gets redacted.
+#[derive(Clone, Copy)]
+struct DocumentBase<'a> {
+    /// The root a local `#/…` pointer resolves against first.
+    root: &'a serde_json::Value,
+    /// The file `root` was loaded from, when it came from one. Relative
+    /// references resolve against its directory.
+    file: Option<&'a Path>,
+    /// Secondary base for a local `#/…` pointer that does not resolve at
+    /// `root` (PROTOCOL_SPEC §4.11 step 4a, D-104).
+    ///
+    /// `Some` only while resolution is still inside the document
+    /// [`RefResolver::with_node_fallback`] described. Crossing into another
+    /// document clears it permanently for that sub-tree: a nested in-document
+    /// hop taken *within* the external document must not bring it back, or the
+    /// external document would inherit a fallback belonging to a schema it has
+    /// never heard of.
+    node_fallback: Option<&'a serde_json::Value>,
+}
+
 /// Resolves $ref references in JSON schemas.
 ///
 /// Supports the three reference formats PROTOCOL_SPEC §4.11 mandates:
@@ -58,6 +89,10 @@ pub struct RefResolver {
     max_depth: usize,
     schemas_dir: Option<PathBuf>,
     current_file: Option<PathBuf>,
+    /// Secondary base for a local `#/…` pointer that does not resolve at the
+    /// file root (PROTOCOL_SPEC §4.11 step 4a, D-104). Set by the loader to the
+    /// `input_schema` / `output_schema` node currently being resolved.
+    node_fallback: Option<serde_json::Value>,
 }
 
 /// A `$ref` target together with the document it came from.
@@ -70,6 +105,12 @@ struct RefTarget {
     value: serde_json::Value,
     /// Root of the document `value` was found in.
     root: serde_json::Value,
+    /// True only for an in-document `#/…` pointer, where `root` is the same
+    /// document the reference was written in. False for every cross-document
+    /// form (a registered URI, a canonical `apcore://` reference, a relative
+    /// file path) — which is what decides whether D-104's `node_fallback`
+    /// survives the hop. See [`DocumentBase::node_fallback`].
+    same_document: bool,
     /// Path of that document, when it came from disk.
     file: Option<PathBuf>,
     /// Stable identity for cycle detection: the raw ref for in-document
@@ -87,6 +128,7 @@ impl RefResolver {
             max_depth: DEFAULT_MAX_REF_DEPTH,
             schemas_dir: None,
             current_file: None,
+            node_fallback: None,
         }
     }
 
@@ -114,6 +156,60 @@ impl RefResolver {
     pub fn with_current_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.current_file = Some(file.into());
         self
+    }
+
+    /// Resolve a local `#/…` pointer against `node` when it does not resolve at
+    /// the document root (PROTOCOL_SPEC §4.11 step 4a, D-104).
+    ///
+    /// Both layouts are normative: `definitions:` beside `input_schema` as a
+    /// top-level key of the schema FILE (what §4.11's own example writes), and
+    /// a `$defs` block nested INSIDE `input_schema` (what apcore-python and
+    /// apcore-typescript accept). File root is tried first; the two lookups
+    /// cannot collide, because a pointer either resolves at the file root or it
+    /// does not.
+    /// The fallback is scoped to THAT document: once resolution follows a
+    /// reference into an external file or a registered schema, it is no longer
+    /// consulted. Otherwise an external document's unresolvable `#/$defs/X`
+    /// would quietly resolve against this node's `$defs`.
+    #[must_use]
+    pub fn with_node_fallback(mut self, node: serde_json::Value) -> Self {
+        self.node_fallback = Some(node);
+        self
+    }
+
+    /// The starting document context for a public entry point: the document
+    /// itself, the file it came from, and the D-104 fallback (which is valid
+    /// only here, at the origin).
+    fn document_base<'a>(
+        &'a self,
+        document: &'a serde_json::Value,
+        file: Option<&'a Path>,
+    ) -> DocumentBase<'a> {
+        DocumentBase {
+            root: document,
+            file,
+            node_fallback: self.node_fallback.as_ref(),
+        }
+    }
+
+    /// Resolve every `$ref` in `node`, treating `document` as the root the
+    /// local `#/…` pointers are looked up in.
+    ///
+    /// [`Self::resolve`] is the case where the two coincide.
+    pub fn resolve_in_document(
+        &self,
+        node: &serde_json::Value,
+        document: &serde_json::Value,
+    ) -> Result<serde_json::Value, ModuleError> {
+        let mut seen: HashSet<String> = root_ref_aliases(document);
+        let base = self.current_file.clone();
+        self.resolve_inner(
+            node,
+            self.document_base(document, base.as_deref()),
+            &mut seen,
+            0,
+            false,
+        )
     }
 
     /// Returns the configured maximum recursion depth for `$ref` resolution.
@@ -144,7 +240,13 @@ impl RefResolver {
     pub fn resolve(&self, schema: &serde_json::Value) -> Result<serde_json::Value, ModuleError> {
         let mut seen: HashSet<String> = root_ref_aliases(schema);
         let base = self.current_file.clone();
-        self.resolve_inner(schema, schema, base.as_deref(), &mut seen, 0, false)
+        self.resolve_inner(
+            schema,
+            self.document_base(schema, base.as_deref()),
+            &mut seen,
+            0,
+            false,
+        )
     }
 
     /// Check if a schema contains a *circular* reference — a `$ref` → `$ref`
@@ -180,14 +282,13 @@ impl RefResolver {
     /// never reaches a schema body and cannot terminate. Re-entering one after a
     /// structural descent is a self-reference and is deferred instead.
     ///
-    /// `base_file` is the document `node` lives in, rebased on every cross-file
-    /// hop so relative references and `#/…` pointers resolve against the right
-    /// document.
+    /// `base` is the document `node` lives in, rebased on every cross-document
+    /// hop so relative references, `#/…` pointers and the D-104 fallback all
+    /// resolve against the right document.
     fn resolve_inner(
         &self,
         node: &serde_json::Value,
-        root: &serde_json::Value,
-        base_file: Option<&Path>,
+        base: DocumentBase<'_>,
         seen: &mut HashSet<String>,
         depth: usize,
         from_ref_chain: bool,
@@ -230,7 +331,7 @@ impl RefResolver {
                             // to bind lazily instead of inlining it forever.
                             return Ok(node.clone());
                         }
-                        let target = self.lookup_ref(ref_str, root, base_file)?;
+                        let target = self.lookup_ref(ref_str, base)?;
                         if seen.contains(&target.seen_key) {
                             if from_ref_chain {
                                 return Err(SchemaCircularRefError::new(
@@ -258,16 +359,62 @@ impl RefResolver {
                         // there rather than in the calling document's tree.
                         // apcore-python and apcore-typescript compute the same
                         // per-hop base (`effective_file`).
-                        let result = self.resolve_inner(
-                            &target.value,
-                            &target.root,
-                            target.file.as_deref(),
-                            seen,
-                            depth + 1,
-                            true,
-                        )?;
+                        let target_base = DocumentBase {
+                            root: &target.root,
+                            file: target.file.as_deref(),
+                            // D-104's fallback belongs to the document
+                            // `resolve` was entered with; it does not follow
+                            // the reference into another one.
+                            node_fallback: if target.same_document {
+                                base.node_fallback
+                            } else {
+                                None
+                            },
+                        };
+                        let mut result =
+                            self.resolve_inner(&target.value, target_base, seen, depth + 1, true)?;
                         seen.remove(ref_str);
                         seen.remove(&target.seen_key);
+
+                        // Overlay the node's NON-`$ref` keys onto the resolved
+                        // target. JSON Schema 2019-09+ makes keys sitting
+                        // beside a `$ref` independent assertions, and
+                        // PROTOCOL_SPEC §4.11 step 1b already requires them
+                        // preserved on the self-reference path (the two
+                        // `Ok(node.clone())` returns above) — dropping them
+                        // here made resolution the only place they vanished.
+                        //
+                        // This is a data leak, not a cosmetic gap: §10.6
+                        // redaction reads `x-sensitive` off the RESOLVED input
+                        // schema, so `{"$ref": …, "x-sensitive": true}` was
+                        // redacted by apcore-python and apcore-typescript and
+                        // logged in plaintext here.
+                        //
+                        // Siblings WIN on a key collision, matching
+                        // apcore-python (`result.update(sibling_keys)`) and
+                        // apcore-typescript (`Object.assign`) — the referring
+                        // node is the more specific statement. They are
+                        // resolved in turn, since a sibling may carry a `$ref`
+                        // of its own; against the REFERRING document's base
+                        // (`root` / `base_file`), which is where they
+                        // textually live, not the target's.
+                        //
+                        // A non-object target (a boolean schema) has nothing to
+                        // overlay onto and is returned unchanged, as in both
+                        // peers.
+                        if map.len() > 1 {
+                            if let Some(obj) = result.as_object_mut() {
+                                for (key, value) in map {
+                                    if key == "$ref" {
+                                        continue;
+                                    }
+                                    obj.insert(
+                                        key.clone(),
+                                        self.resolve_inner(value, base, seen, depth, false)?,
+                                    );
+                                }
+                            }
+                        }
                         return Ok(result);
                     }
                 }
@@ -276,17 +423,14 @@ impl RefResolver {
                 // through map/array children does not consume the $ref budget.
                 let mut new_map = serde_json::Map::new();
                 for (k, v) in map {
-                    new_map.insert(
-                        k.clone(),
-                        self.resolve_inner(v, root, base_file, seen, depth, false)?,
-                    );
+                    new_map.insert(k.clone(), self.resolve_inner(v, base, seen, depth, false)?);
                 }
                 Ok(serde_json::Value::Object(new_map))
             }
             serde_json::Value::Array(arr) => {
                 let resolved: Result<Vec<_>, _> = arr
                     .iter()
-                    .map(|v| self.resolve_inner(v, root, base_file, seen, depth, false))
+                    .map(|v| self.resolve_inner(v, base, seen, depth, false))
                     .collect();
                 Ok(serde_json::Value::Array(resolved?))
             }
@@ -307,29 +451,34 @@ impl RefResolver {
     /// Formats 3 and 4 were previously absent entirely: the fragment was never
     /// split off, so even registering the bare file path could not match, and
     /// there was no schemas-directory containment check.
-    fn lookup_ref(
-        &self,
-        ref_str: &str,
-        root: &serde_json::Value,
-        base_file: Option<&Path>,
-    ) -> Result<RefTarget, ModuleError> {
-        // 1. In-document pointer.
+    fn lookup_ref(&self, ref_str: &str, base: DocumentBase<'_>) -> Result<RefTarget, ModuleError> {
+        // 1. In-document pointer. Resolved against the FILE ROOT first and,
+        //    when it does not resolve there, against the schema node being
+        //    resolved (D-104 — both layouts are normative).
         if let Some(pointer) = ref_str.strip_prefix('#') {
             let value = if pointer.is_empty() {
-                root.clone()
+                base.root.clone()
             } else {
-                root.pointer(pointer).cloned().ok_or_else(|| {
-                    ModuleError::new(
-                        ErrorCode::SchemaNotFound,
-                        format!("Local $ref not found: {ref_str}"),
-                    )
-                })?
+                base.root
+                    .pointer(pointer)
+                    .cloned()
+                    .or_else(|| {
+                        base.node_fallback
+                            .and_then(|node| node.pointer(pointer).cloned())
+                    })
+                    .ok_or_else(|| {
+                        ModuleError::new(
+                            ErrorCode::SchemaNotFound,
+                            format!("Local $ref not found: {ref_str}"),
+                        )
+                    })?
             };
             return Ok(RefTarget {
                 value,
-                root: root.clone(),
-                file: base_file.map(Path::to_path_buf),
-                seen_key: Self::seen_key_for(base_file, ref_str),
+                root: base.root.clone(),
+                file: base.file.map(Path::to_path_buf),
+                seen_key: Self::seen_key_for(base.file, ref_str),
+                same_document: true,
             });
         }
 
@@ -340,6 +489,7 @@ impl RefResolver {
                 root: schema.clone(),
                 file: None,
                 seen_key: format!("registered:{ref_str}"),
+                same_document: false,
             });
         }
 
@@ -354,7 +504,7 @@ impl RefResolver {
             }
         };
 
-        let path = self.resolve_ref_file(&file_part, base_file, is_canonical, ref_str)?;
+        let path = self.resolve_ref_file(&file_part, base.file, is_canonical, ref_str)?;
         let doc = load_schema_document(&path)?;
 
         let value = if pointer.is_empty() || pointer == "#" {
@@ -384,6 +534,7 @@ impl RefResolver {
             root: doc,
             seen_key: format!("{}{pointer}", path.display()),
             file: Some(path),
+            same_document: false,
         })
     }
 

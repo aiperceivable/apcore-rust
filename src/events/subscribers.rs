@@ -811,17 +811,32 @@ impl FilterSubscriber {
     }
 
     /// Decide whether the given event type should be forwarded to the delegate.
+    ///
+    /// `include_events` / `exclude_events` are matched with the shared
+    /// [`crate::utils::helpers::match_glob`] (Algorithm A25, PROTOCOL_SPEC
+    /// §9.16.3). This used to call a local `*`-only matcher whose own doc
+    /// comment scoped it to "the subset of `fnmatch` behaviour the spec
+    /// fixtures and YAML examples actually exercise" — an accurate description
+    /// of what happens whenever a specification is silent: **the corpus becomes
+    /// the contract, and the corpus under-specifies.** Every event pattern in
+    /// every fixture was `*` or a literal name, so `?` never came up (#117).
+    ///
+    /// The direction matters: `exclude_events` FAILS OPEN. A pattern that does
+    /// not match means the event is DELIVERED, so a matcher understanding fewer
+    /// metacharacters than the operator wrote does not narrow the filter, it
+    /// opens it — a subscriber excluding `secret.?vent` received it here while
+    /// the other two SDKs discarded it.
     #[must_use]
     pub fn matches(&self, event_type: &str) -> bool {
         if let Some(includes) = &self.include_events {
             return includes
                 .iter()
-                .any(|pat| match_glob_pattern(pat, event_type));
+                .any(|pat| crate::utils::helpers::match_glob(pat, event_type));
         }
         if let Some(excludes) = &self.exclude_events {
             return !excludes
                 .iter()
-                .any(|pat| match_glob_pattern(pat, event_type));
+                .any(|pat| crate::utils::helpers::match_glob(pat, event_type));
         }
         true
     }
@@ -854,24 +869,6 @@ impl EventSubscriber for FilterSubscriber {
             Ok(())
         }
     }
-}
-
-/// Event-type pattern matching for `FilterSubscriber` (Algorithm A25).
-///
-/// PROTOCOL_SPEC §9.16.3. This used to be a local `*`-only matcher whose own
-/// doc comment scoped it to "the subset of `fnmatch` behaviour the spec
-/// fixtures and YAML examples actually exercise" — an accurate description of
-/// what happens whenever a specification is silent: **the corpus becomes the
-/// contract, and the corpus under-specifies.** Every event pattern in every
-/// fixture was `*` or a literal name, so `?` never came up (#117).
-///
-/// The direction matters: `exclude_events` FAILS OPEN. A pattern that does not
-/// match means the event is DELIVERED, so a matcher understanding fewer
-/// metacharacters than the operator wrote does not narrow the filter, it opens
-/// it — a subscriber excluding `secret.?vent` received it here while the other
-/// two SDKs discarded it.
-fn match_glob_pattern(pattern: &str, value: &str) -> bool {
-    crate::utils::helpers::match_glob(pattern, value)
 }
 
 // ---------------------------------------------------------------------------

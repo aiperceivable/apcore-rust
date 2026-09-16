@@ -726,3 +726,141 @@ async fn test_acl_system_reload_property_thread_safe() {
     // Final state consistent: the file's allow rule still applies.
     assert!(acl.read().unwrap().check(Some("api.x"), "db.y", None));
 }
+
+// ---------------------------------------------------------------------------
+// §6.5 warning discipline (D-88)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct WarnCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for WarnCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for WarnCapture {
+    type Writer = Self;
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Run `f` with a capturing subscriber installed and return the log text.
+fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let buf = WarnCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, f);
+    let bytes = buf
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (out, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn missing_context_warnings(logs: &str) -> usize {
+    logs.lines()
+        .filter(|l| l.contains("has conditions but the check supplied no context"))
+        .count()
+}
+
+/// A conditional `deny` rule that can only be evaluated with a context.
+fn conditional_deny(target: &str) -> ACLRule {
+    let mut r = rule(&["*"], &[target], "deny");
+    r.conditions = Some(serde_json::json!({ "roles": ["admin"] }));
+    r
+}
+
+// clause: acl_system.check.warning.conditions_without_context_is_deduped
+#[test]
+fn check_warning_conditions_without_context_is_deduped() {
+    // §6.5 + D-88: the warning fires, and fires ONCE per (rule index, effect)
+    // — not once per check, which would be log spam proportional to traffic.
+    let acl = ACL::new(vec![conditional_deny("db.users")], "allow", None);
+
+    let (_, logs) = capture_logs(|| {
+        for _ in 0..5 {
+            assert!(acl.check(Some("api.x"), "db.users", None));
+        }
+    });
+    assert_eq!(
+        missing_context_warnings(&logs),
+        1,
+        "the §6.5 warning must be deduped per rule index: {logs}"
+    );
+}
+
+// clause: acl_system.add_rule.side_effect.clears_missing_context_dedupe
+#[test]
+fn add_rule_clears_missing_context_dedupe() {
+    // D-88: `add_rule` inserts at index 0 and shifts every existing rule, so a
+    // retained marker would suppress the warning for a DIFFERENT rule — and
+    // specifically for the rule the operator just added.
+    let mut acl = ACL::new(vec![conditional_deny("db.users")], "allow", None);
+
+    let (_, first) = capture_logs(|| {
+        let _ = acl.check(Some("api.x"), "db.users", None);
+    });
+    assert_eq!(missing_context_warnings(&first), 1);
+
+    let (_, suppressed) = capture_logs(|| {
+        let _ = acl.check(Some("api.x"), "db.users", None);
+    });
+    assert_eq!(
+        missing_context_warnings(&suppressed),
+        0,
+        "still the same rule at the same index"
+    );
+
+    acl.add_rule(conditional_deny("db.orders"));
+    let (_, after_insert) = capture_logs(|| {
+        // The NEW rule is now index 0, and the original has shifted to 1.
+        let _ = acl.check(Some("api.x"), "db.orders", None);
+        let _ = acl.check(Some("api.x"), "db.users", None);
+    });
+    assert_eq!(
+        missing_context_warnings(&after_insert),
+        2,
+        "add_rule must clear the index-keyed dedupe: {after_insert}"
+    );
+}
+
+// clause: acl_system.remove_rule.side_effect.clears_missing_context_dedupe
+#[test]
+fn remove_rule_clears_missing_context_dedupe() {
+    // D-88: removing rule `i` shifts every rule after it up by one.
+    let mut acl = ACL::new(
+        vec![conditional_deny("db.orders"), conditional_deny("db.users")],
+        "allow",
+        None,
+    );
+
+    let (_, first) = capture_logs(|| {
+        let _ = acl.check(Some("api.x"), "db.users", None);
+    });
+    assert_eq!(missing_context_warnings(&first), 1);
+
+    assert!(acl.remove_rule(&["*".to_string()], &["db.orders".to_string()],));
+
+    let (_, after_remove) = capture_logs(|| {
+        let _ = acl.check(Some("api.x"), "db.users", None);
+    });
+    assert_eq!(
+        missing_context_warnings(&after_remove),
+        1,
+        "remove_rule must clear the index-keyed dedupe: {after_remove}"
+    );
+}

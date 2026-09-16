@@ -796,34 +796,93 @@ impl<T> Context<T> {
     }
 }
 
-/// Factory trait for creating execution contexts.
+/// Factory trait for creating execution contexts from runtime requests.
+///
+/// # Why the request is an associated type (spec v1.49.0, D-76)
+///
+/// `Contract: ContextFactory.create_context` declares a single opaque
+/// `request` input: the interface exists so a web-framework integration can
+/// turn a *runtime-specific* request into a [`Context`], extracting the caller
+/// identity along the way. A signature that already receives an [`Identity`]
+/// has had that work done for it and has nothing left to do.
+///
+/// Rust needs a concrete type where Python and TypeScript pass `Any`. The
+/// choices are a trait type parameter (`ContextFactory<R>`) or an associated
+/// type; this trait uses an **associated type**, because a factory maps
+/// exactly one request type to a `Context` — the same reason `Iterator` has
+/// `Item` rather than a parameter. It keeps call sites inference-free
+/// (`factory.create_context(req)` needs no turbofish) and it still names an
+/// object-safe `dyn` form, `&dyn ContextFactory<Request = MyRequest>`.
+///
+/// ```no_run
+/// use apcore::context::{Context, ContextFactory, Identity};
+/// use apcore::errors::ModuleError;
+/// use async_trait::async_trait;
+/// use std::collections::HashMap;
+///
+/// struct AxumRequest {
+///     user_id: Option<String>,
+/// }
+///
+/// struct AxumContextFactory;
+///
+/// #[async_trait]
+/// impl ContextFactory for AxumContextFactory {
+///     type Request = AxumRequest;
+///
+///     async fn create_context(
+///         &self,
+///         request: AxumRequest,
+///     ) -> Result<Context<serde_json::Value>, ModuleError> {
+///         // An unauthenticated request still yields a usable, unprivileged
+///         // Context; the ACL's default-deny governs what it may reach.
+///         let identity = request.user_id.map(|id| {
+///             Identity::new(id, "user".to_string(), vec![], HashMap::new())
+///         });
+///         Ok(Context::create(identity, None, None, None, serde_json::Value::Null, None))
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ContextFactory: Send + Sync {
+    /// The host's runtime request type — an Axum extractor, an
+    /// `http::Request<B>`, a framework-specific wrapper. Opaque to apcore:
+    /// the implementation, not the protocol, knows how to read it.
+    type Request: Send + 'static;
+
+    /// Create a context from a runtime request.
+    ///
+    /// The canonical spec surface. Extraction failures that mean "not
+    /// authenticated" MUST NOT use the error channel — sanitize to the
+    /// anonymous `@external` identity (`identity: None`) instead and let the
+    /// ACL decide. The error channel is for extraction that genuinely fails
+    /// (I/O, for example).
+    async fn create_context(
+        &self,
+        request: Self::Request,
+    ) -> Result<Context<serde_json::Value>, crate::errors::ModuleError>;
+
     /// Create a new context for the given identity and services.
     /// Pass `None` for anonymous/unauthenticated contexts.
+    ///
+    /// Rust-only additive member: not part of
+    /// `Contract: ContextFactory.create_context`, and unconstrained by it.
     async fn create(
         &self,
         identity: Option<Identity>,
         services: serde_json::Value,
-    ) -> Result<Context<serde_json::Value>, crate::errors::ModuleError>;
-
-    /// Spec-compliant alias for [`ContextFactory::create`].
-    ///
-    /// `create_context` is the canonical method name defined in the apcore protocol
-    /// spec (`ContextFactory.create_context(request)`). This default implementation
-    /// delegates to [`ContextFactory::create`] so existing implementations remain unbroken.
-    async fn create_context(
-        &self,
-        identity: Option<Identity>,
-        services: serde_json::Value,
     ) -> Result<Context<serde_json::Value>, crate::errors::ModuleError> {
-        self.create(identity, services).await
+        Ok(Context::create(identity, None, None, None, services, None))
     }
 
     /// Create a child context from an existing parent context.
+    ///
+    /// Rust-only additive member, as [`ContextFactory::create`].
     async fn create_child(
         &self,
         parent: &Context<serde_json::Value>,
         module_name: &str,
-    ) -> Result<Context<serde_json::Value>, crate::errors::ModuleError>;
+    ) -> Result<Context<serde_json::Value>, crate::errors::ModuleError> {
+        Ok(parent.child(module_name))
+    }
 }

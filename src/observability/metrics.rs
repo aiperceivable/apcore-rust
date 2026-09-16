@@ -15,6 +15,8 @@ use crate::observability::store::{InMemoryObservabilityStore, MetricPoint, Obser
 
 /// Metric name for total module call count.
 pub const METRIC_CALLS_TOTAL: &str = "apcore_module_calls_total";
+/// Metric name for total module error count.
+pub const METRIC_ERRORS_TOTAL: &str = "apcore_module_errors_total";
 /// Metric name for module execution duration in seconds.
 pub const METRIC_DURATION_SECONDS: &str = "apcore_module_duration_seconds";
 
@@ -214,14 +216,23 @@ impl MetricsCollector {
                     labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 format!("{}|{}", name, label_parts.join(","))
             };
+            // D-106: the `+Inf` bucket is emitted alongside the finite ones (as
+            // `export_prometheus` already does) so a consumer can tell "no
+            // data" from "all overflow". Its bound is the string `"+Inf"`,
+            // because JSON has no infinity literal and `serde_json` renders
+            // `f64::INFINITY` as `null`.
+            let mut buckets: Vec<serde_json::Value> = data
+                .buckets
+                .iter()
+                .map(|(b, c)| serde_json::json!({"le": b, "count": c}))
+                .collect();
+            buckets.push(serde_json::json!({"le": "+Inf", "count": data.count}));
             histograms_map.insert(
                 label_str,
                 serde_json::json!({
                     "sum": data.sum,
                     "count": data.count,
-                    "buckets": data.buckets.iter().map(|(b, c)| {
-                        serde_json::json!({"le": b, "count": c})
-                    }).collect::<Vec<_>>()
+                    "buckets": buckets,
                 }),
             );
         }
@@ -296,7 +307,7 @@ impl MetricsCollector {
         let mut labels = HashMap::new();
         labels.insert("module_id".to_string(), module_id.to_string());
         labels.insert("status".to_string(), status.to_string());
-        self.increment("apcore_module_calls_total", labels, 1.0);
+        self.increment(METRIC_CALLS_TOTAL, labels, 1.0);
     }
 
     /// Convenience: increment error counter.
@@ -304,14 +315,14 @@ impl MetricsCollector {
         let mut labels = HashMap::new();
         labels.insert("module_id".to_string(), module_id.to_string());
         labels.insert("error_code".to_string(), error_code.to_string());
-        self.increment("apcore_module_errors_total", labels, 1.0);
+        self.increment(METRIC_ERRORS_TOTAL, labels, 1.0);
     }
 
     /// Convenience: observe call duration.
     pub fn observe_duration(&self, module_id: &str, duration_secs: f64) {
         let mut labels = HashMap::new();
         labels.insert("module_id".to_string(), module_id.to_string());
-        self.observe("apcore_module_duration_seconds", labels, duration_secs);
+        self.observe(METRIC_DURATION_SECONDS, labels, duration_secs);
     }
 }
 
@@ -330,12 +341,35 @@ fn metric_help_text(name: &str) -> &str {
     }
 }
 
+/// Escape a Prometheus exposition-format label value.
+///
+/// Per the exposition format, label values are wrapped in double quotes and the
+/// characters that MUST be escaped are backslash (`\`), double quote (`"`) and
+/// line feed (`\n`). Backslash is escaped first so the escapes added after it
+/// are not themselves escaped.
+///
+/// `MetricsCollector::increment` / `observe` take a caller-supplied
+/// `HashMap<String, String>` with no documented constraint on the value, so an
+/// unescaped `"` emitted a malformed line — and Prometheus rejects the ENTIRE
+/// scrape on a parse error, dropping every other metric with it. apcore-python
+/// (`_escape_label_value`) and apcore-typescript (`escapeLabelValue`) both do
+/// this, each with a comment naming the same failure.
+fn escape_prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 /// Format labels as Prometheus label string: {key="value",...}
 fn format_prometheus_labels(labels: &BTreeMap<String, String>) -> String {
     if labels.is_empty() {
         return String::new();
     }
-    let parts: Vec<String> = labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+    let parts: Vec<String> = labels
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{}\"", escape_prometheus_label_value(v)))
+        .collect();
     format!("{{{}}}", parts.join(","))
 }
 
@@ -376,16 +410,33 @@ fn p99_sorted_index(len: usize) -> usize {
 /// Returns the upper bound (`le`) of the first bucket whose cumulative count
 /// reaches or exceeds the 99th-percentile threshold, converted to milliseconds.
 /// Returns 0.0 if `total_count` is 0 or `buckets` is empty/missing.
+///
+/// D-106: when the nearest-rank target falls beyond the largest FINITE bucket —
+/// every observation overflowed it — the estimate is that largest finite bound,
+/// not `0.0`. Returning zero reported the fastest possible latency for the
+/// slowest modules, and since `apcore.health.latency_threshold_exceeded`
+/// compares the estimate against a threshold, it disabled the alert precisely
+/// for the modules that should fire it. Mirrors apcore-python
+/// (`metrics.py`: "Fall back to last finite bucket or 0") and apcore-typescript
+/// (`metrics-utils.ts`: "All observations exceed the largest bucket").
+///
+/// The `+Inf` bucket the snapshot now carries (`le: "+Inf"`) is deliberately
+/// skipped here: it is not a finite bound and cannot be reported as a latency.
 pub(crate) fn estimate_p99_from_histogram(buckets: &[serde_json::Value], total_count: u64) -> f64 {
     if total_count == 0 || buckets.is_empty() {
         return 0.0;
     }
     let target = p99_target_count(total_count);
+    let mut largest_finite: Option<f64> = None;
     for bucket in buckets {
-        let le = bucket
-            .get("le")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(f64::INFINITY);
+        let Some(le) = bucket.get("le").and_then(serde_json::Value::as_f64) else {
+            // `"+Inf"` (or any non-numeric bound) — not a reportable latency.
+            continue;
+        };
+        if !le.is_finite() {
+            continue;
+        }
+        largest_finite = Some(largest_finite.map_or(le, |prev: f64| prev.max(le)));
         let cnt = bucket
             .get("count")
             .and_then(serde_json::Value::as_u64)
@@ -394,7 +445,139 @@ pub(crate) fn estimate_p99_from_histogram(buckets: &[serde_json::Value], total_c
             return le * 1000.0; // seconds -> ms
         }
     }
-    0.0
+    largest_finite.map_or(0.0, |le| le * 1000.0)
+}
+
+/// Label key carrying the module ID on every apcore metric.
+///
+/// `MetricsCollector::increment_calls` / `increment_errors` / `observe_duration`
+/// are the only writers in this crate and all three emit `module_id`. Readers
+/// MUST build their snapshot keys from this constant: a reader that spelled the
+/// label `module=` instead looked up a key that is never written, and silently
+/// reported zero for every module (see `PlatformNotifyMiddleware`, whose error
+/// rate was therefore pinned at 0.0 and whose
+/// `apcore.health.error_threshold_exceeded` event could never fire).
+pub(crate) const LABEL_MODULE_ID: &str = "module_id";
+
+/// Per-module call counts read out of a [`MetricsCollector::snapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModuleCallCounts {
+    /// Successful plus failed calls.
+    pub total: u64,
+    /// Failed calls only.
+    pub errors: u64,
+}
+
+impl ModuleCallCounts {
+    /// Errors as a fraction of total calls; 0.0 when no calls were recorded.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // counter magnitudes are far below 2^53
+    pub fn error_rate(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.errors as f64 / self.total as f64
+    }
+}
+
+/// Per-module latency statistics read out of a [`MetricsCollector::snapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModuleLatencyStats {
+    /// Mean duration in milliseconds; 0.0 when no observations were recorded.
+    pub avg_ms: f64,
+    /// 99th-percentile duration in milliseconds, estimated from the histogram
+    /// buckets; 0.0 when no observations were recorded.
+    pub p99_ms: f64,
+    /// Number of recorded observations.
+    pub count: u64,
+}
+
+/// Snapshot key for a module-scoped counter: `name|module_id=<id>,status=<s>`.
+///
+/// Label order follows `snapshot()`, which renders the labels from a
+/// `BTreeMap` and therefore sorts them (`module_id` before `status`).
+fn counter_key(name: &str, module_id: &str, status: &str) -> String {
+    format!("{name}|{LABEL_MODULE_ID}={module_id},status={status}")
+}
+
+/// Snapshot key for a module-scoped histogram: `name|module_id=<id>`.
+fn histogram_key(name: &str, module_id: &str) -> String {
+    format!("{name}|{LABEL_MODULE_ID}={module_id}")
+}
+
+/// Extract a module's call counts from a [`MetricsCollector::snapshot`].
+///
+/// The single shared reader for `apcore_module_calls_total`. Both the health
+/// system module and `PlatformNotifyMiddleware` go through it so the label
+/// spelling cannot diverge from what `increment_calls` writes again. Mirrors
+/// apcore-typescript `computeModuleErrorRate` in
+/// `src/observability/metrics-utils.ts`.
+#[must_use]
+pub fn extract_module_call_counts(
+    snapshot: &serde_json::Value,
+    module_id: &str,
+) -> ModuleCallCounts {
+    let Some(counters) = snapshot.get("counters").and_then(|c| c.as_object()) else {
+        return ModuleCallCounts::default();
+    };
+    // Counters are `f64` in the collector and `snapshot()` renders them as
+    // JSON floats (`3.0`), so `Value::as_u64` answers `None` for every one of
+    // them — the health module's own extractor read them that way and therefore
+    // reported zero calls for every module, whatever the collector held.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let read = |status: &str| -> u64 {
+        counters
+            .get(&counter_key(METRIC_CALLS_TOTAL, module_id, status))
+            .and_then(serde_json::Value::as_f64)
+            .map_or(0, |value| if value > 0.0 { value as u64 } else { 0 })
+    };
+    let errors = read("error");
+    ModuleCallCounts {
+        total: read("success") + errors,
+        errors,
+    }
+}
+
+/// Extract a module's latency statistics from a [`MetricsCollector::snapshot`].
+///
+/// The single shared reader for `apcore_module_duration_seconds`; see
+/// [`extract_module_call_counts`] for why it is shared. Mirrors apcore-typescript
+/// `estimateP99FromHistogram` in `src/observability/metrics-utils.ts`.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // latency avg: precision loss acceptable
+pub fn extract_module_latency_stats(
+    snapshot: &serde_json::Value,
+    module_id: &str,
+) -> ModuleLatencyStats {
+    let Some(data) = snapshot
+        .get("histograms")
+        .and_then(|h| h.as_object())
+        .and_then(|h| h.get(&histogram_key(METRIC_DURATION_SECONDS, module_id)))
+    else {
+        return ModuleLatencyStats::default();
+    };
+    let sum = data
+        .get("sum")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let count = data
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let avg_ms = if count > 0 {
+        (sum / count as f64) * 1000.0
+    } else {
+        0.0
+    };
+    let p99_ms = data
+        .get("buckets")
+        .and_then(|b| b.as_array())
+        .map_or(0.0, |buckets| estimate_p99_from_histogram(buckets, count));
+    ModuleLatencyStats {
+        avg_ms,
+        p99_ms,
+        count,
+    }
 }
 
 /// Estimate p99 latency from a sorted slice of raw latency values (in ms).
@@ -520,6 +703,49 @@ mod tests {
     use super::*;
     use crate::context::{Context, Identity};
     use crate::errors::ErrorCode;
+
+    // The extractors MUST read what the collector actually writes. Reader and
+    // writer used to spell the module label differently (`module=` vs
+    // `module_id=`), so every lookup missed and the middleware's error rate was
+    // pinned at 0.0. These tests drive the real writers, never a hand-built
+    // label map, so the two halves cannot diverge again unnoticed.
+    #[test]
+    fn extract_module_call_counts_reads_what_increment_calls_writes() {
+        let collector = MetricsCollector::new();
+        for _ in 0..7 {
+            collector.increment_calls("mod.a", "success");
+        }
+        for _ in 0..3 {
+            collector.increment_calls("mod.a", "error");
+        }
+        collector.increment_calls("mod.other", "error");
+
+        let counts = extract_module_call_counts(&collector.snapshot(), "mod.a");
+        assert_eq!(counts.total, 10);
+        assert_eq!(counts.errors, 3);
+        assert!((counts.error_rate() - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extract_module_call_counts_is_zero_for_an_unseen_module() {
+        let collector = MetricsCollector::new();
+        collector.increment_calls("mod.a", "error");
+        let counts = extract_module_call_counts(&collector.snapshot(), "mod.missing");
+        assert_eq!(counts, ModuleCallCounts::default());
+        assert!((counts.error_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn extract_module_latency_stats_reads_what_observe_duration_writes() {
+        let collector = MetricsCollector::new();
+        collector.observe_duration("mod.a", 0.2);
+        collector.observe_duration("mod.a", 0.2);
+
+        let stats = extract_module_latency_stats(&collector.snapshot(), "mod.a");
+        assert_eq!(stats.count, 2);
+        assert!((stats.avg_ms - 200.0).abs() < 1e-6, "{}", stats.avg_ms);
+        assert!(stats.p99_ms > 0.0);
+    }
 
     // A-D-14: the error metric label MUST be the canonical wire code
     // (SCREAMING_SNAKE_CASE), not Debug formatting (PascalCase).
@@ -658,11 +884,39 @@ mod tests {
     }
 
     #[test]
-    fn estimate_p99_from_histogram_no_bucket_exceeds_threshold_returns_zero() {
-        // If no bucket has enough count (e.g. only partial data), returns 0.0
-        let buckets = vec![serde_json::json!({"le": 0.1, "count": 50u64})];
-        // total=100, threshold=99, but bucket only has 50 → no match
-        assert!((estimate_p99_from_histogram(&buckets, 100) - 0.0).abs() < f64::EPSILON);
+    fn estimate_p99_from_histogram_beyond_top_bucket_returns_largest_finite_bound() {
+        // D-106. No bucket reaches the nearest-rank target, which means every
+        // remaining observation overflowed the largest finite bound. The
+        // estimate is that bound — NOT 0.0, which reported the fastest possible
+        // latency for the slowest modules and disabled latency alerting for
+        // exactly the modules that should fire it.
+        //
+        // This test previously asserted 0.0 and so pinned the defect: a green
+        // suite is why it survived. apcore-python (`metrics.py`) and
+        // apcore-typescript (`metrics-utils.ts`) both return the last finite
+        // bound here.
+        let buckets = vec![
+            serde_json::json!({"le": 0.1, "count": 50u64}),
+            serde_json::json!({"le": 0.5, "count": 50u64}),
+            serde_json::json!({"le": "+Inf", "count": 100u64}),
+        ];
+        // total=100, target=99; the top finite bucket holds only 50.
+        assert!((estimate_p99_from_histogram(&buckets, 100) - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_p99_from_histogram_ignores_the_inf_bucket_as_a_bound() {
+        // `+Inf` is not a reportable latency: it must never be returned as the
+        // estimate, even though it is the bucket that holds the overflow.
+        let buckets = vec![
+            serde_json::json!({"le": 1.0, "count": 1u64}),
+            serde_json::json!({"le": "+Inf", "count": 10u64}),
+        ];
+        let p99 = estimate_p99_from_histogram(&buckets, 10);
+        assert!(
+            p99.is_finite() && (p99 - 1000.0).abs() < f64::EPSILON,
+            "got {p99}"
+        );
     }
 
     // -------------------------------------------------------------------------

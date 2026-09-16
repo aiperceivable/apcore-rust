@@ -89,11 +89,11 @@ async fn submit_returns_non_empty_task_id() {
 #[tokio::test]
 async fn submit_increments_task_count() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    assert_eq!(mgr.task_count(), 0);
+    assert_eq!(mgr.task_count().expect("store list"), 0);
     let _ = mgr.submit("m", json!({}), None).await.unwrap();
-    assert_eq!(mgr.task_count(), 1);
+    assert_eq!(mgr.task_count().expect("store list"), 1);
     let _ = mgr.submit("m", json!({}), None).await.unwrap();
-    assert_eq!(mgr.task_count(), 2);
+    assert_eq!(mgr.task_count().expect("store list"), 2);
 }
 
 #[tokio::test]
@@ -115,7 +115,7 @@ async fn get_status_returns_some_after_submit() {
     // Task exists immediately after submit (may be Pending, Running, or Completed
     // depending on scheduling, but must be present).
     assert!(
-        mgr.get_status(&task_id).is_some(),
+        mgr.get_status(&task_id).expect("store read").is_some(),
         "get_status should return Some right after submit"
     );
 }
@@ -123,14 +123,17 @@ async fn get_status_returns_some_after_submit() {
 #[tokio::test]
 async fn get_status_returns_none_for_unknown_id() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    assert!(mgr.get_status("no-such-task").is_none());
+    assert!(mgr
+        .get_status("no-such-task")
+        .expect("store read")
+        .is_none());
 }
 
 #[tokio::test]
 async fn task_info_contains_correct_module_id() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
     let task_id = mgr.submit("echo.module", json!({}), None).await.unwrap();
-    let info = mgr.get_status(&task_id).unwrap();
+    let info = mgr.get_status(&task_id).expect("store read").unwrap();
     assert_eq!(info.module_id, "echo.module");
 }
 
@@ -138,7 +141,7 @@ async fn task_info_contains_correct_module_id() {
 async fn task_info_submitted_at_is_set() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
-    let info = mgr.get_status(&task_id).unwrap();
+    let info = mgr.get_status(&task_id).expect("store read").unwrap();
     assert!(
         info.submitted_at > 0.0,
         "submitted_at must be a positive UNIX timestamp"
@@ -155,7 +158,11 @@ async fn completed_task_has_completed_status() {
     // Poll for completion (up to 1 second).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        let status = mgr.get_status(&task_id).unwrap().status;
+        let status = mgr
+            .get_status(&task_id)
+            .expect("store read")
+            .unwrap()
+            .status;
         if status == TaskStatus::Completed || status == TaskStatus::Failed {
             break;
         }
@@ -166,7 +173,7 @@ async fn completed_task_has_completed_status() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let info = mgr.get_status(&task_id).unwrap();
+    let info = mgr.get_status(&task_id).expect("store read").unwrap();
     assert_eq!(
         info.status,
         TaskStatus::Completed,
@@ -193,7 +200,11 @@ async fn failed_task_has_failed_status_and_error_message() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        let status = mgr.get_status(&task_id).unwrap().status;
+        let status = mgr
+            .get_status(&task_id)
+            .expect("store read")
+            .unwrap()
+            .status;
         if matches!(status, TaskStatus::Failed | TaskStatus::Completed) {
             break;
         }
@@ -204,7 +215,7 @@ async fn failed_task_has_failed_status_and_error_message() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let info = mgr.get_status(&task_id).unwrap();
+    let info = mgr.get_status(&task_id).expect("store read").unwrap();
     assert_eq!(info.status, TaskStatus::Failed);
     assert!(
         info.error.is_some(),
@@ -226,7 +237,7 @@ async fn cancel_pending_task_returns_true() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
 
-    let result = mgr.cancel(&task_id).await;
+    let result = mgr.cancel(&task_id).await.expect("store write");
     assert!(result, "cancel should return true for a Pending task");
 }
 
@@ -234,9 +245,9 @@ async fn cancel_pending_task_returns_true() {
 async fn cancel_pending_task_sets_cancelled_status() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
-    mgr.cancel(&task_id).await;
+    mgr.cancel(&task_id).await.expect("store write");
 
-    let info = mgr.get_status(&task_id).unwrap();
+    let info = mgr.get_status(&task_id).expect("store read").unwrap();
     assert_eq!(info.status, TaskStatus::Cancelled);
 }
 
@@ -244,9 +255,9 @@ async fn cancel_pending_task_sets_cancelled_status() {
 async fn cancel_pending_task_sets_completed_at() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
-    mgr.cancel(&task_id).await;
+    mgr.cancel(&task_id).await.expect("store write");
 
-    let info = mgr.get_status(&task_id).unwrap();
+    let info = mgr.get_status(&task_id).expect("store read").unwrap();
     assert!(
         info.completed_at.is_some(),
         "completed_at should be set when task is cancelled"
@@ -261,9 +272,12 @@ async fn cancel_pending_task_sets_completed_at() {
 async fn cancel_already_cancelled_task_returns_false() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
-    assert!(mgr.cancel(&task_id).await, "first cancel should succeed");
     assert!(
-        !mgr.cancel(&task_id).await,
+        mgr.cancel(&task_id).await.expect("store write"),
+        "first cancel should succeed"
+    );
+    assert!(
+        !mgr.cancel(&task_id).await.expect("store write"),
         "second cancel on an already-cancelled task should return false"
     );
 }
@@ -271,7 +285,7 @@ async fn cancel_already_cancelled_task_returns_false() {
 #[tokio::test]
 async fn cancel_unknown_task_returns_false() {
     let mgr = AsyncTaskManager::new(make_executor(), 4, 100);
-    assert!(!mgr.cancel("ghost-task-id").await);
+    assert!(!mgr.cancel("ghost-task-id").await.expect("store write"));
 }
 
 // ---------------------------------------------------------------------------
@@ -295,10 +309,10 @@ async fn cancel_running_task_sets_cancelled_status() {
     tokio::task::yield_now().await;
 
     // Cancel regardless of whether it transitioned to Running yet.
-    let cancelled = mgr.cancel(&task_id).await;
+    let cancelled = mgr.cancel(&task_id).await.expect("store write");
 
     // The task may already be Failed (module not found) or Cancelled.
-    let info = mgr.get_status(&task_id).unwrap();
+    let info = mgr.get_status(&task_id).expect("store read").unwrap();
     if cancelled {
         // cancel() returned true — status must now be Cancelled.
         assert_eq!(info.status, TaskStatus::Cancelled);
@@ -319,12 +333,12 @@ async fn cancel_running_task_sets_cancelled_status() {
 #[tokio::test]
 async fn list_tasks_without_filter_returns_all() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
-    assert!(mgr.list_tasks(None).is_empty());
+    assert!(mgr.list_tasks(None).expect("store list").is_empty());
 
     let id1 = mgr.submit("m1", json!({}), None).await.unwrap();
     let id2 = mgr.submit("m2", json!({}), None).await.unwrap();
 
-    let all = mgr.list_tasks(None);
+    let all = mgr.list_tasks(None).expect("store list");
     assert_eq!(all.len(), 2);
     let ids: Vec<&str> = all.iter().map(|t| t.task_id.as_str()).collect();
     assert!(ids.contains(&id1.as_str()));
@@ -338,10 +352,14 @@ async fn list_tasks_with_pending_filter_returns_only_pending() {
     let _ = mgr.submit("m", json!({}), None).await.unwrap();
     let _ = mgr.submit("m", json!({}), None).await.unwrap();
 
-    let pending = mgr.list_tasks(Some(TaskStatus::Pending));
+    let pending = mgr
+        .list_tasks(Some(TaskStatus::Pending))
+        .expect("store list");
     assert_eq!(pending.len(), 2, "both tasks should be Pending");
 
-    let completed = mgr.list_tasks(Some(TaskStatus::Completed));
+    let completed = mgr
+        .list_tasks(Some(TaskStatus::Completed))
+        .expect("store list");
     assert!(completed.is_empty(), "no tasks should be Completed yet");
 }
 
@@ -351,13 +369,17 @@ async fn list_tasks_with_cancelled_filter_returns_only_cancelled() {
     let id1 = mgr.submit("m", json!({}), None).await.unwrap();
     let id2 = mgr.submit("m", json!({}), None).await.unwrap();
 
-    mgr.cancel(&id1).await;
+    mgr.cancel(&id1).await.expect("store write");
 
-    let cancelled = mgr.list_tasks(Some(TaskStatus::Cancelled));
+    let cancelled = mgr
+        .list_tasks(Some(TaskStatus::Cancelled))
+        .expect("store list");
     assert_eq!(cancelled.len(), 1);
     assert_eq!(cancelled[0].task_id, id1);
 
-    let pending = mgr.list_tasks(Some(TaskStatus::Pending));
+    let pending = mgr
+        .list_tasks(Some(TaskStatus::Pending))
+        .expect("store list");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].task_id, id2);
 }
@@ -368,7 +390,9 @@ async fn list_tasks_empty_when_no_tasks_match_filter() {
     let _ = mgr.submit("m", json!({}), None).await.unwrap();
 
     // No tasks have been completed — filter should yield nothing.
-    let completed = mgr.list_tasks(Some(TaskStatus::Completed));
+    let completed = mgr
+        .list_tasks(Some(TaskStatus::Completed))
+        .expect("store list");
     assert!(completed.is_empty());
 }
 
@@ -380,25 +404,28 @@ async fn list_tasks_empty_when_no_tasks_match_filter() {
 async fn cleanup_removes_cancelled_tasks_past_max_age() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
-    mgr.cancel(&task_id).await;
+    mgr.cancel(&task_id).await.expect("store write");
 
     // A negative max_age means every task is "old enough."
-    let removed = mgr.cleanup(-1.0);
+    let removed = mgr.cleanup(-1.0).expect("store sweep");
     assert_eq!(removed, 1);
-    assert!(mgr.get_status(&task_id).is_none(), "task should be gone");
+    assert!(
+        mgr.get_status(&task_id).expect("store read").is_none(),
+        "task should be gone"
+    );
 }
 
 #[tokio::test]
 async fn cleanup_keeps_tasks_within_max_age() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
-    mgr.cancel(&task_id).await;
+    mgr.cancel(&task_id).await.expect("store write");
 
     // Very large max_age — the task was just created, so it is not old enough.
-    let removed = mgr.cleanup(9_999_999.0);
+    let removed = mgr.cleanup(9_999_999.0).expect("store sweep");
     assert_eq!(removed, 0);
     assert!(
-        mgr.get_status(&task_id).is_some(),
+        mgr.get_status(&task_id).expect("store read").is_some(),
         "task should still exist"
     );
 }
@@ -408,12 +435,12 @@ async fn cleanup_does_not_remove_active_tasks() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let task_id = mgr.submit("m", json!({}), None).await.unwrap();
     // Task is Pending, not terminal — cleanup with age=-1 must not remove it.
-    let removed = mgr.cleanup(-1.0);
+    let removed = mgr.cleanup(-1.0).expect("store sweep");
     assert_eq!(
         removed, 0,
         "active (Pending) tasks must never be cleaned up"
     );
-    assert!(mgr.get_status(&task_id).is_some());
+    assert!(mgr.get_status(&task_id).expect("store read").is_some());
 }
 
 #[tokio::test]
@@ -423,13 +450,16 @@ async fn cleanup_removes_multiple_terminal_tasks() {
     let id2 = mgr.submit("m", json!({}), None).await.unwrap();
     let id3 = mgr.submit("m", json!({}), None).await.unwrap();
 
-    mgr.cancel(&id1).await;
-    mgr.cancel(&id2).await;
+    mgr.cancel(&id1).await.expect("store write");
+    mgr.cancel(&id2).await.expect("store write");
     // id3 stays Pending
 
-    let removed = mgr.cleanup(-1.0);
+    let removed = mgr.cleanup(-1.0).expect("store sweep");
     assert_eq!(removed, 2, "only the two cancelled tasks should be removed");
-    assert!(mgr.get_status(&id3).is_some(), "pending task must remain");
+    assert!(
+        mgr.get_status(&id3).expect("store read").is_some(),
+        "pending task must remain"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -462,8 +492,8 @@ async fn submit_allowed_after_cleanup_frees_space() {
     assert!(mgr.submit("m", json!({}), None).await.is_err());
 
     // Cancel one task, cleanup it away.
-    mgr.cancel(&id1).await;
-    mgr.cleanup(-1.0);
+    mgr.cancel(&id1).await.expect("store write");
+    mgr.cleanup(-1.0).expect("store sweep");
 
     // Now there is room for one more.
     assert!(
@@ -488,8 +518,8 @@ async fn tasks_are_queued_when_max_concurrent_reached() {
     // Yield so any tokio tasks get a chance to run.
     tokio::task::yield_now().await;
 
-    let s1 = mgr.get_status(&id1).unwrap().status;
-    let s2 = mgr.get_status(&id2).unwrap().status;
+    let s1 = mgr.get_status(&id1).expect("store read").unwrap().status;
+    let s2 = mgr.get_status(&id2).expect("store read").unwrap().status;
 
     assert_eq!(s1, TaskStatus::Pending, "task 1 should be stuck Pending");
     assert_eq!(s2, TaskStatus::Pending, "task 2 should be stuck Pending");
@@ -505,10 +535,13 @@ async fn max_concurrent_one_limits_parallelism() {
     let _id2 = mgr.submit("m2", json!({}), None).await.unwrap();
 
     // The combined count must be exactly 2.
-    assert_eq!(mgr.task_count(), 2);
+    assert_eq!(mgr.task_count().expect("store list"), 2);
 
     // At most 1 task should be Running at any point.
-    let running = mgr.list_tasks(Some(TaskStatus::Running)).len();
+    let running = mgr
+        .list_tasks(Some(TaskStatus::Running))
+        .expect("store list")
+        .len();
     assert!(
         running <= 1,
         "at most 1 task should be Running with max_concurrent=1; got {running}"
@@ -524,10 +557,16 @@ async fn shutdown_cancels_all_pending_tasks() {
     let mgr = AsyncTaskManager::new(make_executor(), 0, 100);
     let id1 = mgr.submit("m1", json!({}), None).await.unwrap();
     let id2 = mgr.submit("m2", json!({}), None).await.unwrap();
-    mgr.shutdown().await;
+    mgr.shutdown().await.expect("store shutdown");
 
-    assert_eq!(mgr.get_status(&id1).unwrap().status, TaskStatus::Cancelled);
-    assert_eq!(mgr.get_status(&id2).unwrap().status, TaskStatus::Cancelled);
+    assert_eq!(
+        mgr.get_status(&id1).expect("store read").unwrap().status,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(
+        mgr.get_status(&id2).expect("store read").unwrap().status,
+        TaskStatus::Cancelled
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +620,7 @@ async fn submit_max_tasks_holds_under_concurrent_load() {
         "accepted submits must never exceed max_tasks; got accepted={accepted}, cap={CAP}"
     );
     assert_eq!(
-        mgr.task_count(),
+        mgr.task_count().expect("store list"),
         accepted,
         "task_count must equal the number of accepted submits"
     );

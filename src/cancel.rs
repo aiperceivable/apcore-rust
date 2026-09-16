@@ -10,22 +10,51 @@ use crate::errors::{ErrorCode, ModuleError};
 ///
 /// Mirrors `apcore-python.ExecutionCancelledError(ModuleError)` and
 /// `apcore-typescript ExecutionCancelledError extends ModuleError`. Carries
-/// `module_id` (the module that was running) and `message` (a human-readable
-/// cancellation reason).
+/// `message` (a human-readable cancellation reason) and, when the caller knew
+/// it, `module_id` (the module that was running).
+///
+/// `module_id` is `Option` because a bare [`CancelToken::check`] has no module
+/// in hand. It used to fabricate the sentinel `"@unknown"` — a string that
+/// appears nowhere in `protocol-spec.md` — and write it into the error
+/// `details`, so an external caller following the spec's own Rust example
+/// produced a payload no other SDK produces (`check()` yields `details == {}`
+/// in both peers). `check_for` still populates it.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("ExecutionCancelledError: module '{module_id}' — {message}")]
 pub struct ExecutionCancelledError {
-    /// ID of the module whose execution was cancelled.
-    pub module_id: String,
+    /// ID of the module whose execution was cancelled, when known.
+    pub module_id: Option<String>,
     /// Human-readable reason or description for the cancellation.
     pub message: String,
+}
+
+impl std::fmt::Display for ExecutionCancelledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.module_id {
+            Some(module_id) => write!(
+                f,
+                "ExecutionCancelledError: module '{}' — {}",
+                module_id, self.message
+            ),
+            None => write!(f, "ExecutionCancelledError: {}", self.message),
+        }
+    }
 }
 
 impl ExecutionCancelledError {
     /// Build an `ExecutionCancelledError` with the given module ID and message.
     pub fn new(module_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            module_id: module_id.into(),
+            module_id: Some(module_id.into()),
+            message: message.into(),
+        }
+    }
+
+    /// Build an `ExecutionCancelledError` with no module ID — the shape a bare
+    /// [`CancelToken::check`] produces, matching its Python and TypeScript
+    /// counterparts, which carry no `module_id` detail either.
+    pub fn without_module(message: impl Into<String>) -> Self {
+        Self {
+            module_id: None,
             message: message.into(),
         }
     }
@@ -33,13 +62,18 @@ impl ExecutionCancelledError {
     /// Convert into a generic [`ModuleError`] with code
     /// `ErrorCode::ExecutionCancelled`. Mirrors the `to_module_error()`
     /// helpers used by the other typed-error structs in `errors.rs`.
+    ///
+    /// `module_id` reaches `details` only when it is known; an unknown module
+    /// leaves `details` empty rather than inventing a placeholder value.
     #[must_use]
     pub fn to_module_error(&self) -> ModuleError {
         let mut err = ModuleError::new(ErrorCode::ExecutionCancelled, &self.message);
-        err.details.insert(
-            "module_id".to_string(),
-            serde_json::Value::String(self.module_id.clone()),
-        );
+        if let Some(module_id) = &self.module_id {
+            err.details.insert(
+                "module_id".to_string(),
+                serde_json::Value::String(module_id.clone()),
+            );
+        }
         err
     }
 }
@@ -92,8 +126,9 @@ impl CancelToken {
     /// ```
     pub fn check(&self) -> Result<(), ExecutionCancelledError> {
         if self.is_cancelled() {
-            Err(ExecutionCancelledError::new(
-                "@unknown",
+            // No module is in hand here, so none is reported — see
+            // `ExecutionCancelledError` for why no sentinel is substituted.
+            Err(ExecutionCancelledError::without_module(
                 "Execution was cancelled",
             ))
         } else {

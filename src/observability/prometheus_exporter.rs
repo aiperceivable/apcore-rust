@@ -12,7 +12,9 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
-use super::metrics::MetricsCollector;
+use super::metrics::{
+    MetricsCollector, METRIC_CALLS_TOTAL, METRIC_DURATION_SECONDS, METRIC_ERRORS_TOTAL,
+};
 use super::usage::UsageCollector;
 
 /// Per-connection read deadline. A slow client that drip-feeds bytes is
@@ -68,14 +70,9 @@ impl PrometheusExporter {
         // discovery succeeds on a cold start before the first observation.
         // Spec reference: observability.md §1.6 normative rules.
         let mut out = String::new();
-        ensure_metric_present(&mut out, &body, "apcore_module_calls_total", "counter");
-        ensure_metric_present(&mut out, &body, "apcore_module_errors_total", "counter");
-        ensure_metric_present(
-            &mut out,
-            &body,
-            "apcore_module_duration_seconds",
-            "histogram",
-        );
+        ensure_metric_present(&mut out, &body, METRIC_CALLS_TOTAL, "counter");
+        ensure_metric_present(&mut out, &body, METRIC_ERRORS_TOTAL, "counter");
+        ensure_metric_present(&mut out, &body, METRIC_DURATION_SECONDS, "histogram");
         out.push_str(&body);
         // §1.3: append UsageCollector metrics if one is attached.
         if let Some(usage) = &self.usage_collector {

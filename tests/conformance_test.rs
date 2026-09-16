@@ -281,7 +281,7 @@ fn conformance_call_chain() {
         let max_depth = tc
             .get("max_call_depth")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(32) as u32;
+            .unwrap_or(32) as usize;
         #[allow(clippy::cast_possible_truncation)]
         // max_module_repeat from fixtures is a small integer
         let max_repeat = tc
@@ -311,8 +311,8 @@ fn conformance_call_chain() {
                 panic!("FAIL [{id}]: expected error {expected_error} but got Ok")
             };
             match expected_error {
-                // The three codes the fixture names are real wire codes, so
-                // resolve them THROUGH serde and compare the variant. A message
+                // The codes the fixture names are real wire codes, so resolve
+                // them THROUGH serde and compare the variant. A message
                 // substring ("depth", "circular") stays green when the fixture's
                 // declared code changes, which is the shape apcore#92 caught.
                 "CALL_DEPTH_EXCEEDED" | "CIRCULAR_CALL" | "CALL_FREQUENCY_EXCEEDED" => {
@@ -323,23 +323,32 @@ fn conformance_call_chain() {
                         err.message
                     );
                 }
-                // Non-positive limit floor (T-B-005). `INVALID_LIMIT` is the
-                // fixture's cross-language NAME for "this SDK's idiomatic
-                // invalid-argument signal", not a wire code — apcore-python
-                // raises ValueError, apcore-typescript Error, and apcore-rust
-                // GENERAL_INVALID_INPUT. The mapping is asserted, not the name.
-                "INVALID_LIMIT" => {
+                // Non-positive limit floor. Since D-84 (spec v1.49.0) the
+                // fixture pins the WIRE CODE `GENERAL_INVALID_INPUT` for all
+                // three SDKs; it used to carry the placeholder `INVALID_LIMIT`
+                // because Python raised `ValueError` and TypeScript a bare
+                // `Error`, neither of which a cross-language caller can catch.
+                // The placeholder is NOT accepted here: the fixture in this
+                // repo's pinned spec version no longer emits it, and the
+                // apcore-python and apcore-typescript drivers dropped their
+                // aliases too. Accepting a spelling no fixture produces would
+                // let the three drivers drift apart again, silently.
+                "GENERAL_INVALID_INPUT" => {
                     assert_eq!(
                         err.code,
                         ErrorCode::GeneralInvalidInput,
-                        "FAIL [{id}]: invalid-limit floor maps to GENERAL_INVALID_INPUT in \
-                         apcore-rust; message was {}",
+                        "FAIL [{id}]: the invalid-limit floor MUST carry the typed \
+                         GENERAL_INVALID_INPUT (D-84); message was {}",
                         err.message
                     );
                     assert!(
                         err.message.contains(">= 1"),
                         "FAIL [{id}]: expected the floor to be named in the message, got: {}",
                         err.message
+                    );
+                    assert!(
+                        err.ai_guidance.is_some(),
+                        "FAIL [{id}]: D-84's typed error carries ai_guidance like its peers"
                     );
                 }
                 other => panic!(
@@ -372,7 +381,7 @@ fn conformance_call_chain() {
             // (There is no Rust analogue of apcore-python's "must not mutate
             // the caller's chain" post-condition: the guard takes `&Context`,
             // so the borrow checker already forbids it.)
-            let depth = u32::try_from(call_chain.len()).unwrap();
+            let depth = call_chain.len();
             if depth >= 2 {
                 let err = guard_call_chain_with_repeat(&ctx, module_id, depth - 1, max_repeat)
                     .expect_err(&format!(
@@ -1823,7 +1832,15 @@ async fn conformance_approval_gate() {
         }
     }
 
-    struct SensitiveModule;
+    /// The fixture's `module_requires_approval` is declared on the LIVE module
+    /// instance, because that is the binding PROTOCOL_SPEC §7.4 Step 5 gates on
+    /// (`annotations = module.annotations`). The descriptor below carries the
+    /// same value, so this driver deliberately does NOT discriminate between
+    /// the two sources — `tests/test_approval_gate_decides_from_live_module.rs`
+    /// is the case that makes them disagree.
+    struct SensitiveModule {
+        requires_approval: bool,
+    }
     #[async_trait]
     impl Module for SensitiveModule {
         fn input_schema(&self) -> Value {
@@ -1835,6 +1852,12 @@ async fn conformance_approval_gate() {
         fn description(&self) -> &'static str {
             "Module gated by the approval step"
         }
+        fn annotations(&self) -> ModuleAnnotations {
+            ModuleAnnotations {
+                requires_approval: self.requires_approval,
+                ..Default::default()
+            }
+        }
         async fn execute(
             &self,
             inputs: Value,
@@ -1844,11 +1867,39 @@ async fn conformance_approval_gate() {
         }
     }
 
+    /// Resolve a case's governance declarations for the two sources SEPARATELY.
+    ///
+    /// Returns `(module_declares, descriptor_declares)`.
+    ///
+    /// The original cases carry a single `module_requires_approval` boolean,
+    /// which each SDK was free to satisfy from whichever source it preferred --
+    /// and that is exactly how an approval bypass survived this fixture. This
+    /// driver set BOTH from that one boolean, so a case could never tell the
+    /// two apart, while the gate read only the descriptor (D-96). The newer
+    /// `governance_sources` cases state them independently, and this SDK is the
+    /// one that can actually set them independently: its `ModuleDescriptor` is
+    /// caller-supplied, not derived from the module.
+    fn governance_of(tc: &Value) -> (bool, bool) {
+        tc.get("governance_sources").map_or_else(
+            || {
+                let both = tc["module_requires_approval"].as_bool().unwrap();
+                (both, both)
+            },
+            |src| {
+                (
+                    src["module"].as_bool().unwrap_or(false),
+                    src["descriptor"].as_bool().unwrap_or(false),
+                )
+            },
+        )
+    }
+
     let fixture = load_fixture("approval_gate");
     for tc in fixture["test_cases"].as_array().unwrap() {
         let id = tc["id"].as_str().unwrap();
         let expected = &tc["expected"];
         let module_id = "executor.test.sensitive";
+        let (module_declares, descriptor_declares) = governance_of(tc);
 
         let registry = Arc::new(Registry::new());
         let descriptor = ModuleDescriptor {
@@ -1861,7 +1912,7 @@ async fn conformance_approval_gate() {
             version: "1.0.0".to_string(),
             tags: vec![],
             annotations: Some(ModuleAnnotations {
-                requires_approval: tc["module_requires_approval"].as_bool().unwrap(),
+                requires_approval: descriptor_declares,
                 ..Default::default()
             }),
             examples: vec![],
@@ -1872,7 +1923,13 @@ async fn conformance_approval_gate() {
             enabled: true,
         };
         registry
-            .register(module_id, Box::new(SensitiveModule), descriptor)
+            .register(
+                module_id,
+                Box::new(SensitiveModule {
+                    requires_approval: module_declares,
+                }),
+                descriptor,
+            )
             .unwrap();
 
         let invocations = Arc::new(AtomicUsize::new(0));

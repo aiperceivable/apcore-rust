@@ -205,7 +205,7 @@ impl SpanExporter for OTLPExporter {
 /// `ExtensionManager`, they are wrapped in this struct so all of them are
 /// invoked instead of silently dropping the trailing entries.
 pub struct CompositeExporter {
-    inner: Vec<Box<dyn SpanExporter>>,
+    inner: Vec<Arc<dyn SpanExporter>>,
 }
 
 impl std::fmt::Debug for CompositeExporter {
@@ -221,6 +221,15 @@ impl CompositeExporter {
     /// each span to all of them.
     #[must_use]
     pub fn new(inner: Vec<Box<dyn SpanExporter>>) -> Self {
+        Self::from_shared(inner.into_iter().map(Arc::from).collect())
+    }
+
+    /// Wrap N *shared* span exporters. Used by
+    /// [`ExtensionManager::apply`](crate::extensions::ExtensionManager::apply),
+    /// which keeps its registrations after wiring them (D-78) and so can only
+    /// hand out clones of the handle.
+    #[must_use]
+    pub fn from_shared(inner: Vec<Arc<dyn SpanExporter>>) -> Self {
         Self { inner }
     }
 

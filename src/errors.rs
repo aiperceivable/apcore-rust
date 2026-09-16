@@ -427,6 +427,14 @@ pub fn retryable_for_code(code: ErrorCode) -> Option<bool> {
         ErrorCode::ApprovalTimeout
         | ErrorCode::ModuleTimeout
         | ErrorCode::GeneralInternalError
+        // A full task pool is a capacity condition, not a caller fault: the
+        // slot the submission wants is freed by a task finishing. apcore-python
+        // (`TaskLimitExceededError._default_retryable = True`) and
+        // apcore-typescript (`DEFAULT_RETRYABLE = true`) both resolve it this
+        // way, and `RetryMiddleware` in all three gates on
+        // `retryable == Some(true)` — so omitting it here meant the peers
+        // auto-retried a submission this SDK surfaced to the caller (ERR-003).
+        | ErrorCode::TaskLimitExceeded
         | ErrorCode::ReloadFailed => Some(true),
 
         // §8.6 "No", grouped by why retrying cannot help.
@@ -984,6 +992,122 @@ impl ModuleError {
             format!("Module '{module_id}' is already registered or registration is in progress"),
         )
         .with_details(details)
+    }
+
+    /// Builder for `MODULE_NOT_FOUND` carrying the default AI recovery
+    /// guidance (ERR-004).
+    ///
+    /// The five codes below (`MODULE_NOT_FOUND`, `MODULE_DISABLED`,
+    /// `MODULE_TIMEOUT`, `DEPENDENCY_NOT_FOUND`,
+    /// `DEPENDENCY_VERSION_MISMATCH`) were the only ones apcore-python and
+    /// apcore-typescript attach a default `ai_guidance` to and this SDK did
+    /// not — every raise site built them with a bare [`Self::new`], while eight
+    /// other codes already had guidance here. The wording is the peers',
+    /// verbatim, so an agent reading `ai_guidance` gets the same instruction on
+    /// all three.
+    #[must_use]
+    pub fn module_not_found(module_id: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
+        Self::new(
+            ErrorCode::ModuleNotFound,
+            format!("Module not found: {module_id}"),
+        )
+        .with_details(details)
+        .with_ai_guidance(format!(
+            "Module '{module_id}' does not exist in the registry. Verify the module ID \
+             spelling. Use system.manifest.full to list available modules."
+        ))
+    }
+
+    /// Builder for `MODULE_DISABLED` carrying the default AI recovery guidance
+    /// (ERR-004).
+    #[must_use]
+    pub fn module_disabled(module_id: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
+        Self::new(
+            ErrorCode::ModuleDisabled,
+            format!("Module '{module_id}' is disabled"),
+        )
+        .with_details(details)
+        .with_ai_guidance(format!(
+            "Module '{module_id}' is currently disabled. Use system.control.toggle_feature \
+             to re-enable it, or find an alternative module."
+        ))
+    }
+
+    /// Builder for `MODULE_TIMEOUT` carrying the default AI recovery guidance
+    /// (ERR-004).
+    #[must_use]
+    pub fn module_timeout(module_id: &str, timeout_ms: u64) -> Self {
+        let mut details = HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
+        details.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        Self::new(
+            ErrorCode::ModuleTimeout,
+            format!("Module {module_id} timed out after {timeout_ms}ms"),
+        )
+        .with_details(details)
+        .with_ai_guidance(format!(
+            "Module '{module_id}' timed out after {timeout_ms}ms. Consider: 1) Breaking \
+             the operation into smaller steps. 2) Reducing the input data size. 3) Asking \
+             the user if a longer timeout is acceptable."
+        ))
+    }
+
+    /// Builder for `DEPENDENCY_NOT_FOUND` carrying the default AI recovery
+    /// guidance (ERR-004).
+    #[must_use]
+    pub fn dependency_not_found(module_id: &str, dependency_id: &str) -> Self {
+        let mut details = HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
+        details.insert(
+            "dependency_id".to_string(),
+            serde_json::json!(dependency_id),
+        );
+        Self::new(
+            ErrorCode::DependencyNotFound,
+            format!("Module '{module_id}' has unsatisfied required dependency '{dependency_id}'"),
+        )
+        .with_details(details)
+        .with_ai_guidance(format!(
+            "Module '{module_id}' declares a required dependency on '{dependency_id}', but \
+             no such module is registered. Either register '{dependency_id}' before loading \
+             '{module_id}', mark the dependency as optional, or remove it."
+        ))
+    }
+
+    /// Builder for `DEPENDENCY_VERSION_MISMATCH` carrying the default AI
+    /// recovery guidance (ERR-004).
+    #[must_use]
+    pub fn dependency_version_mismatch(
+        module_id: &str,
+        dependency_id: &str,
+        required: &str,
+        actual: &str,
+    ) -> Self {
+        let mut details = HashMap::new();
+        details.insert("module_id".to_string(), serde_json::json!(module_id));
+        details.insert(
+            "dependency_id".to_string(),
+            serde_json::json!(dependency_id),
+        );
+        details.insert("required".to_string(), serde_json::json!(required));
+        details.insert("actual".to_string(), serde_json::json!(actual));
+        Self::new(
+            ErrorCode::DependencyVersionMismatch,
+            format!(
+                "Module '{module_id}' requires dependency '{dependency_id}' version \
+                 '{required}', but registered version is '{actual}'"
+            ),
+        )
+        .with_details(details)
+        .with_ai_guidance(format!(
+            "Module '{module_id}' declares dependency '{dependency_id}' with version \
+             constraint '{required}', but the registered version is '{actual}'. Either \
+             upgrade the dependency, relax the constraint, or register a compatible version."
+        ))
     }
 
     /// Builder for `ID_TOO_LONG` (Issue #32, PROTOCOL_SPEC §2.1.1, §2.7).

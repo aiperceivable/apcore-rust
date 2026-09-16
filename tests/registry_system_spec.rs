@@ -445,7 +445,8 @@ fn register_side_effect_8_register_event_emitted() {
         Box::new(move |module_id: &str, _m: &dyn Module| {
             received_cb.lock().unwrap().push(module_id.to_string());
         }),
-    );
+    )
+    .expect("valid registry event");
 
     register_spec(&reg, "math.add", SpecModule::new()).expect("register");
 
@@ -473,7 +474,8 @@ fn register_side_effect_ordering_load_then_event() {
         Box::new(move |_module_id: &str, _m: &dyn Module| {
             seq_event.lock().unwrap().push("event".to_string());
         }),
-    );
+    )
+    .expect("valid registry event");
 
     reg.register_module("order.mod", Box::new(module))
         .expect("register");

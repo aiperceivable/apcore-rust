@@ -94,8 +94,10 @@ impl ApprovalHandler for RecordingHandler {
 
 /// Build a descriptor whose metadata deliberately DIFFERS from the live module:
 /// stale description, stale tags, and annotations missing the live `cache_ttl`.
-/// `requires_approval: true` is kept so the gate fires (the gating check still
-/// reads the descriptor); the metadata fields are what must NOT be sourced here.
+/// The gate fires on the LIVE module's `requires_approval` (PROTOCOL_SPEC §7.4
+/// Step 5 — see `test_approval_gate_decides_from_live_module.rs`); the
+/// descriptor keeps it only so the two sources differ in the metadata fields
+/// alone, which is what this test is about.
 fn stale_descriptor(module_id: &str) -> ModuleDescriptor {
     let annotations = ModuleAnnotations {
         requires_approval: true,

@@ -12,8 +12,9 @@
 // public, observable surface that the factory delegates to). The idiomatic Rust
 // equivalent is `Context::create(identity, trace_parent, cancel_token, data,
 // services, global_deadline)` (src/context.rs:509), plus the async
-// `ContextFactory` trait (src/context.rs:774) whose `create_context` method is
-// the spec-named surface.
+// `ContextFactory` trait whose `create_context(request)` method is the
+// spec-named surface. Since spec v1.49.0 (D-76) that method takes the runtime
+// request, typed by the implementation's `Request` associated type.
 //
 // Each test maps to exactly one clause. The verbatim cross-language clause id
 // appears in a leading `// clause: <clause_id>` comment on the line above each
@@ -66,27 +67,37 @@ fn create_context(
     ctx
 }
 
+/// A stand-in for a framework request object (a Django `HttpRequest`, an
+/// Express `Request`, an Axum extractor). Opaque to apcore: only `SpecFactory`
+/// knows how to read it.
+struct FakeRequest {
+    user_id: Option<String>,
+    roles: Vec<String>,
+}
+
 /// Concrete `ContextFactory` implementation used to exercise the spec-named
-/// async `create_context` trait method (the Rust analog of Python's
+/// async `create_context(request)` trait method (the Rust analog of Python's
 /// `runtime_checkable` Protocol conformance).
 struct SpecFactory;
 
 #[async_trait]
 impl ContextFactory for SpecFactory {
-    async fn create(
-        &self,
-        identity: Option<Identity>,
-        services: Value,
-    ) -> Result<Context<Value>, ModuleError> {
-        Ok(Context::create(identity, None, None, None, services, None))
-    }
+    type Request = FakeRequest;
 
-    async fn create_child(
-        &self,
-        parent: &Context<Value>,
-        module_name: &str,
-    ) -> Result<Context<Value>, ModuleError> {
-        Ok(parent.child(module_name))
+    async fn create_context(&self, request: FakeRequest) -> Result<Context<Value>, ModuleError> {
+        // An unauthenticated request is sanitized to the anonymous `@external`
+        // identity rather than rejected — the contract's `### Errors` row.
+        let identity = request
+            .user_id
+            .map(|id| Identity::new(id, "user".to_string(), request.roles, HashMap::new()));
+        Ok(Context::create(
+            identity,
+            None,
+            None,
+            None,
+            Value::Null,
+            None,
+        ))
     }
 }
 
@@ -341,7 +352,7 @@ fn identity_system_create_context_property_pure_not_pure_fresh_context_each_call
 // clause: identity_system.create_context.property.protocol.runtime_checkable_conformance
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_system_create_context_property_protocol_runtime_checkable_conformance() {
-    let factory: &dyn ContextFactory = &SpecFactory;
+    let factory: &dyn ContextFactory<Request = FakeRequest> = &SpecFactory;
     let ident = Identity::new(
         "admin@example.com".to_string(),
         "user".to_string(),
@@ -349,9 +360,62 @@ async fn identity_system_create_context_property_protocol_runtime_checkable_conf
         HashMap::new(),
     );
     let ctx = factory
-        .create_context(Some(ident.clone()), Value::Null)
+        .create_context(FakeRequest {
+            user_id: Some("admin@example.com".to_string()),
+            roles: vec!["admin".to_string()],
+        })
         .await
         .expect("create_context resolves to a usable Context");
     assert!(!ctx.trace_id.is_empty());
     assert_eq!(ctx.identity.as_ref(), Some(&ident));
+}
+
+// clause: identity_system.create_context.input.request.extracts_identity
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_system_create_context_input_request_extracts_identity() {
+    // D-76: `create_context` takes the runtime request, and the factory — not
+    // the protocol — reads the identity out of it.
+    let ctx = SpecFactory
+        .create_context(FakeRequest {
+            user_id: Some("u-7".to_string()),
+            roles: vec!["viewer".to_string()],
+        })
+        .await
+        .expect("a well-formed request yields a Context");
+    let identity = ctx.identity.as_ref().expect("identity extracted");
+    assert_eq!(identity.id(), "u-7");
+    assert_eq!(identity.roles(), ["viewer".to_string()]);
+}
+
+// clause: identity_system.create_context.error.unauthenticated_request_is_external
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_system_create_context_error_unauthenticated_request_is_external() {
+    // `### Errors`: a request that cannot be authenticated is sanitized to
+    // `@external`, not rejected through the error channel.
+    let ctx = SpecFactory
+        .create_context(FakeRequest {
+            user_id: None,
+            roles: vec![],
+        })
+        .await
+        .expect("an unauthenticated request still yields a Context");
+    assert!(ctx.identity.is_none());
+    assert!(!ctx.trace_id.is_empty());
+}
+
+// clause: identity_system.create_context.property.additive_members_have_defaults
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_system_create_context_property_additive_members_have_defaults() {
+    // `create` / `create_child` are Rust-only additive members; the trait
+    // supplies defaults so a host implementing the spec surface alone compiles.
+    let parent = SpecFactory
+        .create(None, Value::Null)
+        .await
+        .expect("default create");
+    let child = SpecFactory
+        .create_child(&parent, "executor.email.send")
+        .await
+        .expect("default create_child");
+    assert_eq!(child.trace_id, parent.trace_id);
+    assert_eq!(child.call_chain, vec!["executor.email.send".to_string()]);
 }

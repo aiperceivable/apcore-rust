@@ -42,7 +42,9 @@ use async_trait::async_trait;
 use crate::context::Context;
 use crate::errors::ModuleError;
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
-use crate::observability::metrics::{estimate_p99_from_histogram, MetricsCollector};
+use crate::observability::metrics::{
+    extract_module_call_counts, extract_module_latency_stats, MetricsCollector,
+};
 
 /// Platform notification middleware — monitors error rates and latency,
 /// emits threshold events with hysteresis.
@@ -110,38 +112,18 @@ impl PlatformNotifyMiddleware {
         Self::new(emitter, metrics_collector, 0.1, 5000.0)
     }
 
-    /// Compute error rate for a module from `MetricsCollector` snapshot.
+    /// Compute error rate for a module from a `MetricsCollector` snapshot.
+    ///
+    /// Delegates to the shared reader in `observability::metrics`. This used to
+    /// build its own keys and spelled the module label `module=`, which
+    /// `MetricsCollector::increment_calls` never writes — it emits `module_id=`.
+    /// Every lookup missed, so the error rate was permanently 0.0 and
+    /// `apcore.health.error_threshold_exceeded` could never fire.
     fn compute_error_rate(&self, module_id: &str) -> f64 {
-        if self.metrics_collector.is_none() {
-            return 0.0;
-        }
-        let collector = self.metrics_collector.as_ref().unwrap();
-        let snap = collector.snapshot();
-
-        // snapshot() returns {"counters": {...}, "histograms": {...}}
-        let Some(counters) = snap.get("counters") else {
+        let Some(collector) = self.metrics_collector.as_ref() else {
             return 0.0;
         };
-
-        // Look for counters matching apcore_module_calls_total with module label.
-        // Keys are formatted as "name|key=value,key=value".
-        let total_key = format!("apcore_module_calls_total|module={module_id},status=success");
-        let error_key = format!("apcore_module_calls_total|module={module_id},status=error");
-
-        let success = counters
-            .get(&total_key)
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-        let errors = counters
-            .get(&error_key)
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-        let total = success + errors;
-
-        if total == 0.0 {
-            return 0.0;
-        }
-        errors / total
+        extract_module_call_counts(&collector.snapshot(), module_id).error_rate()
     }
 
     /// Check error rate threshold; returns the canonical event to emit if the
@@ -177,29 +159,11 @@ impl PlatformNotifyMiddleware {
         let Some(collector) = self.metrics_collector.as_ref() else {
             return vec![];
         };
-        let snap = collector.snapshot();
-
-        let Some(histograms) = snap.get("histograms").and_then(|v| v.as_object()) else {
-            return vec![];
-        };
-        let hist_key = format!("apcore_module_duration_seconds|module_id={module_id}");
-        let Some(data) = histograms.get(&hist_key) else {
-            return vec![];
-        };
-
-        let count = data
-            .get("count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        if count == 0 {
+        let stats = extract_module_latency_stats(&collector.snapshot(), module_id);
+        if stats.count == 0 {
             return vec![];
         }
-
-        // Estimate p99 from cumulative histogram buckets.
-        let Some(buckets) = data.get("buckets").and_then(|v| v.as_array()) else {
-            return vec![];
-        };
-        let p99_ms = estimate_p99_from_histogram(buckets, count);
+        let p99_ms = stats.p99_ms;
 
         let mut alerted = self.alerted.lock();
         let module_alerts = alerted.entry(module_id.to_string()).or_default();

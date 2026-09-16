@@ -4,7 +4,9 @@
 //! - A-D-AT-01: `max_tasks` capacity counts only active tasks (`Pending` +
 //!   `Running`), not terminal-state records still pending TTL cleanup.
 //! - A-D-AT-05: `start_reaper` is single-instance — a second call without
-//!   `stop()` returns `ErrorCode::ReaperAlreadyRunning`.
+//!   `stop()` returns `ErrorCode::ReaperAlreadyRunning`. Dropping the handle
+//!   detaches rather than stops, so it does NOT release the guard;
+//!   `AsyncTaskManager::stop_reaper` (and `shutdown`) do.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -141,9 +143,11 @@ async fn start_reaper_rejects_concurrent_start() {
 }
 
 #[tokio::test]
-async fn dropped_reaper_handle_releases_running_flag() {
-    // Even when a caller drops the handle without calling stop(), the
-    // Drop impl MUST release the running flag so subsequent calls succeed.
+async fn dropped_reaper_handle_keeps_the_reaper_running() {
+    // Dropping the handle DETACHES the reaper — the sweep loop keeps running.
+    // Releasing the single-reaper flag on drop (without signalling stop) let a
+    // SECOND sweep loop start alongside the first, both deleting from the same
+    // store. A detached reaper is still running, so the guard stays set.
     let mgr = make_manager(/*max_tasks=*/ 100);
     let mut cfg = ReaperConfig::default();
     cfg.ttl_seconds = 60.0;
@@ -152,11 +156,34 @@ async fn dropped_reaper_handle_releases_running_flag() {
         let _detached = mgr.start_reaper(cfg).unwrap();
         // _detached drops here.
     }
-    // Give the runtime a moment to surface the drop; spawning a new reaper
-    // MUST not see the prior flag.
     tokio::time::sleep(Duration::from_millis(10)).await;
+    mgr.start_reaper(cfg)
+        .expect_err("a detached reaper is still running; a second must not start");
+
+    // stop_reaper() is how a detached reaper is stopped.
+    assert!(mgr.stop_reaper(), "a reaper was running");
     let handle = mgr
         .start_reaper(cfg)
-        .expect("drop must release running flag");
+        .expect("stop_reaper must release the guard");
     handle.stop().await;
+    assert!(!mgr.stop_reaper(), "stop_reaper is idempotent");
+}
+
+#[tokio::test]
+async fn shutdown_stops_the_reaper() {
+    // `shutdown()` never touched the reaper, so a started sweep loop outlived
+    // it — apcore-python's `shutdown` awaits `stop_reaper()` first and
+    // apcore-typescript clears its sweep timer there.
+    let mgr = make_manager(/*max_tasks=*/ 100);
+    let mut cfg = ReaperConfig::default();
+    cfg.ttl_seconds = 60.0;
+    cfg.sweep_interval_ms = 5_000;
+    let _detached = mgr.start_reaper(cfg).unwrap();
+
+    mgr.shutdown().await.expect("store shutdown");
+
+    mgr.start_reaper(cfg)
+        .expect("shutdown must have stopped the reaper")
+        .stop()
+        .await;
 }

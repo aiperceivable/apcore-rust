@@ -435,9 +435,12 @@ impl Middleware for ObsLoggingMiddleware {
             "error".to_string(),
             serde_json::Value::String(error.message.clone()),
         );
+        // ERR-001: a field named `error_code` carries the protocol's canonical
+        // wire code (SCREAMING_SNAKE), never the Rust enum's `Debug` name —
+        // the same rule the metrics label and the tracing span attribute follow.
         extra.insert(
             "error_code".to_string(),
-            serde_json::Value::String(format!("{:?}", error.code)),
+            serde_json::Value::String(error.code.wire_str()),
         );
         self.logger.emit(
             "error",

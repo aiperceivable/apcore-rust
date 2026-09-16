@@ -2,7 +2,7 @@
 // Spec reference: Module execution engine
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
@@ -17,7 +17,7 @@ use crate::builtin_steps::{
     build_standard_strategy, build_testing_strategy,
 };
 use crate::config::Config;
-use crate::context::{Context, Identity};
+use crate::context::Context;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
 use crate::middleware::adapters::{AfterMiddleware, BeforeMiddleware};
@@ -27,7 +27,8 @@ use crate::module::PreflightCheckResult as PfCheck;
 use crate::module::{PreflightCheckResult, PreflightResult};
 use crate::observability::redaction::RedactionConfig;
 use crate::pipeline::{
-    BuiltinGate, ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, StrategyInfo,
+    BuiltinGate, ExecutionStrategy, PipelineContext, PipelineEngine, PipelineTrace, RunOptions,
+    StrategyInfo,
 };
 use crate::policy::ExecutionPolicy;
 use crate::registry::registry::{module_id_pattern, Registry};
@@ -264,28 +265,43 @@ pub const REDACTED_VALUE: &str = "***REDACTED***";
 /// streaming body needs to invoke `module.stream()` and run Phase 3.
 struct StreamSetup {
     module: Arc<dyn crate::module::Module>,
-    inputs: Value,
-    context: Context<Value>,
-    output_schema: Value,
-    middleware_manager: Option<Arc<MiddlewareManager>>,
-    /// Indices of the middlewares that ran during Phase-1 setup, so a Phase-2
-    /// (mid-stream) error can run on_error recovery over exactly those
-    /// (A-D-015 — parity with `call()` and Python/TS stream()).
-    executed_middlewares: Vec<usize>,
-    /// Optional event emitter, threaded from the pipeline context so Phase 3
-    /// can publish `apcore.stream.post_validation_failed` when a post-stream
-    /// failure is swallowed (parity with apcore-python / apcore-typescript).
-    event_emitter: Option<Arc<EventEmitter>>,
+    /// The Phase-1 pipeline context, carried whole.
+    ///
+    /// Phase 2 reads `inputs` / `context` off it, and Phases 2b (the
+    /// non-streaming fallback) and 3 RUN pipeline steps against it — so the
+    /// post steps see, and can write, exactly the state the pre-execute steps
+    /// left. Copying the fields out instead meant the post steps ran against a
+    /// clone: `context.redacted_output`, which `output_validation` populates,
+    /// was then never visible to the after-middleware that records the audit
+    /// entry (MW-002).
+    pipe_ctx: PipelineContext,
     /// Carried so the non-streaming fallback can resolve the same effective
     /// timeout `BuiltinExecute` would have applied. The streaming path stops
     /// the pipeline before `execute`, so that step never runs.
     module_id: String,
-    registry: Option<Arc<crate::registry::registry::Registry>>,
     default_timeout_ms: u64,
     /// `stream.max_merge_depth` resolved once at setup (PROTOCOL_SPEC §5).
     /// Carried on the setup rather than re-read in Phase 3 so one stream uses
     /// one cap even if the configuration is mutated mid-stream.
     merge_depth: usize,
+}
+
+impl StreamSetup {
+    fn inputs(&self) -> &Value {
+        &self.pipe_ctx.inputs
+    }
+
+    fn context(&self) -> &Context<Value> {
+        &self.pipe_ctx.context
+    }
+
+    fn middleware_manager(&self) -> Option<&Arc<MiddlewareManager>> {
+        self.pipe_ctx.middleware_manager.as_ref()
+    }
+
+    fn event_emitter(&self) -> Option<&Arc<EventEmitter>> {
+        self.pipe_ctx.event_emitter.as_ref()
+    }
 }
 
 /// Internal: outcome of `Executor::prepare_stream`. A Phase-1 (pre-execute)
@@ -403,10 +419,12 @@ fn stream_deadline_exceeded(deadline: Option<f64>, module_id: &str) -> Option<Mo
         .unwrap_or_default()
         .as_secs_f64();
     if now > deadline {
-        return Some(ModuleError::new(
-            ErrorCode::ModuleTimeout,
-            format!("Module '{module_id}' streaming aborted: global deadline exceeded"),
-        ));
+        // ERR-004: guidance-bearing builder, then the streaming-specific
+        // message — the deadline, not a per-module timeout, is what elapsed.
+        let mut err = ModuleError::module_timeout(module_id, 0);
+        err.message = format!("Module '{module_id}' streaming aborted: global deadline exceeded");
+        err.details.remove("timeout_ms");
+        return Some(err);
     }
     None
 }
@@ -955,12 +973,27 @@ impl Executor {
 
     /// Set the ACL for access control.
     pub fn set_acl(&mut self, acl: ACL) {
-        self.acl = Some(Arc::new(acl));
+        self.set_acl_shared(Arc::new(acl));
+    }
+
+    /// Install an already-shared ACL handle.
+    ///
+    /// The counterpart to [`Self::set_acl`] for callers that keep their own
+    /// reference — [`ExtensionManager::apply`](crate::extensions::ExtensionManager::apply)
+    /// retains its registrations (D-78), so it wires a clone rather than the
+    /// only copy.
+    pub fn set_acl_shared(&mut self, acl: Arc<ACL>) {
+        self.acl = Some(acl);
     }
 
     /// Set the approval handler.
     pub fn set_approval_handler(&mut self, handler: Box<dyn ApprovalHandler>) {
-        self.approval_handler = Some(Arc::from(handler));
+        self.set_approval_handler_shared(Arc::from(handler));
+    }
+
+    /// Install an already-shared approval-handler handle (D-78).
+    pub fn set_approval_handler_shared(&mut self, handler: Arc<dyn ApprovalHandler>) {
+        self.approval_handler = Some(handler);
     }
 
     /// Set (or clear) the execution-time governance policy consulted by the
@@ -1002,6 +1035,22 @@ impl Executor {
         self.middleware_manager.add(middleware)
     }
 
+    /// Add an already-shared middleware handle to the pipeline.
+    ///
+    /// The counterpart to [`Self::use_middleware`] for callers that keep their
+    /// own reference (D-78).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModuleError`] if the middleware's priority exceeds the
+    /// allowed range.
+    pub fn use_middleware_shared(
+        &self,
+        middleware: Arc<dyn Middleware>,
+    ) -> Result<MiddlewareHandle, ModuleError> {
+        self.middleware_manager.add_shared(middleware)
+    }
+
     /// Remove a middleware by name.
     ///
     /// Removes the FIRST match in pipeline order. When the caller means one
@@ -1040,6 +1089,21 @@ impl Executor {
                 ),
             ));
         }
+        // `Contract: Executor.call` requires over-length IDs to be rejected
+        // here, before the PipelineContext is built (D-75). The registry
+        // enforces the same bound one step later; without this check a
+        // 300-character well-formed ID reached the pipeline and came back as
+        // MODULE_NOT_FOUND instead of INVALID_MODULE_ID.
+        if module_id.len() > crate::registry::registry::MAX_MODULE_ID_LENGTH {
+            return Err(ModuleError::new(
+                ErrorCode::InvalidModuleId,
+                format!(
+                    "Module ID exceeds maximum length of {}: {}",
+                    crate::registry::registry::MAX_MODULE_ID_LENGTH,
+                    module_id.len()
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -1056,12 +1120,11 @@ impl Executor {
         Self::validate_module_id(module_id)?;
         let context = match ctx {
             Some(c) => c.clone(),
-            None => Context::<serde_json::Value>::new(Identity::new(
-                crate::acl::EXTERNAL_CALLER.to_string(),
-                "external".to_string(),
-                vec![],
-                HashMap::new(),
-            )),
+            // D-103: a call that supplied no identity keeps a null one. The
+            // `@external` sentinel is the caller-side ACL substitution for a
+            // null `caller_id` (applied by `BuiltinContextCreation`), never a
+            // principal.
+            None => Context::<serde_json::Value>::anonymous(),
         };
         let mut pipe_ctx = PipelineContext::new(module_id, inputs, context, self.strategy.name());
         if let Some(hint) = version_hint {
@@ -1191,14 +1254,10 @@ impl Executor {
                 predicted_changes: vec![],
             });
         }
-        let context = ctx.cloned().unwrap_or_else(|| {
-            Context::<serde_json::Value>::new(Identity::new(
-                crate::acl::EXTERNAL_CALLER.to_string(),
-                "external".to_string(),
-                vec![],
-                HashMap::new(),
-            ))
-        });
+        // D-103: no synthetic principal for a call that supplied none.
+        let context = ctx
+            .cloned()
+            .unwrap_or_else(Context::<serde_json::Value>::anonymous);
         let mut pipe_ctx =
             PipelineContext::new(module_id, inputs.clone(), context, self.strategy.name());
         pipe_ctx.dry_run = true;
@@ -1278,22 +1337,42 @@ impl Executor {
         // ExecutionPolicy (apcore#76) the preflight MUST report the
         // policy-effective verdict (`PolicyDecision::needs_approval`) so it
         // matches what the Step-5 gate will actually enforce.
-        let desc_annotations = self
-            .registry
-            .get_definition(module_id)
-            .ok()
-            .flatten()
-            .and_then(|desc| desc.annotations);
+        //
+        // Read the SAME governance source `BuiltinApprovalGate` reads: the
+        // D-96 union of the live instance's annotations and the registry
+        // descriptor's (`ModuleAnnotations::governance_union`). A preflight that
+        // consults a narrower source than the gate reports a verdict the gate
+        // will not honour, which is the one thing §7.9.5 exists to prevent.
+        //
+        // The descriptor is a real governance source here and not merely a
+        // fallback for an unresolved module: this SDK accepts a caller-supplied
+        // `ModuleDescriptor`. Taking it only when the live module is absent —
+        // an `or_else` rather than a union — meant a descriptor-only
+        // `requires_approval: true` was reported as "no approval needed" for
+        // every module that DID resolve, and the caller then hit the gate.
+        let module_annotations = crate::module::ModuleAnnotations::governance_union(
+            pipe_ctx
+                .module
+                .as_ref()
+                .map(|module| module.annotations())
+                .as_ref(),
+            self.registry
+                .get_definition(module_id)
+                .ok()
+                .flatten()
+                .and_then(|desc| desc.annotations)
+                .as_ref(),
+        );
         let policy_effective_approval = if let Some(policy) = self.policy.as_ref() {
             // §7.9.6: preflight resolves through the same call-site-aware entry
             // point the Step-5 gate uses, so the two cannot report different
             // verdicts. The built-in rules ignore the call site (§7.9.6 rule 2),
             // so this is identical to `resolve()` for any rule-based policy.
             policy
-                .resolve_with_call_site(module_id, desc_annotations.as_ref(), Some(inputs), ctx)
+                .resolve_with_call_site(module_id, module_annotations.as_ref(), Some(inputs), ctx)
                 .needs_approval
         } else {
-            desc_annotations
+            module_annotations
                 .as_ref()
                 .is_some_and(|a| a.requires_approval)
         };
@@ -1462,7 +1541,7 @@ impl Executor {
             // middleware on_error recovery chain (A-D-001): a recovery value is
             // yielded as the stream's chunk; otherwise the error short-circuits
             // the whole stream.
-            let setup = match self
+            let mut setup = match self
                 .prepare_stream(
                     &module_id_owned,
                     inputs,
@@ -1500,18 +1579,21 @@ impl Executor {
             // `module.stream()`, so a token cancelled while Phase-1 setup ran
             // aborts before any chunk is produced — matching apcore-python
             // (builtin_steps.py:607) and apcore-typescript (builtin-steps.ts:502).
-            if let Some(token) = setup.context.cancel_token.as_ref() {
+            if let Some(token) = setup.context().cancel_token.as_ref() {
                 token.check_for(&module_id_owned)?;
             }
 
-            let stream_handle = setup.module.stream(setup.inputs.clone(), &setup.context);
+            let stream_handle = setup
+                .module
+                .clone()
+                .stream(setup.inputs().clone(), setup.context());
             let mut accumulated: Vec<Value> = Vec::new();
 
             if let Some(mut inner) = stream_handle {
                 while let Some(chunk_result) = inner.next().await {
                     // STREAM-003 (sync): enforce global_deadline between chunks.
                     if let Some(err) =
-                        stream_deadline_exceeded(setup.context.global_deadline, &module_id_owned)
+                        stream_deadline_exceeded(setup.context().global_deadline, &module_id_owned)
                     {
                         Err(err)?;
                         return;
@@ -1530,7 +1612,7 @@ impl Executor {
                             let decorated = propagate_module_error(
                                 chunk_err,
                                 &module_id_owned,
-                                &setup.context,
+                                setup.context(),
                             );
                             // `recover_stream_chunk_error` returns Some(recovery)
                             // to yield, or None to surface `decorated` raw
@@ -1572,15 +1654,17 @@ impl Executor {
                 // (both run the full pipeline in stream Phase 1, so their
                 // fallback goes through BuiltinExecute).
                 let timeout_ms = crate::builtin_steps::resolve_effective_timeout_ms(
-                    setup.registry.as_ref(),
+                    setup.pipe_ctx.registry.as_ref(),
                     &setup.module_id,
-                    setup.context.global_deadline,
+                    setup.context().global_deadline,
                     setup.default_timeout_ms,
                 )?;
+                let module = setup.module.clone();
+                let inputs = setup.inputs().clone();
                 let output = if timeout_ms > 0 {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(timeout_ms),
-                        setup.module.execute(setup.inputs.clone(), &setup.context),
+                        module.execute(inputs, setup.context()),
                     )
                     .await
                     {
@@ -1596,26 +1680,125 @@ impl Executor {
                         }
                     }
                 } else {
-                    setup.module.execute(setup.inputs.clone(), &setup.context).await?
+                    module.execute(inputs, setup.context()).await?
                 };
+
+                // STR-1: run the REST of the strategy — everything after
+                // `execute` — with normal error semantics, then yield what it
+                // produced.
+                //
+                // apcore-python (`executor.py`) and apcore-typescript
+                // (`executor.ts`) run the FULL strategy in Phase 1 and yield
+                // `pipe_ctx.output`, so on this path an output violating
+                // `output_schema` fails the call and yields nothing, and an
+                // after-middleware that transforms the output is reflected in
+                // what the caller receives. Rust stopped the pipeline before
+                // `execute` and yielded the raw `execute()` result, leaving the
+                // tail to Phase 3 — which swallows. The "chunks already
+                // delivered, cannot un-send" rationale that justifies swallowing
+                // does not apply here: nothing has been delivered yet.
+                let output = self
+                    .run_stream_fallback_tail(&mut setup, output)
+                    .await?;
+
                 accumulated.push(output.clone());
                 yield output;
+
+                // The tail has already run with full error semantics; running
+                // Phase 3 as well would validate twice and fire `after()` twice.
+                return;
             }
 
             // Phase 3: post-stream validation + middleware_after on the merged
             // output (pure side effects — chunks are already delivered, so
             // failures are swallowed, never yielded; sync finding A-D-012).
-            Self::run_stream_phase3(&setup, &accumulated, &module_id_owned).await;
+            Self::run_stream_phase3(&self.strategy, &mut setup, &accumulated, &module_id_owned).await;
         })
     }
 
-    /// Phase 3 of streaming: deep-merge the delivered chunks, validate the
-    /// merged result against the output schema, and run the after-middleware
-    /// chain. All failures are SWALLOWED (logged via `tracing::warn`) rather
-    /// than surfaced — the chunks have already been delivered to the consumer.
-    /// Matches apcore-python (`apcore.stream.post_validation_failed` event,
-    /// no raise) and apcore-typescript (console.warn + swallow).
-    async fn run_stream_phase3(setup: &StreamSetup, accumulated: &[Value], module_id: &str) {
+    /// Step names that follow `execute` in `strategy`, in strategy order.
+    ///
+    /// Empty when the strategy has no `execute` step — there is then no
+    /// "after the module ran" segment to speak of.
+    fn post_execute_step_names(strategy: &ExecutionStrategy) -> Vec<String> {
+        let names = strategy.step_names();
+        names
+            .iter()
+            .position(|n| n == "execute")
+            .map_or_else(Vec::new, |idx| names[idx + 1..].to_vec())
+    }
+
+    /// STR-1: run the pipeline tail over a fallback (`execute()`-only) result,
+    /// propagating failures to the caller.
+    ///
+    /// Returns the output the tail produced — `middleware_after` may have
+    /// rewritten it, which is what the peers yield.
+    async fn run_stream_fallback_tail(
+        &self,
+        setup: &mut StreamSetup,
+        output: Value,
+    ) -> Result<Value, ModuleError> {
+        let tail = Self::post_execute_step_names(&self.strategy);
+        setup.pipe_ctx.output = Some(output.clone());
+        if tail.is_empty() {
+            return Ok(output);
+        }
+        PipelineEngine::run_with_options(
+            &self.strategy,
+            &mut setup.pipe_ctx,
+            RunOptions::only_steps(tail),
+        )
+        .await
+        .map_err(|e| {
+            // Same unwrapping `call()` applies: the caller sees the typed
+            // cause, decorated with trace_id + module_id (Algorithm A11).
+            let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+            let underlying = underlying
+                .unwrap_middleware_chain_error()
+                .unwrap_or(underlying);
+            propagate_module_error(underlying, &setup.module_id, &setup.pipe_ctx.context)
+        })?;
+        Ok(setup.pipe_ctx.output.clone().unwrap_or(output))
+    }
+
+    /// The post-stream steps of `strategy`, in strategy order.
+    ///
+    /// STR-2: the same filter apcore-python applies when it assembles its
+    /// `post_stream` sub-strategy (`s.name in ("output_validation",
+    /// "middleware_after", "return_result")`) and apcore-typescript applies
+    /// inline. Reading them off the ACTUAL strategy is the point: on the
+    /// `minimal` preset, which removes `output_validation` and
+    /// `middleware_after`, this list is empty and a streamed call does neither —
+    /// matching what `call()` does on that preset. A step REPLACED under one of
+    /// these names runs in its predecessor's place, as it does everywhere else.
+    fn post_stream_step_names(strategy: &ExecutionStrategy) -> Vec<String> {
+        const POST_STREAM_STEPS: [&str; 3] =
+            ["output_validation", "middleware_after", "return_result"];
+        strategy
+            .step_names()
+            .into_iter()
+            .filter(|name| POST_STREAM_STEPS.contains(&name.as_str()))
+            .collect()
+    }
+
+    /// Phase 3 of streaming: deep-merge the delivered chunks, then run the
+    /// strategy's post-stream steps over the merged result. All failures are
+    /// SWALLOWED (logged via `tracing::warn`) rather than surfaced — the chunks
+    /// have already been delivered to the consumer. Matches apcore-python
+    /// (`apcore.stream.post_validation_failed` event, no raise) and
+    /// apcore-typescript (console.warn + swallow).
+    ///
+    /// The steps are the strategy's own, not a hardcoded "validate + fire
+    /// after()" pair (STR-2). Running the real `output_validation` step is also
+    /// what populates `context.redacted_output` for a streamed call, so its
+    /// audit record carries the same output projection its non-streamed twin
+    /// does (MW-002).
+    async fn run_stream_phase3(
+        strategy: &ExecutionStrategy,
+        setup: &mut StreamSetup,
+        accumulated: &[Value],
+        module_id: &str,
+    ) {
         // D-58: enforce that all chunks are objects before merging. A non-object
         // chunk is logged and skips post-stream validation.
         let merged = match deep_merge_chunks_checked_with_depth(accumulated, setup.merge_depth) {
@@ -1630,25 +1813,29 @@ impl Executor {
                 return;
             }
         };
-        if let Err(e) = validate_against_schema(&merged, &setup.output_schema, "Output") {
+
+        let post_steps = Self::post_stream_step_names(strategy);
+        if post_steps.is_empty() {
+            return;
+        }
+        setup.pipe_ctx.output = Some(merged);
+        if let Err(e) = PipelineEngine::run_with_options(
+            strategy,
+            &mut setup.pipe_ctx,
+            RunOptions::only_steps(post_steps),
+        )
+        .await
+        {
+            let underlying = e.unwrap_pipeline_step_error().unwrap_or(e);
+            let underlying = underlying
+                .unwrap_middleware_chain_error()
+                .unwrap_or(underlying);
             tracing::warn!(
                 module_id = %module_id,
-                error = %e.message,
-                "stream phase-3 output schema validation failed (chunks already delivered, swallowed)"
+                error = %underlying.message,
+                "stream phase-3 post steps failed (chunks already delivered, swallowed)"
             );
-            Self::emit_post_stream_failure(setup, module_id, &e).await;
-        } else if let Some(ref mm) = setup.middleware_manager {
-            if let Err(e) = mm
-                .execute_after(module_id, setup.inputs.clone(), merged, &setup.context)
-                .await
-            {
-                tracing::warn!(
-                    module_id = %module_id,
-                    error = %e.message,
-                    "stream phase-3 middleware_after failed (chunks already delivered, swallowed)"
-                );
-                Self::emit_post_stream_failure(setup, module_id, &e).await;
-            }
+            Self::emit_post_stream_failure(setup, module_id, &underlying).await;
         }
     }
 
@@ -1657,7 +1844,7 @@ impl Executor {
     /// a no-op when no event emitter is configured. Mirrors apcore-python's
     /// `_emit_post_stream_failure` payload (`error_type`, `message`, `trace_id`).
     async fn emit_post_stream_failure(setup: &StreamSetup, module_id: &str, error: &ModuleError) {
-        let Some(emitter) = setup.event_emitter.as_ref() else {
+        let Some(emitter) = setup.event_emitter() else {
             return;
         };
         let event = ApCoreEvent::with_module(
@@ -1673,7 +1860,7 @@ impl Executor {
                 // `wire_str()`.
                 "error_type": format!("{:?}", error.code),
                 "message": error.message.clone(),
-                "trace_id": setup.context.trace_id.clone(),
+                "trace_id": setup.context().trace_id.clone(),
             }),
             module_id,
             "error",
@@ -1702,17 +1889,17 @@ impl Executor {
         decorated: &ModuleError,
         module_id: &str,
     ) -> Option<Value> {
-        let mm = setup.middleware_manager.as_ref()?;
-        if setup.executed_middlewares.is_empty() {
+        let mm = setup.middleware_manager()?.clone();
+        if setup.pipe_ctx.executed_middlewares.is_empty() {
             return None;
         }
         let outcome = mm
             .execute_on_error_outcome(
                 module_id,
-                setup.inputs.clone(),
+                setup.inputs().clone(),
                 decorated,
-                &setup.context,
-                &setup.executed_middlewares,
+                setup.context(),
+                &setup.pipe_ctx.executed_middlewares,
             )
             .await;
         match outcome {
@@ -1735,14 +1922,8 @@ impl Executor {
         ctx: Option<Context<Value>>,
         version_hint: Option<&str>,
     ) -> Result<StreamPrep, ModuleError> {
-        let context = ctx.unwrap_or_else(|| {
-            Context::<Value>::new(Identity::new(
-                crate::acl::EXTERNAL_CALLER.to_string(),
-                "external".to_string(),
-                vec![],
-                HashMap::new(),
-            ))
-        });
+        // D-103: no synthetic principal for a call that supplied none.
+        let context = ctx.unwrap_or_else(Context::<Value>::anonymous);
 
         let mut pipe_ctx = PipelineContext::new(module_id, inputs, context, self.strategy.name());
         if let Some(hint) = version_hint {
@@ -1851,14 +2032,10 @@ impl Executor {
                 format!("Module '{module_id}' was not resolved during pre-stream setup"),
             )
         })?;
-        let output_schema = module.output_schema();
 
-        Ok(StreamPrep::Setup(Box::new(self.build_stream_setup(
-            module,
-            output_schema,
-            module_id,
-            pipe_ctx,
-        ))))
+        Ok(StreamPrep::Setup(Box::new(
+            self.build_stream_setup(module, module_id, pipe_ctx),
+        )))
     }
 
     /// Assemble the [`StreamSetup`] Phase 2 and Phase 3 run from.
@@ -1871,22 +2048,15 @@ impl Executor {
     fn build_stream_setup(
         &self,
         module: Arc<dyn crate::module::Module>,
-        output_schema: Value,
         module_id: &str,
         pipe_ctx: PipelineContext,
     ) -> StreamSetup {
         StreamSetup {
             module,
-            inputs: pipe_ctx.inputs,
-            context: pipe_ctx.context,
-            output_schema,
-            middleware_manager: pipe_ctx.middleware_manager.clone(),
-            executed_middlewares: pipe_ctx.executed_middlewares.clone(),
-            event_emitter: pipe_ctx.event_emitter.clone(),
             module_id: module_id.to_string(),
-            registry: pipe_ctx.registry.clone(),
             default_timeout_ms: self.config.executor.default_timeout,
             merge_depth: resolve_merge_depth(&self.config),
+            pipe_ctx,
         }
     }
 
@@ -1938,18 +2108,30 @@ impl Executor {
                 || id.starts_with("system.manifest.")
         });
 
-        // Read the annotation off the descriptor — the same source the approval
-        // gate reads when it decides whether to fire. A second reading here
-        // would be a second way for the accessor to disagree with the pipeline
-        // it describes.
+        // Read governance through `governance_union` — the same source the
+        // approval gate reads when it decides whether to fire. A second reading
+        // here would be a second way for the accessor to disagree with the
+        // pipeline it describes, and reading the descriptor alone (as this did)
+        // is exactly that: a `system.control.*` module declaring
+        // `requires_approval` on its INSTANCE, with a descriptor that omits it,
+        // is gated by the pipeline and was reported here as ungated.
         let all_control_modules_require_approval = !control_ids.is_empty()
             && control_ids.iter().all(|id| {
-                self.registry
-                    .get_definition(id)
-                    .ok()
-                    .flatten()
-                    .and_then(|d| d.annotations)
-                    .is_some_and(|a| a.requires_approval)
+                crate::module::ModuleAnnotations::governance_union(
+                    self.registry
+                        .get(id)
+                        .ok()
+                        .flatten()
+                        .map(|m| m.annotations())
+                        .as_ref(),
+                    self.registry
+                        .get_definition(id)
+                        .ok()
+                        .flatten()
+                        .and_then(|d| d.annotations)
+                        .as_ref(),
+                )
+                .is_some_and(|a| a.requires_approval)
             });
 
         let acl_configured = self.acl.is_some();
@@ -2004,15 +2186,32 @@ impl Executor {
         register_strategy(info);
     }
 
-    /// List all registered strategy summaries.
+    /// Strategy summaries for this executor: its current strategy first, then
+    /// every strategy registered via [`register_strategy`].
     ///
-    /// Delegates to the module-level [`list_strategies`] function.
-    #[deprecated(
-        since = "0.20.0",
-        note = "Use the module-level `list_strategies` function directly."
-    )]
-    pub fn list_strategies() -> Vec<StrategyInfo> {
-        list_strategies()
+    /// Per `core-executor.md` "Contract: Executor.list_strategies" the result
+    /// carries "one entry for the executor's current strategy plus one for
+    /// every strategy registered". The module-level [`list_strategies`]
+    /// function answers a different question — it reports the global registry
+    /// only, and `STRATEGY_REGISTRY` is not pre-seeded with the built-ins, so
+    /// it returns an empty Vec for a default executor. `design-execution-
+    /// pipeline.md` publishes this instance-scoped signature; AI strategy
+    /// selection reads it, and an empty menu is not a usable answer.
+    pub fn list_strategies(&self) -> Vec<StrategyInfo> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut result: Vec<StrategyInfo> = Vec::new();
+
+        // Current strategy first, matching apcore-python's ordering.
+        let current = self.strategy.info();
+        seen.insert(current.name.clone());
+        result.push(current);
+
+        for info in list_strategies() {
+            if seen.insert(info.name.clone()) {
+                result.push(info);
+            }
+        }
+        result
     }
 
     /// Execute a module through the pipeline engine, returning both the output
@@ -2064,12 +2263,8 @@ impl Executor {
 
         let context = match ctx {
             Some(c) => c.clone(),
-            None => Context::<Value>::new(Identity::new(
-                crate::acl::EXTERNAL_CALLER.to_string(),
-                "external".to_string(),
-                vec![],
-                HashMap::new(),
-            )),
+            // D-103: no synthetic principal for a call that supplied none.
+            None => Context::<Value>::anonymous(),
         };
 
         let mut pipeline_ctx =
@@ -2368,6 +2563,32 @@ mod tests {
         }
     }
 
+    /// A module that returns its own inputs, so a test can assert exactly what
+    /// reached `execute()`.
+    struct EchoInputsModule {
+        input_schema: Value,
+    }
+
+    #[async_trait]
+    impl Module for EchoInputsModule {
+        fn input_schema(&self) -> Value {
+            self.input_schema.clone()
+        }
+        fn output_schema(&self) -> Value {
+            json!({})
+        }
+        fn description(&self) -> &'static str {
+            "echo inputs module"
+        }
+        async fn execute(
+            &self,
+            inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, ModuleError> {
+            Ok(inputs)
+        }
+    }
+
     // ── Mock approval handler ────────────────────────────────────────
 
     /// Tracks which method was called (request vs check) and returns a
@@ -2416,8 +2637,43 @@ mod tests {
 
     // ── Helper: build executor with a registered module ──────────────
 
-    fn build_executor_with_module(module: MockModule, annotations: ModuleAnnotations) -> Executor {
+    /// Wraps a test module so its LIVE `annotations()` reports the declared
+    /// governance values. `BuiltinApprovalGate` and `validate()` both read
+    /// `module.annotations()` (PROTOCOL_SPEC §7.4 Step 5), so putting the
+    /// annotations only on the descriptor would declare nothing they consult.
+    struct AnnotatedModule<M: Module> {
+        inner: M,
+        annotations: ModuleAnnotations,
+    }
+
+    #[async_trait]
+    impl<M: Module> Module for AnnotatedModule<M> {
+        fn input_schema(&self) -> Value {
+            self.inner.input_schema()
+        }
+        fn output_schema(&self) -> Value {
+            self.inner.output_schema()
+        }
+        fn description(&self) -> &str {
+            self.inner.description()
+        }
+        fn annotations(&self) -> ModuleAnnotations {
+            self.annotations.clone()
+        }
+        async fn execute(&self, inputs: Value, ctx: &Context<Value>) -> Result<Value, ModuleError> {
+            self.inner.execute(inputs, ctx).await
+        }
+    }
+
+    fn build_executor_with_module<M: Module + 'static>(
+        module: M,
+        annotations: ModuleAnnotations,
+    ) -> Executor {
         let registry = Registry::new();
+        let module = AnnotatedModule {
+            inner: module,
+            annotations: annotations.clone(),
+        };
         let descriptor = ModuleDescriptor {
             module_id: "test_mod".to_string(),
             name: None,
@@ -2676,6 +2932,82 @@ mod tests {
         let inputs = json!({"data": "hello"});
         let result = executor.call("test_mod", inputs, None, None).await;
         assert!(result.is_ok());
+    }
+
+    /// Strict input schema that rejects any key it does not declare — the
+    /// shape that makes a leaked `_approval_token` observable in Step 7.
+    fn closed_input_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"data": {"type": "string"}},
+            "additionalProperties": false
+        })
+    }
+
+    #[tokio::test]
+    async fn test_approval_token_stripped_when_no_handler_configured() {
+        // PROTOCOL_SPEC §7.4 is unconditional: `_approval_token` MUST be
+        // removed from the arguments before they reach a subsequent step. The
+        // no-handler skip returns from Step 5 early, so the token used to
+        // survive into Step 7 where `additionalProperties: false` rejects it as
+        // an undeclared key — and then into the module's own execute().
+        let module = EchoInputsModule {
+            input_schema: closed_input_schema(),
+        };
+        let annotations = ModuleAnnotations {
+            requires_approval: true,
+            ..Default::default()
+        };
+        let executor = build_executor_with_module(module, annotations);
+
+        let result = executor
+            .call(
+                "test_mod",
+                json!({"_approval_token": "tok-123", "data": "hello"}),
+                None,
+                None,
+            )
+            .await
+            .expect("the token must be stripped before input validation");
+        assert_eq!(result, json!({"data": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn test_approval_token_stripped_when_module_not_gated() {
+        // The other early return from Step 5: the module needs no approval at
+        // all, so the gate continues immediately. §7.4 still applies.
+        let module = EchoInputsModule {
+            input_schema: closed_input_schema(),
+        };
+        let executor = build_executor_with_module(module, ModuleAnnotations::default());
+
+        let result = executor
+            .call(
+                "test_mod",
+                json!({"_approval_token": "tok-123", "data": "hello"}),
+                None,
+                None,
+            )
+            .await
+            .expect("the token must be stripped before input validation");
+        assert_eq!(result, json!({"data": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn test_approval_token_non_string_rejected_on_ungated_path() {
+        // The non-string rejection runs ahead of every early return too, so a
+        // malformed token never slips through an ungated call.
+        let module = EchoInputsModule {
+            input_schema: json!({}),
+        };
+        let executor = build_executor_with_module(module, ModuleAnnotations::default());
+
+        let err = executor
+            .call("test_mod", json!({"_approval_token": 123}), None, None)
+            .await
+            .expect_err("a non-string _approval_token must be rejected");
+        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
+        assert!(err.message.contains("must be a string"), "{}", err.message);
     }
 
     #[tokio::test]

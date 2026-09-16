@@ -146,6 +146,44 @@ impl Module for FunctionModule {
         &self.description
     }
 
+    // A `FunctionModule` is built from a declaration — `APCore::module()` or a
+    // `*.binding.yaml` entry — and those declarations are stored on the struct
+    // below. Without these four accessors the trait defaults answered instead
+    // (`ModuleAnnotations::default()`, an empty tag list, `None`, an empty
+    // map), so `Registry::register_module`, `BuiltinApprovalGate` and every
+    // other `dyn Module` reader saw a module that declared nothing — and a
+    // binding's `annotations: {requires_approval: true}` was discarded at
+    // registration. Cross-language parity with apcore-python (`decorator.py`
+    // attaches the declared values to the wrapped function) and
+    // apcore-typescript (`bindings.ts` attaches them to the module object).
+    fn annotations(&self) -> ModuleAnnotations {
+        self.annotations.clone()
+    }
+
+    fn tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
+
+    fn documentation(&self) -> Option<&str> {
+        self.documentation.as_deref()
+    }
+
+    fn metadata(&self) -> HashMap<String, serde_json::Value> {
+        self.metadata.clone()
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some(self.version.as_str())
+    }
+
+    fn examples(&self) -> Vec<ModuleExample> {
+        self.examples.clone()
+    }
+
+    fn dependencies(&self) -> Vec<crate::registry::registry::DependencyInfo> {
+        crate::registry::registry::dependencies_from_metadata(&self.metadata)
+    }
+
     async fn execute(
         &self,
         inputs: serde_json::Value,

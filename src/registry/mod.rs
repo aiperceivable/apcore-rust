@@ -32,4 +32,7 @@ pub use registry::{
 pub use scanner::{scan_extensions, scan_multi_root};
 pub use types::{DepInfo, DiscoveredFile};
 pub use validation::validate_descriptor;
-pub use version::{matches_version_hint, parse_semver, select_best_version, VersionedStore};
+pub use version::{
+    matches_version_hint, parse_semver, select_best_version, try_matches_version_hint,
+    try_select_best_version, VersionedStore,
+};

@@ -179,8 +179,8 @@ pub use sys_modules::{
 };
 pub use trace_context::{TraceContext, TraceParent};
 pub use utils::{
-    calculate_specificity, guard_call_chain, guard_call_chain_with_repeat, match_pattern,
-    normalize_to_canonical_id, propagate_error, propagate_module_error, DEFAULT_MAX_CALL_DEPTH,
-    DEFAULT_MAX_MODULE_REPEAT,
+    calculate_specificity, guard_call_chain, guard_call_chain_for_context,
+    guard_call_chain_with_repeat, match_pattern, normalize_to_canonical_id, propagate_error,
+    propagate_module_error, DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_MODULE_REPEAT,
 };
 pub use version::negotiate_version;

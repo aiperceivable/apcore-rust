@@ -769,80 +769,95 @@ pub fn register_sys_modules_with_options(
     // dispatch the async emit — fire-and-forget, error-isolated.
     if events_enabled {
         let emitter_for_register = Arc::clone(&emitter_arc);
-        registry.on(
-            "register",
-            Box::new(move |module_id: &str, _module: &dyn Module| {
-                tracing::info!(module_id = %module_id, "module_registered");
-                let emitter = Arc::clone(&emitter_for_register);
-                let module_id_owned = module_id.to_string();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        // Audit-event single-emit rule for ephemeral.* per
-                        // apcore RFC docs/spec/rfc-ephemeral-modules.md.
-                        // Ephemeral modules emit ONE canonical event with the
-                        // full contextual payload (namespace_class +
-                        // caller_id) and do NOT emit the legacy bare-name
-                        // event so downstream subscribers do not see dual
-                        // events for the same module_id.
-                        if is_ephemeral_module_id(&module_id_owned) {
-                            let payload = json!({
-                                "namespace_class": "ephemeral",
-                                "caller_id": crate::acl::EXTERNAL_CALLER,
-                            });
+        // `on` is fallible since D-80; both names are in the closed set, so the
+        // `?` can only fire if that set ever changes under us.
+        registry
+            .on(
+                crate::registry::registry_events::REGISTER,
+                Box::new(move |module_id: &str, _module: &dyn Module| {
+                    tracing::info!(module_id = %module_id, "module_registered");
+                    let emitter = Arc::clone(&emitter_for_register);
+                    let module_id_owned = module_id.to_string();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            // Audit-event single-emit rule for ephemeral.* per
+                            // apcore RFC docs/spec/rfc-ephemeral-modules.md.
+                            // Ephemeral modules emit ONE canonical event with the
+                            // full contextual payload (namespace_class +
+                            // caller_id) and do NOT emit the legacy bare-name
+                            // event so downstream subscribers do not see dual
+                            // events for the same module_id.
+                            if is_ephemeral_module_id(&module_id_owned) {
+                                let payload = json!({
+                                    "namespace_class": "ephemeral",
+                                    "caller_id": crate::acl::EXTERNAL_CALLER,
+                                });
+                                let canonical = ApCoreEvent::with_module(
+                                    "apcore.registry.module_registered",
+                                    payload,
+                                    &module_id_owned,
+                                    "info",
+                                );
+                                emitter.emit(&canonical).await;
+                                return;
+                            }
                             let canonical = ApCoreEvent::with_module(
                                 "apcore.registry.module_registered",
-                                payload,
+                                json!({}),
                                 &module_id_owned,
                                 "info",
                             );
                             emitter.emit(&canonical).await;
-                            return;
-                        }
-                        let canonical = ApCoreEvent::with_module(
-                            "apcore.registry.module_registered",
-                            json!({}),
-                            &module_id_owned,
-                            "info",
-                        );
-                        emitter.emit(&canonical).await;
-                    });
-                }
-            }),
-        );
+                        });
+                    }
+                }),
+            )
+            .unwrap_or_else(|e| {
+                // Unreachable: REGISTER is in the closed event set. Log rather
+                // than widen SysModuleError for a branch that cannot be taken.
+                tracing::error!(error = %e.message, "registry 'register' subscription refused");
+                0
+            });
         let emitter_for_unregister = Arc::clone(&emitter_arc);
-        registry.on(
-            "unregister",
-            Box::new(move |module_id: &str, _module: &dyn Module| {
-                tracing::info!(module_id = %module_id, "module_unregistered");
-                let emitter = Arc::clone(&emitter_for_unregister);
-                let module_id_owned = module_id.to_string();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        if is_ephemeral_module_id(&module_id_owned) {
-                            let payload = json!({
-                                "namespace_class": "ephemeral",
-                                "caller_id": crate::acl::EXTERNAL_CALLER,
-                            });
+        registry
+            .on(
+                crate::registry::registry_events::UNREGISTER,
+                Box::new(move |module_id: &str, _module: &dyn Module| {
+                    tracing::info!(module_id = %module_id, "module_unregistered");
+                    let emitter = Arc::clone(&emitter_for_unregister);
+                    let module_id_owned = module_id.to_string();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if is_ephemeral_module_id(&module_id_owned) {
+                                let payload = json!({
+                                    "namespace_class": "ephemeral",
+                                    "caller_id": crate::acl::EXTERNAL_CALLER,
+                                });
+                                let canonical = ApCoreEvent::with_module(
+                                    "apcore.registry.module_unregistered",
+                                    payload,
+                                    &module_id_owned,
+                                    "info",
+                                );
+                                emitter.emit(&canonical).await;
+                                return;
+                            }
                             let canonical = ApCoreEvent::with_module(
                                 "apcore.registry.module_unregistered",
-                                payload,
+                                json!({}),
                                 &module_id_owned,
                                 "info",
                             );
                             emitter.emit(&canonical).await;
-                            return;
-                        }
-                        let canonical = ApCoreEvent::with_module(
-                            "apcore.registry.module_unregistered",
-                            json!({}),
-                            &module_id_owned,
-                            "info",
-                        );
-                        emitter.emit(&canonical).await;
-                    });
-                }
-            }),
-        );
+                        });
+                    }
+                }),
+            )
+            .unwrap_or_else(|e| {
+                // Unreachable: UNREGISTER is in the closed event set.
+                tracing::error!(error = %e.message, "registry 'unregister' subscription refused");
+                0
+            });
     }
 
     Ok(SysModulesContext {

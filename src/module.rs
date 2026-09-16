@@ -135,6 +135,84 @@ pub trait Module: Send + Sync {
         ModuleAnnotations::default()
     }
 
+    /// Long-form module documentation (Markdown), when the module carries any.
+    ///
+    /// Read by `Registry::register_module` so a declaration made on the module
+    /// instance — e.g. a `*.binding.yaml` `documentation:` block, which the
+    /// binding loader folds into the `FunctionModule` it builds — reaches the
+    /// registered `ModuleDescriptor` instead of being hardcoded to `None`.
+    /// Cross-language alignment with apcore-python (`registry/metadata.py`
+    /// merges the module's `documentation`) and apcore-typescript
+    /// (`registry/metadata-pure.ts`).
+    ///
+    /// The default returns `None`, so existing `impl Module` blocks are
+    /// unaffected.
+    fn documentation(&self) -> Option<&str> {
+        None
+    }
+
+    /// Free-form module metadata, when the module carries any.
+    ///
+    /// Read by `Registry::register_module` for the same reason as
+    /// [`documentation`](Self::documentation): the binding loader computes the
+    /// `display:` block into `metadata["apcore.display"]` on the module it
+    /// builds, and that map used to be overwritten with an empty one at
+    /// registration.
+    ///
+    /// The default returns an empty map.
+    fn metadata(&self) -> HashMap<String, serde_json::Value> {
+        HashMap::new()
+    }
+
+    /// The module's own declared version, when it carries one.
+    ///
+    /// Read by `Registry::register_module`, which used to hardcode
+    /// [`DEFAULT_MODULE_VERSION`](crate::registry::registry::DEFAULT_MODULE_VERSION)
+    /// because there was nothing to read. That completes D-97: `FunctionModule`
+    /// stored `version` and `examples` as fields with no corresponding trait
+    /// accessor, exactly as it stored `annotations` / `tags` / `documentation` /
+    /// `metadata` before D-97 added theirs — so a `*.binding.yaml` declaring
+    /// `version:` was **validated** against
+    /// `validation.binding.version_require_semver` and then discarded, and the
+    /// module registered as `1.0.0`.
+    ///
+    /// apcore-python (`merge_module_metadata`: `getattr(module, "version",
+    /// "1.0.0")`) and apcore-typescript (`mergeModuleMetadata`) both carry it.
+    ///
+    /// The default returns `None`, which the registry reads as "use the
+    /// default version" — the same fallback the peers apply.
+    fn version(&self) -> Option<&str> {
+        None
+    }
+
+    /// The module's own declared examples, when it carries any.
+    ///
+    /// The second half of the same gap as [`version`](Self::version): stored as
+    /// a `FunctionModule` field, reachable through no accessor, and replaced
+    /// with an empty `Vec` at registration. Both peers merge the module's
+    /// examples into the descriptor.
+    ///
+    /// The default returns an empty Vec.
+    fn examples(&self) -> Vec<ModuleExample> {
+        Vec::new()
+    }
+
+    /// The module's own declared dependencies, when it carries any.
+    ///
+    /// The last field of the same family as [`version`](Self::version) and
+    /// [`examples`](Self::examples). `register_versioned` parsed dependencies
+    /// out of its `metadata` ARGUMENT only, so a module that declares them on
+    /// itself — which is how apcore-python (`getattr(module, "dependencies",
+    /// [])`) and apcore-typescript read them — registered with an empty graph.
+    /// `ReloadModule::topo_sort_modules` reads that accessor, so a
+    /// `path_filter` reload of such modules sorted nothing and degenerated to
+    /// alphabetical order.
+    ///
+    /// The default returns an empty Vec.
+    fn dependencies(&self) -> Vec<crate::registry::registry::DependencyInfo> {
+        Vec::new()
+    }
+
     /// Optional preview hook — return a structured prediction of changes.
     ///
     /// Per the apcore RFC `docs/spec/rfc-preview-method.md` (Accepted, target
@@ -361,6 +439,51 @@ impl Default for ModuleAnnotations {
             pagination_style: "cursor".to_string(),
             discoverable: true,
             extra: HashMap::new(),
+        }
+    }
+}
+
+impl ModuleAnnotations {
+    /// Union the two governance sources a module's requirement can come from
+    /// (D-96): the live instance's `annotations()` and the registry
+    /// descriptor's.
+    ///
+    /// This SDK — unlike its peers, whose descriptors are DERIVED from the
+    /// module — accepts a caller-supplied [`ModuleDescriptor`], documented on
+    /// `Registry::register` as "loaded from a config file or discovered from an
+    /// external source". Both single-source readings are therefore fail-OPEN:
+    /// reading only the descriptor ignores what the module declares, reading
+    /// only the module ignores what an operator declared in configuration. On
+    /// an approval gate the failure direction is the whole argument —
+    /// requiring an approval that was not strictly needed costs a prompt,
+    /// skipping one that WAS needed is a bypass.
+    ///
+    /// Only the two governance flags are unioned. The rest of the annotations
+    /// (caching, pagination, streaming, `extra`) describe the module's
+    /// behaviour rather than its governance, and the live instance is
+    /// authoritative for those; they are taken from `module` when it is
+    /// present. Returns `None` only when neither source exists.
+    ///
+    /// **Every governance read MUST go through here.** It exists as one
+    /// function precisely because the first fix for D-96 unioned the *gate* and
+    /// left two other sites reading `module.annotations()` directly — the
+    /// `ApprovalRequest` handed to the handler, and `Executor::validate`'s
+    /// preflight — so the gate fired on one source and both the handler and the
+    /// preflight described the call from another.
+    ///
+    /// [`ModuleDescriptor`]: crate::registry::registry::ModuleDescriptor
+    #[must_use]
+    pub fn governance_union(module: Option<&Self>, descriptor: Option<&Self>) -> Option<Self> {
+        match (module, descriptor) {
+            (Some(m), Some(d)) => {
+                let mut merged = m.clone();
+                merged.requires_approval = m.requires_approval || d.requires_approval;
+                merged.destructive = m.destructive || d.destructive;
+                Some(merged)
+            }
+            (Some(m), None) => Some(m.clone()),
+            (None, Some(d)) => Some(d.clone()),
+            (None, None) => None,
         }
     }
 }

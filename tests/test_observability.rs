@@ -495,8 +495,16 @@ fn test_metrics_collector_histogram_buckets() {
 
     // Buckets below 0.07 should have count 0, buckets >= 0.07 should have count 1
     for bucket in buckets {
-        let le = bucket["le"].as_f64().unwrap();
         let count = bucket["count"].as_u64().unwrap();
+        // D-106: the snapshot also carries the `+Inf` bucket, whose bound is the
+        // string `"+Inf"` (JSON has no infinity literal). It holds every
+        // observation, which is how a consumer tells "no data" from "all
+        // overflow".
+        let Some(le) = bucket["le"].as_f64() else {
+            assert_eq!(bucket["le"].as_str(), Some("+Inf"));
+            assert_eq!(count, 1, "the +Inf bucket counts every observation");
+            continue;
+        };
         if le >= 0.07 {
             assert_eq!(count, 1, "Bucket le={le} should contain the observation");
         } else {

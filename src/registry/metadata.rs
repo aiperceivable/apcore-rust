@@ -159,14 +159,52 @@ pub fn merge_module_metadata<S: std::hash::BuildHasher>(
     }
     merged.insert("metadata".to_string(), serde_json::Value::Object(meta_map));
 
-    // annotations: YAML wins when present, otherwise code
-    let annotations = yaml
-        .get("annotations")
-        .filter(|v| !v.is_null())
-        .or_else(|| code.get("annotations"));
-    if let Some(a) = annotations {
-        merged.insert("annotations".to_string(), a.clone());
+    // annotations: FIELD-LEVEL merge, YAML > code > defaults
+    // (PROTOCOL_SPEC §4.13). This used to take the YAML object WHOLE whenever
+    // one was present, so a module whose code declared
+    // `{destructive: true, readonly: false}` and whose YAML declared only
+    // `{readonly: true}` lost `destructive` entirely. Both peers merge per
+    // field (`merge_annotations` / `mergeAnnotations`); the keys neither side
+    // sets fall through to the `ModuleAnnotations` serde defaults, which is the
+    // "> defaults" leg of the rule.
+    let yaml_annotations = yaml.get("annotations").filter(|v| !v.is_null());
+    let code_annotations = code.get("annotations").filter(|v| !v.is_null());
+    match (code_annotations, yaml_annotations) {
+        (Some(base), Some(overlay)) => {
+            let mut fields = base.as_object().cloned().unwrap_or_default();
+            if let Some(overlay) = overlay.as_object() {
+                for (key, value) in overlay {
+                    fields.insert(key.clone(), value.clone());
+                }
+                merged.insert("annotations".to_string(), serde_json::Value::Object(fields));
+            } else {
+                // A non-object YAML annotations value cannot be merged per
+                // field; keep the existing "YAML wins" behaviour for it.
+                merged.insert("annotations".to_string(), overlay.clone());
+            }
+        }
+        (None, Some(only)) | (Some(only), None) => {
+            merged.insert("annotations".to_string(), only.clone());
+        }
+        (None, None) => {}
     }
+
+    // dependencies: YAML wins when present (an explicit empty list overrides
+    // code-declared dependencies), code is the fallback.
+    //
+    // The key was absent from the returned map altogether, so it survived
+    // discovery — the registry reads it off the raw YAML before merging — and
+    // was then lost before storage, leaving the post-registration metadata
+    // accessor unable to see it. LOAD-order topological sorting therefore
+    // worked while RELOAD-order sorting had nothing to sort by. Same defect and
+    // same fix as apcore-python and apcore-typescript (aiperceivable/apcore-typescript#35).
+    let dependencies = yaml
+        .get("dependencies")
+        .filter(|v| !v.is_null())
+        .or_else(|| code.get("dependencies").filter(|v| !v.is_null()))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    merged.insert("dependencies".to_string(), dependencies);
 
     // examples: YAML wins fully when present
     let examples = yaml
@@ -281,6 +319,83 @@ mod tests {
         let raw = vec![serde_json::json!({"version": "1.0.0"})];
         let deps = parse_dependencies(&raw);
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_merge_module_metadata_annotations_are_field_level_merged() {
+        // PROTOCOL_SPEC §4.13: YAML > code > defaults, per FIELD. Taking the
+        // YAML object whole silently dropped every code-set flag the YAML did
+        // not restate — here, `destructive`.
+        let mut code = HashMap::new();
+        code.insert(
+            "annotations".to_string(),
+            serde_json::json!({"destructive": true, "readonly": false}),
+        );
+
+        let mut yaml = HashMap::new();
+        yaml.insert(
+            "annotations".to_string(),
+            serde_json::json!({"readonly": true}),
+        );
+
+        let merged = merge_module_metadata(&code, &yaml);
+        let annotations = merged.get("annotations").expect("annotations key");
+        assert_eq!(annotations["destructive"], serde_json::json!(true));
+        assert_eq!(annotations["readonly"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_merge_module_metadata_annotations_from_one_side_only() {
+        let mut code = HashMap::new();
+        code.insert(
+            "annotations".to_string(),
+            serde_json::json!({"destructive": true}),
+        );
+        let yaml: HashMap<String, serde_json::Value> = HashMap::new();
+        let merged = merge_module_metadata(&code, &yaml);
+        assert_eq!(
+            merged.get("annotations").expect("annotations key")["destructive"],
+            serde_json::json!(true)
+        );
+
+        // Absent on both sides stays absent, so the descriptor keeps `None`.
+        let empty: HashMap<String, serde_json::Value> = HashMap::new();
+        assert!(!merge_module_metadata(&empty, &empty).contains_key("annotations"));
+    }
+
+    #[test]
+    fn test_merge_module_metadata_emits_dependencies() {
+        // The key was missing from the returned map entirely, so a declared
+        // dependency was lost between discovery and storage.
+        let mut code = HashMap::new();
+        code.insert(
+            "dependencies".to_string(),
+            serde_json::json!([{"module_id": "common.db"}]),
+        );
+        let yaml: HashMap<String, serde_json::Value> = HashMap::new();
+        let merged = merge_module_metadata(&code, &yaml);
+        assert_eq!(
+            merged.get("dependencies").expect("dependencies key"),
+            &serde_json::json!([{"module_id": "common.db"}])
+        );
+
+        // YAML wins, and an explicit empty list is a real override.
+        let mut yaml = HashMap::new();
+        yaml.insert("dependencies".to_string(), serde_json::json!([]));
+        let merged = merge_module_metadata(&code, &yaml);
+        assert_eq!(
+            merged.get("dependencies").expect("dependencies key"),
+            &serde_json::json!([])
+        );
+
+        // Declared nowhere: the key is still present, as an empty list.
+        let empty: HashMap<String, serde_json::Value> = HashMap::new();
+        assert_eq!(
+            merge_module_metadata(&empty, &empty)
+                .get("dependencies")
+                .expect("dependencies key"),
+            &serde_json::json!([])
+        );
     }
 
     #[test]

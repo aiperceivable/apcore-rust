@@ -836,7 +836,7 @@ impl BindingLoader {
                     output: serde_json::json!({"type": "object"}),
                 });
 
-            let annotations = annotations_from_value(entry.annotations.as_ref());
+            let annotations = annotations_from_value(module_id, entry.annotations.as_ref())?;
 
             let display_meta = display_into_metadata(entry.display.as_ref());
             let mut metadata = entry.metadata.clone();
@@ -950,7 +950,7 @@ impl BindingLoader {
                 )?;
             }
 
-            let annotations = annotations_from_value(entry.annotations.as_ref());
+            let annotations = annotations_from_value(module_id, entry.annotations.as_ref())?;
             let display_meta = display_into_metadata(entry.display.as_ref());
             let mut metadata = entry.metadata.clone();
             for (k, v) in display_meta {
@@ -1110,50 +1110,42 @@ fn detect_modes(entry: &BindingEntry) -> Vec<String> {
 
 /// Translate an `annotations` JSON object into [`ModuleAnnotations`].
 ///
-/// Unknown keys collect into `extra`. Missing or non-object input yields
-/// `ModuleAnnotations::default()`.
-fn annotations_from_value(value: Option<&serde_json::Value>) -> ModuleAnnotations {
-    let mut annotations = ModuleAnnotations::default();
-    let Some(serde_json::Value::Object(obj)) = value else {
-        return annotations;
+/// Deserialization is delegated to [`ModuleAnnotations`]'s own `Deserialize`
+/// impl, which is the single definition of the §4.4.1 wire format: all twelve
+/// declared keys plus `discoverable`, the nested `extra` object, the legacy
+/// flattened form, and the nested-wins precedence rule.
+///
+/// A hand-rolled parser lived here and matched five keys —
+/// `readonly` / `destructive` / `idempotent` / `requires_approval` /
+/// `open_world`. Everything else, `streaming`, `cacheable`, `cache_ttl`,
+/// `cache_key_fields`, `paginated`, `pagination_style` and the literal key
+/// `extra` itself, fell into the catch-all and was nested under its own name,
+/// so `{"extra": {...}}` deserialized to `extra.extra` and
+/// `annotations: {streaming: true}` never reached the streaming-interface check
+/// that apcore-python and apcore-typescript fail registration on.
+///
+/// Missing or `null` input yields `ModuleAnnotations::default()`.
+///
+/// # Errors
+///
+/// `BINDING_FILE_INVALID` when the block is not an object or a declared key
+/// carries the wrong type (e.g. `cache_ttl: "soon"`).
+fn annotations_from_value(
+    module_id: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<ModuleAnnotations, ModuleError> {
+    let Some(value) = value else {
+        return Ok(ModuleAnnotations::default());
     };
-    let mut extra = HashMap::new();
-    for (k, v) in obj {
-        match k.as_str() {
-            "readonly" => {
-                if let Some(b) = v.as_bool() {
-                    annotations.readonly = b;
-                }
-            }
-            "destructive" => {
-                if let Some(b) = v.as_bool() {
-                    annotations.destructive = b;
-                }
-            }
-            "idempotent" => {
-                if let Some(b) = v.as_bool() {
-                    annotations.idempotent = b;
-                }
-            }
-            "requires_approval" => {
-                if let Some(b) = v.as_bool() {
-                    annotations.requires_approval = b;
-                }
-            }
-            "open_world" => {
-                if let Some(b) = v.as_bool() {
-                    annotations.open_world = b;
-                }
-            }
-            _ => {
-                extra.insert(k.clone(), v.clone());
-            }
-        }
+    if value.is_null() {
+        return Ok(ModuleAnnotations::default());
     }
-    if !extra.is_empty() {
-        annotations.extra = extra;
-    }
-    annotations
+    serde_json::from_value::<ModuleAnnotations>(value.clone()).map_err(|e| {
+        ModuleError::new(
+            ErrorCode::BindingFileInvalid,
+            format!("Invalid `annotations` block for binding '{module_id}': {e}"),
+        )
+    })
 }
 
 /// Move a `display` JSON value into the module's `metadata` namespace under

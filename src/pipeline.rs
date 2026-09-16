@@ -875,6 +875,17 @@ pub struct RunOptions {
     /// and not recorded in the trace). Used by the streaming path to drive the
     /// shared engine up to the `execute` step. `None` runs to the end.
     pub stop_before_step: Option<String>,
+    /// Run ONLY the steps named here; every other step is passed over without
+    /// running and without a trace record. `None` runs every step.
+    ///
+    /// The streaming path uses this to run a SEGMENT of an already-started
+    /// strategy — the tail after `execute` on the non-streaming fallback
+    /// (STR-1), and the post-stream steps in Phase 3 (STR-2) — against the same
+    /// `PipelineContext` the pre-execute steps ran against. It is the Rust
+    /// equivalent of apcore-python's `post_strategy` slice, which is built with
+    /// `validate_dependencies=False` for the same reason: the segment's
+    /// `requires` keys were seeded by the earlier steps, not by this run.
+    pub only_steps: Option<Vec<String>>,
     /// Predicate evaluated **after** every successful step completes. Returning
     /// `true` halts the pipeline; the current step's output is preserved.
     /// See `core-executor.md` §Pipeline Hardening §1.4.
@@ -887,6 +898,17 @@ impl RunOptions {
     pub fn stop_before(step_name: impl Into<String>) -> Self {
         Self {
             stop_before_step: Some(step_name.into()),
+            only_steps: None,
+            until: None,
+        }
+    }
+
+    /// Build options that run only the named steps, in strategy order.
+    #[must_use]
+    pub fn only_steps(step_names: Vec<String>) -> Self {
+        Self {
+            stop_before_step: None,
+            only_steps: Some(step_names),
             until: None,
         }
     }
@@ -899,6 +921,7 @@ impl RunOptions {
     {
         Self {
             stop_before_step: None,
+            only_steps: None,
             until: Some(Box::new(predicate)),
         }
     }
@@ -1000,6 +1023,16 @@ impl PipelineEngine {
             if let Some(stop_name) = options.stop_before_step.as_deref() {
                 if step.name() == stop_name {
                     break;
+                }
+            }
+
+            // Segment filter: a step outside the requested set is passed over
+            // entirely — not run, not traced, and not recorded as skipped,
+            // because it is not part of this run at all.
+            if let Some(only) = options.only_steps.as_ref() {
+                if !only.iter().any(|name| name == step.name()) {
+                    idx += 1;
+                    continue;
                 }
             }
 

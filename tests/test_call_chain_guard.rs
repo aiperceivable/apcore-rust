@@ -4,7 +4,8 @@
 //! circular call detection, frequency throttle, happy path, and edge cases.
 
 use apcore::errors::ErrorCode;
-use apcore::{guard_call_chain, guard_call_chain_with_repeat, Context};
+use apcore::Context;
+use apcore::{guard_call_chain_with_repeat, DEFAULT_MAX_MODULE_REPEAT};
 
 fn anon_ctx() -> Context<serde_json::Value> {
     Context::<serde_json::Value>::anonymous()
@@ -23,26 +24,26 @@ fn ctx_with_chain(chain: Vec<&str>) -> Context<serde_json::Value> {
 #[test]
 fn guard_empty_chain_passes() {
     let ctx = anon_ctx();
-    assert!(guard_call_chain(&ctx, "mod.a", 10).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.a", 10, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 #[test]
 fn guard_single_module_in_chain_passes() {
     let ctx = ctx_with_chain(vec!["mod.a"]);
-    assert!(guard_call_chain(&ctx, "mod.b", 10).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.b", 10, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 #[test]
 fn guard_short_diverse_chain_passes() {
     let ctx = ctx_with_chain(vec!["mod.a", "mod.b"]);
-    assert!(guard_call_chain(&ctx, "mod.c", 10).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.c", 10, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 #[test]
 fn guard_module_repeated_below_limit_passes() {
     // mod.a appears twice; default repeat limit is 3, so one more is allowed.
     let ctx = ctx_with_chain(vec!["mod.a", "mod.b", "mod.a"]);
-    assert!(guard_call_chain(&ctx, "mod.c", 100).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.c", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ fn guard_module_repeated_below_limit_passes() {
 fn guard_depth_exceeded_returns_error() {
     // chain of 4 entries exceeds max_depth=3
     let ctx = ctx_with_chain(vec!["a", "b", "c", "d"]);
-    let result = guard_call_chain(&ctx, "e", 3);
+    let result = guard_call_chain_with_repeat(&ctx, "e", 3, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CallDepthExceeded);
 }
@@ -62,13 +63,13 @@ fn guard_depth_exceeded_returns_error() {
 fn guard_depth_exactly_at_limit_passes() {
     // chain length == max_depth is allowed (guard checks `>`, not `>=`)
     let ctx = ctx_with_chain(vec!["a", "b", "c"]);
-    assert!(guard_call_chain(&ctx, "d", 3).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "d", 3, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 #[test]
 fn guard_depth_one_above_limit_errors() {
     let ctx = ctx_with_chain(vec!["a", "b", "c", "d"]);
-    let result = guard_call_chain(&ctx, "e", 3);
+    let result = guard_call_chain_with_repeat(&ctx, "e", 3, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CallDepthExceeded);
 }
@@ -76,20 +77,20 @@ fn guard_depth_one_above_limit_errors() {
 #[test]
 fn guard_max_depth_one_empty_chain_passes() {
     let ctx = anon_ctx();
-    assert!(guard_call_chain(&ctx, "mod.a", 1).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.a", 1, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 #[test]
 fn guard_max_depth_one_chain_of_one_passes() {
     // chain length == max_depth (1), no violation
     let ctx = ctx_with_chain(vec!["mod.a"]);
-    assert!(guard_call_chain(&ctx, "mod.b", 1).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.b", 1, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 #[test]
 fn guard_max_depth_one_chain_of_two_errors() {
     let ctx = ctx_with_chain(vec!["a", "b"]);
-    let result = guard_call_chain(&ctx, "c", 1);
+    let result = guard_call_chain_with_repeat(&ctx, "c", 1, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CallDepthExceeded);
 }
@@ -102,7 +103,7 @@ fn guard_max_depth_one_chain_of_two_errors() {
 fn guard_circular_call_returns_error() {
     // mod.a -> mod.b -> mod.a: circular
     let ctx = ctx_with_chain(vec!["mod.a", "mod.b", "mod.a"]);
-    let result = guard_call_chain(&ctx, "mod.a", 100);
+    let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CircularCall);
 }
@@ -111,7 +112,7 @@ fn guard_circular_call_returns_error() {
 fn guard_circular_longer_chain_detected() {
     // a -> b -> c -> a is circular when calling a again
     let ctx = ctx_with_chain(vec!["a", "b", "c", "a"]);
-    let result = guard_call_chain(&ctx, "a", 100);
+    let result = guard_call_chain_with_repeat(&ctx, "a", 100, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CircularCall);
 }
@@ -126,7 +127,7 @@ fn guard_frequency_at_default_limit_passes() {
     // includes the trailing self, so exactly 3 occurrences == default limit 3
     // is allowed (3 > 3 is false).
     let ctx = ctx_with_chain(vec!["mod.a", "mod.a", "mod.a"]);
-    assert!(guard_call_chain(&ctx, "mod.a", 100).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
 
 #[test]
@@ -134,7 +135,7 @@ fn guard_frequency_exceeded_returns_error() {
     // mod.a appears 4 times (consecutive, no cycle) — exceeds default
     // max_module_repeat=3 (count 4 > 3).
     let ctx = ctx_with_chain(vec!["mod.a", "mod.a", "mod.a", "mod.a"]);
-    let result = guard_call_chain(&ctx, "mod.a", 100);
+    let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::CallFrequencyExceeded);
 }
@@ -145,9 +146,9 @@ fn guard_frequency_two_occurrences_passes_with_default_limit() {
     let ctx = ctx_with_chain(vec!["mod.a", "mod.b", "mod.a"]);
     // mod.a at chain end would create a cycle; check a different module
     let ctx2 = ctx_with_chain(vec!["mod.a", "mod.b", "mod.a", "mod.c"]);
-    assert!(guard_call_chain(&ctx2, "mod.d", 100).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx2, "mod.d", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok());
     // also: mod.a appears twice; calling mod.a next would be the 3rd occurrence (allowed)
-    let result = guard_call_chain(&ctx, "mod.a", 100);
+    let result = guard_call_chain_with_repeat(&ctx, "mod.a", 100, DEFAULT_MAX_MODULE_REPEAT);
     // This may trigger CircularCall (cycle a->b->a) before FrequencyExceeded
     assert!(result.is_err());
     let code = result.unwrap_err().code;
@@ -223,12 +224,13 @@ fn guard_max_depth_zero_rejected_as_invalid_input() {
     // matching apcore-python and apcore-typescript. The rejection is
     // unconditional — it fires even on an empty chain.
     let ctx = anon_ctx();
-    let err = guard_call_chain(&ctx, "mod.a", 0).expect_err("max_depth=0 is invalid input");
+    let err = guard_call_chain_with_repeat(&ctx, "mod.a", 0, DEFAULT_MAX_MODULE_REPEAT)
+        .expect_err("max_depth=0 is invalid input");
     assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
 }
 
 #[test]
 fn guard_module_name_not_in_chain_passes() {
     let ctx = ctx_with_chain(vec!["x", "y", "z"]);
-    assert!(guard_call_chain(&ctx, "mod.new", 100).is_ok());
+    assert!(guard_call_chain_with_repeat(&ctx, "mod.new", 100, DEFAULT_MAX_MODULE_REPEAT).is_ok());
 }
