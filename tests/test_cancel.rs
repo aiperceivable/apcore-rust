@@ -131,3 +131,78 @@ fn test_check_produces_no_module_id_detail() {
         Some("ns.target")
     );
 }
+
+// ---------------------------------------------------------------------------
+// D-90 (spec v1.49.0) — `reset()` must not substitute the cancellation handle
+// ---------------------------------------------------------------------------
+//
+// This SDK is one of the decision's two AUTHORITIES and had no test for it.
+// The defect the decision is about is apcore-typescript's: `reset()` installed
+// a fresh `AbortController`, so a consumer holding the pre-reset handle was
+// permanently detached and a later `cancel()` could not reach it — invisible to
+// cooperative checkers, which read the current handle and report what the
+// caller expects.
+//
+// Here the handle is the `Arc<AtomicBool>` a `CancelToken` clone shares.
+//
+// The substitution itself is NOT expressible today: `reset(&self)` takes a
+// shared reference, and moving the `Arc` behind an interior-mutable cell does
+// not reproduce the defect either — every clone reads through the same cell, so
+// swapping what it holds is visible to all of them rather than detaching any.
+// Reproducing it needs per-clone state, i.e. `reset(&mut self)` replacing the
+// field, which is a signature change. These tests therefore stand against that
+// future refactor and pin the OBSERVABLE contract apcore-typescript had to be
+// changed to match.
+//
+// They are verified red by the one detachment that IS expressible: a `Clone`
+// impl returning `Self::new()`. All three go red, which is what establishes
+// that they rest on genuine handle sharing rather than on two tokens that
+// happen to agree.
+
+#[test]
+fn a_clone_taken_before_reset_still_observes_a_later_cancel() {
+    let token = CancelToken::new();
+    let held_by_a_module = token.clone();
+
+    token.reset();
+    token.cancel();
+
+    assert!(
+        held_by_a_module.is_cancelled(),
+        "a clone taken before reset must not be detached from the token"
+    );
+    assert!(held_by_a_module.check().is_err());
+}
+
+#[test]
+fn reset_clears_the_flag_for_every_holder() {
+    let token = CancelToken::new();
+    let held_by_a_module = token.clone();
+
+    token.cancel();
+    assert!(held_by_a_module.is_cancelled());
+
+    token.reset();
+    assert!(
+        !held_by_a_module.is_cancelled(),
+        "the cooperative flag is shared, so a reset is visible to every holder"
+    );
+    assert!(held_by_a_module.check().is_ok());
+}
+
+#[test]
+fn control_a_clone_is_not_an_independent_token() {
+    // Without this, both tests above would also pass for a `clone()` that
+    // produced a fresh, unrelated token: it would be un-cancelled after the
+    // reset and un-cancelled after the cancel, satisfying neither assertion by
+    // sharing anything. Cancel through the CLONE and observe it on the
+    // original, which only a shared handle can do.
+    let token = CancelToken::new();
+    let clone = token.clone();
+
+    clone.cancel();
+    assert!(
+        token.is_cancelled(),
+        "cancelling through a clone must reach the original"
+    );
+}
