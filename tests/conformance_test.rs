@@ -2336,7 +2336,17 @@ fn conformance_dependency_version_constraints() {
             modules.push((module_id, deps));
         }
 
-        let result = resolve_dependencies(&modules, None, Some(&versions));
+        // D-79 needs a dependency that is a KNOWN id and absent from the batch
+        // — the only way to stall Kahn's algorithm without a cycle. Cases that
+        // do not declare `known_ids` keep the default.
+        let known: Option<std::collections::HashSet<String>> = tc.get("known_ids").map(|v| {
+            v.as_array()
+                .expect("known_ids is an array")
+                .iter()
+                .map(|x| x.as_str().expect("known id is a string").to_string())
+                .collect()
+        });
+        let result = resolve_dependencies(&modules, known.as_ref(), Some(&versions));
 
         match expected_outcome {
             "ok" => {
