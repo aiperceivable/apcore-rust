@@ -469,9 +469,109 @@ fn unregister_removes_identity() {
         .collect();
     assert_eq!(survivors, vec!["keep"]);
 
-    // And the handle form removes exactly one too.
+    // And the identity form removes the second one too. (This comment used to
+    // say "the handle form"; it does not call it. `unregister_handle` is
+    // covered by `unregister_handle_removes_the_registration_it_was_given`
+    // below and by the unit test in src/extensions.rs.)
     assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(keep)));
     assert_eq!(mgr.count("middleware"), Some(0));
+}
+
+// clause: extension_system.unregister.removes.identity_not_equality
+#[test]
+fn unregister_removes_by_identity_not_equality() {
+    // D-128. apcore-python used `list.remove`, which compares with `__eq__`, so
+    // `unregister(second)` deleted `first`: a host removing the second of two
+    // identically-configured middlewares kept the one it wanted gone and lost
+    // the one it wanted kept, silently. This SDK compares `object_address()`,
+    // which is the behaviour the contract's Inputs row ("identity comparison")
+    // has always required and which apcore-python was corrected to match.
+    //
+    // The two registrations MUST be indistinguishable by value and MUST NOT be
+    // the same allocation, or the test cannot tell the two semantics apart —
+    // which is why `unregister_removes_identity` above, whose two middlewares
+    // carry different names, cannot.
+    let mut mgr = ExtensionManager::new();
+    let first = NamedMiddleware::boxed("same");
+    let second = NamedMiddleware::boxed("same");
+    assert_eq!(first.name(), second.name(), "precondition: equal by value");
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "precondition: distinct allocations"
+    );
+
+    mgr.register("middleware", ExtensionKind::Middleware(Arc::clone(&first)))
+        .expect("register first");
+    mgr.register("middleware", ExtensionKind::Middleware(Arc::clone(&second)))
+        .expect("register second");
+
+    assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(second)));
+
+    let survivors = mgr.get_all("middleware");
+    assert_eq!(survivors.len(), 1);
+    match &survivors[0] {
+        ExtensionKind::Middleware(m) => assert!(
+            Arc::ptr_eq(m, &first),
+            "unregister removed the wrong registration"
+        ),
+        other => panic!("expected middleware, got {other:?}"),
+    }
+}
+
+// clause: extension_system.unregister.removes.equal_unregistered_is_a_no_op
+#[test]
+fn unregister_an_equal_but_unregistered_extension_is_a_no_op() {
+    // Control for the test above: equality alone must not authorise a removal.
+    // Without it, "removal is by identity" is also satisfied by an
+    // implementation that removes the LAST value-equal entry — still wrong, and
+    // still passing whenever only one registration exists.
+    let mut mgr = ExtensionManager::new();
+    let registered = NamedMiddleware::boxed("same");
+    let never_registered = NamedMiddleware::boxed("same");
+
+    mgr.register(
+        "middleware",
+        ExtensionKind::Middleware(Arc::clone(&registered)),
+    )
+    .expect("register");
+
+    assert!(!mgr.unregister("middleware", &ExtensionKind::Middleware(never_registered)));
+    assert_eq!(mgr.count("middleware"), Some(1));
+}
+
+// clause: extension_system.unregister_handle.removes.the_given_registration
+#[test]
+fn unregister_handle_removes_the_registration_it_was_given() {
+    // D-91's reachable removal path, exercised across the crate boundary —
+    // which is the only place the decision's question can be answered, because
+    // a unit test inside the manager's own module can reach state a host
+    // cannot. Two value-equal registrations, so the handle is the ONLY thing
+    // that distinguishes them.
+    let mut mgr = ExtensionManager::new();
+    let first = NamedMiddleware::boxed("same");
+    let second = NamedMiddleware::boxed("same");
+    let _h1 = mgr
+        .register("middleware", ExtensionKind::Middleware(Arc::clone(&first)))
+        .expect("register first");
+    let h2 = mgr
+        .register("middleware", ExtensionKind::Middleware(Arc::clone(&second)))
+        .expect("register second");
+
+    assert!(mgr.unregister_handle(h2));
+    assert!(
+        !mgr.unregister_handle(h2),
+        "a spent handle is a silent no-op"
+    );
+
+    let survivors = mgr.get_all("middleware");
+    assert_eq!(survivors.len(), 1);
+    match &survivors[0] {
+        ExtensionKind::Middleware(m) => assert!(
+            Arc::ptr_eq(m, &first),
+            "unregister_handle removed the wrong registration"
+        ),
+        other => panic!("expected middleware, got {other:?}"),
+    }
 }
 
 // clause: extension_system.unregister.error.missing_is_silent_no_op
