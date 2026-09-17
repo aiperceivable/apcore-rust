@@ -55,6 +55,19 @@ pub struct AuditEntry {
     pub actor_type: String,
     pub trace_id: String,
     pub change: AuditChange,
+    /// Groups the entries a single multi-module operation produced (D-111).
+    ///
+    /// A bulk reload writes one entry PER MODULE, because
+    /// `AuditStore::query(module_id)` filters on a concrete id and cannot find
+    /// an entry keyed on the glob. Per-module entries alone lose the fact that
+    /// they were one deploy, so every entry from one bulk reload carries the
+    /// same correlation id and "what did this deploy touch" stays a single
+    /// query.
+    ///
+    /// Empty for single-target operations, which need no grouping. `#[serde(default)]`
+    /// so a stored entry written before this field existed still deserializes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub correlation_id: String,
 }
 
 /// Storage backend for audit entries.
@@ -141,6 +154,17 @@ pub(crate) fn build_audit_entry(
     ctx: &Context<serde_json::Value>,
     change: AuditChange,
 ) -> AuditEntry {
+    build_correlated_audit_entry(action, target_module_id, ctx, change, String::new())
+}
+
+/// [`build_audit_entry`] with an explicit correlation id (D-111).
+pub(crate) fn build_correlated_audit_entry(
+    action: AuditAction,
+    target_module_id: &str,
+    ctx: &Context<serde_json::Value>,
+    change: AuditChange,
+    correlation_id: String,
+) -> AuditEntry {
     let (actor_id, actor_type) = ctx.identity.as_ref().map_or_else(
         || ("unknown".to_string(), "unknown".to_string()),
         |id| (id.id().to_string(), id.identity_type().to_string()),
@@ -153,6 +177,7 @@ pub(crate) fn build_audit_entry(
         actor_type,
         trace_id: ctx.trace_id.clone(),
         change,
+        correlation_id,
     }
 }
 

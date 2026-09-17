@@ -741,16 +741,30 @@ impl ReloadModule {
             "Bulk module reload"
         );
 
-        let entry = build_audit_entry(
-            AuditAction::ReloadModule,
-            &path_filter,
-            ctx,
-            AuditChange {
-                before: serde_json::Value::Null,
-                after: json!(reloaded.clone()),
-            },
-        );
-        record_audit(self.audit_store.as_ref(), entry).await;
+        // D-111: one entry PER MODULE, not one keyed on the glob.
+        //
+        // `AuditStore::query(module_id)` filters on a concrete id, so an entry
+        // whose `target_module_id` was `executor.*` is unfindable by the
+        // accessor the store exists for — the operation was audited and could
+        // not be looked up.
+        //
+        // Per-module entries alone lose the fact that they were ONE deploy, so
+        // they share a correlation id and "what did this deploy touch" stays a
+        // single query. Generated once, here, rather than per entry.
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        for mid in &reloaded {
+            let entry = crate::sys_modules::audit::build_correlated_audit_entry(
+                AuditAction::ReloadModule,
+                mid,
+                ctx,
+                AuditChange {
+                    before: serde_json::Value::Null,
+                    after: json!(mid),
+                },
+                correlation_id.clone(),
+            );
+            record_audit(self.audit_store.as_ref(), entry).await;
+        }
 
         Ok(json!({
             "success": true,

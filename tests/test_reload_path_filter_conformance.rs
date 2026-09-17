@@ -147,7 +147,10 @@ async fn conformance_reload_path_filter() {
             .collect();
         registry.set_discoverer(Box::new(RestoringDiscoverer { ids: all_ids }));
 
-        let reload = ReloadModule::new(Arc::clone(&registry), Arc::new(EventEmitter::new()));
+        let audit_store: Arc<dyn apcore::sys_modules::audit::AuditStore> =
+            Arc::new(apcore::sys_modules::audit::InMemoryAuditStore::new());
+        let reload = ReloadModule::new(Arc::clone(&registry), Arc::new(EventEmitter::new()))
+            .with_audit_store(Some(Arc::clone(&audit_store)));
         let outcome = reload.execute(tc["input"].clone(), &dummy_ctx()).await;
 
         let expected = tc["expected"]
@@ -206,6 +209,54 @@ async fn conformance_reload_path_filter() {
                         reloaded_set(response)
                     };
                     assert_eq!(actual, want_ids, "[{id}] reloaded_modules_set");
+                }
+                "audit_target_module_ids_set" => {
+                    // D-111. Asserted as a SET of concrete ids rather than a
+                    // count: an aggregate entry keyed on the glob has count 1,
+                    // which a count assertion accepts whenever the glob matches
+                    // one module, and its target is one `query(module_id)` can
+                    // never find.
+                    let mut want_ids: Vec<String> = want
+                        .as_array()
+                        .expect("audit_target_module_ids_set is an array")
+                        .iter()
+                        .map(|v| v.as_str().expect("module id is a string").to_string())
+                        .collect();
+                    want_ids.sort();
+                    let entries = audit_store.query(None, None, None).await.expect("query");
+                    let mut got: Vec<String> =
+                        entries.iter().map(|e| e.target_module_id.clone()).collect();
+                    got.sort();
+                    assert_eq!(got, want_ids, "[{id}] audit targets");
+                    for module_id in &want_ids {
+                        let found = audit_store
+                            .query(Some(module_id), None, None)
+                            .await
+                            .expect("query by module id");
+                        assert_eq!(
+                            found
+                                .iter()
+                                .map(|e| e.target_module_id.clone())
+                                .collect::<Vec<_>>(),
+                            vec![module_id.clone()],
+                            "[{id}] {module_id} is not findable by the accessor the store exists for"
+                        );
+                    }
+                }
+                "audit_correlation_ids_are_equal_and_non_empty" => {
+                    // A property, not a value: the id is generated per call.
+                    // All equal rejects a fresh id per entry, which groups
+                    // nothing; non-empty rejects leaving the field unset.
+                    assert_eq!(want, &serde_json::Value::Bool(true));
+                    let entries = audit_store.query(None, None, None).await.expect("query");
+                    let ids: std::collections::HashSet<&str> =
+                        entries.iter().map(|e| e.correlation_id.as_str()).collect();
+                    assert_eq!(
+                        ids.len(),
+                        1,
+                        "[{id}] entries from one bulk reload must share one id: {ids:?}"
+                    );
+                    assert!(!ids.contains(""), "[{id}] the correlation id must be set");
                 }
                 other => panic!(
                     "[{id}] reload_path_filter.json grew expectation `{other}` that this \
