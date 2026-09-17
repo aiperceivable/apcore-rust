@@ -1661,6 +1661,53 @@ fn conformance_identity_system() {
 // 14. ModuleAnnotations Extra Round-Trip (spec §4.4)
 // ---------------------------------------------------------------------------
 
+/// D-115: a malformed annotation value is dropped, the rest survives.
+///
+/// Returns `true` when the case declared `expected_survivors` and was handled
+/// here. Extracted from the round-trip driver so that driver stays under the
+/// line limit — and because the two assertions answer different questions: the
+/// round-trip cases ask whether a WELL-FORMED value survives the wire, this asks
+/// whether a MALFORMED one is survivable at all.
+///
+/// `expected_deserialized_extra` alone cannot express it: an SDK that rejects
+/// the whole value never reaches the assertion, and one that drops everything
+/// satisfies it.
+fn assert_malformed_value_is_tolerated(id: &str, tc: &Value) -> bool {
+    let Some(survivors) = tc.get("expected_survivors").and_then(Value::as_object) else {
+        return false;
+    };
+    let raw = tc
+        .get("input_serialized")
+        .expect("expected_survivors needs input_serialized");
+    let ann: apcore::module::ModuleAnnotations = serde_json::from_value(raw.clone())
+        .unwrap_or_else(|e| {
+            panic!(
+                "FAIL [{id}]: a malformed annotation value must be dropped, not reject \
+             the whole value: {e}"
+            )
+        });
+    let got = serde_json::to_value(&ann).expect("reserialize");
+    for (field, want) in survivors {
+        assert_eq!(
+            got.get(field.as_str()),
+            Some(want),
+            "FAIL [{id}]: {field} must survive a malformed sibling"
+        );
+    }
+    if let Some(expected_extra) = tc
+        .get("expected_deserialized_extra")
+        .and_then(Value::as_object)
+    {
+        assert_eq!(
+            ann.extra.len(),
+            expected_extra.len(),
+            "FAIL [{id}]: extra should be {expected_extra:?}, got {:?}",
+            ann.extra
+        );
+    }
+    true
+}
+
 #[test]
 fn conformance_annotations_extra_round_trip() {
     use apcore::module::ModuleAnnotations;
@@ -1670,6 +1717,10 @@ fn conformance_annotations_extra_round_trip() {
         let id = tc["id"].as_str().unwrap();
 
         // Cases that use "input" (canonical nested form or producer test).
+        if assert_malformed_value_is_tolerated(id, tc) {
+            continue;
+        }
+
         if let Some(input) = tc.get("input") {
             let annotations: ModuleAnnotations = serde_json::from_value(input.clone())
                 .unwrap_or_else(|e| panic!("FAIL [{id}] deserialize: {e}"));

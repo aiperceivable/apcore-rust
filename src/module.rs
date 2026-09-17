@@ -376,7 +376,21 @@ impl<'de> Deserialize<'de> for ModuleAnnotations {
                         "open_world" => ann.open_world = map.next_value()?,
                         "streaming" => ann.streaming = map.next_value()?,
                         "cacheable" => ann.cacheable = map.next_value()?,
-                        "cache_ttl" => ann.cache_ttl = map.next_value()?,
+                        // D-115: a malformed value is TOLERATED and dropped, the
+                        // rest survives, and it warns. Rejecting removed an
+                        // ENTIRE module over one out-of-range integer, which is
+                        // worse than strict — the declaration is recoverable and
+                        // the module is not.
+                        "cache_ttl" => {
+                            let v: serde_json::Value = map.next_value()?;
+                            ann.cache_ttl = v.as_u64().unwrap_or_else(|| {
+                                tracing::warn!(
+                                    value = %v,
+                                    "cache_ttl must be a non-negative integer; clamping to 0 (D-115)"
+                                );
+                                0
+                            });
+                        }
                         "cache_key_fields" => ann.cache_key_fields = map.next_value()?,
                         "paginated" => ann.paginated = map.next_value()?,
                         "pagination_style" => ann.pagination_style = map.next_value()?,
@@ -387,10 +401,17 @@ impl<'de> Deserialize<'de> for ModuleAnnotations {
                             explicit_extra = Some(match v {
                                 serde_json::Value::Null => HashMap::new(),
                                 serde_json::Value::Object(obj) => obj.into_iter().collect(),
-                                _ => {
-                                    return Err(serde::de::Error::custom(
-                                        "ModuleAnnotations.extra must be an object",
-                                    ))
+                                // D-115: `extra` is declared an object; a
+                                // scalar there is neither an object nor a reason
+                                // to discard the module. Dropped with a warning
+                                // rather than failing the whole
+                                // ModuleDescriptor.
+                                other => {
+                                    tracing::warn!(
+                                        value = %other,
+                                        "ModuleAnnotations.extra must be an object; dropping it (D-115)"
+                                    );
+                                    HashMap::new()
                                 }
                             });
                         }

@@ -226,6 +226,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A malformed annotation value is dropped rather than rejecting the whole value (spec v1.51.0,
+  D-115).** `extra: "oops"` failed deserialization with `ModuleAnnotations.extra must be an object`
+  and `cache_ttl: -5` with `expected u64`, so one bad value removed an entire module — worse than
+  strict, because the declaration is recoverable and the module is not. Both are now dropped with a
+  `tracing::warn!`; a well-formed value is untouched.
+
 - **`MiddlewareManager::remove` / `remove_handle` clear the duplicate-identity entry (spec v1.51.0,
   D-114).** Neither touched `registered_identities`, so `use` / `remove` / `use` — a legitimate swap
   — reported a duplicate against a registration that no longer existed. The entry is cleared only
