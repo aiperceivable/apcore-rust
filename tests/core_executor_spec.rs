@@ -635,3 +635,85 @@ fn global_deadline_side_effect_1_no_serialize() {
     let revived = Context::<Value>::deserialize(serialized).expect("deserialize");
     assert_eq!(revived.global_deadline, None);
 }
+
+// ===========================================================================
+// D-74 / D-75 — boundary values at the entry doors
+// ===========================================================================
+
+// clause: config.get.input.key.empty_is_not_an_error
+#[test]
+fn config_get_empty_key_is_not_an_error() {
+    // D-74. The `Config.get` Inputs row said an empty key "is rejected with
+    // ValueError/ConfigInvalidError". The same block's Errors row said "No
+    // errors raised under normal operation", and no SDK had ever rejected it —
+    // this one's `get` has no error channel at all, so the clause described
+    // behaviour that could not exist here. A conformance case written from it
+    // would have failed on all three.
+    //
+    // "Like any other absent key" is the decision's own wording, so the two
+    // paths are asserted to AGREE rather than each being checked alone: an
+    // implementation short-circuiting on the empty key would still return
+    // `None` and pass a lone `is_none()` assertion.
+    let mut config = Config::default();
+    config.set("a.b", json!(1));
+
+    assert_eq!(config.get(""), None);
+    assert_eq!(config.get(""), config.get("no.such.key"));
+    assert_eq!(config.get_declared(""), config.get_declared("no.such.key"));
+
+    // Control: a present key is unaffected. Without it, an implementation
+    // returning `None` for EVERY key satisfies the assertions above.
+    assert_eq!(config.get("a.b"), Some(json!(1)));
+}
+
+// clause: core_executor.call.input.module_id.over_length
+#[tokio::test]
+async fn call_rejects_an_over_length_module_id_at_the_entry_guard() {
+    // D-75: "Empty / over-length / malformed IDs MUST be rejected before the
+    // pipeline context is constructed." A well-formed but over-length ID used
+    // to pass the entry guard, build a PipelineContext and come back as
+    // MODULE_NOT_FOUND from the registry lookup one step later.
+    //
+    // The discriminator is WHICH code comes back, not that an error comes
+    // back at all: the registry enforces the same bound, so an SDK with no
+    // entry check still fails the call — with the wrong error, from the wrong
+    // layer, after building state the guard exists to avoid.
+    use apcore::registry::registry::MAX_MODULE_ID_LENGTH;
+
+    let executor = make_executor("executor.echo");
+    let over_length = "a".repeat(MAX_MODULE_ID_LENGTH + 1);
+
+    let err = executor
+        .call(&over_length, json!({}), None, None)
+        .await
+        .expect_err("an over-length id must be refused");
+    assert_eq!(
+        err.code,
+        ErrorCode::InvalidModuleId,
+        "the entry guard must report it, not the registry lookup: {}",
+        err.message
+    );
+}
+
+// clause: core_executor.call.input.module_id.at_bound
+#[tokio::test]
+async fn call_accepts_an_id_exactly_at_the_length_bound() {
+    // The bound is inclusive. Without this, "over-length is refused" is also
+    // satisfied by an off-by-one that refuses the bound itself, and the two
+    // outcomes together are what pin the boundary.
+    use apcore::registry::registry::MAX_MODULE_ID_LENGTH;
+
+    let executor = make_executor("executor.echo");
+    let at_bound = "a".repeat(MAX_MODULE_ID_LENGTH);
+
+    let err = executor
+        .call(&at_bound, json!({}), None, None)
+        .await
+        .expect_err("still unregistered, so the lookup refuses it");
+    assert_eq!(
+        err.code,
+        ErrorCode::ModuleNotFound,
+        "an id at the bound must pass the guard and reach the registry: {}",
+        err.message
+    );
+}

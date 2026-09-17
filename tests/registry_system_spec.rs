@@ -943,3 +943,156 @@ async fn get_definition_property_thread_safe() {
         assert_eq!(id, Some("math.add".to_string()));
     }
 }
+
+// ===========================================================================
+// D-86 — `Registry.register` validation order
+// ===========================================================================
+//
+// `registry-system.md` "Side Effects (ordered)" pins it as
+// `module_id` -> structure/streaming -> custom validator -> duplicate:
+// intrinsic-then-extrinsic, because what is wrong with the MODULE must be
+// fixed either way, whereas a duplicate id may only mean the author picked the
+// wrong name. This SDK's order is the one the decision adopted, and it had no
+// test for it; apcore-python pinned it, apcore-typescript did not.
+//
+// Each test makes TWO checks fail at once and asserts which is reported. That
+// is the entire discriminator: a test tripping one check at a time passes under
+// every ordering, including the three the SDKs actually shipped.
+
+/// Declares `streaming: true` and implements no streaming interface.
+#[derive(Debug)]
+struct StreamingLiar;
+
+#[async_trait]
+impl Module for StreamingLiar {
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn description(&self) -> &'static str {
+        "Claims to stream"
+    }
+    fn annotations(&self) -> apcore::module::ModuleAnnotations {
+        let mut ann = apcore::module::ModuleAnnotations::default();
+        ann.streaming = true;
+        ann
+    }
+    async fn execute(&self, _i: Value, _c: &Context<Value>) -> Result<Value, ModuleError> {
+        Ok(json!({}))
+    }
+}
+
+#[derive(Debug)]
+struct RejectAllValidator;
+
+impl apcore::registry::registry::ModuleValidator for RejectAllValidator {
+    fn validate(
+        &self,
+        _module: &dyn Module,
+        _descriptor: Option<&ModuleDescriptor>,
+    ) -> apcore::module::ValidationResult {
+        let mut result = apcore::module::ValidationResult::default();
+        result.valid = false;
+        result.errors = vec![apcore::module::ValidationErrorDetail::message_only(
+            "rejected by the custom validator",
+        )];
+        result
+    }
+}
+
+// clause: registry_system.register.order.structure_before_validator
+#[test]
+fn register_reports_structure_before_the_custom_validator() {
+    let reg = Registry::new();
+    reg.set_validator(Box::new(RejectAllValidator));
+
+    let err = reg
+        .register_module("order.streaming_and_validator", Box::new(StreamingLiar))
+        .expect_err("both checks fail");
+    assert_eq!(err.code, ErrorCode::StreamingInterfaceMismatch, "{err:?}");
+}
+
+// clause: registry_system.register.order.structure_before_duplicate
+#[test]
+fn register_reports_structure_before_the_duplicate_check() {
+    // Malformed, validator-rejected AND duplicate at once: structure wins.
+    let reg = Registry::new();
+    reg.register_module("order.all_three", Box::new(SpecModule::new()))
+        .expect("incumbent registers");
+    reg.set_validator(Box::new(RejectAllValidator));
+
+    let err = reg
+        .register_module("order.all_three", Box::new(StreamingLiar))
+        .expect_err("all three checks fail");
+    assert_eq!(err.code, ErrorCode::StreamingInterfaceMismatch, "{err:?}");
+
+    // The incumbent registration is untouched — a rejected register must not
+    // have removed or replaced what was already there.
+    assert!(reg.get("order.all_three").expect("lookup").is_some());
+}
+
+// clause: registry_system.register.order.validator_before_duplicate
+#[test]
+fn register_reports_the_custom_validator_before_the_duplicate_check() {
+    let reg = Registry::new();
+    reg.register_module("order.validator_and_dup", Box::new(SpecModule::new()))
+        .expect("incumbent registers");
+    reg.set_validator(Box::new(RejectAllValidator));
+
+    let err = reg
+        .register_module("order.validator_and_dup", Box::new(SpecModule::new()))
+        .expect_err("both checks fail");
+    assert_eq!(err.code, ErrorCode::ModuleLoadError, "{err:?}");
+}
+
+// clause: registry_system.register.order.module_id_first
+#[test]
+fn register_reports_the_module_id_before_everything_else() {
+    let reg = Registry::new();
+    reg.set_validator(Box::new(RejectAllValidator));
+
+    let err = reg
+        .register_module("Not A Valid Id", Box::new(StreamingLiar))
+        .expect_err("id, structure and validator all fail");
+    assert_eq!(err.code, ErrorCode::InvalidModuleId, "{err:?}");
+}
+
+// clause: registry_system.register.order.each_check_fires_alone
+#[test]
+fn control_each_register_check_still_fires_on_its_own() {
+    // Without this, "structure wins" is also satisfied by an implementation
+    // reporting StreamingInterfaceMismatch for everything, and "validator
+    // wins" by one that never reaches the duplicate check at all.
+    let structure_only = Registry::new();
+    assert_eq!(
+        structure_only
+            .register_module("order.stream_only", Box::new(StreamingLiar))
+            .expect_err("structure alone")
+            .code,
+        ErrorCode::StreamingInterfaceMismatch
+    );
+
+    let validator_only = Registry::new();
+    validator_only.set_validator(Box::new(RejectAllValidator));
+    assert_eq!(
+        validator_only
+            .register_module("order.validator_only", Box::new(SpecModule::new()))
+            .expect_err("validator alone")
+            .code,
+        ErrorCode::ModuleLoadError
+    );
+
+    let duplicate_only = Registry::new();
+    duplicate_only
+        .register_module("order.dup_only", Box::new(SpecModule::new()))
+        .expect("incumbent");
+    assert_eq!(
+        duplicate_only
+            .register_module("order.dup_only", Box::new(SpecModule::new()))
+            .expect_err("duplicate alone")
+            .code,
+        ErrorCode::DuplicateModuleId
+    );
+}
