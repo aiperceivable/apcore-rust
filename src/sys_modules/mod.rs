@@ -730,6 +730,11 @@ pub fn register_sys_modules_with_options(
                 requires_approval: is_control,
                 readonly: !is_control,
                 idempotent: !is_control,
+                // D-119: written out rather than inherited. `Default` gives
+                // `open_world: true`, which means the OPPOSITE of the intended
+                // value — no system module reaches an external system — and
+                // relying on that default is how the divergence arose.
+                open_world: false,
                 ..Default::default()
             }),
             examples: vec![],

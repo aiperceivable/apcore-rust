@@ -226,6 +226,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every `system.*` module declares `open_world: false` (spec v1.51.0, D-119).** The descriptor
+  built by `register_sys_modules` took `..Default::default()`, which gives `open_world: true` — the
+  OPPOSITE of the intended value, since no system module reaches an external system. Written out
+  explicitly now; relying on a default that means the opposite is how the divergence arose, and is
+  the second half of the decision. D-110 needed no change here — this SDK already returned
+  `"apcore"`, and the case is what stops that regressing.
+
 - **A malformed dependency constraint is reported as malformed, not as a version mismatch (spec
   v1.49.0, D-85).** D-85 was implemented in `try_matches_version_hint`, which reports
   `VERSION_CONSTRAINT_INVALID` for an operand that does not start with a digit — and

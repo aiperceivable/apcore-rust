@@ -704,6 +704,9 @@ const COVERED_CASE_IDS: &[&str] = &[
     "startup_fail_on_error_false_continues",
     "rust_register_returns_result",
     "reload_order_is_topological_not_alphabetical",
+    "manifest_full_project_name_defaults_to_apcore",
+    "health_summary_project_name_agrees_with_manifest_full",
+    "system_modules_declare_open_world_false",
 ];
 
 #[test]
@@ -1376,4 +1379,122 @@ impl apcore::registry::registry::Discoverer for HardeningRestoringDiscoverer {
             })
             .collect())
     }
+}
+
+// ---------------------------------------------------------------------------
+// D-110 / D-119 — v1.51.0 policy decisions
+// ---------------------------------------------------------------------------
+//
+// Both are decisions where the spec was silent and each SDK had answered
+// reasonably, so the assertions come from the fixture rather than from what any
+// implementation happens to do.
+
+/// Case `manifest_full_project_name_defaults_to_apcore`.
+#[tokio::test]
+async fn case_manifest_full_project_name_defaults_to_apcore() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "manifest_full_project_name_defaults_to_apcore");
+
+    let registry = Arc::new(Registry::new());
+    let config = Arc::new(tokio::sync::Mutex::new(Config::default()));
+    let out = apcore::sys_modules::ManifestFullModule::new(registry, config)
+        .execute(json!({}), &Context::<Value>::anonymous())
+        .await
+        .expect("manifest.full");
+
+    assert_eq!(
+        out["project_name"].as_str(),
+        case["expected"]["project_name"].as_str(),
+        "D-110: project_name when `project.name` is unset"
+    );
+}
+
+/// Case `health_summary_project_name_agrees_with_manifest_full`.
+///
+/// The pairing IS the decision. `manifest.full` alone could be satisfied while
+/// the two system modules still disagreed, which is the state D-110 removes.
+#[tokio::test]
+async fn case_health_summary_project_name_agrees_with_manifest_full() {
+    let fixture = load_fixture();
+    let case = fixture_case(
+        &fixture,
+        "health_summary_project_name_agrees_with_manifest_full",
+    );
+
+    let registry = Arc::new(Registry::new());
+    let config = Arc::new(tokio::sync::Mutex::new(Config::default()));
+    let summary = apcore::sys_modules::HealthSummaryModule::new(
+        Arc::clone(&registry),
+        None,
+        apcore::observability::error_history::ErrorHistory::new(100),
+        Arc::clone(&config),
+    )
+    .execute(json!({}), &Context::<Value>::anonymous())
+    .await
+    .expect("health.summary");
+    let manifest = apcore::sys_modules::ManifestFullModule::new(registry, config)
+        .execute(json!({}), &Context::<Value>::anonymous())
+        .await
+        .expect("manifest.full");
+
+    assert_eq!(
+        summary["project"]["name"].as_str(),
+        case["expected"]["project_name"].as_str()
+    );
+    assert_eq!(
+        summary["project"]["name"].as_str(),
+        manifest["project_name"].as_str(),
+        "health.summary and manifest.full must not disagree about the same fact"
+    );
+}
+
+/// Case `system_modules_declare_open_world_false`.
+///
+/// Reads `get_definition().annotations`, which is the surface
+/// `system.manifest.*` publishes and the one shape all three SDKs share — not a
+/// per-language class attribute. The second half of the decision is that the
+/// value is written out rather than inherited: `ModuleAnnotations::default()`
+/// gives `open_world: true`, which means the opposite of the intended value.
+#[tokio::test]
+async fn case_system_modules_declare_open_world_false() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "system_modules_declare_open_world_false");
+
+    let registry = Arc::new(Registry::new());
+    let executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+    let mut config = Config::default();
+    config.set("sys_modules.enabled", json!(true));
+    config.set("sys_modules.control.enabled", json!(true));
+    apcore::sys_modules::register_sys_modules(Arc::clone(&registry), &executor, &config, None)
+        .expect("register sys modules");
+
+    let system_ids: Vec<String> = registry
+        .list(None, None, Some(&["public", "hidden"]))
+        .into_iter()
+        .filter(|id| id.starts_with("system."))
+        .collect();
+    let at_least = usize::try_from(case["expected"]["at_least"].as_u64().unwrap()).unwrap();
+    assert!(
+        system_ids.len() >= at_least,
+        "no system modules registered; the case would pass vacuously"
+    );
+
+    let want = case["expected"]["every_value"].as_bool().unwrap();
+    let wrong: Vec<(String, Option<bool>)> = system_ids
+        .iter()
+        .map(|id| {
+            let ow = registry
+                .get_definition(id)
+                .ok()
+                .flatten()
+                .and_then(|d| d.annotations)
+                .map(|a| a.open_world);
+            (id.clone(), ow)
+        })
+        .filter(|(_, ow)| *ow != Some(want))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "these system modules do not declare open_world={want}: {wrong:?}"
+    );
 }
