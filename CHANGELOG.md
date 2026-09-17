@@ -226,6 +226,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A malformed dependency constraint is reported as malformed, not as a version mismatch (spec
+  v1.49.0, D-85).** D-85 was implemented in `try_matches_version_hint`, which reports
+  `VERSION_CONSTRAINT_INVALID` for an operand that does not start with a digit — and
+  `resolve_dependencies` called the NON-fallible `matches_version_hint`, which fails closed to
+  `false` and was then reported as `DEPENDENCY_VERSION_MISMATCH`. An operator who typed `v1.0.0`
+  against an actual `1.0.0` was told the versions did not satisfy each other, about versions that
+  are identical; `latest` produced the same misdirection. Both peers surface
+  `VERSION_CONSTRAINT_INVALID` from this path with the offending constraint and the rule it broke.
+  A malformed constraint is **not** downgraded for an optional dependency either — `optional` means
+  the dependency may be absent, not that the declaration may be nonsense.
+
+  *Found by `conformance/decision_coverage.json`: two cases added to
+  `dependency_version_constraints.json` came back red here. The decision was implemented at the
+  wrong layer, which is invisible from the layer that has it.*
+
 - **`ErrorCode::TaskStoreUnavailable` exists and is framework-reserved (spec v1.50.0,
   async-tasks.md, D-92).** D-92 required all three SDKs to define, register and export the type; it
   landed in apcore-python alone, and this SDK never had it — `TASK_STORE_UNAVAILABLE` appeared

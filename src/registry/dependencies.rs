@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::errors::{ErrorCode, ModuleError};
 use crate::registry::types::DepInfo;
-use crate::registry::version::matches_version_hint;
+use crate::registry::version::try_matches_version_hint;
 
 /// Resolve module load order using Kahn's topological sort.
 ///
@@ -169,8 +169,21 @@ fn check_version_constraint(
         );
         return VersionCheck::Ok;
     };
-    if matches_version_hint(actual, constraint) {
-        return VersionCheck::Ok;
+    // The FALLIBLE form (D-85). `matches_version_hint` fails closed to `false`
+    // for a malformed constraint, and reporting that `false` from here turns
+    // "your constraint is not a version" into "your versions do not line up" —
+    // so an operator who typed `latest` or `v1.0.0` is sent to look at versions.
+    // apcore-python and apcore-typescript both surface VERSION_CONSTRAINT_INVALID
+    // from this path, naming the rule the operand broke.
+    //
+    // A malformed constraint is NOT downgraded for an optional dependency
+    // either: `optional` means "this dependency may be absent", not "this
+    // declaration may be nonsense", and skipping the edge would leave the typo
+    // in place and silent.
+    match try_matches_version_hint(actual, constraint) {
+        Ok(true) => return VersionCheck::Ok,
+        Ok(false) => {}
+        Err(err) => return VersionCheck::Err(err),
     }
     if dep.optional {
         tracing::warn!(
