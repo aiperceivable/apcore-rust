@@ -450,5 +450,23 @@ async fn conformance_contextual_audit() {
                 );
             }
         }
+
+        // D-118 needs key ABSENCE inside the identity snapshot, which
+        // `data_contains` cannot express: it is a SUBSET match, so an extra
+        // `roles: []` passes it, and asserting `roles: []` is exactly what the
+        // diverging SDK emits.
+        if let Some(forbidden) = expected
+            .get("identity_must_not_contain_keys")
+            .and_then(Value::as_array)
+        {
+            let identity = evt.data.get("identity").cloned().unwrap_or(Value::Null);
+            for key in forbidden {
+                let key_str = key.as_str().unwrap();
+                assert!(
+                    identity.get(key_str).is_none(),
+                    "FAIL [{id}]: identity snapshot MUST NOT contain key {key_str:?}; identity={identity}"
+                );
+            }
+        }
     }
 }
