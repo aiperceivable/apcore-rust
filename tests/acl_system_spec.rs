@@ -784,6 +784,21 @@ fn conditional_deny(target: &str) -> ACLRule {
     r
 }
 
+/// A conditional `deny` rule matching EVERY target, distinguished only by the
+/// role it names.
+///
+/// The index-collision shape D-88 is about needs every rule evaluated on one
+/// `check`, so that removing rule 0 leaves the survivor sitting on an index a
+/// marker was already recorded for. Rules with distinct targets do not collide
+/// — the survivor lands on an index nobody warned about and warns whether or
+/// not the dedupe was cleared, which is a test that reads as coverage and
+/// proves nothing.
+fn conditional_deny_role(role: &str) -> ACLRule {
+    let mut r = rule(&["*"], &["*"], "deny");
+    r.conditions = Some(serde_json::json!({ "roles": [role] }));
+    r
+}
+
 // clause: acl_system.check.warning.conditions_without_context_is_deduped
 #[test]
 fn check_warning_conditions_without_context_is_deduped() {
@@ -842,8 +857,18 @@ fn add_rule_clears_missing_context_dedupe() {
 #[test]
 fn remove_rule_clears_missing_context_dedupe() {
     // D-88: removing rule `i` shifts every rule after it up by one.
+    //
+    // This test used to use two rules with DIFFERENT targets, so one `check`
+    // evaluated one of them and the survivor moved onto an index nobody had
+    // warned about. It passed with the clear removed — the right name, the
+    // right comment, and no discriminating power. Both rules match every
+    // target now, so one `check` marks index 0 AND index 1, and the survivor
+    // inherits a marked index.
     let mut acl = ACL::new(
-        vec![conditional_deny("db.orders"), conditional_deny("db.users")],
+        vec![
+            conditional_deny_role("admin"),
+            conditional_deny_role("operator"),
+        ],
         "allow",
         None,
     );
@@ -851,9 +876,17 @@ fn remove_rule_clears_missing_context_dedupe() {
     let (_, first) = capture_logs(|| {
         let _ = acl.check(Some("api.x"), "db.users", None);
     });
-    assert_eq!(missing_context_warnings(&first), 1);
+    assert_eq!(
+        missing_context_warnings(&first),
+        2,
+        "both rules warn: {first}"
+    );
 
-    assert!(acl.remove_rule(&["*".to_string()], &["db.orders".to_string()],));
+    assert!(acl.remove_rule_with_conditions(
+        &["*".to_string()],
+        &["*".to_string()],
+        Some(&serde_json::json!({ "roles": ["admin"] })),
+    ));
 
     let (_, after_remove) = capture_logs(|| {
         let _ = acl.check(Some("api.x"), "db.users", None);
@@ -861,6 +894,31 @@ fn remove_rule_clears_missing_context_dedupe() {
     assert_eq!(
         missing_context_warnings(&after_remove),
         1,
-        "remove_rule must clear the index-keyed dedupe: {after_remove}"
+        "the survivor moved from index 1 to index 0; without the clear the \
+         REMOVED rule's marker silences it: {after_remove}"
+    );
+}
+
+// clause: acl_system.remove_rule.side_effect.failed_remove_keeps_dedupe
+#[test]
+fn a_remove_that_removed_nothing_does_not_have_to_clear() {
+    // Separates "clears correctly" from "clears unconditionally": the latter
+    // re-warns on every failed lookup, which is the spam D-88 exists to bound.
+    let mut acl = ACL::new(vec![conditional_deny_role("admin")], "allow", None);
+
+    let (_, first) = capture_logs(|| {
+        let _ = acl.check(Some("api.x"), "db.users", None);
+    });
+    assert_eq!(missing_context_warnings(&first), 1);
+
+    assert!(!acl.remove_rule(&["nobody".to_string()], &["*".to_string()]));
+
+    let (_, after) = capture_logs(|| {
+        let _ = acl.check(Some("api.x"), "db.users", None);
+    });
+    assert_eq!(
+        missing_context_warnings(&after),
+        0,
+        "no rule removed means no index shifted: {after}"
     );
 }

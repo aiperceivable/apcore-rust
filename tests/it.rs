@@ -399,3 +399,6 @@ mod test_executor_async_acl_path;
 
 #[path = "test_global_deadline_lifetime.rs"]
 mod test_global_deadline_lifetime;
+
+#[path = "test_deprecation_warning_cadence.rs"]
+mod test_deprecation_warning_cadence;
