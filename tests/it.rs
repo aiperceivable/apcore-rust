@@ -405,3 +405,6 @@ mod test_deprecation_warning_cadence;
 
 #[path = "test_registry_describe_d77.rs"]
 mod test_registry_describe_d77;
+
+#[path = "test_reload_dependents_deprecation.rs"]
+mod test_reload_dependents_deprecation;

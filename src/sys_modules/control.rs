@@ -278,6 +278,13 @@ pub struct ReloadModule {
     emitter: Arc<EventEmitter>,
     audit_store: Option<Arc<dyn AuditStore>>,
     config: Option<Arc<Mutex<Config>>>,
+    /// Once per INSTANCE, not per process (D-121). `reload` is called by
+    /// hot-reload loops and watchers, so an advisory whose volume is
+    /// proportional to traffic is one operators learn to filter out — the
+    /// cadence reasoning D-89 settled. Per instance rather than per process for
+    /// the reason D-90's notice is per token: a process-wide one-shot tells the
+    /// first caller and leaves every later one to discover it in production.
+    reload_dependents_warned: std::sync::atomic::AtomicBool,
 }
 
 impl ReloadModule {
@@ -287,7 +294,41 @@ impl ReloadModule {
             emitter,
             audit_store: None,
             config: None,
+            reload_dependents_warned: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Warn once that `reload_dependents` is ignored and will be removed (D-121).
+    ///
+    /// The field was declared in all three SDKs' input schemas and read by
+    /// none — a spec MUST that no implementation satisfied, which is the
+    /// §9.1.3 "declared surface reaches no mechanism" shape applied to a module
+    /// input field. Three independent implementations skipping it is the
+    /// evidence the maintainer decision rests on.
+    ///
+    /// Deprecated rather than removed now, because the input schema sets
+    /// `additionalProperties: false`: at 2.0 the same call stops being a silent
+    /// no-op and becomes a validation error, so a caller passing it today needs
+    /// a release in which they are told.
+    fn warn_reload_dependents(&self, inputs: &serde_json::Value) {
+        if inputs
+            .get("reload_dependents")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return;
+        }
+        if self
+            .reload_dependents_warned
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        tracing::warn!(
+            "system.control.reload: 'reload_dependents' is ignored and will be removed at 2.0 \
+             (spec D-121). No SDK has ever implemented it. Use a 'path_filter' that also matches \
+             the dependents; after removal this field becomes a validation error, not a no-op."
+        );
     }
 
     #[must_use]
@@ -733,7 +774,16 @@ impl Module for ReloadModule {
             "properties": {
                 "module_id":         {"type": "string"},
                 "path_filter":       {"type": "string"},
-                "reload_dependents": {"type": "boolean", "default": false},
+                "reload_dependents": {
+                    "type": "boolean",
+                    "default": false,
+                    "deprecated": true,
+                    "description": "DEPRECATED (spec v1.51.0, D-121) — ignored, and removed at 2.0. \
+        Declared in all three SDKs and implemented by none, so no caller could ever rely on it. Use an \
+        explicit path_filter that also matches the dependents. At 2.0 this field is REMOVED and, because \
+        this schema sets additionalProperties: false, passing it becomes a validation error rather than a \
+        silent no-op."
+                },
                 "reload_config":     {"type": "boolean", "default": false},
                 "reason":            {"type": "string"}
             }
@@ -759,6 +809,7 @@ impl Module for ReloadModule {
         inputs: serde_json::Value,
         ctx: &Context<serde_json::Value>,
     ) -> Result<serde_json::Value, ModuleError> {
+        self.warn_reload_dependents(&inputs);
         let reason = require_string(&inputs, "reason")?;
 
         let module_id_input = inputs
