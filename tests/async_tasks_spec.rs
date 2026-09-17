@@ -835,13 +835,32 @@ async fn async_tasks_save_property_idempotent() {
 }
 
 // clause: async_tasks.save.error.TASK_STORE_UNAVAILABLE
-// MISSING SYMBOL: no TaskStoreError class / TASK_STORE_UNAVAILABLE error code
-// exists in apcore-rust; InMemoryTaskStore MUST NOT raise it, and no
-// network-backed store ships yet (contract gap — mirrors the Python skip).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "async_tasks.save.error.TASK_STORE_UNAVAILABLE: missing symbol TaskStoreError/TASK_STORE_UNAVAILABLE (contract gap)"]
 async fn async_tasks_save_error_task_store_unavailable() {
-    panic!("unreachable — ignored: TASK_STORE_UNAVAILABLE is absent from this SDK");
+    // This test was `#[ignore]`d with the reason "missing symbol
+    // TaskStoreError/TASK_STORE_UNAVAILABLE (contract gap)" — true when it was
+    // written, and made false by D-92, which required all three SDKs to define
+    // and export the type. Nothing turned red when the gap closed, because a
+    // disabled test explaining why something cannot be tested keeps explaining
+    // it after it can.
+    let store = InMemoryTaskStore::new();
+    let info = make_task_info("t1", "test.echo", TaskStatus::Pending, 1.0, None, None);
+
+    // The bundled in-memory store cannot fail, so it MUST NOT raise it.
+    store
+        .save(&info)
+        .await
+        .expect("the in-memory store cannot be unavailable");
+
+    // A network-backed store has one canonical code to raise, and it survives
+    // the manager's error channel unchanged.
+    let err = ModuleError::task_store_unavailable("save", "connection refused");
+    assert_eq!(err.code, ErrorCode::TaskStoreUnavailable);
+    assert!(
+        err.message.contains("save") && err.message.contains("connection refused"),
+        "operation and reason must reach the caller: {}",
+        err.message
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,9 +1203,14 @@ impl FlakyStore {
 
     fn outage(&self) -> Result<(), ModuleError> {
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            // The CANONICAL code D-92 requires the SDK to define. This store
+            // used to raise `GeneralInternalError` with the string in its
+            // message, which is what a host would have had to do before D-92
+            // landed — and which left the whole D-81 suite green against a
+            // manager that swallowed `TaskStoreUnavailable` specifically.
             return Err(ModuleError::new(
-                ErrorCode::GeneralInternalError,
-                "TASK_STORE_UNAVAILABLE: backing store is unreachable",
+                ErrorCode::TaskStoreUnavailable,
+                "backing store is unreachable",
             ));
         }
         Ok(())
@@ -1242,22 +1266,67 @@ async fn async_tasks_store_error_reaches_the_caller() {
 
     store.go_down();
 
-    assert!(
-        manager.get_status(&task_id).is_err(),
-        "an unreachable store must not read as 'task not found'"
+    // Assert the CODE, not merely `is_err()`. A manager that maps the store's
+    // outage onto some other error still hides which failure the caller is
+    // looking at, and — the case that actually escaped — `is_err()` stays true
+    // against a manager that swallows `TaskStoreUnavailable` specifically
+    // while re-raising everything else, because the old FlakyStore raised
+    // `GeneralInternalError`.
+    fn unavailable(what: &str, r: Result<impl std::fmt::Debug, ModuleError>) {
+        match r {
+            Err(e) => assert_eq!(
+                e.code,
+                ErrorCode::TaskStoreUnavailable,
+                "{what} must propagate the store's own code"
+            ),
+            Ok(v) => panic!("{what} absorbed a store outage into {v:?}"),
+        }
+    }
+
+    unavailable("get_status", manager.get_status(&task_id));
+    unavailable("get_status_async", manager.get_status_async(&task_id).await);
+    unavailable("get_result", manager.get_result(&task_id));
+    unavailable("get_result_async", manager.get_result_async(&task_id).await);
+    unavailable("list_tasks", manager.list_tasks(None));
+    unavailable("task_count", manager.task_count());
+    unavailable("cleanup", manager.cleanup(0.0));
+    unavailable("cancel", manager.cancel(&task_id).await);
+    unavailable(
+        "submit",
+        manager
+            .submit("test.slow", json!({"delay": 1.0}), None)
+            .await,
     );
-    assert!(manager.get_result(&task_id).is_err());
-    assert!(
-        manager.list_tasks(None).is_err(),
-        "an unreachable store must not read as 'no tasks'"
+    unavailable("shutdown", manager.shutdown().await);
+}
+
+/// Control for `async_tasks_store_error_reaches_the_caller`: with the store
+/// healthy, every one of those methods succeeds. Without it, "they all
+/// returned Err" would also be satisfied by a manager that fails everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn async_tasks_store_error_control_healthy_store_succeeds() {
+    let store = Arc::new(FlakyStore::new());
+    let manager = AsyncTaskManager::with_store(
+        make_executor(),
+        4,
+        100,
+        Arc::clone(&store) as Arc<dyn TaskStore>,
     );
-    assert!(manager.task_count().is_err());
-    assert!(manager.cleanup(0.0).is_err());
-    assert!(
-        manager.cancel(&task_id).await.is_err(),
-        "cancel must not report success for a save that never landed"
-    );
-    assert!(manager.shutdown().await.is_err());
+    let task_id = manager
+        .submit("test.slow", json!({"delay": 1.0}), None)
+        .await
+        .expect("submit");
+
+    manager.get_status(&task_id).expect("get_status");
+    manager
+        .get_status_async(&task_id)
+        .await
+        .expect("get_status_async");
+    manager.list_tasks(None).expect("list_tasks");
+    manager.task_count().expect("task_count");
+    manager.cleanup(0.0).expect("cleanup");
+    manager.cancel(&task_id).await.expect("cancel");
+    manager.shutdown().await.expect("shutdown");
 }
 
 // clause: async_tasks.list_tasks.return.insertion_order
