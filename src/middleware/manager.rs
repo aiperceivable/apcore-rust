@@ -64,6 +64,11 @@ pub struct MiddlewareManager {
     /// and `remove(name)` drops the first in pipeline order rather than the one
     /// the caller holds (sync finding A-C-001).
     handles: Mutex<Vec<MiddlewareHandle>>,
+    /// The identity `add_with_opts` computed for each registration, parallel to
+    /// `handles`, so `remove` / `remove_handle` can clear the right entry
+    /// (D-114). The identity depends on an optional `identity_key` override
+    /// that is an option of the call and is not recoverable from the instance.
+    identities: Mutex<Vec<String>>,
     next_handle: AtomicU64,
     /// Tracks identity -> first registration location hint for duplicate detection.
     registered_identities: Mutex<HashMap<String, String>>,
@@ -89,6 +94,7 @@ impl MiddlewareManager {
         Self {
             middlewares: Mutex::new(vec![]),
             handles: Mutex::new(vec![]),
+            identities: Mutex::new(vec![]),
             next_handle: AtomicU64::new(0),
             registered_identities: Mutex::new(HashMap::new()),
         }
@@ -200,11 +206,12 @@ impl MiddlewareManager {
                     }
                 }
                 None => {
-                    ids.insert(identity, location);
+                    ids.insert(identity.clone(), location);
                 }
             }
         }
 
+        self.identities.lock().push(identity);
         self.add(Box::new(opts.middleware))
     }
 
@@ -237,7 +244,32 @@ impl MiddlewareManager {
         };
         mws.remove(i);
         self.handles.lock().remove(i);
+        self.forget_identity_at(i);
         true
+    }
+
+    /// Drop the duplicate-identity entry for the registration at `index`,
+    /// unless another registration still holds the same identity (D-114).
+    ///
+    /// The registry records the FIRST registration so a later duplicate can be
+    /// traced back to it; leaving the entry behind corrupts that record in both
+    /// directions. It names a registration that no longer exists, and
+    /// `use` / `remove` / `use` — a legitimate swap — warns about a duplicate
+    /// that is not one, which is how an operator learns to ignore the warning
+    /// that will next fire for a real one.
+    ///
+    /// Duplicate registration warns but succeeds, so two instances sharing an
+    /// identity is a reachable state: removing one must not make the survivor
+    /// invisible to duplicate detection.
+    fn forget_identity_at(&self, index: usize) {
+        let mut identities = self.identities.lock();
+        if index >= identities.len() {
+            return;
+        }
+        let identity = identities.remove(index);
+        if !identities.contains(&identity) {
+            self.registered_identities.lock().remove(&identity);
+        }
     }
 
     /// Remove exactly the middleware that [`Self::add`] returned `handle` for.
@@ -258,6 +290,8 @@ impl MiddlewareManager {
         };
         handles.remove(i);
         self.middlewares.lock().remove(i);
+        drop(handles);
+        self.forget_identity_at(i);
         true
     }
 

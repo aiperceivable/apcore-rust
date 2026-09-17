@@ -226,6 +226,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`MiddlewareManager::remove` / `remove_handle` clear the duplicate-identity entry (spec v1.51.0,
+  D-114).** Neither touched `registered_identities`, so `use` / `remove` / `use` — a legitimate swap
+  — reported a duplicate against a registration that no longer existed. The entry is cleared only
+  when no OTHER registration still holds the same identity, which is reachable because duplicate
+  registration warns but succeeds. The identity is now remembered per registration, parallel to
+  `handles`, since it depends on an optional `identity_key` that is an option of the call rather
+  than a property of the instance.
+
 - **Every `system.*` module declares `open_world: false` (spec v1.51.0, D-119).** The descriptor
   built by `register_sys_modules` took `..Default::default()`, which gives `open_world: true` — the
   OPPOSITE of the intended value, since no system module reaches an external system. Written out

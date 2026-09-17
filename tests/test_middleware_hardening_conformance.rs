@@ -516,3 +516,131 @@ fn conformance_async_detection_coroutine_function() {
 }
 
 fn assert_async_signatures<M: Middleware>() {}
+
+// ---------------------------------------------------------------------------
+// D-114 — `remove` clears the duplicate-identity entry
+// ---------------------------------------------------------------------------
+//
+// The registry records the FIRST registration so a later duplicate can be traced
+// back to it. A stale entry corrupts that record in both directions: it names a
+// registration that no longer exists, and `use` / `remove` / `use` — a
+// legitimate swap — warns about a duplicate that is not one, which is how an
+// operator learns to ignore the warning that will next fire for a real one.
+//
+// Observed through `identity_registered`, which is the public accessor for the
+// duplicate-detection state. Counting log lines would pin the tracing setup
+// rather than the decision, and the fixture states the count because the peers
+// have no such accessor.
+
+#[derive(Debug)]
+struct IdentityProbeMiddleware;
+
+#[async_trait]
+impl apcore::middleware::Middleware for IdentityProbeMiddleware {
+    fn name(&self) -> &str {
+        "audit"
+    }
+
+    // The hooks are never invoked: this probe exists to occupy a slot in the
+    // duplicate-identity registry, which is what the decision is about.
+    async fn before(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(None)
+    }
+
+    async fn after(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        _output: Value,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(None)
+    }
+
+    async fn on_error(
+        &self,
+        _module_id: &str,
+        _inputs: Value,
+        _error: &ModuleError,
+        _ctx: &Context<Value>,
+    ) -> Result<Option<Value>, ModuleError> {
+        Ok(None)
+    }
+}
+
+fn identity_probe_manager() -> apcore::middleware::MiddlewareManager {
+    apcore::middleware::MiddlewareManager::new()
+}
+
+/// A registration with an EXPLICIT identity key, so the two probe registrations
+/// share an identity the way two instances of one middleware type would.
+fn identity_probe_registration(
+) -> apcore::middleware::MiddlewareRegistration<IdentityProbeMiddleware> {
+    let mut reg = apcore::middleware::MiddlewareRegistration::new(IdentityProbeMiddleware);
+    reg.identity_key = Some("audit".to_string());
+    reg
+}
+
+#[test]
+fn case_remove_clears_the_duplicate_identity_entry() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "remove_clears_the_duplicate_identity_entry");
+    let name = case["input"]["middleware_name"].as_str().unwrap();
+
+    let manager = identity_probe_manager();
+    manager
+        .add_with_opts(identity_probe_registration())
+        .expect("register");
+    assert!(
+        manager.identity_registered("audit"),
+        "precondition: recorded"
+    );
+
+    manager.remove(name);
+
+    assert!(
+        !manager.identity_registered("audit"),
+        "[{}] a removed registration must not remain in the duplicate-identity registry: \
+         the next `use` of the same identity would be reported as colliding with a \
+         registration that no longer exists",
+        case["id"].as_str().unwrap()
+    );
+}
+
+#[test]
+fn case_use_twice_still_warns_about_the_duplicate() {
+    // The control. Without it an SDK that simply stopped recording identities
+    // passes, and the decision is about CLEARING on removal, not about dropping
+    // duplicate detection.
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "use_twice_still_warns_about_the_duplicate");
+
+    let manager = identity_probe_manager();
+    manager
+        .add_with_opts(identity_probe_registration())
+        .expect("register");
+    manager
+        .add_with_opts(identity_probe_registration())
+        .expect("register duplicate");
+
+    assert!(
+        manager.identity_registered("audit"),
+        "[{}] a genuine duplicate must still be detectable",
+        case["id"].as_str().unwrap()
+    );
+    // And removing ONE of two registrations sharing an identity must NOT clear
+    // it — duplicate registration warns but succeeds, so this state is reachable
+    // and the survivor has to stay visible to duplicate detection.
+    manager.remove("audit");
+    assert!(
+        manager.identity_registered("audit"),
+        "[{}] removing one of two registrations sharing an identity must leave the \
+         survivor detectable",
+        case["id"].as_str().unwrap()
+    );
+}
