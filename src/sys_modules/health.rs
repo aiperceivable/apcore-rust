@@ -356,8 +356,12 @@ impl Module for HealthModule {
                     "message": e.message,
                     "ai_guidance": e.ai_guidance,
                     "count": e.count,
-                    "first_occurred": e.first_occurred.to_rfc3339(),
-                    "last_occurred": e.last_occurred.to_rfc3339(),
+                    // D-120: the same `…123Z` form the record itself serializes.
+                    // `to_rfc3339()` gives `+00:00` and the instant's own
+                    // precision, so this summary used to disagree with the
+                    // stored record it was summarizing.
+                    "first_occurred": crate::observability::error_history::format_millis_z(e.first_occurred),
+                    "last_occurred": crate::observability::error_history::format_millis_z(e.last_occurred),
                 })
             })
             .collect();

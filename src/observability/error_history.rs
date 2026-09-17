@@ -37,6 +37,31 @@ fn error_code_string(code: ErrorCode) -> String {
 /// `fingerprint` is the SHA-256 of `error_code:module_id:normalized_message`.
 /// Two errors that differ only by ephemeral values (UUIDs, large integers,
 /// ISO 8601 timestamps) share the same fingerprint and are deduplicated.
+/// Format an instant as `2026-09-16T10:30:00.123Z` (D-120).
+///
+/// Exactly three fractional digits and a `Z` suffix. chrono's `to_rfc3339()`
+/// gives `+00:00` and whatever precision the instant happens to carry, and
+/// serde's default for `DateTime<Utc>` gives `Z` with microseconds — two forms
+/// inside one SDK, neither of them the one the spec's example uses.
+///
+/// Specifying the suffix alone would have left the precisions diverging behind
+/// one `Z`: the same divergence, harder to see. That is why the decision fixes
+/// both, and why this is applied at the PRODUCER — the record's own
+/// serialization and every reader that formats it — rather than at one summary
+/// on the way out, which would leave the stored record and every other
+/// consumer on the old form.
+#[must_use]
+pub fn format_millis_z(ts: DateTime<Utc>) -> String {
+    ts.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+fn serialize_millis_z<S>(ts: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format_millis_z(*ts))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEntry {
     pub module_id: String,
@@ -47,10 +72,13 @@ pub struct ErrorEntry {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_guidance: Option<String>,
+    #[serde(serialize_with = "serialize_millis_z")]
     pub timestamp: DateTime<Utc>,
     pub count: u64,
+    #[serde(serialize_with = "serialize_millis_z")]
     pub first_occurred: DateTime<Utc>,
     /// Most recent occurrence; semantically equivalent to spec's `last_seen_at`.
+    #[serde(serialize_with = "serialize_millis_z")]
     pub last_occurred: DateTime<Utc>,
     /// SHA-256(error_code:module_id:normalize(message)) as 64-char lowercase hex.
     #[serde(default)]

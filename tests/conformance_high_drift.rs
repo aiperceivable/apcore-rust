@@ -174,6 +174,39 @@ fn conformance_error_fingerprinting() {
                 "FAIL [{id}]: first_entry_count"
             );
         }
+        if let Some(pattern_src) = expected.get("timestamp_pattern").and_then(|v| v.as_str()) {
+            // D-120. Driven through the real `ErrorHistory` and its own
+            // serialization, because the decision is about the record the
+            // PRODUCER writes: this SDK's health summary used to reformat the
+            // same entry with `to_rfc3339()` into a third form, so asserting on
+            // a reader would have passed while the stored record diverged.
+            let pattern = regex::Regex::new(pattern_src).expect("timestamp_pattern compiles");
+            let history = apcore::observability::error_history::ErrorHistory::new(100);
+            for err in errors {
+                history.record(
+                    err["caller_id"].as_str().unwrap(),
+                    &apcore::errors::ModuleError::new(
+                        apcore::errors::ErrorCode::GeneralInternalError,
+                        err["message"].as_str().unwrap(),
+                    ),
+                );
+            }
+            let entries = history.get_all(None);
+            assert!(!entries.is_empty(), "FAIL [{id}]: no entries recorded");
+            for entry in &entries {
+                let json = serde_json::to_value(entry).expect("entry serializes");
+                for field in expected["timestamp_fields"].as_array().unwrap() {
+                    let name = field.as_str().unwrap();
+                    let value = json[name]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("FAIL [{id}]: {name} is not a string: {json}"));
+                    assert!(
+                        pattern.is_match(value),
+                        "FAIL [{id}]: {name} = {value:?} does not match {pattern_src}"
+                    );
+                }
+            }
+        }
     }
 
     // Spot-check the same algorithm via the canonical `ErrorHistory` storage
