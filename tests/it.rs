@@ -393,3 +393,6 @@ mod test_webhook_http_retry_contract;
 
 #[path = "test_scanner_symlink_confinement.rs"]
 mod test_scanner_symlink_confinement;
+
+#[path = "test_executor_async_acl_path.rs"]
+mod test_executor_async_acl_path;

@@ -226,6 +226,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The executor's ACL step is pinned to the ASYNC path (spec v1.50.0, D-105).** No behaviour change
+  — this SDK already takes it. What was missing is the case: a whole extension point
+  (`register_async_condition`) reachable from every door except the enforcing one is invisible from
+  the door, and a registry that accepts a handler is not evidence anything calls it. `tests/test_executor_async_acl_path.rs`
+  registers a SYNC handler answering false and an ASYNC handler answering true for one key, so the
+  verdict separates the paths — counting invocations would not, since both invoke a handler. Verified
+  red by forcing the synchronous accessor. Each case uses its own condition key, because handlers are
+  registered into a PROCESS-level registry and a shared key let one case decide another.
+
 - **A symlinked module file is discovered, and an aliased directory is not discovered twice (spec
   v1.56.0, D-127).** `if file_type.is_dir() || (file_type.is_symlink() && follow_symlinks)` routed a
   symlinked FILE into the directory branch, where `entry_path.is_dir()` is false and it fell out
