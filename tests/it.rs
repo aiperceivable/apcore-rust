@@ -396,3 +396,6 @@ mod test_scanner_symlink_confinement;
 
 #[path = "test_executor_async_acl_path.rs"]
 mod test_executor_async_acl_path;
+
+#[path = "test_global_deadline_lifetime.rs"]
+mod test_global_deadline_lifetime;
