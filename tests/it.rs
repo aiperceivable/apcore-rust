@@ -390,3 +390,6 @@ mod test_usage_contract_conformance;
 mod test_v0_21_preview_and_ephemeral;
 #[path = "test_webhook_http_retry_contract.rs"]
 mod test_webhook_http_retry_contract;
+
+#[path = "test_scanner_symlink_confinement.rs"]
+mod test_scanner_symlink_confinement;
