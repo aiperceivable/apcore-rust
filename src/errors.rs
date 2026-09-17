@@ -163,6 +163,29 @@ pub enum ErrorCode {
     /// Raised when `AsyncTaskManager::submit` is called at the task-slot limit.
     /// Cross-language: Python `TASK_LIMIT_EXCEEDED`, TypeScript `TASK_LIMIT_EXCEEDED`.
     TaskLimitExceeded,
+    /// Raised when a `TaskStore` backend is unreachable or refuses an operation
+    /// (spec v1.50.0, D-92).
+    ///
+    /// `async-tasks.md` declares `TaskStoreError(code=TASK_STORE_UNAVAILABLE)`
+    /// on eight surfaces — every `TaskStore` method and every
+    /// `AsyncTaskManager` method that touches the store — and no SDK defined
+    /// it, so no caller could ever catch it. A declared error type no
+    /// implementation can raise is the "declared surface reaches no mechanism"
+    /// shape PROTOCOL_SPEC §9.1.3 forbids for configuration keys, applied to an
+    /// error contract.
+    ///
+    /// The bundled `InMemoryTaskStore` cannot fail and never raises it; that is
+    /// exactly why the code is **public** rather than raised internally. The
+    /// hosts who need it write the network-backed stores the contract was
+    /// written for, and `AsyncTaskManager` propagates it (D-81) rather than
+    /// mapping a store outage onto "task not found".
+    ///
+    /// Landed late: D-92 was implemented in apcore-python in the v1.50.0 wave
+    /// and missed here and in apcore-typescript. Nothing noticed until
+    /// `error_codes.json` gained a case asserting the code is
+    /// framework-reserved — an SDK that never defined it does not collide, so
+    /// the case is red for exactly the state the decision corrects.
+    TaskStoreUnavailable,
     /// Raised when `AsyncTaskManager::start_reaper` is called while another
     /// reaper is already running. Rust-specific (A-D-019): apcore-python raises
     /// a generic `RuntimeError` and apcore-typescript throws a plain `Error`
@@ -319,6 +342,7 @@ impl ErrorCode {
         ErrorCode::EntryPointRuntimeUnsupported,
         ErrorCode::NoDiscovererConfigured,
         ErrorCode::TaskLimitExceeded,
+        ErrorCode::TaskStoreUnavailable,
         ErrorCode::ReaperAlreadyRunning,
         ErrorCode::VersionConstraintInvalid,
         ErrorCode::InvalidParentId,
@@ -435,6 +459,7 @@ pub fn retryable_for_code(code: ErrorCode) -> Option<bool> {
         // `retryable == Some(true)` — so omitting it here meant the peers
         // auto-retried a submission this SDK surfaced to the caller (ERR-003).
         | ErrorCode::TaskLimitExceeded
+        | ErrorCode::TaskStoreUnavailable
         | ErrorCode::ReloadFailed => Some(true),
 
         // §8.6 "No", grouped by why retrying cannot help.
@@ -665,6 +690,41 @@ impl ModuleError {
             "The input was malformed or missing required fields. Check the values against the \
              module's input_schema and retry with corrected input.",
         )
+    }
+
+    /// A `TaskStore` backend is unreachable or refused an operation (D-92).
+    ///
+    /// The counterpart of apcore-python's `TaskStoreError` and
+    /// apcore-typescript's `TaskStoreError`. Rust carries the type as an
+    /// `ErrorCode` variant plus this constructor rather than a per-error
+    /// struct, which is how every other error in this SDK is shaped.
+    ///
+    /// The bundled `InMemoryTaskStore` cannot fail and never calls this; it is
+    /// public because the hosts who need it are the ones writing the
+    /// network-backed stores `async-tasks.md` was written for. Details carry
+    /// `operation` and `reason` when supplied, matching both peers.
+    #[must_use]
+    pub fn task_store_unavailable(operation: &str, reason: &str) -> Self {
+        let mut detail = if operation.is_empty() {
+            "TaskStore is unavailable".to_string()
+        } else {
+            format!("TaskStore operation '{operation}' failed")
+        };
+        if !reason.is_empty() {
+            detail = format!("{detail}: {reason}");
+        }
+        let mut err = Self::new(ErrorCode::TaskStoreUnavailable, detail);
+        let mut details: HashMap<String, serde_json::Value> = HashMap::new();
+        if !operation.is_empty() {
+            details.insert("operation".to_string(), serde_json::json!(operation));
+        }
+        if !reason.is_empty() {
+            details.insert("reason".to_string(), serde_json::json!(reason));
+        }
+        if !details.is_empty() {
+            err = err.with_details(details);
+        }
+        err
     }
 
     /// Builder for `ACL_DENIED` carrying the default AI recovery guidance and

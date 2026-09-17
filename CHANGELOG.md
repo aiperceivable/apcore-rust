@@ -226,6 +226,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ErrorCode::TaskStoreUnavailable` exists and is framework-reserved (spec v1.50.0,
+  async-tasks.md, D-92).** D-92 required all three SDKs to define, register and export the type; it
+  landed in apcore-python alone, and this SDK never had it — `TASK_STORE_UNAVAILABLE` appeared
+  nowhere in the source. `async-tasks.md` declares it on **eight** surfaces, so callers had eight
+  documented places to catch an error no implementation could raise. The variant is now in the
+  framework set Algorithm A17 reserves against module registration, is retryable (a store outage is
+  transient, matching both peers), and `ModuleError::task_store_unavailable(operation, reason)` is
+  the constructor — this SDK carries error types as `ErrorCode` variants plus constructors rather
+  than per-error structs, which is how every other error here is shaped.
+
+  *Found by `conformance/decision_coverage.json`: the case asserting the collision was added to
+  `error_codes.json` and came back red here and in apcore-typescript.*
+
 - **`version` and `examples` were the unfixed half of D-97 — declared, validated, then discarded at
   registration.** D-97 gave `FunctionModule` trait accessors for `annotations` / `tags` /
   `documentation` / `metadata`; `version` and `examples` stayed fields the `Module` trait exposed no
