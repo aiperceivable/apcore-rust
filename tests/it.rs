@@ -402,3 +402,6 @@ mod test_global_deadline_lifetime;
 
 #[path = "test_deprecation_warning_cadence.rs"]
 mod test_deprecation_warning_cadence;
+
+#[path = "test_registry_describe_d77.rs"]
+mod test_registry_describe_d77;
