@@ -185,7 +185,12 @@ fn scan_dir(
                     visited_real_paths,
                 );
             }
-        } else if file_type.is_file() {
+        } else if file_type.is_file() || (file_type.is_symlink() && follow_symlinks) {
+            // D-127: a symlinked FILE reaches here too. It used to be routed into
+            // the directory branch above by `is_dir() || (is_symlink() && follow)`,
+            // where `entry_path.is_dir()` is false and it fell out unappended —
+            // so `follow_symlinks` governed directories and did nothing for
+            // files, which is a declared key that does not reach its mechanism.
             let ext = entry_path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -207,10 +212,29 @@ fn scan_dir(
                 continue;
             }
 
-            // Derive canonical ID from relative path
-            let Ok(rel) = entry_path.strip_prefix(root) else {
+            // D-127: identity and the module ID are keyed on the CANONICAL
+            // REAL PATH, never on whichever alias the traversal reached first.
+            // Deriving the ID from the alias makes the registered ID depend on
+            // directory iteration order, which is not stable across filesystems
+            // or platforms — and recording both paths made one file two modules
+            // with different IDs, which the duplicate check cannot catch
+            // precisely because they differ.
+            let Ok(real_file) = entry_path.canonicalize() else {
                 continue;
             };
+            if visited_real_paths.contains(&real_file) {
+                continue;
+            }
+            let Ok(rel) = real_file.strip_prefix(root) else {
+                // Containment already ran before the dir/file split (D-94).
+                tracing::warn!(
+                    "Resolved path escapes the extensions root, skipping: {}",
+                    entry_path.display()
+                );
+                continue;
+            };
+            let rel = rel.to_path_buf();
+            visited_real_paths.insert(real_file.clone());
             let canonical_id = rel
                 .with_extension("")
                 .to_string_lossy()
@@ -254,7 +278,9 @@ fn scan_dir(
             seen_ids_lower.insert(lower_id, canonical_id.clone());
 
             results.push(DiscoveredFile {
-                file_path: entry_path,
+                // D-127: the REAL path, so the loader opens the target rather
+                // than the alias — the alias is a name, not the module.
+                file_path: real_file,
                 canonical_id,
                 meta_path,
                 namespace: None,

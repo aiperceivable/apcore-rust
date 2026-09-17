@@ -226,6 +226,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A symlinked module file is discovered, and an aliased directory is not discovered twice (spec
+  v1.56.0, D-127).** `if file_type.is_dir() || (file_type.is_symlink() && follow_symlinks)` routed a
+  symlinked FILE into the directory branch, where `entry_path.is_dir()` is false and it fell out
+  unappended — so `follow_symlinks` governed directories and did nothing for files. An aliased
+  directory, meanwhile, was traversed twice and produced duplicate module IDs. Identity, the module
+  ID and visited-directory tracking are now keyed on the canonical real path, and `file_path` is the
+  target rather than the alias.
+
 - **A malformed annotation value is dropped rather than rejecting the whole value (spec v1.51.0,
   D-115).** `extra: "oops"` failed deserialization with `ModuleAnnotations.extra must be an object`
   and `cache_ttl: -5` with `expected u64`, so one bad value removed an entire module — worse than
