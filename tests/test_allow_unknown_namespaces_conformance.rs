@@ -73,6 +73,11 @@ fn conformance_allow_unknown_namespaces() {
         let input = &case["input"];
         let expected = &case["expected"];
 
+        if input.get("registered_namespace").is_some() {
+            drive_registered_namespace_default(id, input, expected, &base);
+            continue;
+        }
+
         let mut doc = serde_json::Map::new();
         if input["mode"] == "namespace" {
             doc.insert("apcore".to_string(), base.clone());
@@ -128,5 +133,63 @@ fn conformance_allow_unknown_namespaces() {
         if let Some(needle) = expected.get("warns_absent").and_then(Value::as_str) {
             assert!(!logs.contains(needle), "case {id}, logs:\n{logs}");
         }
+    }
+}
+
+/// D-117: a registered namespace's defaults answer only in NAMESPACE mode.
+///
+/// A legacy document has no namespaces, so a declaration ABOUT a namespace has
+/// nothing to say about one. The key is absent from the file by construction —
+/// if it were present the document would be answering, not the registration.
+fn drive_registered_namespace_default(id: &str, input: &Value, expected: &Value, base: &Value) {
+    let registration = &input["registered_namespace"];
+    // Namespace registration is process-wide and permanent (§9.6.3 point 5), so
+    // each case registers under its own name rather than racing the other.
+    let declared = registration["name"].as_str().expect("name");
+    let name = format!("{declared}_{}", &id[..12.min(id.len())]);
+    let _ = Config::register_namespace(apcore::config::NamespaceRegistration {
+        name: name.clone(),
+        env_prefix: None,
+        defaults: Some(registration["defaults"].clone()),
+        schema: None,
+        env_style: apcore::config::EnvStyle::Auto,
+        max_depth: apcore::config::DEFAULT_MAX_DEPTH,
+        env_map: None,
+    });
+
+    let mut doc = serde_json::Map::new();
+    if input["mode"] == "namespace" {
+        doc.insert("apcore".to_string(), base.clone());
+    } else {
+        for (k, v) in base.as_object().expect("base") {
+            doc.insert(k.clone(), v.clone());
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("apcore.yaml");
+    std::fs::write(
+        &path,
+        serde_yaml_ng::to_string(&Value::Object(doc)).expect("yaml"),
+    )
+    .expect("write");
+
+    let config = Config::from_yaml_file(&path).unwrap_or_else(|e| panic!("case {id}: {e}"));
+    let key = input["key"]
+        .as_str()
+        .expect("key")
+        .replacen(declared, &name, 1);
+    let value = config.get(&key);
+
+    assert_eq!(
+        value.is_some(),
+        expected["value_readable"]
+            .as_bool()
+            .expect("value_readable"),
+        "case {id}: get({key}) -> {value:?}; the registration must answer in \
+         namespace mode and stay silent for a legacy document"
+    );
+    if let Some(want) = expected.get("value") {
+        assert_eq!(value.as_ref(), Some(want), "case {id}");
     }
 }

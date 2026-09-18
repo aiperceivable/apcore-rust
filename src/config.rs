@@ -1894,8 +1894,20 @@ impl Config {
         // delegates to `get_direct`, and legacy-mode required-field validation
         // depends on it distinguishing "declared" from "defaulted". A default
         // leaking there would let §9.3 step 1 pass on an undeclared key.
-        if let Some(val) = Self::registered_namespace_default(key) {
-            return Some(val);
+        // D-117: only in NAMESPACE mode. A legacy (namespace-less) document has
+        // no namespaces, so a declaration ABOUT a namespace has nothing to say
+        // about one — §9.6.3's reading, and what apcore-python and
+        // apcore-typescript already did by seeding these defaults into the data
+        // tree at load time, which only happens in namespace mode.
+        //
+        // Consulted unconditionally, this SDK answered a registered namespace's
+        // default for a document that never opted into namespaces at all: a key
+        // no reader of that file could see in it, and one the peers reported as
+        // absent.
+        if self.mode == ConfigMode::Namespace {
+            if let Some(val) = Self::registered_namespace_default(key) {
+                return Some(val);
+            }
         }
 
         // Fall back to the canonical default table. apcore-python deep-merges
