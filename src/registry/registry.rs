@@ -686,7 +686,7 @@ impl Registry {
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
-        self.register_core(name, module, descriptor, false, true)
+        self.register_core(name, module.into(), descriptor, false, true)
     }
 
     /// Register a module — **spec-compliant two-argument form**.
@@ -1091,7 +1091,7 @@ impl Registry {
                 ),
             ));
         }
-        self.register_core(name, module, descriptor, true, false)
+        self.register_core(name, module.into(), descriptor, true, false)
     }
 
     /// Soft-warn when an `ephemeral.*` module is registered without
@@ -1233,11 +1233,40 @@ impl Registry {
     /// Always acquire `core` before `in_flight`. Never hold `in_flight.lock()`
     /// while trying to acquire `core.read()` or `core.write()`. Violations
     /// create deadlock cycles.
+    /// Re-publish a module instance the caller already holds (D-112).
+    ///
+    /// Every other registration entry point takes `Box<dyn Module>`, and
+    /// `Registry::get` hands back an `Arc` — which cannot be turned back into a
+    /// `Box`, because the Arc may be shared. Without this, restoring the
+    /// PREVIOUS instance after a failed reload is not expressible here at all:
+    /// the same "provided but uncallable" shape D-91 settled for
+    /// `ExtensionManager::unregister`, reached from the other side.
+    ///
+    /// Runs the full registration path, so the restored module's `on_load`
+    /// re-runs — which D-112 rule 2 requires, since its `on_unload` already ran
+    /// during the unregister and re-publishing without `on_load` yields a
+    /// module that is visible but torn down.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever the registration path reports, including a failing
+    /// `on_load`. D-112 rule 3: if the restoring load also fails the module
+    /// stays unavailable, because publishing a module whose load hook failed is
+    /// the defect deferred publication exists to prevent.
+    pub fn reinstate_internal(
+        &self,
+        name: &str,
+        module: Arc<dyn Module>,
+        descriptor: ModuleDescriptor,
+    ) -> Result<(), ModuleError> {
+        self.register_core(name, module, descriptor, true, false)
+    }
+
     #[allow(clippy::too_many_lines)] // one atomic register path: conflict detection, in_flight reservation, lock-free on_load, and the re-checked publish/rollback must stay together to preserve the lock-ordering and single-winner invariants
     fn register_core(
         &self,
         name: &str,
-        module: Box<dyn Module>,
+        module: Arc<dyn Module>,
         descriptor: ModuleDescriptor,
         allow_reserved: bool,
         run_validator: bool,
@@ -1330,7 +1359,7 @@ impl Registry {
             in_flight.insert(name.to_string());
         }
 
-        let module_arc: Arc<dyn Module> = module.into();
+        let module_arc: Arc<dyn Module> = module;
         let module_clone = Arc::clone(&module_arc);
 
         // Issue #65: run on_load WITHOUT any lock held and WITHOUT the module

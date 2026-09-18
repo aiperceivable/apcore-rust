@@ -331,6 +331,102 @@ impl ReloadModule {
         );
     }
 
+    /// Snapshot every matched module's instance, descriptor and version while
+    /// they are still registered.
+    ///
+    /// D-112: the restore needs the previous INSTANCE, and `Registry::get`
+    /// cannot answer once the module is unregistered. It hands back an `Arc`,
+    /// which only `reinstate_internal` accepts. SYS-15's version capture has
+    /// the same "while it is still there" constraint, so both happen here.
+    fn capture_for_restore(
+        &self,
+        order: &[String],
+        previous_versions: &mut std::collections::HashMap<String, String>,
+    ) -> std::collections::HashMap<
+        String,
+        (Arc<dyn Module>, crate::registry::registry::ModuleDescriptor),
+    > {
+        let mut captured = std::collections::HashMap::new();
+        for mid in order {
+            if !self.registry.has(mid) {
+                continue;
+            }
+            if let Ok(Some(descriptor)) = self.registry.get_definition(mid) {
+                previous_versions.insert(mid.clone(), descriptor.version.clone());
+                if let Ok(Some(module)) = self.registry.get(mid) {
+                    captured.insert(mid.clone(), (module, descriptor));
+                }
+            }
+        }
+        captured
+    }
+
+    /// Restore each named module after a failed BULK reload (D-112 rule 4).
+    ///
+    /// Restoration is PER MODULE. The operation as a whole still fails (D-17),
+    /// and modules that already reloaded successfully are NOT rolled back —
+    /// cross-module transactionality is not a primitive the registry has, and
+    /// claiming it would be the atomicity rule 1 forbids at batch scale.
+    fn restore_each_after_failed_reload(
+        &self,
+        module_ids: &[String],
+        previous: &std::collections::HashMap<
+            String,
+            (Arc<dyn Module>, crate::registry::registry::ModuleDescriptor),
+        >,
+    ) {
+        for mid in module_ids {
+            let Some((module, descriptor)) = previous.get(mid) else {
+                continue;
+            };
+            self.restore_after_failed_reload(
+                mid,
+                Some(Arc::clone(module)),
+                Some(descriptor.clone()),
+            );
+        }
+    }
+
+    /// Put the previous instance back after a reload failed (D-112).
+    ///
+    /// COMPENSATING, not transactional. The module is genuinely unregistered
+    /// for a window and a concurrent call in that window sees
+    /// `MODULE_NOT_FOUND`; this does not claim atomic replacement, and the spec
+    /// forbids implementations from claiming it. What it does prevent is the
+    /// worse outcome: a failed hot-fix making a WORKING module disappear.
+    ///
+    /// `reinstate_internal` re-runs the module's `on_load`, which rule 2
+    /// requires — `on_unload` already ran during the unregister, so
+    /// re-publishing without it yields a module that is visible but torn down,
+    /// harder to diagnose than one that is absent.
+    ///
+    /// If the restoring load ALSO fails the module stays unavailable (rule 3).
+    /// The original failure is the one the caller is told about, so this logs
+    /// rather than returning an error.
+    fn restore_after_failed_reload(
+        &self,
+        module_id: &str,
+        previous_module: Option<Arc<dyn Module>>,
+        previous_descriptor: Option<crate::registry::registry::ModuleDescriptor>,
+    ) {
+        let (Some(module), Some(descriptor)) = (previous_module, previous_descriptor) else {
+            return;
+        };
+        if self.registry.has(module_id) {
+            return;
+        }
+        if let Err(restore_err) = self
+            .registry
+            .reinstate_internal(module_id, module, descriptor)
+        {
+            tracing::error!(
+                module_id = %module_id,
+                error = %restore_err.message,
+                "Restoring the module after a failed reload also failed; it is unavailable (D-112 rule 3)"
+            );
+        }
+    }
+
     #[must_use]
     pub fn with_audit_store(mut self, audit_store: Option<Arc<dyn AuditStore>>) -> Self {
         self.audit_store = audit_store;
@@ -437,6 +533,12 @@ impl ReloadModule {
         // (2) on_suspend (best-effort) — capture state for handoff to on_resume.
         // Panics inside the user-supplied trait method are caught so a faulty
         // hook cannot abort the reload.
+        // D-112: hold the previous instance so a failed reload can put it back.
+        // `Registry::get` hands back an `Arc`, which no other registration entry
+        // point accepts — `reinstate_internal` exists for exactly this.
+        let previous_module = self.registry.get(&module_id).ok().flatten();
+        let previous_descriptor = self.registry.get_definition(&module_id).ok().flatten();
+
         let suspended_state = match self.registry.get(&module_id) {
             Ok(Some(module)) => {
                 let module_for_panic = Arc::clone(&module);
@@ -472,6 +574,11 @@ impl ReloadModule {
                 error = %e.message,
                 "Reload: discover_internal failed after unregistering"
             );
+            self.restore_after_failed_reload(
+                &module_id,
+                previous_module.clone(),
+                previous_descriptor.clone(),
+            );
             return Err(ModuleError::new(
                 ErrorCode::ReloadFailed,
                 format!(
@@ -494,6 +601,7 @@ impl ReloadModule {
                 module_id = %module_id,
                 "Reload: module absent after re-discovery"
             );
+            self.restore_after_failed_reload(&module_id, previous_module, previous_descriptor);
             return Err(ModuleError::new(
                 ErrorCode::ReloadFailed,
                 format!(
@@ -671,12 +779,10 @@ impl ReloadModule {
         // SYS-15: capture each module's version while it is still registered.
         let mut previous_versions: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let previous_modules = self.capture_for_restore(&order, &mut previous_versions);
         for mid in order {
             if !self.registry.has(&mid) {
                 continue;
-            }
-            if let Ok(Some(descriptor)) = self.registry.get_definition(&mid) {
-                previous_versions.insert(mid.clone(), descriptor.version);
             }
             match self.registry.safe_unregister(&mid, 5000).await {
                 Ok(_) => unregistered.push(mid),
@@ -699,6 +805,7 @@ impl ReloadModule {
                 count = unregistered.len(),
                 "Bulk reload: re-discovery failed after unregistering"
             );
+            self.restore_each_after_failed_reload(&unregistered, &previous_modules);
             return Err(ModuleError::new(
                 ErrorCode::ReloadFailed,
                 format!(
@@ -722,6 +829,7 @@ impl ReloadModule {
                 missing = %missing.join(", "),
                 "Bulk reload: modules absent after re-discovery"
             );
+            self.restore_each_after_failed_reload(&missing, &previous_modules);
             return Err(ModuleError::new(
                 ErrorCode::ReloadFailed,
                 format!(

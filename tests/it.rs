@@ -408,3 +408,6 @@ mod test_registry_describe_d77;
 
 #[path = "test_reload_dependents_deprecation.rs"]
 mod test_reload_dependents_deprecation;
+
+#[path = "test_reload_restores_previous_module.rs"]
+mod test_reload_restores_previous_module;
