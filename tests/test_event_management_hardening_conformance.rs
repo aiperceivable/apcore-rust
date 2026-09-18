@@ -125,6 +125,40 @@ impl CircuitEventSink for CapturingSink {
     }
 }
 
+/// Fails every delivery, and optionally DECLARES a subscriber type.
+///
+/// The id carries a hyphen and the declared kind is not its prefix — the whole
+/// discriminator for D-116, since this SDK used to split the id on the first
+/// hyphen (`health-alert` -> `health`) and the peers reported a class name.
+#[derive(Debug)]
+struct DeclaringFail {
+    id: String,
+    declared_type: Option<&'static str>,
+}
+
+#[async_trait]
+impl EventSubscriber for DeclaringFail {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn event_pattern(&self) -> &str {
+        "*"
+    }
+    fn subscriber_type(&self) -> &str {
+        // `None` means "declares nothing", so the trait's own default answers —
+        // which is exactly what the DLQ path reports, and what the decision
+        // requires this surface to reuse rather than inventing a second default.
+        self.declared_type.unwrap_or("subscriber")
+    }
+    async fn on_event(&self, _event: &ApCoreEvent) -> Result<(), ModuleError> {
+        Err(ModuleError::new(
+            ErrorCode::GeneralInternalError,
+            "intentional fixture failure",
+        ))
+    }
+}
+
 #[derive(Debug)]
 struct AlwaysFail {
     id: String,
@@ -383,6 +417,8 @@ fn every_case_in_the_fixture_is_named_by_this_driver() {
         "circuit_half_open_after_window",
         "circuit_closes_on_success",
         "event_naming_canonical",
+        "circuit_event_reports_the_declared_subscriber_type",
+        "circuit_event_uses_the_dlq_default_for_an_undeclared_subscriber",
     ];
     let fixture = load_fixture();
     let ids: Vec<&str> = fixture["test_cases"]
@@ -664,4 +700,92 @@ fn conformance_event_naming_canonical() {
         );
     }
     assert_eq!(case["expected"]["all_match_pattern"].as_bool(), Some(true));
+}
+
+// D-116: the circuit event reports the DECLARED subscriber type.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_circuit_event_reports_the_declared_subscriber_type() {
+    let fixture = load_fixture();
+    let case = fixture_case(
+        &fixture,
+        "circuit_event_reports_the_declared_subscriber_type",
+    );
+    let event = trip_open_and_capture(&case, Some("webhook")).await;
+    assert_eq!(
+        event.data["subscriber_type"].as_str(),
+        case["expected"]["event_subscriber_type"].as_str(),
+        "the circuit event must report the DECLARED kind, not a guess from the id"
+    );
+}
+
+// D-116 control: no second default is invented for this surface.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_circuit_event_uses_the_dlq_default_for_an_undeclared_subscriber() {
+    let fixture = load_fixture();
+    let case = fixture_case(
+        &fixture,
+        "circuit_event_uses_the_dlq_default_for_an_undeclared_subscriber",
+    );
+    assert_eq!(
+        case["expected"]["event_subscriber_type_equals_dlq_subscriber_type"],
+        json!(true)
+    );
+    let event = trip_open_and_capture(&case, None).await;
+
+    // Asserted as EQUAL TO what the DLQ path reports for the same subscriber
+    // rather than as a literal: the default is a language-shaped derivation,
+    // and what is normative is that the two surfaces AGREE. All three SDKs
+    // disagreed with their own DLQ value, which is the finding.
+    let subscriber = DeclaringFail {
+        id: case["input"]["subscriber"]["subscriber_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        declared_type: None,
+    };
+    assert_eq!(
+        event.data["subscriber_type"].as_str(),
+        Some(subscriber.subscriber_type())
+    );
+}
+
+/// Drive the breaker to OPEN with the fixture's config and return the event.
+async fn trip_open_and_capture(
+    case: &serde_json::Value,
+    declared_type: Option<&'static str>,
+) -> ApCoreEvent {
+    let cb_cfg = &case["input"]["circuit_breaker_config"];
+    let sink = Arc::new(CapturingSink::default());
+    let wrapper = CircuitBreakerWrapper::new(
+        Box::new(DeclaringFail {
+            id: case["input"]["subscriber"]["subscriber_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            declared_type,
+        }),
+        sink.clone(),
+    )
+    .with_timeout_ms(cb_cfg["timeout_ms"].as_u64().unwrap())
+    .with_open_threshold(
+        cb_cfg["open_threshold"]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .with_recovery_window_ms(cb_cfg["recovery_window_ms"].as_u64().unwrap());
+
+    let event = ApCoreEvent::new("test.event", json!({}));
+    for _ in 0..case["input"]["failure_sequence"].as_array().unwrap().len() {
+        wrapper.on_event(&event).await.unwrap();
+    }
+
+    let expected_event = case["expected"]["event_emitted"].as_str().unwrap();
+    let captured = sink.captured();
+    captured
+        .iter()
+        .find(|e| e.event_type == expected_event)
+        .unwrap_or_else(|| panic!("no {expected_event} emitted; got {captured:?}"))
+        .clone()
 }

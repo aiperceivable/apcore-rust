@@ -100,7 +100,7 @@ impl CircuitBreakerWrapper {
     /// around the surrounding `EventEmitter`.
     #[must_use]
     pub fn new(subscriber: Box<dyn EventSubscriber>, sink: Arc<dyn CircuitEventSink>) -> Self {
-        let subscriber_type_name = guess_subscriber_type_name(subscriber.as_ref());
+        let subscriber_type_name = declared_subscriber_type(subscriber.as_ref());
         Self {
             subscriber,
             sink,
@@ -319,13 +319,21 @@ impl EventSubscriber for CircuitBreakerWrapper {
 /// `subscriber_id` carries a deterministic prefix for built-in types
 /// (`webhook-…`, `a2a-…`, `file-…`, `stdout-…`, `filter-…`). Use that prefix
 /// when present; otherwise fall back to the literal id.
-fn guess_subscriber_type_name(subscriber: &dyn EventSubscriber) -> String {
-    let id = subscriber.subscriber_id();
-    if let Some(idx) = id.find('-') {
-        id[..idx].to_string()
-    } else {
-        id.to_string()
-    }
+/// The DECLARED subscriber kind, the same value the DLQ path reports (D-116).
+///
+/// This used to split `subscriber_id` on the first hyphen, so `health-alert`
+/// became the type `health` and an id with no hyphen became the whole id —
+/// neither the declared kind nor what this same SDK puts in its own
+/// `apcore.event.delivery_failed` payload, which reads
+/// `EventSubscriber::subscriber_type`. A consumer routing on `subscriber_type`
+/// therefore got one answer for a delivery failure and a different one for the
+/// circuit opening on the SAME subscriber.
+///
+/// An undeclared subscriber takes the trait's existing default; no second
+/// default is invented for this surface, which the decision forbids and which
+/// is how the three SDKs came to disagree three ways.
+fn declared_subscriber_type(subscriber: &dyn EventSubscriber) -> String {
+    subscriber.subscriber_type().to_string()
 }
 
 #[cfg(test)]
