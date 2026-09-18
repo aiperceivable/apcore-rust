@@ -9,19 +9,20 @@
 //! the artifact that records the decision; the emitted warning is the mechanism
 //! it exists for. This file asserts the mechanism.
 //!
-//! Two dimensions are deliberately NOT asserted, because the three SDKs
-//! disagree and D-89 settles neither:
+//! Two dimensions left open by v1.49.0 were adjudicated at v1.59.0 and are
+//! asserted here. Both changed this SDK:
 //!
-//!   * WHERE the warning fires — this SDK warns at REGISTRATION, apcore-python
-//!     and apcore-typescript warn on the read (`get_definition`). D-89's own
-//!     rationale ("`get_definition` is a read that hosts call in loops") is
-//!     written about the read path.
-//!   * What an unregister + re-register does — apcore-python forgets the marker
-//!     and re-warns, this SDK and apcore-typescript stay silent. The unit test
-//!     beside this one asserts the silence AS THE REQUIREMENT, and
-//!     apcore-python's source comment asserts the opposite as the requirement.
-//!
-//! See the open item beside D-89 in the decision log.
+//!   * WHERE the warning fires — the READ (`get_definition`). This SDK warned
+//!     at REGISTRATION and its reads never warned at all, which loses the
+//!     notice outright for a host that registers before installing a `tracing`
+//!     subscriber: the dedupe marker is written whether or not anything was
+//!     listening, so no later read can re-emit it. `discover()` at startup is
+//!     the ordinary case. D-89's own rationale ("`get_definition` is a read
+//!     that hosts call in loops") was written about the read path.
+//!   * What an unregister + re-register does — the key carries the
+//!     `x-deprecation` BLOCK and is never cleared on unregister. The same
+//!     notice is silent; a changed or newly added one warns. This SDK stayed
+//!     silent for both, swallowing a genuinely new notice.
 
 use apcore::context::Context;
 use apcore::errors::ModuleError;
@@ -108,31 +109,138 @@ fn deprecation_warnings(f: impl FnOnce()) -> usize {
 }
 
 fn register(reg: &Registry, id: &str, version: &str) {
-    reg.register_versioned(
-        id,
-        Box::new(Noop),
-        Some(version),
-        Some(deprecation_metadata()),
-    )
-    .expect("register");
+    register_with(reg, id, version, deprecation_metadata());
+}
+
+fn register_with(reg: &Registry, id: &str, version: &str, metadata: HashMap<String, Value>) {
+    reg.register_versioned(id, Box::new(Noop), Some(version), Some(metadata))
+        .expect("register");
+}
+
+/// The same notice with its sunset brought forward — a CHANGED block.
+fn changed_deprecation_metadata() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(
+        "x-deprecation".to_string(),
+        json!({
+            "deprecated_since": "1.0.0",
+            "sunset_version": "2.0.0",
+            "migration_guide": "Use mod.new instead.",
+        }),
+    );
+    m
 }
 
 #[test]
 fn one_warning_reaches_the_operator_per_module_and_version() {
     let reg = Registry::new();
-    assert_eq!(
-        deprecation_warnings(|| register(&reg, "cadence.once", "1.0.0")),
-        1,
-        "registering a deprecated module must warn exactly once"
-    );
+    register(&reg, "cadence.once", "1.0.0");
     assert_eq!(
         deprecation_warnings(|| {
             for _ in 0..10 {
                 let _ = reg.get_definition("cadence.once");
             }
         }),
+        1,
+        "ten reads must produce one warning"
+    );
+}
+
+#[test]
+fn the_warning_fires_on_the_read_not_on_registration() {
+    // D-89 / spec v1.59.0. Registration runs at startup, frequently before a
+    // `tracing` subscriber exists; the marker is written either way, so a
+    // registration-time warning is lost with no later chance to re-emit.
+    let reg = Registry::new();
+    assert_eq!(
+        deprecation_warnings(|| register(&reg, "cadence.read_path", "1.0.0")),
         0,
-        "the advisory must not ride the read path"
+        "registration must not warn"
+    );
+    assert_eq!(
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.read_path");
+        }),
+        1,
+        "the read must warn"
+    );
+}
+
+#[test]
+fn a_re_registration_carrying_the_same_notice_stays_silent() {
+    // D-89 / spec v1.59.0. `watch()` re-runs discovery as an unregister +
+    // re-register, so clearing the key there re-warns for every deprecated
+    // module on every hot reload.
+    let reg = Registry::new();
+    register(&reg, "cadence.same_notice", "1.0.0");
+    assert_eq!(
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.same_notice");
+        }),
+        1
+    );
+
+    reg.unregister("cadence.same_notice").expect("unregister");
+    register(&reg, "cadence.same_notice", "1.0.0");
+    assert_eq!(
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.same_notice");
+        }),
+        0,
+        "an unchanged notice must not be announced twice"
+    );
+}
+
+#[test]
+fn a_re_registration_carrying_a_changed_notice_warns_again() {
+    // The other half, and the control for the test above: without it, "stays
+    // silent" is equally satisfied by a registry that never warns for a
+    // re-registered module at all — which is what this SDK did.
+    let reg = Registry::new();
+    register(&reg, "cadence.changed_notice", "1.0.0");
+    assert_eq!(
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.changed_notice");
+        }),
+        1
+    );
+
+    reg.unregister("cadence.changed_notice")
+        .expect("unregister");
+    register_with(
+        &reg,
+        "cadence.changed_notice",
+        "1.0.0",
+        changed_deprecation_metadata(),
+    );
+    assert_eq!(
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.changed_notice");
+        }),
+        1,
+        "a CHANGED notice on a re-registered module must be announced"
+    );
+}
+
+#[test]
+fn a_notice_added_on_re_registration_warns() {
+    let reg = Registry::new();
+    reg.register_versioned("cadence.added_notice", Box::new(Noop), Some("1.0.0"), None)
+        .expect("register");
+    assert_eq!(
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.added_notice");
+        }),
+        0
+    );
+
+    reg.unregister("cadence.added_notice").expect("unregister");
+    register(&reg, "cadence.added_notice", "1.0.0");
+    assert_eq!(
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.added_notice");
+        }),
+        1
     );
 }
 
@@ -154,10 +262,14 @@ fn control_a_module_with_no_deprecation_block_never_warns() {
 #[test]
 fn distinct_modules_warn_separately() {
     let reg = Registry::new();
+    register(&reg, "cadence.first", "1.0.0");
+    register(&reg, "cadence.second", "1.0.0");
     assert_eq!(
         deprecation_warnings(|| {
-            register(&reg, "cadence.first", "1.0.0");
-            register(&reg, "cadence.second", "1.0.0");
+            for _ in 0..3 {
+                let _ = reg.get_definition("cadence.first");
+                let _ = reg.get_definition("cadence.second");
+            }
         }),
         2
     );
@@ -169,10 +281,12 @@ fn the_dedupe_is_per_registry_instance_not_process_global() {
     // module its operator has never been told about.
     let a = Registry::new();
     let b = Registry::new();
+    register(&a, "cadence.instance", "1.0.0");
+    register(&b, "cadence.instance", "1.0.0");
     assert_eq!(
         deprecation_warnings(|| {
-            register(&a, "cadence.instance", "1.0.0");
-            register(&b, "cadence.instance", "1.0.0");
+            let _ = a.get_definition("cadence.instance");
+            let _ = b.get_definition("cadence.instance");
         }),
         2
     );
@@ -183,13 +297,19 @@ fn the_dedupe_key_includes_the_version() {
     // A newly registered version is a new deprecation notice with its own
     // sunset. Keying on the module id alone silences it.
     let reg = Registry::new();
+    register(&reg, "cadence.versions", "1.0.0");
     assert_eq!(
-        deprecation_warnings(|| register(&reg, "cadence.versions", "1.0.0")),
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.versions");
+        }),
         1
     );
     reg.unregister("cadence.versions").expect("unregister");
+    register(&reg, "cadence.versions", "2.0.0");
     assert_eq!(
-        deprecation_warnings(|| register(&reg, "cadence.versions", "2.0.0")),
+        deprecation_warnings(|| {
+            let _ = reg.get_definition("cadence.versions");
+        }),
         1,
         "a different version is a different notice"
     );

@@ -30,7 +30,11 @@ pub fn content_hash(schema: &Value) -> String {
 
 /// Serialize a JSON value with object keys sorted at every level. Output uses the
 /// same compact form as `serde_json::to_string` (no whitespace).
-fn canonical_json(value: &Value) -> String {
+///
+/// Crate-visible because the registry's D-89 deprecation-warning dedupe key
+/// needs the same "equal by value, regardless of how it was built" rendering
+/// for an `x-deprecation` block (spec v1.59.0).
+pub(crate) fn canonical_json(value: &Value) -> String {
     let mut out = String::new();
     write_canonical(value, &mut out);
     out

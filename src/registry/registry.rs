@@ -474,7 +474,7 @@ pub struct Registry {
     callback_counter: AtomicU64,
     /// D-89: `(module_id, version)` pairs whose deprecation warning has already
     /// been emitted by THIS registry instance.
-    deprecation_warned: ParkingLotMutex<HashSet<(String, String)>>,
+    deprecation_warned: ParkingLotMutex<HashSet<(String, String, String)>>,
     /// Drain completion notification — signaled when a draining module reaches zero refs.
     drain_events: RwLock<HashMap<String, Arc<tokio::sync::Notify>>>,
     /// Optional discoverer for module discovery.
@@ -940,7 +940,14 @@ impl Registry {
         if self.get(name)?.is_none() {
             return Ok(None);
         }
-        Ok(self.core.read().descriptors.get(name).cloned())
+        let descriptor = self.core.read().descriptors.get(name).cloned();
+        // D-89 (spec v1.59.0): the READ is the emission point. Done outside the
+        // core read lock — `log_deprecation_warning` calls into `tracing`, and a
+        // subscriber is host code.
+        if let Some(ref d) = descriptor {
+            self.warn_if_deprecated(name, d);
+        }
+        Ok(descriptor)
     }
 
     /// List registered module names with optional filtering.
@@ -1165,8 +1172,7 @@ impl Registry {
         tracing::warn!(module_id = %name, "{}", message);
     }
 
-    /// Derive `descriptor.sunset_date` from `metadata["x-deprecation"]` and log
-    /// the deprecation warning.
+    /// Derive `descriptor.sunset_date` from `metadata["x-deprecation"]`.
     ///
     /// `sunset_date` is DERIVED, not hand-set: apcore-python reads it out of the
     /// `x-deprecation` block in `get_definition`, while every Rust descriptor
@@ -1176,36 +1182,65 @@ impl Registry {
     /// `register`, `register_module` and `register_versioned` at once. An
     /// explicit descriptor value wins, so a caller may still set it directly.
     ///
-    /// # Warning cadence (D-89)
-    ///
-    /// At most once per `(module_id, version)` per registry instance. Deriving
-    /// at registration rather than on every `get_definition` read already keeps
-    /// the warning off the read path — `get_definition` is a read hosts call in
-    /// loops, and warning per read is spam proportional to traffic, which is how
-    /// operators learn to filter it out. The dedupe set closes the remaining
-    /// gap: `watch()` re-runs discovery, which unregisters and re-registers
-    /// every module, so without it a hot reload re-warned for each one.
-    fn apply_deprecation_metadata(&self, name: &str, descriptor: &mut ModuleDescriptor) {
+    /// This registration step DERIVES the field only. The warning itself is
+    /// emitted from [`Self::get_definition`] — see [`Self::warn_if_deprecated`].
+    fn apply_deprecation_metadata(descriptor: &mut ModuleDescriptor) {
         let Some(deprecation) = descriptor
             .metadata
             .get(Self::DEPRECATION_METADATA_KEY)
             .and_then(serde_json::Value::as_object)
-            .cloned()
         else {
             return;
         };
-        let first_sighting = self
-            .deprecation_warned
-            .lock()
-            .insert((name.to_string(), descriptor.version.clone()));
-        if first_sighting {
-            Self::log_deprecation_warning(name, &descriptor.version, &deprecation);
-        }
         if descriptor.sunset_date.is_none() {
             descriptor.sunset_date = deprecation
                 .get("sunset_date")
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
+        }
+    }
+
+    /// Emit the deprecation warning for `descriptor`, at most once per
+    /// `(module_id, version, x-deprecation block)` per registry instance.
+    ///
+    /// # Where this fires (D-89, spec v1.59.0)
+    ///
+    /// The READ, not registration. This crate used to emit from the shared
+    /// registration core and its reads never warned at all, which loses the
+    /// notice outright for a host that registers before installing a
+    /// `tracing` subscriber — `discover()` at startup is the ordinary case —
+    /// because the dedupe entry is written whether or not anything was
+    /// listening, so no later read can re-emit it. The accepted cost of the
+    /// rule is stated rather than hidden: a module whose definition is never
+    /// read is not warned about.
+    ///
+    /// # What a re-registration does (D-89, spec v1.59.0)
+    ///
+    /// The BLOCK is part of the key, and the key is never cleared on
+    /// `unregister`. A re-registration carrying the same notice is silent; one
+    /// carrying a changed or newly added notice warns. Clearing on unregister
+    /// is the other wrong answer — `watch()` re-runs discovery as an
+    /// unregister + re-register, so it re-warns for every deprecated module on
+    /// every hot reload, which is the traffic-proportional spam D-89 exists to
+    /// prevent.
+    fn warn_if_deprecated(&self, name: &str, descriptor: &ModuleDescriptor) {
+        let Some(deprecation) = descriptor
+            .metadata
+            .get(Self::DEPRECATION_METADATA_KEY)
+            .and_then(serde_json::Value::as_object)
+        else {
+            return;
+        };
+        let notice = crate::schema::hardening::canonical_json(
+            &descriptor.metadata[Self::DEPRECATION_METADATA_KEY],
+        );
+        let first_sighting = self.deprecation_warned.lock().insert((
+            name.to_string(),
+            descriptor.version.clone(),
+            notice,
+        ));
+        if first_sighting {
+            Self::log_deprecation_warning(name, &descriptor.version, deprecation);
         }
     }
 
@@ -1274,7 +1309,7 @@ impl Registry {
         validate_module_id(name, allow_reserved)?;
 
         let mut descriptor = descriptor;
-        self.apply_deprecation_metadata(name, &mut descriptor);
+        Self::apply_deprecation_metadata(&mut descriptor);
 
         // Ephemeral RFC pilot: emit a soft tracing::warn when an ephemeral.*
         // module lacks requires_approval=true. Does NOT fail the registration —
@@ -2561,13 +2596,18 @@ mod deprecation_metadata_tests {
     }
 
     #[test]
-    fn deprecation_warning_fires_once_per_module_and_version() {
-        // D-89: at most once per (module_id, version) per registry instance.
-        // `get_definition` is a read hosts call in loops, so the warning must
-        // not ride on it; and `watch()` re-runs discovery (unregister +
-        // re-register), so registration alone is not once either.
+    fn deprecation_warning_fires_on_the_read_not_on_registration() {
+        // D-89 / spec v1.59.0. This crate used to record the marker (and emit)
+        // from the shared REGISTRATION core, and its reads never warned at all
+        // — which loses the notice outright for a host that registers before
+        // installing a `tracing` subscriber, because the marker is written
+        // whether or not anything was listening and no later read can re-emit.
+        //
+        // This test reads the private marker set, so it proves WHERE the entry
+        // is recorded, not that a subscriber received anything. The emitted
+        // warning is counted in tests/test_deprecation_warning_cadence.rs,
+        // which is the assertion that survives deleting the `tracing::warn!`.
         let registry = Registry::new();
-        let key = ("executor.email.send_email".to_string(), "0.9.0".to_string());
 
         registry
             .register_versioned(
@@ -2577,45 +2617,80 @@ mod deprecation_metadata_tests {
                 Some(deprecation_metadata()),
             )
             .expect("register");
-        assert!(registry.deprecation_warned.lock().contains(&key));
-        assert_eq!(registry.deprecation_warned.lock().len(), 1);
+        assert!(
+            registry.deprecation_warned.lock().is_empty(),
+            "registration must not consume the once-per-notice budget"
+        );
 
-        // Reads never add a marker — the warning does not live on the read path.
+        // The first read records it; further reads do not.
         for _ in 0..5 {
             let _ = registry.get_definition("executor.email.send_email");
         }
         assert_eq!(registry.deprecation_warned.lock().len(), 1);
+    }
 
-        // A hot reload (unregister + re-register) does not re-warn.
+    #[test]
+    fn the_deprecation_dedupe_key_carries_the_notice_and_survives_unregister() {
+        // D-89 / spec v1.59.0. A re-registration carrying the SAME notice is
+        // silent — `watch()` re-runs discovery as an unregister + re-register,
+        // so clearing the key there re-warns for every deprecated module on
+        // every hot reload. A re-registration carrying a CHANGED notice warns,
+        // which is what keying on the block buys and what this crate used to
+        // swallow.
+        let registry = Registry::new();
+
+        let register = |version: &str, metadata: HashMap<String, Value>| {
+            registry
+                .register_versioned(
+                    "executor.email.send_email",
+                    Box::new(Noop),
+                    Some(version),
+                    Some(metadata),
+                )
+                .expect("register");
+            let _ = registry.get_definition("executor.email.send_email");
+        };
+
+        register("0.9.0", deprecation_metadata());
+        assert_eq!(registry.deprecation_warned.lock().len(), 1);
+
+        // Same notice, same version: no new entry.
         registry
             .unregister("executor.email.send_email")
             .expect("unregister");
-        registry
-            .register_versioned(
-                "executor.email.send_email",
-                Box::new(Noop),
-                Some("0.9.0"),
-                Some(deprecation_metadata()),
-            )
-            .expect("re-register");
+        register("0.9.0", deprecation_metadata());
         assert_eq!(
             registry.deprecation_warned.lock().len(),
             1,
-            "the same (module_id, version) must not be recorded twice"
+            "an unchanged notice must not be recorded twice"
         );
 
-        // A DIFFERENT version is a different deprecation notice.
+        // Changed notice, same version: a new entry.
         registry
             .unregister("executor.email.send_email")
             .expect("unregister");
+        let mut changed = HashMap::new();
+        changed.insert(
+            "x-deprecation".to_string(),
+            json!({
+                "deprecated_since": "0.9.0",
+                "sunset_version": "0.10.0",
+                "sunset_date": "2026-06-30",
+                "migration_guide": "Use executor.email.send_email_v2",
+            }),
+        );
+        register("0.9.0", changed);
+        assert_eq!(
+            registry.deprecation_warned.lock().len(),
+            2,
+            "a CHANGED notice on a re-registered module must warn"
+        );
+
+        // A different VERSION is still a different notice.
         registry
-            .register_versioned(
-                "executor.email.send_email",
-                Box::new(Noop),
-                Some("0.10.0"),
-                Some(deprecation_metadata()),
-            )
-            .expect("register 0.10.0");
-        assert_eq!(registry.deprecation_warned.lock().len(), 2);
+            .unregister("executor.email.send_email")
+            .expect("unregister");
+        register("0.10.0", deprecation_metadata());
+        assert_eq!(registry.deprecation_warned.lock().len(), 3);
     }
 }
