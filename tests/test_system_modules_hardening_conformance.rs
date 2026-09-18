@@ -707,6 +707,8 @@ const COVERED_CASE_IDS: &[&str] = &[
     "manifest_full_project_name_defaults_to_apcore",
     "health_summary_project_name_agrees_with_manifest_full",
     "system_modules_declare_open_world_false",
+    "error_rate_threshold_moves_only_the_healthy_boundary",
+    "the_error_boundary_stays_at_the_table_value",
 ];
 
 #[test]
@@ -1497,4 +1499,76 @@ async fn case_system_modules_declare_open_world_false() {
         wrong.is_empty(),
         "these system modules do not declare open_world={want}: {wrong:?}"
     );
+}
+
+// D-109: `error_rate_threshold` moves the HEALTHY/DEGRADED boundary only.
+//
+// This SDK is the decision's reference — it reads the classification table's
+// fixed 0.10 — while apcore-python and apcore-typescript computed the second
+// boundary as `threshold * 10`, so a module erroring 5% of the time was
+// `error` there and `degraded` here for the same metrics and configuration.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_error_rate_threshold_moves_only_the_healthy_boundary() {
+    let fixture = load_fixture();
+    let case = fixture_case(
+        &fixture,
+        "error_rate_threshold_moves_only_the_healthy_boundary",
+    );
+    assert_eq!(
+        health_status_for(case).await,
+        case["expected"]["module_status"].as_str().unwrap()
+    );
+}
+
+// Control: the ERROR boundary stays AT the table value. Without it, "not
+// scaled" is also satisfied by an implementation that removed the boundary and
+// called everything above healthy `degraded`.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_the_error_boundary_stays_at_the_table_value() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "the_error_boundary_stays_at_the_table_value");
+    assert_eq!(
+        health_status_for(case).await,
+        case["expected"]["module_status"].as_str().unwrap()
+    );
+}
+
+/// Register one module, record the case's observed calls, and return its status.
+async fn health_status_for(case: &Value) -> String {
+    let observed = &case["action"]["observed"];
+    let module_id = observed["module_id"].as_str().expect("module_id");
+
+    let registry = Arc::new(Registry::new());
+    registry
+        .register_module(module_id, Box::new(DummyModule))
+        .expect("register");
+
+    let metrics = apcore::observability::metrics::MetricsCollector::new();
+    let errors = observed["error_calls"].as_u64().expect("error_calls");
+    for i in 0..observed["total_calls"].as_u64().expect("total_calls") {
+        metrics.increment_calls(module_id, if i < errors { "error" } else { "success" });
+    }
+
+    let summary = apcore::sys_modules::HealthSummaryModule::new(
+        Arc::clone(&registry),
+        Some(metrics),
+        apcore::observability::error_history::ErrorHistory::new(100),
+        Arc::new(tokio::sync::Mutex::new(Config::default())),
+    )
+    .execute(
+        case["action"]["input"].clone(),
+        &Context::<Value>::anonymous(),
+    )
+    .await
+    .expect("health.summary");
+
+    summary["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|m| m["module_id"].as_str() == Some(module_id))
+        .unwrap_or_else(|| panic!("{module_id} missing from the summary: {summary}"))["status"]
+        .as_str()
+        .expect("status")
+        .to_string()
 }
