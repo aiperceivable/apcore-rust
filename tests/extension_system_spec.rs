@@ -16,17 +16,17 @@
 //     path — the nearest runtime failure is a point/variant MISMATCH, which
 //     Rust surfaces as `ErrorCode::GeneralInvalidInput` ("GENERAL_INVALID_INPUT"),
 //     NOT Python's `TypeError`/`KeyError`.
-//   * Rust has NO `get()` / `get_all()` / `unregister()` methods. The observable
-//     surface is `count()`, `has()`, `clear()`, `clear_all()`, `list_points()`,
-//     and `apply()`. Clauses targeting those missing symbols are marked
-//     `#[ignore]` (contract gap) so the crate still compiles.
+//   * Rust HAS `get()` / `get_all()` / `unregister()`, alongside `count()`,
+//     `has()`, `clear()`, `clear_all()`, `list_points()` and `apply()`. All
+//     three return `Result` and reject an unregistered point name with
+//     `ErrorCode::GeneralInvalidInput` (D-108), matching Python/TypeScript.
 //   * Rust `apply()` does NOT expose registry.discoverer / executor.acl /
 //     executor.approval_handler getters, so side-effects 1-4 are observed
 //     indirectly (apply() returns Ok and drains the internal store). Middleware
 //     wiring (side-effect 5) and span-exporter wiring (side-effect 6) ARE
 //     observable via `executor.middlewares()`.
-//   * Rust `apply()` DRAINS the internal store (std::mem::take), so a second
-//     apply() is a no-op rather than Python's "stacks middleware" behavior.
+//   * Rust `apply()` leaves the internal store INTACT (D-78), so applying the
+//     same manager twice wires the same set again, as Python does.
 
 use std::sync::Arc;
 
@@ -455,12 +455,15 @@ fn unregister_removes_identity() {
     .expect("register drop");
     assert_eq!(mgr.count("middleware"), Some(2));
 
-    assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(drop_me)));
+    assert!(mgr
+        .unregister("middleware", &ExtensionKind::Middleware(drop_me))
+        .expect("known point"));
     assert_eq!(mgr.count("middleware"), Some(1));
 
     // The survivor is the one that was not named.
     let survivors: Vec<&str> = mgr
         .get_all("middleware")
+        .expect("known point")
         .iter()
         .map(|e| match e {
             ExtensionKind::Middleware(m) => m.name(),
@@ -473,7 +476,9 @@ fn unregister_removes_identity() {
     // say "the handle form"; it does not call it. `unregister_handle` is
     // covered by `unregister_handle_removes_the_registration_it_was_given`
     // below and by the unit test in src/extensions.rs.)
-    assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(keep)));
+    assert!(mgr
+        .unregister("middleware", &ExtensionKind::Middleware(keep))
+        .expect("known point"));
     assert_eq!(mgr.count("middleware"), Some(0));
 }
 
@@ -505,9 +510,11 @@ fn unregister_removes_by_identity_not_equality() {
     mgr.register("middleware", ExtensionKind::Middleware(Arc::clone(&second)))
         .expect("register second");
 
-    assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(second)));
+    assert!(mgr
+        .unregister("middleware", &ExtensionKind::Middleware(second))
+        .expect("known point"));
 
-    let survivors = mgr.get_all("middleware");
+    let survivors = mgr.get_all("middleware").expect("known point");
     assert_eq!(survivors.len(), 1);
     match &survivors[0] {
         ExtensionKind::Middleware(m) => assert!(
@@ -535,7 +542,9 @@ fn unregister_an_equal_but_unregistered_extension_is_a_no_op() {
     )
     .expect("register");
 
-    assert!(!mgr.unregister("middleware", &ExtensionKind::Middleware(never_registered)));
+    assert!(!mgr
+        .unregister("middleware", &ExtensionKind::Middleware(never_registered))
+        .expect("known point"));
     assert_eq!(mgr.count("middleware"), Some(1));
 }
 
@@ -563,7 +572,7 @@ fn unregister_handle_removes_the_registration_it_was_given() {
         "a spent handle is a silent no-op"
     );
 
-    let survivors = mgr.get_all("middleware");
+    let survivors = mgr.get_all("middleware").expect("known point");
     assert_eq!(survivors.len(), 1);
     match &survivors[0] {
         ExtensionKind::Middleware(m) => assert!(
@@ -586,14 +595,21 @@ fn unregister_error_missing_is_silent_no_op() {
         .expect("register");
 
     let stranger = NamedMiddleware::boxed("stranger");
-    assert!(!mgr.unregister(
-        "middleware",
-        &ExtensionKind::Middleware(Arc::clone(&stranger))
-    ));
+    assert!(!mgr
+        .unregister(
+            "middleware",
+            &ExtensionKind::Middleware(Arc::clone(&stranger))
+        )
+        .expect("known point"));
     assert_eq!(mgr.count("middleware"), Some(1));
 
-    // Unknown point: also a silent false, not an error.
-    assert!(!mgr.unregister("nonexistent", &ExtensionKind::Middleware(stranger)));
+    // D-108: the silent `false` is scoped to "this point does not hold that
+    // extension". An unregistered POINT is a different question, and it is an
+    // error — see `lookup_rejects_unknown_point_but_not_empty_point`.
+    let err = mgr
+        .unregister("nonexistent", &ExtensionKind::Middleware(stranger))
+        .expect_err("unknown point must be rejected");
+    assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
 
     // A handle already spent is a silent false on the second call.
     assert!(mgr.unregister_handle(handle));
@@ -903,8 +919,11 @@ fn apply_postcondition_store_retained() {
     assert_eq!(mgr.count("middleware"), Some(1));
     assert_eq!(mgr.count("span_exporter"), Some(1));
     // And the entries are still readable, not just counted.
-    assert!(matches!(mgr.get("acl"), Some(ExtensionKind::Acl(_))));
-    assert_eq!(mgr.get_all("middleware").len(), 1);
+    assert!(matches!(
+        mgr.get("acl").expect("known point"),
+        Some(ExtensionKind::Acl(_))
+    ));
+    assert_eq!(mgr.get_all("middleware").expect("known point").len(), 1);
 }
 
 // clause: extension_system.apply.side_effect.ordered.full_sequence

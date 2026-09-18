@@ -3731,3 +3731,187 @@ async fn conformance_toggle_state_isolation() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// extension_point_lookup (D-108)
+//
+// An UNKNOWN extension point is an error; an EMPTY one is not. The two halves
+// are asserted together because each is the other's control: answering
+// `None`/`&[]`/`false` for a misspelled name turns a typo into a wiring bug
+// that first surfaces at `apply()`, while erroring for a registered point that
+// holds nothing breaks every host that probes before it registers.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)] // fixture-driven runner: set up, drive, assert per case
+fn conformance_extension_point_lookup() {
+    use apcore::errors::ModuleError;
+    use apcore::extensions::{ExtensionKind, ExtensionManager};
+    use apcore::middleware::Middleware;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    /// A distinct allocation per construction — `unregister` compares by the
+    /// extension object's own address, so a stranger must not be a clone.
+    #[derive(Debug)]
+    struct LookupMiddleware;
+
+    #[async_trait]
+    impl Middleware for LookupMiddleware {
+        fn name(&self) -> &'static str {
+            "lookup"
+        }
+        async fn before(
+            &self,
+            _module_id: &str,
+            _inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Option<Value>, ModuleError> {
+            Ok(None)
+        }
+        async fn after(
+            &self,
+            _module_id: &str,
+            _inputs: Value,
+            _output: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Option<Value>, ModuleError> {
+            Ok(None)
+        }
+        async fn on_error(
+            &self,
+            _module_id: &str,
+            _inputs: Value,
+            _error: &ModuleError,
+            _ctx: &Context<Value>,
+        ) -> Result<Option<Value>, ModuleError> {
+            Ok(None)
+        }
+    }
+
+    /// Two `ExtensionKind` handles onto ONE extension object: the first is
+    /// registered, the second is the identity a host would hand back to
+    /// `unregister`. `ExtensionKind` is not `Clone` (the address it wraps is
+    /// the identity, so a derived clone would be misleading), and building the
+    /// pair from a single `Arc` is how a caller reaches the same object twice.
+    fn make_extension_pair(id: &str, point_name: &str) -> (ExtensionKind, ExtensionKind) {
+        match point_name {
+            "middleware" => {
+                let mw: Arc<dyn Middleware> = Arc::new(LookupMiddleware);
+                (
+                    ExtensionKind::Middleware(Arc::clone(&mw)),
+                    ExtensionKind::Middleware(mw),
+                )
+            }
+            "acl" => {
+                let acl = Arc::new(ACL::new(vec![], "deny", None));
+                (
+                    ExtensionKind::Acl(Arc::clone(&acl)),
+                    ExtensionKind::Acl(acl),
+                )
+            }
+            other => {
+                panic!("FAIL [{id}]: extension_point_lookup has no factory for point `{other}`")
+            }
+        }
+    }
+
+    let fixture = load_fixture("extension_point_lookup");
+
+    for tc in fixture["test_cases"].as_array().unwrap() {
+        let id = tc["id"].as_str().unwrap();
+        let mut mgr = ExtensionManager::new();
+        let mut registered: Vec<ExtensionKind> = Vec::new();
+        for point in tc["setup"].as_array().unwrap() {
+            let point_name = point.as_str().unwrap();
+            let (to_register, same_object) = make_extension_pair(id, point_name);
+            mgr.register(point_name, to_register).unwrap_or_else(|e| {
+                panic!("FAIL [{id}]: setup register({point_name}) failed: {e}")
+            });
+            registered.push(same_object);
+        }
+
+        let point_name = tc["point_name"].as_str().unwrap();
+        let operation = tc["operation"].as_str().unwrap();
+        let expected = &tc["expected"];
+
+        // Perform the operation, collapsing the three return shapes into one
+        // (error code, textual answer) pair so the assertions below read the
+        // fixture's keys rather than the SDK's types.
+        let (err_code, answer) = match operation {
+            "get" => match mgr.get(point_name) {
+                Ok(v) => (None, format!("{:?}", v.is_some())),
+                Err(e) => (Some(e.code), String::new()),
+            },
+            "get_all" => match mgr.get_all(point_name) {
+                Ok(v) => (None, v.len().to_string()),
+                Err(e) => (Some(e.code), String::new()),
+            },
+            "unregister" => {
+                let stranger;
+                let target = if tc["unregister_target"].as_str().unwrap() == "setup" {
+                    &registered[0]
+                } else {
+                    // A stranger of the SAME type, never registered, so the call
+                    // is a genuine identity miss rather than a type mismatch.
+                    let kind = if point_name == "acl" {
+                        "acl"
+                    } else {
+                        "middleware"
+                    };
+                    stranger = make_extension_pair(id, kind).0;
+                    &stranger
+                };
+                match mgr.unregister(point_name, target) {
+                    Ok(v) => (None, v.to_string()),
+                    Err(e) => (Some(e.code), String::new()),
+                }
+            }
+            other => panic!("FAIL [{id}]: unknown operation `{other}`"),
+        };
+
+        if let Some(wire) = expected["error_code"].as_str() {
+            let want = wire_error_code(id, "extension_point_lookup", wire);
+            let got = err_code.unwrap_or_else(|| {
+                panic!(
+                    "FAIL [{id}]: {operation}(`{point_name}`) must reject an unregistered \
+                     extension point with {wire}, but answered `{answer}`"
+                )
+            });
+            assert_eq!(
+                got, want,
+                "FAIL [{id}]: {operation}(`{point_name}`) raised {got:?}, expected {want:?}"
+            );
+            continue;
+        }
+
+        // No error expected: the call must answer, and answer this.
+        assert!(
+            err_code.is_none(),
+            "FAIL [{id}]: {operation}(`{point_name}`) raised {:?} for a REGISTERED point; \
+             an empty point is not an error",
+            err_code.unwrap()
+        );
+        if let Some(value) = expected["value"].as_str() {
+            assert_eq!(
+                answer,
+                (value == "present").to_string(),
+                "FAIL [{id}]: get(`{point_name}`) answered `{answer}`, expected {value}"
+            );
+        } else if let Some(count) = expected["count"].as_u64() {
+            assert_eq!(
+                answer,
+                count.to_string(),
+                "FAIL [{id}]: get_all(`{point_name}`) returned {answer} extensions, expected {count}"
+            );
+        } else if let Some(removed) = expected["removed"].as_bool() {
+            assert_eq!(
+                answer,
+                removed.to_string(),
+                "FAIL [{id}]: unregister(`{point_name}`) returned `{answer}`, expected {removed}"
+            );
+        } else {
+            panic!("FAIL [{id}]: expected block names no assertion: {expected}");
+        }
+    }
+}

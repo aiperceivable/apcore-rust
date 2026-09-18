@@ -312,6 +312,25 @@ impl ExtensionManager {
 
         Ok(handle)
     }
+    /// The extensions at `point_name`, or `GeneralInvalidInput` if unknown.
+    ///
+    /// One place decides what "unknown" means, so `get`, `get_all` and
+    /// `unregister` cannot drift apart on it (D-108). The message names the
+    /// registered points, because the failure this exists to catch is a TYPO
+    /// and the fix is visible in the list.
+    fn require_point(&self, point_name: &str) -> Result<&Vec<ExtensionKind>, ModuleError> {
+        self.extensions.get(point_name).ok_or_else(|| {
+            let mut available: Vec<&str> = self.points.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            ModuleError::new(
+                ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Unknown extension point: '{point_name}'. Available: {}",
+                    available.join(", ")
+                ),
+            )
+        })
+    }
 
     /// Return the first extension registered at `point_name`, or `None`.
     ///
@@ -323,21 +342,52 @@ impl ExtensionManager {
     ///
     /// For a single-cardinality point (`acl`, `module_validator`,
     /// `approval_handler`, `discoverer`) this is *the* registered extension.
-    #[must_use]
-    pub fn get(&self, point_name: &str) -> Option<&ExtensionKind> {
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::GeneralInvalidInput`] when `point_name` names no registered
+    /// extension point (D-108). An UNKNOWN point is an error; an EMPTY one is
+    /// not — this used to return a silent empty answer for both, so a typo
+    /// became a wiring bug that first surfaced at `apply()`, far from the
+    /// `get("middlewares")` that caused it, with nothing naming the mistake.
+    /// Unchecked lookup of a BUILT-IN point, for [`Self::apply`] only.
+    ///
+    /// [`Self::get`] reports an unknown point name as an error (D-108). The
+    /// names used by `apply` are compile-time constants that [`Self::new`]
+    /// always registers, so there is no unknown-point case to report and no
+    /// `Result` to thread through the wiring code.
+    fn first_builtin(&self, point_name: &str) -> Option<&ExtensionKind> {
         self.extensions
             .get(point_name)
             .and_then(|exts| exts.first())
     }
 
+    /// Unchecked bulk lookup of a BUILT-IN point. See [`Self::first_builtin`].
+    fn all_builtin(&self, point_name: &str) -> &[ExtensionKind] {
+        self.extensions.get(point_name).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn get(&self, point_name: &str) -> Result<Option<&ExtensionKind>, ModuleError> {
+        let exts = self.require_point(point_name)?;
+        Ok(exts.first())
+    }
+
     /// Return every extension registered at `point_name`, in registration
     /// order.
     ///
-    /// Empty for an unknown point and for a point with nothing registered —
-    /// the spec's Contract block raises no error for either.
-    #[must_use]
-    pub fn get_all(&self, point_name: &str) -> &[ExtensionKind] {
-        self.extensions.get(point_name).map_or(&[], Vec::as_slice)
+    /// Empty for a point with nothing registered; an ERROR for an unknown one
+    /// (D-108). The Contract block's "no errors raised" row was written about
+    /// the empty case, and this SDK read it as covering the unknown case too.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::GeneralInvalidInput`] when `point_name` names no registered
+    /// extension point (D-108). An UNKNOWN point is an error; an EMPTY one is
+    /// not — this used to return a silent empty answer for both, so a typo
+    /// became a wiring bug that first surfaced at `apply()`, far from the
+    /// `get("middlewares")` that caused it, with nothing naming the mistake.
+    pub fn get_all(&self, point_name: &str) -> Result<&[ExtensionKind], ModuleError> {
+        Ok(self.require_point(point_name)?.as_slice())
     }
 
     /// Remove one specific extension from `point_name`.
@@ -365,13 +415,23 @@ impl ExtensionManager {
     /// [`Self::unregister_handle`] is the same removal keyed on the token
     /// `register` hands back, for callers that would rather not keep the
     /// object. [`Self::clear`] drops everything at the point.
-    pub fn unregister(&mut self, point_name: &str, extension: &ExtensionKind) -> bool {
+    pub fn unregister(
+        &mut self,
+        point_name: &str,
+        extension: &ExtensionKind,
+    ) -> Result<bool, ModuleError> {
+        // D-108: an UNKNOWN point is an error; an extension that is simply not
+        // there is a silent `false`. Checked before the mutable borrow so the
+        // error path and `get`/`get_all` agree on what "unknown" means.
+        if !self.extensions.contains_key(point_name) {
+            self.require_point(point_name)?;
+        }
         let target = extension.object_address();
         let Some(exts) = self.extensions.get_mut(point_name) else {
-            return false;
+            return Ok(false);
         };
         let Some(index) = exts.iter().position(|e| e.object_address() == target) else {
-            return false;
+            return Ok(false);
         };
         exts.remove(index);
         if let Some(handles) = self.handles.get_mut(point_name) {
@@ -379,7 +439,7 @@ impl ExtensionManager {
                 handles.remove(index);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Remove exactly the extension [`Self::register`] returned `handle` for.
@@ -494,28 +554,28 @@ impl ExtensionManager {
         executor: &mut Executor,
     ) -> Result<(), ModuleError> {
         // Discoverer
-        if let Some(ExtensionKind::Discoverer(d)) = self.get("discoverer") {
+        if let Some(ExtensionKind::Discoverer(d)) = self.first_builtin("discoverer") {
             registry.set_discoverer_shared(Arc::clone(d));
         }
 
         // Module validator
-        if let Some(ExtensionKind::ModuleValidator(v)) = self.get("module_validator") {
+        if let Some(ExtensionKind::ModuleValidator(v)) = self.first_builtin("module_validator") {
             registry.set_validator_shared(Arc::clone(v));
         }
 
         // ACL
-        if let Some(ExtensionKind::Acl(acl)) = self.get("acl") {
+        if let Some(ExtensionKind::Acl(acl)) = self.first_builtin("acl") {
             executor.set_acl_shared(Arc::clone(acl));
         }
 
         // Approval handler
-        if let Some(ExtensionKind::ApprovalHandler(h)) = self.get("approval_handler") {
+        if let Some(ExtensionKind::ApprovalHandler(h)) = self.first_builtin("approval_handler") {
             executor.set_approval_handler_shared(Arc::clone(h));
         }
 
         // Middleware — wire every entry, keeping them registered.
         let middlewares: Vec<Arc<dyn Middleware>> = self
-            .get_all("middleware")
+            .all_builtin("middleware")
             .iter()
             .filter_map(|ext| match ext {
                 ExtensionKind::Middleware(mw) => Some(Arc::clone(mw)),
@@ -533,7 +593,7 @@ impl ExtensionManager {
         // (extensions.py:226) and apcore-typescript (extensions.ts:261). Sync
         // finding A-D-18.
         let exporters: Vec<Arc<dyn SpanExporter>> = self
-            .get_all("span_exporter")
+            .all_builtin("span_exporter")
             .iter()
             .filter_map(|ext| {
                 if let ExtensionKind::SpanExporter(e) = ext {
@@ -717,23 +777,28 @@ mod tests {
     fn test_get_returns_the_registered_extension() {
         // The manager could count and clear extensions but never read one back.
         let mut mgr = ExtensionManager::new();
-        assert!(mgr.get("acl").is_none());
+        assert!(mgr.get("acl").unwrap().is_none());
 
         mgr.register(
             "acl",
             ExtensionKind::Acl(Arc::new(ACL::new(vec![], "deny", None))),
         )
         .unwrap();
-        assert!(matches!(mgr.get("acl"), Some(ExtensionKind::Acl(_))));
+        assert!(matches!(
+            mgr.get("acl").unwrap(),
+            Some(ExtensionKind::Acl(_))
+        ));
 
-        // Contract: no error for an unknown point, just nothing.
-        assert!(mgr.get("nonexistent").is_none());
+        // D-108: a point that EXISTS but holds nothing answers `None`; a point
+        // that was never registered is an error, not an empty answer.
+        let err = mgr.get("nonexistent").unwrap_err();
+        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
     }
 
     #[test]
     fn test_get_all_returns_registration_order() {
         let mut mgr = ExtensionManager::new();
-        assert!(mgr.get_all("middleware").is_empty());
+        assert!(mgr.get_all("middleware").unwrap().is_empty());
 
         for name in ["first", "second"] {
             mgr.register(
@@ -743,7 +808,7 @@ mod tests {
             .unwrap();
         }
 
-        let all = mgr.get_all("middleware");
+        let all = mgr.get_all("middleware").unwrap();
         assert_eq!(all.len(), 2);
         let names: Vec<&str> = all
             .iter()
@@ -754,7 +819,9 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["first", "second"]);
 
-        assert!(mgr.get_all("nonexistent").is_empty());
+        // D-108: unknown point, not an empty point.
+        let err = mgr.get_all("nonexistent").unwrap_err();
+        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
     }
 
     #[test]
@@ -788,11 +855,13 @@ mod tests {
         // rather than an error (spec Contract: "No error if the extension is
         // not found").
         let other = ExtensionKind::Middleware(Arc::new(TestMiddleware("keep")));
-        assert!(!mgr.unregister("middleware", &other));
+        assert!(!mgr.unregister("middleware", &other).unwrap());
         assert_eq!(mgr.count("middleware"), Some(1));
 
-        // Unknown point: also a silent `false`.
-        assert!(!mgr.unregister("nonexistent", &other));
+        // D-108: the silent `false` is for an extension the point does not
+        // hold. An unregistered POINT is a different question and is an error.
+        let err = mgr.unregister("nonexistent", &other).unwrap_err();
+        assert_eq!(err.code, ErrorCode::GeneralInvalidInput);
 
         // `unregister` is identity-scoped; `clear` is the point-wide removal.
         mgr.clear("middleware").unwrap();
@@ -823,6 +892,7 @@ mod tests {
         assert_eq!(mgr.count("middleware"), Some(1));
         let remaining: Vec<&str> = mgr
             .get_all("middleware")
+            .unwrap()
             .iter()
             .map(|e| match e {
                 ExtensionKind::Middleware(m) => m.name(),
@@ -848,7 +918,9 @@ mod tests {
             .unwrap();
         assert_eq!(mgr.count("middleware"), Some(1));
 
-        assert!(mgr.unregister("middleware", &ExtensionKind::Middleware(mw)));
+        assert!(mgr
+            .unregister("middleware", &ExtensionKind::Middleware(mw))
+            .unwrap());
         assert_eq!(mgr.count("middleware"), Some(0));
     }
 

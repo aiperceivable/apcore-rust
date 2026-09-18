@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`get`, `get_all` and `unregister` reject an unknown extension point (spec v1.51.0, extension-system.md, D-108).** All three answered `None` / `&[]` / `false` for a point name that was never registered — the silent reading of the contract's `### Errors: No errors raised` row, which was written about a point that exists and currently holds **nothing**. The consequence is that `get("middlewares")`, the plural typo of a real point, wired nothing and first surfaced as a missing middleware at `apply()`, far from the call that caused it, with nothing naming the mistake. `has` and `clear` already rejected it correctly, so one manager answered the same question two ways.
+
+  **Signature change:** `get` now returns `Result<Option<&ExtensionKind>, ModuleError>`, `get_all` returns `Result<&[ExtensionKind], ModuleError>` and `unregister` returns `Result<bool, ModuleError>`, all failing with `ErrorCode::GeneralInvalidInput`. A registered point holding nothing is still `Ok(None)` / `Ok(&[])` / `Ok(false)`. `apply()` is unaffected: it looks up only the six built-in points the manager registers in `new()`, so it uses a private unchecked accessor rather than threading a `Result` through wiring code where the error cannot occur.
+
 > The five entries below implement decisions **D-76, D-78/D-91, D-80, D-81 and D-83**
 > from spec v1.49.0 (`docs/spec/2026-09-deep-chain-decisions.md`). Each one closes a
 > divergence that passed shape-level parity — same method, same arity, same declared
