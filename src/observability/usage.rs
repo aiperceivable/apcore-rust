@@ -97,6 +97,15 @@ impl UsageCollector {
     /// Create with an optional `StorageBackend` (Issue #43 §1).
     #[must_use]
     pub fn with_storage_backend(storage_backend: Option<Arc<dyn StorageBackend>>) -> Self {
+        // D-113: an OMITTED backend means the bundled in-memory one, not "no
+        // storage". Only apcore-typescript honoured that, so the same omission
+        // produced a working store there and a silent no-op here — and a caller
+        // reading records back got an empty list rather than an error. The
+        // parameter stays `Option` so existing callers compile unchanged;
+        // `None` now resolves to the default rather than disabling persistence.
+        let storage_backend = Some(
+            storage_backend.unwrap_or_else(crate::observability::storage::default_storage_backend),
+        );
         Self {
             data: Arc::new(Mutex::new(HashMap::new())),
             storage_backend,

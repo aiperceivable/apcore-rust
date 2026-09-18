@@ -87,6 +87,12 @@ async fn conformance_storage_backend() {
 
     for tc in cases {
         let id = tc["id"].as_str().expect("every case needs an id");
+
+        if tc.get("collectors").is_some() {
+            drive_collector_case(id, tc).await;
+            continue;
+        }
+
         let ops = tc["input"]["operations"]
             .as_array()
             .unwrap_or_else(|| panic!("[{id}] case has no input.operations"));
@@ -144,4 +150,97 @@ async fn conformance_storage_backend() {
             }
         }
     }
+}
+
+/// D-113: which namespace each bundled collector writes, and the omitted default.
+///
+/// Drives all named collectors through ONE backend so the assertion is the SET
+/// of namespaces the surface produces, not three independent behaviours — an
+/// SDK writing two of three would otherwise read as a partial gap rather than a
+/// wrong surface.
+async fn drive_collector_case(id: &str, tc: &Value) {
+    use apcore::observability::storage::InMemoryStorageBackend;
+    use std::sync::Arc;
+
+    if tc["omit_backend"] == Value::Bool(true) {
+        // The observable is READABILITY: a record written with no backend
+        // supplied is still there to read. Asserting a type name would pin this
+        // SDK's spelling, which the decision does not.
+        let history = apcore::observability::error_history::ErrorHistory::with_storage_backend(
+            100, 1000, None,
+        );
+        history.record(
+            "mod.x",
+            &apcore::errors::ModuleError::new(
+                apcore::errors::ErrorCode::GeneralInternalError,
+                "boom",
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stored = history
+            .storage_backend()
+            .expect("an omitted backend must resolve to the in-memory one")
+            .list("error_history", "")
+            .await
+            .expect("list");
+        assert_eq!(
+            !stored.is_empty(),
+            tc["expected"]["records_readable"]
+                .as_bool()
+                .expect("records_readable"),
+            "[{id}] an omitted backend must be the in-memory one, not 'no storage'"
+        );
+        return;
+    }
+
+    let backend = Arc::new(InMemoryStorageBackend::new());
+    let handle: Arc<dyn apcore::observability::storage::StorageBackend> = backend.clone();
+    for collector in tc["collectors"].as_array().expect("collectors") {
+        match collector.as_str().expect("collector name") {
+            "metrics" => {
+                apcore::observability::metrics::MetricsCollector::with_storage_backend(Some(
+                    handle.clone(),
+                ))
+                .observe_duration("mod.x", 0.01);
+            }
+            "usage" => {
+                apcore::observability::usage::UsageCollector::with_storage_backend(Some(
+                    handle.clone(),
+                ))
+                .record("mod.x", Some("caller"), 12.0, true);
+            }
+            "error_history" => {
+                apcore::observability::error_history::ErrorHistory::with_storage_backend(
+                    100,
+                    1000,
+                    Some(handle.clone()),
+                )
+                .record(
+                    "mod.x",
+                    &apcore::errors::ModuleError::new(
+                        apcore::errors::ErrorCode::GeneralInternalError,
+                        "boom",
+                    ),
+                );
+            }
+            other => panic!("[{id}] unknown collector {other:?}"),
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut seen: Vec<String> = Vec::new();
+    for ns in ["error_history", "metrics", "usage"] {
+        if !handle.list(ns, "").await.expect("list").is_empty() {
+            seen.push(ns.to_string());
+        }
+    }
+    let mut want: Vec<String> = tc["expected"]["namespaces_written"]
+        .as_array()
+        .expect("namespaces_written")
+        .iter()
+        .map(|v| v.as_str().expect("namespace").to_string())
+        .collect();
+    want.sort();
+    seen.sort();
+    assert_eq!(seen, want, "[{id}] namespaces written");
 }

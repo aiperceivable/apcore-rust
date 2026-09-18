@@ -252,6 +252,15 @@ impl ErrorHistory {
         max_total_entries: usize,
         storage_backend: Option<Arc<dyn StorageBackend>>,
     ) -> Self {
+        // D-113: an OMITTED backend means the bundled in-memory one, not "no
+        // storage". Only apcore-typescript honoured that, so the same omission
+        // produced a working store there and a silent no-op here — and a caller
+        // reading records back got an empty list rather than an error. The
+        // parameter stays `Option` so existing callers compile unchanged;
+        // `None` now resolves to the default rather than disabling persistence.
+        let storage_backend = Some(
+            storage_backend.unwrap_or_else(crate::observability::storage::default_storage_backend),
+        );
         Self {
             state: Arc::new(Mutex::new(ErrorHistoryState::default())),
             max_entries_per_module,
@@ -277,6 +286,21 @@ impl ErrorHistory {
     /// Record an error, deduplicating by fingerprint. Uses the current time.
     pub fn record(&self, module_id: &str, error: &ModuleError) {
         self.record_at(module_id, error, Utc::now());
+    }
+
+    /// The resolved storage backend (D-113).
+    ///
+    /// apcore-typescript exposes `history.storage` and apcore-python
+    /// `_storage`; this SDK exposed nothing, so "an omitted backend means the
+    /// in-memory one" was not observable from outside at all — the decision was
+    /// untestable here rather than merely unimplemented, the same shape D-91
+    /// settled for `ExtensionManager::unregister`.
+    ///
+    /// Always `Some` since D-113: an omitted backend resolves to the default
+    /// rather than disabling persistence.
+    #[must_use]
+    pub fn storage_backend(&self) -> Option<Arc<dyn StorageBackend>> {
+        self.storage_backend.clone()
     }
 
     /// Record an error at an explicit timestamp. Used by conformance tests
