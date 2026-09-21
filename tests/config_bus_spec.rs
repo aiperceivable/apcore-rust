@@ -314,14 +314,18 @@ fn config_bus_load_property_pure() {
 // ===========================================================================
 
 // clause: config_bus.get.input.key.empty
-// Spec: empty string is rejected with ValueError/ConfigInvalidError. This Rust
-// SDK does NOT reject an empty key — `get("")` returns `None` (no panic, no
-// error). Recorded as a cross-language gap; mirrors the skipped Python clause.
+// D-74: an empty key is NOT an error. It resolves no value and answers like any
+// other absent key — `None` here, where Python and TypeScript return the
+// supplied default. Previously `#[ignore]`d in all three SDKs as a "spec/impl
+// divergence", a reason written before D-74 deleted the rejection row and
+// recorded that it "described behaviour no SDK has ever had". A symmetric skip
+// is invisible to the skip-asymmetry guard, which needs a LIVE peer as oracle.
 #[test]
-#[ignore = "config_bus.get.input.key.empty: spec/impl divergence — Rust Config::get(\"\") returns None instead of rejecting; cross-language gap"]
 fn config_bus_get_input_key_empty() {
     let config = Config::from_defaults();
-    let _ = config.get("");
+    assert_eq!(config.get(""), None);
+    // ...and it is the same answer as any other absent key, not a special case.
+    assert_eq!(config.get("definitely.absent.key"), None);
 }
 
 // clause: config_bus.get.input.default.missing_key

@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use apcore::acl::ACL;
+use apcore::approval::{ApprovalHandler, AutoApproveHandler};
 use apcore::errors::{ErrorCode, ModuleError};
 use apcore::extensions::{ExtensionKind, ExtensionManager};
 use apcore::middleware::base::Middleware;
@@ -253,64 +254,88 @@ fn register_property_idempotent_multi_accumulates() {
     assert_eq!(mgr.count("middleware"), Some(2));
 }
 
+/// Data address of the ACL behind an `ExtensionKind`, for identity comparison
+/// from outside the crate. `ExtensionKind::object_address` is private — a test
+/// must reach identity the way a host does, through the public `Arc` the
+/// variant holds (the same handle D-91 made `unregister` take).
+fn acl_address(ext: Option<&ExtensionKind>) -> Option<usize> {
+    ext.map(|e| match e {
+        ExtensionKind::Acl(acl) => Arc::as_ptr(acl) as *const () as usize,
+        other => panic!("expected acl, got {other:?}"),
+    })
+}
+
+/// Data addresses of a middleware slice, in order.
+fn middleware_addresses(exts: &[ExtensionKind]) -> Vec<usize> {
+    exts.iter()
+        .map(|e| match e {
+            ExtensionKind::Middleware(m) => Arc::as_ptr(m) as *const () as usize,
+            other => panic!("expected middleware, got {other:?}"),
+        })
+        .collect()
+}
+
 // ===========================================================================
 // Contract: ExtensionManager.get
 //
-// Rust exposes NO `get()` method (contract gap). The retrieval surface is
-// `count()` / `has()`. Clauses naming `get` are marked #[ignore] for the
-// missing symbol; the thread-safety/purity INTENT is exercised against the
-// real `count()`/`has()` surface where a meaningful equivalent exists.
+// `get()` EXISTS — it was added with D-91 and gained a `Result` return with
+// D-108. This block used to assert every `get` clause against `count()`/`has()`
+// under a header saying the symbol was missing, which is the stand-in-assertion
+// shape: the clause id said `get`, the assertion said `count`, and deleting
+// `get` would have left all of it green. The clauses now drive `get`.
 // ===========================================================================
 
 // clause: extension_system.get.property.async.false
 #[test]
 fn get_property_async_false() {
-    // get() async=false. Rust has no get(); the equivalent sync read is has()/
-    // count(), which return plain values (not futures) without an async runtime.
+    // get() async=false: it returns a plain value, not a future, and needs no
+    // async runtime. The binding's TYPE is the assertion — this test fn is not
+    // `async` and never awaits.
     let mut mgr = ExtensionManager::new();
     mgr.register("acl", make_acl()).expect("register acl");
-    let present: bool = mgr.has("acl").expect("has(acl)");
-    assert!(present);
-    let n: Option<usize> = mgr.count("acl");
-    assert_eq!(n, Some(1));
+    let found: Option<&ExtensionKind> = mgr.get("acl").expect("known point");
+    assert!(matches!(found, Some(ExtensionKind::Acl(_))));
 }
 
 // clause: extension_system.get.error.no_error_returns_none
 #[test]
 fn get_error_no_error_returns_none() {
-    // No errors raised; returns None when nothing registered. Rust has no get();
-    // the equivalent for an empty single-cardinality point is has()==false /
-    // count()==Some(0). Neither raises.
+    // A REGISTERED point holding nothing returns None and does not raise. (An
+    // UNREGISTERED point does raise — that is D-108, pinned by
+    // `lookup_rejects_unknown_point_but_not_empty_point` and by
+    // extension_point_lookup.json.)
     let mgr = ExtensionManager::new();
-    assert!(!mgr.has("acl").expect("has(acl) on empty"));
-    assert_eq!(mgr.count("acl"), Some(0));
+    assert!(mgr
+        .get("acl")
+        .expect("registered point must not error")
+        .is_none());
 }
 
 // clause: extension_system.get.property.pure.true
 #[test]
 fn get_property_pure_true() {
-    // pure=true. Querying twice must not mutate the manager. Rust: two count()
-    // reads return identical values and leave other points untouched.
+    // pure=true. Two `get` calls answer identically and leave the store — this
+    // point and every other — exactly as it was.
     let mut mgr = ExtensionManager::new();
     mgr.register("acl", make_acl()).expect("register acl");
     let before_points = mgr.list_points().len();
-    let first = mgr.count("acl");
-    let second = mgr.count("acl");
-    let after_points = mgr.list_points().len();
-    assert_eq!(first, Some(1));
-    assert_eq!(second, Some(1));
-    assert_eq!(before_points, after_points);
-    // State for other points is untouched by the query.
+
+    let first = acl_address(mgr.get("acl").expect("known point"));
+    let second = acl_address(mgr.get("acl").expect("known point"));
+
+    assert!(first.is_some());
+    assert_eq!(first, second, "get must answer with the same object twice");
+    assert_eq!(mgr.count("acl"), Some(1), "reading must not consume");
+    assert_eq!(before_points, mgr.list_points().len());
     assert_eq!(mgr.count("middleware"), Some(0));
 }
 
 // clause: extension_system.get.property.thread_safe.concurrent_reads
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_property_thread_safe_concurrent_reads() {
-    // thread_safe=true. Launch >=8 concurrent reads against a shared manager and
-    // assert no panic + every call observes the same consistent value. Rust has
-    // no get(); the equivalent read is count(). An immutable &ExtensionManager is
-    // Send + Sync, so it is shared across tasks via Arc.
+    // thread_safe=true. Launch >=8 concurrent `get` reads against a shared
+    // manager and assert no panic + every call observes the same object. An
+    // immutable &ExtensionManager is Send + Sync, so it is shared via Arc.
     let mut mgr = ExtensionManager::new();
     mgr.register("acl", make_acl()).expect("register acl");
     let mgr = Arc::new(mgr);
@@ -318,65 +343,109 @@ async fn get_property_thread_safe_concurrent_reads() {
     let mut handles = Vec::new();
     for _ in 0..16 {
         let m = Arc::clone(&mgr);
-        handles.push(tokio::spawn(async move { m.count("acl") }));
+        handles.push(tokio::spawn(async move {
+            acl_address(m.get("acl").expect("known point"))
+        }));
     }
     let mut results = Vec::new();
     for h in handles {
         results.push(h.await.expect("task join"));
     }
     assert_eq!(results.len(), 16);
-    assert!(results.iter().all(|r| *r == Some(1)));
+    let first = results[0];
+    assert!(first.is_some());
+    assert!(results.iter().all(|r| *r == first));
 }
 
 // ===========================================================================
 // Contract: ExtensionManager.get_all
 //
-// Rust exposes NO `get_all()` method (contract gap). The multi-cardinality read
-// surface is `count()`. Clauses asserting list IDENTITY/ORDER/COPY semantics of
-// a returned Vec are marked #[ignore] (missing symbol). The async/empty/
-// thread-safe INTENT is exercised against `count()`.
+// `get_all()` EXISTS — added with D-91, `Result`-returning since D-108. Same
+// correction as the `get` block above: these clauses used to be asserted
+// against `count()` under a header saying the symbol was missing, and the two
+// that could not be faked that way were `#[ignore]`d for a symbol that was
+// there. One Rust-actual difference is kept and stated: `get_all` returns a
+// BORROW (`&[ExtensionKind]`), not the copied Vec Python returns, so the
+// purity clause is asserted as what a borrow guarantees.
 // ===========================================================================
 
 // clause: extension_system.get_all.property.async.false
 #[test]
 fn get_all_property_async_false() {
-    // get_all() returns synchronously. Rust has no get_all(); count() is the sync
-    // multi-cardinality read and returns a plain value without an async runtime.
+    // get_all() returns synchronously: a plain slice, not a future. This test fn
+    // is not `async` and never awaits.
     let mgr = ExtensionManager::new();
-    let n: Option<usize> = mgr.count("middleware");
-    assert_eq!(n, Some(0));
+    let all: &[ExtensionKind] = mgr.get_all("middleware").expect("known point");
+    assert!(all.is_empty());
 }
 
 // clause: extension_system.get_all.error.no_error_returns_empty
 #[test]
 fn get_all_error_no_error_returns_empty() {
-    // No errors raised; returns empty when nothing registered. Rust: count() for
-    // an empty multi-cardinality point is Some(0) and never errors.
+    // A REGISTERED point holding nothing returns an empty slice and does not
+    // error. (An UNREGISTERED one does — D-108.)
     let mgr = ExtensionManager::new();
-    assert_eq!(mgr.count("middleware"), Some(0));
+    assert!(mgr
+        .get_all("middleware")
+        .expect("registered point must not error")
+        .is_empty());
 }
 
 // clause: extension_system.get_all.returns.registration_order
-#[ignore = "extension_system.get_all.returns.registration_order: missing symbol ExtensionManager::get_all (contract gap); registration order is verified via apply() -> executor.middlewares() instead"]
 #[test]
 fn get_all_returns_registration_order() {
-    // Rust has no get_all() to return the ordered list of extensions. Registration
-    // order IS verified through apply() in
-    // apply_side_effect_5_use_middleware_in_order. This placeholder records the
-    // missing direct-read symbol.
-    let mgr = ExtensionManager::new();
-    let _ = mgr.count("middleware");
-    panic!("ExtensionManager::get_all does not exist");
+    // The direct read answers in REGISTRATION order. Previously `#[ignore]`d for
+    // a missing symbol and deferred to `apply() -> executor.middlewares()`, which
+    // is a different mechanism: apply() filters and wires, so it could preserve
+    // order while `get_all` did not.
+    let mut mgr = ExtensionManager::new();
+    for name in ["first", "second", "third"] {
+        mgr.register(
+            "middleware",
+            ExtensionKind::Middleware(NamedMiddleware::boxed(name)),
+        )
+        .expect("register middleware");
+    }
+
+    let names: Vec<&str> = mgr
+        .get_all("middleware")
+        .expect("known point")
+        .iter()
+        .map(|e| match e {
+            ExtensionKind::Middleware(m) => m.name(),
+            other => panic!("expected middleware, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["first", "second", "third"]);
 }
 
 // clause: extension_system.get_all.property.pure.true
-#[ignore = "extension_system.get_all.property.pure.true: missing symbol ExtensionManager::get_all (contract gap); cannot test returned-list copy semantics"]
 #[test]
 fn get_all_property_pure_true() {
-    // Python asserts the Vec returned by get_all() is a copy (mutating it does
-    // not affect the store). Rust has no get_all(), so there is no returned list
-    // whose copy-semantics can be checked.
-    panic!("ExtensionManager::get_all does not exist");
+    // Python asserts the returned list is a COPY: mutating it does not affect the
+    // store. Rust hands back a `&[ExtensionKind]` borrow, so the copy cannot be
+    // mutated — the borrow checker refuses it at compile time, which is the
+    // stronger guarantee and the reason the signature is a slice. What is left to
+    // assert at runtime is the half a copy does not give you either: reading does
+    // not consume, and two reads answer with the same objects in the same order.
+    let mut mgr = ExtensionManager::new();
+    for name in ["first", "second"] {
+        mgr.register(
+            "middleware",
+            ExtensionKind::Middleware(NamedMiddleware::boxed(name)),
+        )
+        .expect("register middleware");
+    }
+
+    let first = middleware_addresses(mgr.get_all("middleware").expect("known point"));
+    let second = middleware_addresses(mgr.get_all("middleware").expect("known point"));
+
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        first, second,
+        "a read must not consume or reorder the store"
+    );
+    assert_eq!(mgr.count("middleware"), Some(2));
 }
 
 // clause: extension_system.get_all.property.thread_safe.concurrent_reads
@@ -690,26 +759,67 @@ fn apply_side_effect_2_set_validator() {
 // clause: extension_system.apply.side_effect.3.set_acl
 #[test]
 fn apply_side_effect_3_set_acl() {
-    // Python observes executor.set_acl(ext). Rust's Executor exposes no acl
-    // getter; we assert the observable contract: apply() succeeds and (D-78)
-    // the registered acl is still registered afterwards.
+    // `Executor.acl` is a PUBLIC FIELD, so the wiring is directly observable.
+    // This test used to say "Rust's Executor exposes no acl getter" and assert
+    // instead that apply() succeeded and the store was intact — which is D-78,
+    // not this clause. It passed with the ACL wiring deleted.
+    let acl: Arc<ACL> = Arc::new(ACL::new(vec![], "deny", None));
     let mut mgr = ExtensionManager::new();
-    mgr.register("acl", make_acl()).expect("register acl");
-    assert_eq!(mgr.count("acl"), Some(1));
+    mgr.register("acl", ExtensionKind::Acl(Arc::clone(&acl)))
+        .expect("register acl");
+
     let registry = Arc::new(Registry::new());
     let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+    assert!(executor.acl.is_none(), "precondition: nothing wired yet");
+
     mgr.apply(&registry, &mut executor).expect("apply");
+
+    let wired = executor.acl.as_ref().expect("apply must wire the acl");
+    assert!(
+        Arc::ptr_eq(wired, &acl),
+        "the executor must hold the registered ACL object, not a copy"
+    );
     assert_eq!(mgr.count("acl"), Some(1), "apply must not drain the store");
 }
 
 // clause: extension_system.apply.side_effect.4.set_approval_handler
-#[ignore = "extension_system.apply.side_effect.4.set_approval_handler: cannot observe — Executor exposes no approval_handler getter AND no public ApprovalHandler stub is trivially constructible for registration in a test crate (contract gap)"]
 #[test]
 fn apply_side_effect_4_set_approval_handler() {
-    // Python registers an approval_handler and asserts executor.set_approval_handler.
-    // Rust's Executor exposes no approval-handler getter, so the wiring is not
-    // observable through the public API.
-    panic!("approval_handler wiring is not observable via the public Rust API");
+    // Previously `#[ignore]`d with a two-part reason, both parts false:
+    // `Executor.approval_handler` is a PUBLIC FIELD, and `AutoApproveHandler` is
+    // a public unit struct any test crate can construct. The skip-asymmetry
+    // guard could not report it because it read apcore-rust's `#[ignore]`
+    // attributes as live.
+    let handler: Arc<dyn ApprovalHandler> = Arc::new(AutoApproveHandler);
+    let mut mgr = ExtensionManager::new();
+    mgr.register(
+        "approval_handler",
+        ExtensionKind::ApprovalHandler(Arc::clone(&handler)),
+    )
+    .expect("register approval_handler");
+
+    let registry = Arc::new(Registry::new());
+    let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+    assert!(
+        executor.approval_handler.is_none(),
+        "precondition: nothing wired yet"
+    );
+
+    mgr.apply(&registry, &mut executor).expect("apply");
+
+    let wired = executor
+        .approval_handler
+        .as_ref()
+        .expect("apply must wire the approval handler");
+    assert!(
+        Arc::ptr_eq(wired, &handler),
+        "the executor must hold the registered handler object, not a copy"
+    );
+    assert_eq!(
+        mgr.count("approval_handler"),
+        Some(1),
+        "apply must not drain the store"
+    );
 }
 
 // clause: extension_system.apply.side_effect.5.use_middleware_in_order

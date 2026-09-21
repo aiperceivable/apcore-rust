@@ -236,6 +236,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Four contract tests were `#[ignore]`d for symbols that exist, and two live ones asserted a stand-in (skip-asymmetry guard).** None of it could turn red: `check_skip_asymmetry.py` read apcore-rust's `// clause:`-above-`#[ignore]` convention as *live*, so every ignored clause in this crate was invisible to the guard built to find exactly this.
+
+  - `extension_system.get_all.returns.registration_order` and `.property.pure.true` — reason "missing symbol `ExtensionManager::get_all`". It has existed since D-91 and changed signature under D-108. The block header said the same, so the **live** `get`/`get_all` clauses around them were asserted against `count()`: the clause id said `get`, the assertion said `count`, and deleting `get` left them green. Both now drive the real symbol, and the purity clause states the Rust-actual difference — `get_all` returns a borrow, so the copy Python mutates cannot exist and the borrow checker gives the stronger guarantee.
+  - `extension_system.apply.side_effect.4.set_approval_handler` — reason "Executor exposes no approval_handler getter AND no public ApprovalHandler stub is trivially constructible", **both halves false**: `Executor.approval_handler` is a public field and `AutoApproveHandler` is a public unit struct. Its live sibling `apply.side_effect.3.set_acl` carried the same false premise about `Executor.acl` and asserted D-78's store-intactness instead; it passed with the ACL wiring deleted. Both now assert the wiring by `Arc::ptr_eq` against the public field, and both red when `apply()` stops wiring.
+  - `system_modules.check_module_disabled.error.module_disabled` and `is_module_disabled.return.true_when_disabled` — reason "no public mutator for the process-global ToggleState". `global_toggle_state_arc()` is `pub` and returns that exact `Arc`; `ToggleState::disable` is `pub`. Both now exercise the disabled branch with an id unique to the test, restored before returning, so the shared `it` binary is unaffected.
+
+  Also: `config_bus.get.input.key.empty` was `#[ignore]`d in all three SDKs for a rule **D-74 deleted** — a symmetric skip, which is the one shape the guard cannot see, since it needs a live peer as oracle. It now asserts the D-74 behaviour.
+
 - **The executor's ACL step is pinned to the ASYNC path (spec v1.50.0, D-105).** No behaviour change
   — this SDK already takes it. What was missing is the case: a whole extension point
   (`register_async_condition`) reachable from every door except the enforcing one is invisible from

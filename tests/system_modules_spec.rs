@@ -35,7 +35,7 @@ use apcore::module::{Module, ModuleAnnotations};
 use apcore::registry::registry::{ModuleDescriptor, Registry};
 use apcore::sys_modules::control::{ReloadModule, ToggleFeatureModule, UpdateConfigModule};
 use apcore::sys_modules::{
-    check_module_disabled, is_module_disabled, register_sys_modules,
+    check_module_disabled, global_toggle_state_arc, is_module_disabled, register_sys_modules,
     register_sys_modules_with_options, SysModulesOptions, ToggleState,
 };
 use serde_json::json;
@@ -716,14 +716,33 @@ fn toggle_feature_property_requires_approval() {
 // ===========================================================================
 
 // clause: system_modules.check_module_disabled.error.module_disabled
-// MISSING SYMBOL: `check_module_disabled` reads a private process-global
-// `ToggleState` (src/sys_modules/mod.rs:81). There is no PUBLIC mutator for that
-// global, so the "disabled" branch cannot be exercised via the public API.
 #[test]
-#[ignore = "system_modules.check_module_disabled.error.module_disabled: no public mutator for the process-global ToggleState read by check_module_disabled (contract gap; src/sys_modules/mod.rs:81)"]
 fn check_module_disabled_error_module_disabled() {
-    // Read-only public surface only; the disabled branch is unreachable here.
-    let _ = check_module_disabled("spec.check.disabled.unreachable");
+    // Previously `#[ignore]`d: "no PUBLIC mutator for that global". There is —
+    // `global_toggle_state_arc()` is `pub` and hands back the very `Arc`
+    // `check_module_disabled` reads, and `ToggleState::disable` is `pub` too.
+    // The reason was written once and nothing re-read it; the skip-asymmetry
+    // guard could not report it because it read `#[ignore]` as live.
+    //
+    // The state IS process-global and this file compiles into the shared `it`
+    // binary, so the id is unique to this test and the disable is undone before
+    // returning: the global set is keyed by module id, so a unique id touches
+    // nothing else even when tests share a process.
+    let id = "spec.check.disabled.unique.a";
+    let toggles = global_toggle_state_arc();
+    assert!(check_module_disabled(id).is_ok(), "precondition: enabled");
+
+    toggles.disable(id);
+    let denied = check_module_disabled(id);
+    toggles.enable(id);
+
+    let err = denied.expect_err("a disabled module must be refused");
+    assert_eq!(err.code, ErrorCode::ModuleDisabled);
+    assert!(err.message.contains(id), "the refusal must name the module");
+    assert!(
+        check_module_disabled(id).is_ok(),
+        "postcondition: the global is restored"
+    );
 }
 
 // clause: system_modules.check_module_disabled.return.none_when_enabled
@@ -760,12 +779,23 @@ fn check_module_disabled_input_registry_param() {
 // ===========================================================================
 
 // clause: system_modules.is_module_disabled.return.true_when_disabled
-// MISSING SYMBOL: no public mutator for the process-global ToggleState, so the
-// "true when disabled" branch cannot be reached via the public API.
 #[test]
-#[ignore = "system_modules.is_module_disabled.return.true_when_disabled: no public mutator for the process-global ToggleState read by is_module_disabled (contract gap; src/sys_modules/mod.rs:81)"]
 fn is_module_disabled_return_true_when_disabled() {
-    let _ = is_module_disabled("spec.is.true.unreachable");
+    // Same correction as `check_module_disabled_error_module_disabled` above:
+    // the public mutator exists. Unique id, restored before returning.
+    let id = "spec.is.true.unique.f";
+    let toggles = global_toggle_state_arc();
+    assert!(!is_module_disabled(id), "precondition: enabled");
+
+    toggles.disable(id);
+    let observed = is_module_disabled(id);
+    toggles.enable(id);
+
+    assert!(observed, "a disabled module must read as disabled");
+    assert!(
+        !is_module_disabled(id),
+        "postcondition: the global is restored"
+    );
 }
 
 // clause: system_modules.is_module_disabled.return.false_when_enabled
