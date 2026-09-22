@@ -484,6 +484,54 @@ async fn batch_processor_shutdown_drains_remaining_spans() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// force_flush: drains the queue synchronously without shutting down (A-C-002)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn batch_processor_force_flush_drains_queue_synchronously() {
+    let exporter = InMemoryExporter::new();
+    let processor = BatchSpanProcessor::builder(Arc::new(exporter.clone()))
+        .schedule_delay_ms(60_000)
+        .build();
+
+    for i in 0..3 {
+        processor
+            .on_span_end(Span::new(format!("s-{i}"), "trace-force-flush"))
+            .await;
+    }
+    assert_eq!(processor.queue_size(), 3);
+
+    let drained = processor.force_flush(2_000).await;
+    assert!(drained, "force_flush should report the queue as drained");
+    assert_eq!(processor.queue_size(), 0);
+    assert_eq!(exporter.get_spans().len(), 3);
+
+    // The processor stays alive after force_flush — new spans can still be enqueued.
+    processor
+        .on_span_end(Span::new("s-after", "trace-force-flush"))
+        .await;
+    assert_eq!(processor.queue_size(), 1);
+}
+
+#[tokio::test]
+async fn batch_processor_force_flush_safe_after_shutdown() {
+    let exporter = InMemoryExporter::new();
+    let processor = BatchSpanProcessor::builder(Arc::new(exporter.clone()))
+        .schedule_delay_ms(60_000)
+        .build();
+
+    <BatchSpanProcessor as SpanProcessor>::shutdown(&processor)
+        .await
+        .expect("shutdown returned ok");
+
+    let drained = processor.force_flush(1_000).await;
+    assert!(
+        drained,
+        "force_flush on an empty, shut-down queue is a no-op success"
+    );
+}
+
 /// `TracingMiddleware` accepts a `BatchSpanProcessor` directly via the
 /// `SpanExporter` adapter — verifies the spec's Rust example compiles and
 /// routes spans through the non-blocking processor (observability.md §1.2).

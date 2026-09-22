@@ -215,6 +215,34 @@ impl BatchSpanProcessor {
     pub fn max_queue_size(&self) -> usize {
         self.inner.config.max_queue_size
     }
+
+    /// Synchronously (from the caller's point of view) drain the queue,
+    /// exporting all currently buffered spans.
+    ///
+    /// Unlike [`shutdown`](SpanProcessor::shutdown), the processor stays
+    /// alive after this call; new spans can continue to be enqueued.
+    /// Returns `true` once the queue is empty, or `false` if `timeout_ms`
+    /// elapses first. Delegates to the same [`flush_batch`] the background
+    /// loop uses, repeatedly, since spans can arrive between successive
+    /// calls. Safe to call on an already-shut-down processor — it only
+    /// touches the queue and the exporter, neither of which `shutdown()`
+    /// tears down.
+    ///
+    /// Mirrors apcore-python's `BatchSpanProcessor.force_flush`.
+    pub async fn force_flush(&self, timeout_ms: u64) -> bool {
+        let inner = self.inner.clone();
+        let _ = timeout(Duration::from_millis(timeout_ms), async {
+            loop {
+                flush_batch(&inner).await;
+                if inner.queue_size.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        self.inner.queue_size.load(Ordering::Relaxed) == 0
+    }
 }
 
 /// Drain spans up to `max_export_batch_size` and export them.

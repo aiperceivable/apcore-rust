@@ -187,10 +187,13 @@ pub enum ErrorCode {
     /// the case is red for exactly the state the decision corrects.
     TaskStoreUnavailable,
     /// Raised when `AsyncTaskManager::start_reaper` is called while another
-    /// reaper is already running. Rust-specific (A-D-019): apcore-python raises
-    /// a generic `RuntimeError` and apcore-typescript throws a plain `Error`
-    /// for this case — neither defines a `REAPER_ALREADY_RUNNING` code. The
-    /// Rust SDK uses a typed code for idiomatic error handling.
+    /// reaper is already running (async-tasks.md "Contract:
+    /// AsyncTaskManager.start_reaper", A-C-004/A-C-005). This doc comment
+    /// previously cited a decision "A-D-019" claiming the divergence from
+    /// apcore-python's `RuntimeError` and apcore-typescript's plain `Error`
+    /// was intentional and Rust-specific; no such decision exists in
+    /// `docs/spec/*.md` in the apcore repo, and both peers now raise
+    /// `ModuleError` with this same code.
     ReaperAlreadyRunning,
     /// Raised when a version constraint string is malformed (e.g., `">="`
     /// without a digit operand, `"v1.0"` prefix, or a non-semver operand).

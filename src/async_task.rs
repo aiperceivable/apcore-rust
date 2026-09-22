@@ -790,12 +790,11 @@ impl AsyncTaskManager {
     /// `Err(ModuleError { code: ReaperAlreadyRunning, .. })`. Call
     /// [`ReaperHandle::stop`] (or drop the handle) before starting a new one.
     ///
-    /// **Cross-language note (A-D-019):** the typed
-    /// [`ErrorCode::ReaperAlreadyRunning`] is Rust-specific. apcore-python
-    /// raises a generic `RuntimeError` and apcore-typescript throws a plain
-    /// `Error` in this situation — there is no `REAPER_ALREADY_RUNNING` error
-    /// code in those SDKs. The Rust SDK surfaces a typed code here to match
-    /// idiomatic Rust error handling, not for cross-language code parity.
+    /// **Cross-language note (A-C-004/A-C-005):** apcore-python and
+    /// apcore-typescript now also raise `ModuleError`/`ModuleError` with this
+    /// same code for a double `start_reaper`, matching Rust. They previously
+    /// raised an untyped `RuntimeError` / plain `Error`, which a caller
+    /// writing `except ModuleError` could not catch.
     ///
     /// # Errors
     /// Returns `ModuleError` with [`ErrorCode::ReaperAlreadyRunning`] when a

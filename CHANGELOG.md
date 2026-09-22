@@ -236,6 +236,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`schema.strategy` was silently ignored — `SchemaLoader::with_config` hardcoded `YamlFirst` regardless of the config value (A-C-003).** apcore-python (`loader.py:1037`) and apcore-typescript (`loader.ts:138`) both read `schema.strategy` at the point they resolve a module's schema; this crate's `strategy` field was set once at construction to `YamlFirst` and, as it turns out, never *read* by any branching logic at all — the new `SchemaLoader::get_schema` (see Added) is the first thing in this crate that consults it. A user setting `schema.strategy: native_first` got native-first loading on Python and TypeScript and yaml-first on Rust, from the same config file, with no error or warning. An absent or unparseable value still falls back to `YamlFirst`, matching the declared default at `config.rs:452` and TypeScript's own fallback (apcore-python's constructor raises on an unparseable value instead — a pre-existing Python/TypeScript divergence this fix does not change).
+
 - **Four contract tests were `#[ignore]`d for symbols that exist, and two live ones asserted a stand-in (skip-asymmetry guard).** None of it could turn red: `check_skip_asymmetry.py` read apcore-rust's `// clause:`-above-`#[ignore]` convention as *live*, so every ignored clause in this crate was invisible to the guard built to find exactly this.
 
   - `extension_system.get_all.returns.registration_order` and `.property.pure.true` — reason "missing symbol `ExtensionManager::get_all`". It has existed since D-91 and changed signature under D-108. The block header said the same, so the **live** `get`/`get_all` clauses around them were asserted against `count()`: the clause id said `get`, the assertion said `count`, and deleting `get` left them green. Both now drive the real symbol, and the purity clause states the Rust-actual difference — `get_all` returns a borrow, so the copy Python mutates cannot exist and the borrow checker gives the stronger guarantee.
@@ -590,6 +592,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schemas/sys-manifest-*.schema.json`, the way `usage.rs` already did.
 
 ### Added
+
+- **`BatchSpanProcessor::force_flush(timeout_ms: u64) -> bool`** (observability.md "Contract: BatchSpanProcessor.force_flush", A-C-002). apcore-python has always exposed `force_flush`; this crate had only a private `flush_batch` helper reachable solely by the background loop, so a caller had no way to drain the queue before exit and spans buffered at shutdown could be silently lost. Repeatedly calls the same `flush_batch` the background loop uses, since spans can arrive between successive calls; returns `true` once the queue is empty or `false` if the deadline elapses first. Safe to call on an already-shut-down processor.
+
+- **`SchemaLoader::get_schema(module_id, native_input_schema, native_output_schema) -> Result<SchemaDefinition, ModuleError>`** (schema-system.md "Contract: SchemaLoader.get_schema", A-C-003). Mirrors apcore-python's `SchemaLoader.get_schema` and apcore-typescript's `SchemaLoader.getSchema`, resolving a module's schema per `self.strategy` (`YamlFirst` tries the YAML file first and falls back to the native schema; `NativeFirst` reverses that; `YamlOnly` never falls back). Returns a single `SchemaDefinition` rather than the peers' `(ResolvedSchema, ResolvedSchema)` pair — this crate has no analogous content-addressable cache to key a second type off of, and neither peer's cache has a caller outside its own tests.
 
 - **`Registry::set_discoverer_shared` / `set_validator_shared`, `Executor::set_acl_shared` /
   `set_approval_handler_shared` / `use_middleware_shared`, `MiddlewareManager::add_shared`,

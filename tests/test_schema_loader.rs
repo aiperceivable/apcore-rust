@@ -235,6 +235,33 @@ fn test_schema_loader_with_config_uses_modules_path_fallback() {
     assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
 }
 
+// A-C-003: `schema.strategy` used to be silently ignored — `with_config`
+// hardcoded `YamlFirst` regardless of the config value. Parity with
+// apcore-python (loader.py:1037) and apcore-typescript (loader.ts:138).
+#[test]
+fn test_schema_loader_with_config_reads_native_first_strategy() {
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("native_first"));
+    let loader = SchemaLoader::with_config(&config, None);
+    assert_eq!(loader.strategy, SchemaStrategy::NativeFirst);
+}
+
+#[test]
+fn test_schema_loader_with_config_reads_yaml_only_strategy() {
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("yaml_only"));
+    let loader = SchemaLoader::with_config(&config, None);
+    assert_eq!(loader.strategy, SchemaStrategy::YamlOnly);
+}
+
+#[test]
+fn test_schema_loader_with_config_unparseable_strategy_falls_back_to_yaml_first() {
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("not_a_real_strategy"));
+    let loader = SchemaLoader::with_config(&config, None);
+    assert_eq!(loader.strategy, SchemaStrategy::YamlFirst);
+}
+
 // ---------------------------------------------------------------------------
 // load() — spec-compatible method
 // ---------------------------------------------------------------------------
@@ -349,4 +376,116 @@ fn test_schema_loader_falls_back_to_schema_yml_extension() {
     let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
     let def = loader.load("legacy_mod").unwrap();
     assert_eq!(def.module_id, "legacy_mod");
+}
+
+// ---------------------------------------------------------------------------
+// get_schema() — strategy-driven native/YAML resolution (A-C-003)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_schema_yaml_first_prefers_file_over_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.schema.yaml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        "module_id: m\ndescription: from yaml\ninput_schema:\n  type: object\noutput_schema:\n  type: object\n"
+    )
+    .unwrap();
+    drop(file);
+
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("yaml_first"));
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let native_input = json!({"type": "string"});
+    let native_output = json!({"type": "string"});
+    let def = loader
+        .get_schema("m", Some(&native_input), Some(&native_output))
+        .unwrap();
+    assert_eq!(def.description, "from yaml");
+    assert_eq!(def.input_schema, json!({"type": "object"}));
+}
+
+#[test]
+fn test_get_schema_yaml_first_falls_back_to_native_when_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("yaml_first"));
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let native_input = json!({"type": "string"});
+    let native_output = json!({"type": "integer"});
+    let def = loader
+        .get_schema("no_file_module", Some(&native_input), Some(&native_output))
+        .expect("no YAML file, but native schemas are available");
+    assert_eq!(def.input_schema, native_input);
+    assert_eq!(def.output_schema, native_output);
+}
+
+#[test]
+fn test_get_schema_yaml_first_errors_when_no_file_and_no_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("yaml_first"));
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let err = loader
+        .get_schema("no_file_no_native", None, None)
+        .expect_err("no YAML file and no native fallback must error");
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaNotFound);
+}
+
+#[test]
+fn test_get_schema_native_first_prefers_native_over_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.schema.yaml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        "module_id: m\ndescription: from yaml\ninput_schema:\n  type: object\noutput_schema:\n  type: object\n"
+    )
+    .unwrap();
+    drop(file);
+
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("native_first"));
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let native_input = json!({"type": "string"});
+    let native_output = json!({"type": "string"});
+    let def = loader
+        .get_schema("m", Some(&native_input), Some(&native_output))
+        .unwrap();
+    assert_eq!(def.input_schema, native_input);
+    assert_eq!(def.output_schema, native_output);
+}
+
+#[test]
+fn test_get_schema_native_first_falls_back_to_file_when_no_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.schema.yaml");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write!(
+        file,
+        "module_id: m\ndescription: from yaml\ninput_schema:\n  type: object\noutput_schema:\n  type: object\n"
+    )
+    .unwrap();
+    drop(file);
+
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("native_first"));
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let def = loader.get_schema("m", None, None).unwrap();
+    assert_eq!(def.description, "from yaml");
+}
+
+#[test]
+fn test_get_schema_yaml_only_ignores_native_even_when_provided() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.set("schema.strategy", json!("yaml_only"));
+    let mut loader = SchemaLoader::with_config(&config, Some(dir.path()));
+    let native_input = json!({"type": "string"});
+    let native_output = json!({"type": "string"});
+    let err = loader
+        .get_schema("no_file_module", Some(&native_input), Some(&native_output))
+        .expect_err("yaml_only must never fall back to native, even when provided");
+    assert_eq!(err.code, apcore::errors::ErrorCode::SchemaNotFound);
 }

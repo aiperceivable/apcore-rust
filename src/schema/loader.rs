@@ -75,9 +75,27 @@ impl SchemaLoader {
             .and_then(|v| v.as_u64())
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(DEFAULT_MAX_REF_DEPTH);
+        // A-C-003: apcore-python (loader.py:1037) and apcore-typescript
+        // (loader.ts:138) both read `schema.strategy` here; this loader used
+        // to hardcode `YamlFirst` regardless of the config value. An absent
+        // or unparseable value falls back to `YamlFirst`, matching the
+        // declared default at config.rs:452 and TypeScript's fallback
+        // (Python's constructor raises on an unparseable value instead —
+        // a pre-existing Python/TypeScript divergence this fix does not
+        // change).
+        let strategy = config
+            .get("schema.strategy")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .and_then(|s| match s.as_str() {
+                "yaml_first" => Some(SchemaStrategy::YamlFirst),
+                "native_first" => Some(SchemaStrategy::NativeFirst),
+                "yaml_only" => Some(SchemaStrategy::YamlOnly),
+                _ => None,
+            })
+            .unwrap_or(SchemaStrategy::YamlFirst);
         Self {
             schemas: HashMap::new(),
-            strategy: SchemaStrategy::YamlFirst,
+            strategy,
             schemas_dir: resolved_dir,
             max_ref_depth,
         }
@@ -226,6 +244,76 @@ impl SchemaLoader {
                 format!("Schema not found for module '{module_id}'"),
             )
         }))
+    }
+
+    /// Resolve `module_id`'s schema using `self.strategy` (`schema.strategy`,
+    /// set via [`Self::with_config`] or [`Self::with_strategy`]).
+    ///
+    /// `native_input_schema` / `native_output_schema` are the schemas
+    /// generated from the module's Rust types (e.g. via `schemars`), when
+    /// available. Under [`SchemaStrategy::YamlFirst`] (the default) a YAML
+    /// file is tried first and the native schemas are the fallback when no
+    /// file is found; [`SchemaStrategy::NativeFirst`] reverses that;
+    /// [`SchemaStrategy::YamlOnly`] never falls back to the native schemas.
+    ///
+    /// Mirrors apcore-python's `SchemaLoader.get_schema`
+    /// (`schema/loader.py:1027`) and apcore-typescript's
+    /// `SchemaLoader.getSchema` (`schema/loader.ts:133`) — schema-system.md
+    /// "Contract: SchemaLoader.get_schema" (A-C-003). Returns a single
+    /// [`SchemaDefinition`] rather than the peers' `(ResolvedSchema,
+    /// ResolvedSchema)` pair: this loader has no analogous
+    /// content-addressable cache to key a second type off of, and neither
+    /// peer's cache is reached by any caller outside their own tests.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::load`]'s errors when no native fallback applies
+    /// for the active strategy.
+    pub fn get_schema(
+        &mut self,
+        module_id: &str,
+        native_input_schema: Option<&serde_json::Value>,
+        native_output_schema: Option<&serde_json::Value>,
+    ) -> Result<SchemaDefinition, ModuleError> {
+        match self.strategy {
+            SchemaStrategy::YamlFirst => match self.load(module_id) {
+                Ok(sd) => Ok(sd),
+                Err(err) if err.code == ErrorCode::SchemaNotFound => {
+                    match (native_input_schema, native_output_schema) {
+                        (Some(input), Some(output)) => {
+                            Ok(Self::wrap_native(module_id, input.clone(), output.clone()))
+                        }
+                        _ => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            },
+            SchemaStrategy::NativeFirst => match (native_input_schema, native_output_schema) {
+                (Some(input), Some(output)) => {
+                    Ok(Self::wrap_native(module_id, input.clone(), output.clone()))
+                }
+                _ => self.load(module_id),
+            },
+            SchemaStrategy::YamlOnly => self.load(module_id),
+        }
+    }
+
+    /// Build a [`SchemaDefinition`] directly from already-resolved native
+    /// schemas, without touching disk or the `$ref` resolver.
+    fn wrap_native(
+        module_id: &str,
+        input_schema: serde_json::Value,
+        output_schema: serde_json::Value,
+    ) -> SchemaDefinition {
+        SchemaDefinition {
+            module_id: module_id.to_string(),
+            description: String::new(),
+            input_schema,
+            output_schema,
+            error_schema: None,
+            definitions: None,
+            version: None,
+        }
     }
 
     /// Convert a raw JSON `Value` into a [`SchemaDefinition`] for `module_id`.
