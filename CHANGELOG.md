@@ -12,747 +12,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
-
-### BREAKING
-
-- **The deprecation warning moves from registration to `get_definition`, and its dedupe key carries the notice (spec v1.59.0, D-89).** This crate emitted the warning from the shared registration core and **its reads never warned at all**. A host that registers before installing a `tracing` subscriber — `discover()` at startup is the ordinary case — therefore lost the notice outright, with no later chance to re-emit, because the dedupe marker is written whether or not anything was listening. The warning now fires from `get_definition`, as apcore-python and apcore-typescript already did and as D-89's own rationale was written about. The accepted cost is stated rather than hidden: a module whose definition is never read is not warned about.
-
-  The key is now `(module_id, version, canonical x-deprecation block)` rather than `(module_id, version)`, and is still never cleared on `unregister`. Keying on the version alone made this crate **swallow a genuinely new or changed notice** on a re-registered module; the block closes it without re-warning on every hot reload. `sunset_date` derivation stays at registration — that fills a descriptor field and is not an advisory. `schema::hardening::canonical_json` is now `pub(crate)` so both sites render a block the same way.
-
-  The in-module unit test that asserted the old behaviour is rewritten. It had pinned both open dimensions as requirements — "reads never add a marker" and "a hot reload does not re-warn" — which is how two SDKs came to hold opposite readings of D-89 with both suites green.
-
-- **`get`, `get_all` and `unregister` reject an unknown extension point (spec v1.51.0, extension-system.md, D-108).** All three answered `None` / `&[]` / `false` for a point name that was never registered — the silent reading of the contract's `### Errors: No errors raised` row, which was written about a point that exists and currently holds **nothing**. The consequence is that `get("middlewares")`, the plural typo of a real point, wired nothing and first surfaced as a missing middleware at `apply()`, far from the call that caused it, with nothing naming the mistake. `has` and `clear` already rejected it correctly, so one manager answered the same question two ways.
-
-  **Signature change:** `get` now returns `Result<Option<&ExtensionKind>, ModuleError>`, `get_all` returns `Result<&[ExtensionKind], ModuleError>` and `unregister` returns `Result<bool, ModuleError>`, all failing with `ErrorCode::GeneralInvalidInput`. A registered point holding nothing is still `Ok(None)` / `Ok(&[])` / `Ok(false)`. `apply()` is unaffected: it looks up only the six built-in points the manager registers in `new()`, so it uses a private unchecked accessor rather than threading a `Result` through wiring code where the error cannot occur.
-
-> The five entries below implement decisions **D-76, D-78/D-91, D-80, D-81 and D-83**
-> from spec v1.49.0 (`docs/spec/2026-09-deep-chain-decisions.md`). Each one closes a
-> divergence that passed shape-level parity — same method, same arity, same declared
-> types — and differed only in what the code actually did.
-
-- **`ContextFactory::create_context` takes the runtime request (D-76).** The trait declared
-  `create_context(&self, identity: Option<Identity>, services: Value)` while its own doc comment
-  asserted that "the canonical method name defined in the apcore protocol spec" is
-  `create_context(request)`. The factory exists so a web-framework integration can extract an
-  identity *from a request*; a signature that already receives an `Identity` has had that work done
-  for it and has nothing left to do. `create_context` is now a required member taking
-  `Self::Request`, a new associated type.
-
-  **Why an associated type rather than a trait parameter (`ContextFactory<R>`):** a factory maps
-  exactly one request type to a `Context` — the same reason `Iterator` has `Item` rather than a
-  parameter. It keeps call sites inference-free (`factory.create_context(req)` needs no turbofish)
-  and still names an object-safe `dyn` form, `&dyn ContextFactory<Request = MyRequest>`. The
-  async/fallible declaration is kept: the spec permits it as a language-ecosystem allowance.
-  `create` and `create_child` remain as additive Rust-only members and now have default
-  implementations, so a host implementing only the spec surface compiles.
-
-  Migration: add `type Request = YourRequest;` and move the identity extraction into
-  `create_context`; `impl ContextFactory` blocks that only defined `create` / `create_child` no
-  longer satisfy the trait.
-
-- **`ExtensionKind` holds `Arc`, not `Box`; `ExtensionManager::register` returns an
-  `ExtensionHandle` (D-78, D-91).** `apply` consumed its registrations (`take_single`,
-  `std::mem::take`), so applying one manager to two registry/executor pairs wired both on
-  apcore-python and apcore-typescript and only the first here — silently. The block's own
-  `idempotent: false` row had already chosen: it promises that a second `apply` *stacks*
-  middleware, an observable only a non-consuming implementation can produce. `apply` now wires a
-  shared clone and leaves the store intact.
-
-  The same change makes `unregister(point, extension)` expressible from outside the manager for
-  the first time (D-91): hold the `Arc`, register a clone of it, hand another clone back. The
-  manager owns its registrations, so a caller could previously never borrow one out and pass it
-  back across `&mut self` — the method compiled, but no positive removal could be written.
-  `register` additionally returns a token that `unregister_handle` accepts, for callers that would
-  rather not keep the object.
-
-  Migration: `ExtensionKind::Middleware(Box::new(x))` becomes `ExtensionKind::Middleware(Arc::new(x))`
-  (likewise `Discoverer` / `SpanExporter` / `ModuleValidator` / `ApprovalHandler`), and
-  `ExtensionKind::Acl(acl)` becomes `ExtensionKind::Acl(Arc::new(acl))`. `register(...)?;` and
-  `register(...).unwrap();` keep compiling.
-
-- **`Registry::on` returns `Result<u64, ModuleError>` and rejects unknown event names (D-80).** The
-  registry accepted any name and handed back a valid-looking handle, so a typo was a permanently
-  silent subscription — the callback simply never fired and nothing said so. The event set is now
-  closed and exported as `registry_events::ALL`. For this SDK that set is `register` + `unregister`:
-  `watch()` re-runs discovery and already emits both for a file change, and the new "Registry
-  events" section's rule 3 forbids such an implementation from *also* emitting `file_changed`. An
-  out-of-set name is refused with `GENERAL_INVALID_INPUT`. `off` takes only the handle `on` issued
-  and no event name, so there is no name there to reject.
-
-- **Every `AsyncTaskManager` method that touches the store propagates the store's error (D-81).**
-  The manager discarded all of them — `.ok().flatten()`, `unwrap_or_default()`,
-  `let _ = save(...)` — so a store outage reported "task not found" or "no tasks", and, worst,
-  `cancel()` returned `true` after a `save` that never landed, telling the caller the task was
-  terminated while it kept running. `TaskStoreError` is declared on every `TaskStore` method;
-  declaring it there and dropping it here meant no caller could ever catch it.
-
-  `cancel -> Result<bool, ModuleError>`, `shutdown -> Result<(), ModuleError>`,
-  `list_tasks -> Result<Vec<TaskInfo>, ModuleError>`, `cleanup -> Result<usize, ModuleError>`,
-  `task_count -> Result<usize, ModuleError>`, and `get_status` / `get_status_async ->
-  Result<Option<TaskInfo>, ModuleError>`. `Ok(None)` / `Ok(false)` / an empty `Ok` list now mean
-  the store answered; an outage is an `Err`. The background execution path has no caller to
-  propagate to, so its store failures are logged rather than dropped.
-
-- **`guard_call_chain` takes the chain, not a `Context` (D-83).** `call-chain-guard.md` publishes
-  `guard_call_chain(module_id: &str, call_chain: &[String], max_call_depth: usize,
-  max_module_repeat: usize) -> Result<(), ModuleError>`, and the shipped crate had
-  `guard_call_chain(ctx: &Context<serde_json::Value>, module_name: &str, max_depth: u32)` — so the
-  spec's own Rust example did not compile. Because `Context<T>` is generic, a host whose services
-  type was anything else **could not call the guard at all**, and ran nested calls with no depth,
-  cycle or frequency enforcement while the Python and TypeScript equivalents got all three from a
-  one-line call. The A20 algorithm itself was byte-for-byte identical across the three SDKs; only
-  the door was missing.
-
-  The two `Context`-taking forms survive as thin wrappers and are now **generic over the services
-  type**: `guard_call_chain_for_context(ctx, module_id)` applies `DEFAULT_MAX_CALL_DEPTH` and
-  `DEFAULT_MAX_MODULE_REPEAT` — a `pub const` pair the guard never consulted before — and
-  `guard_call_chain_with_repeat(ctx, module_id, max_call_depth, max_module_repeat)` takes explicit
-  limits and is what the executor's `call_chain_guard` pipeline step uses. Both limit parameters
-  are `usize` (`max_depth` was `u32`).
-
-  Migration: `guard_call_chain(&ctx, name, depth)` becomes
-  `guard_call_chain_with_repeat(&ctx, name, depth, DEFAULT_MAX_MODULE_REPEAT)`.
-
-- **The approval gate now fires on the UNION of the live module's and the registry descriptor's
-  governance annotations (D-96).** See the security entry under **Fixed** for why it had to change:
-  the gate decided from the descriptor alone while the `ApprovalRequest` it built read the live
-  module, so a module declaring `requires_approval: true` ran **ungated** whenever its descriptor
-  omitted the annotation — and a single call could be gated by one source and described by the
-  other.
-
-  The correction is a union, **not a swap**. Reading only the module would have inverted the bypass
-  rather than closing it: `Registry::register(module_id, module, descriptor)` is the Rust-only
-  three-argument form, and its own documentation advertises descriptors "loaded from a config file
-  or discovered from an external source", so an operator's requirement declared THERE would have
-  stopped gating. Both single-source readings are fail-OPEN, and on an approval gate the failure
-  direction is the whole argument: requiring an approval that was not strictly needed costs a
-  prompt, skipping one that was needed is a bypass. This mirrors §6.9, where the requirement is
-  already the union of the module annotation, the ACL rule and `gate_destructive`.
-
-  Why it is listed as BREAKING even though it only ever gates MORE: a module or descriptor
-  declaring `requires_approval` / `destructive` that previously slipped through now prompts, so a
-  deployment with no `ApprovalHandler` configured and `ExecutionPolicy(strict)` set will start
-  failing closed on calls that used to run. That is the intended outcome, and it is a behaviour
-  change a consumer must know about before upgrading.
-
-  Migration: none required for correctness — declare governance on either source and it is honoured.
-  apcore-python and apcore-typescript cannot express a disagreement between the two at all, since
-  their descriptors are derived from the module, which is why the union costs them nothing. Modules
-  registered through `register_module` / `register_versioned` / a `*.binding.yaml` derive the
-  descriptor from the module and, with the `FunctionModule` fix below, agree by construction.
-
-- **Per-class markers are the only multi-class opt-in; the file-level `DiscoveryConfig` gate is
-  inert (D-107).** `DiscoveryConfig { multi_class }` was a FILE-LEVEL toggle whose own doc comment
-  still cited `extensions.multi_class_discovery` — the config key decision-log D-06 removed, and one
-  no SDK ever implemented — while `DiscoveredClass` carried no marker at all. A file-level flag
-  cannot express the case the feature exists for: two participating classes beside a helper class
-  that must not become a module. `DiscoveredClass` and `MultiClassEntry` each gained a
-  `multi_class` field, and `derive_module_ids` resolves the opt-in from
-  `classes.iter().any(|c| c.multi_class)` — the same rule apcore-typescript's
-  `Registry.discoverMultiClass` already applies. `DiscoveryConfig` still compiles and is still
-  accepted by `derive_module_ids` / `register_multi_class`; it no longer decides anything.
-
-  Migration: `DiscoveredClass { name, implements_module }` becomes
-  `DiscoveredClass::new(name, implements_module).with_multi_class(true)` for a participating class
-  (the struct gained a field, so struct-literal construction needs it either way), and
-  `MultiClassEntry::new(class, module)` becomes `.with_multi_class(true)` for each class a
-  multi-class file registers. Passing `DiscoveryConfig::with_multi_class()` without markers now
-  derives the bare `base_id`, as an un-annotated file should.
-
-- **A binding's declared `annotations` reach registration in full, so a `streaming: true` binding
-  with no `stream()` implementation is now rejected (DEC-002).** The binding loader's hand-rolled
-  annotation parser matched five of the twelve keys §4.4's `Annotations` declares —
-  `readonly` / `destructive` / `idempotent` / `requires_approval` / `open_world`. `streaming`,
-  `cacheable`, `cache_ttl`, `cache_key_fields`, `paginated`, `pagination_style` and the literal key
-  `extra` all fell into the catch-all and were nested under their own names, so `{"extra": {...}}`
-  deserialized to `extra.extra` — a §4.4.1 wire-format violation — and a binding claiming to stream
-  registered cleanly where apcore-python and apcore-typescript both raise
-  `STREAMING_INTERFACE_MISMATCH`. Deserialization is now delegated to `ModuleAnnotations`'s own
-  `Deserialize`, the single definition of that format. A malformed `annotations` block
-  (`cache_ttl: "soon"`) is reported as `BINDING_FILE_INVALID` instead of being swallowed into
-  `extra`.
-
-- **`DependencyInfo` serializes its constraint as `version` (SYS-12).** The manifest sys modules
-  emitted `dependencies[].version_constraint`, a name that appears in neither peer nor in the
-  metadata YAML the value is read from — both spell it `version`. The Rust field keeps its more
-  explicit name; only the wire form changed. A consumer reading `version_constraint` off
-  `system.manifest.module` / `system.manifest.full` (or off a serialized `ModuleDescriptor`) must
-  read `version`.
-
-- **`Executor::stream` runs the full pipeline tail on the non-streaming fallback path (STR-1).**
-  For a module with no `stream()`, the fallback ran `execute()` and yielded the raw result: the
-  strategy's tail never ran, and Phase 3's swallow-and-warn then hid whatever it would have found.
-  apcore-python and apcore-typescript run the FULL strategy in Phase 1, so an output violating
-  `output_schema` fails the call and yields nothing, and an after-middleware that transforms the
-  output is reflected in what the caller receives. The "chunks already delivered, cannot un-send"
-  rationale that justifies swallowing does not apply on this path — nothing has been delivered yet.
-  A caller that was receiving a schema-invalid chunk from a non-streaming module now receives an
-  `Err` item instead.
-
-- **Stream Phase 3 runs the strategy's own post steps (STR-2).** It hardcoded output-schema
-  validation plus `middleware_after`, so on the `minimal` preset — which removes both — a streamed
-  call still validated and still fired every `after()` hook, side effects for a strategy that had
-  explicitly removed them, while `call()` on the same preset skipped both. A REPLACED
-  `output_validation` step never ran at all. Phase 3 now runs the steps the strategy actually
-  carries (`output_validation`, `middleware_after`, `return_result`) — the filter apcore-python
-  applies when it builds its `post_stream` sub-strategy.
-
-- **A call that supplies no identity reaches the module with `context.identity == None` (D-103).**
-  `BuiltinContextCreation` and four `Executor` entry points manufactured
-  `Identity::new("@external", "external", …)` for a caller-less call, and `child()` cloned it down
-  to the module. `@external` is the **caller-side ACL sentinel** substituted for a null `caller_id`,
-  not a principal: a module written to the spec's own example — `if not context.identity: raise
-  "Authentication required"` — rejects an unauthenticated call on apcore-python and
-  apcore-typescript and ADMITTED it here, which is the wrong way for that divergence to fail. The
-  `caller_id` half of the default is unchanged. A module or middleware that read
-  `context.identity` on an unauthenticated call now sees `None`.
-
-### Removed
-
-- **BREAKING (deprecated since 0.20.0, no known callers): the associated function `Executor::list_strategies()`.**
-  It took no `self` and merely delegated to the module-level `list_strategies()`, which remains exported and is
-  what its own deprecation note already pointed callers at. It had to go so the name could carry the
-  instance method below: Rust rejects two inherent associated items with the same name on one type
-  regardless of receiver (E0592), so keeping the shadow made the documented signature unimplementable.
-
-### Changed
-
-- **`AsyncTaskManager::shutdown()` attempts every cancellation before it reports (spec v1.52.0,
-  async-tasks.md, D-122).** D-81 made `TaskStoreError` reach the caller and said nothing about the
-  tasks not yet reached, so the three SDKs split while implementing it on the same day: this one and
-  apcore-python returned at the first failing `cancel()`, apcore-typescript attempted all. Stopping
-  early is the worse half of an asymmetry — when the *store* is unreachable both strategies cancel
-  nothing and fail-fast merely arrives there sooner, but when *one task* fails it leaves every
-  remaining active task uncancelled, and an uncancelled task in a shared store holds a `max_tasks`
-  slot for every manager pointed at that store and outlives the process that could have cancelled it.
-  `shutdown()` now cancels every active record and returns the **first** error afterwards, so the
-  caller still learns the shutdown was not clean. This does not make `shutdown()` slower to hang: it
-  is **already an unbounded wait by contract** — it waits for in-flight tasks and takes no timeout
-  parameter — so a caller needing a bound must already impose one from outside, and that bound covers
-  the cancellation loop too. Pinned red-first by
-  `tests/async_tasks_spec.rs::async_tasks_shutdown_attempts_every_cancellation`, whose store fails
-  the CANCELLED write for exactly one task id and asserts the task *after* it is still cancelled.
-
-### Fixed
-
-- **`schema.strategy` was silently ignored — `SchemaLoader::with_config` hardcoded `YamlFirst` regardless of the config value (A-C-003).** apcore-python (`loader.py:1037`) and apcore-typescript (`loader.ts:138`) both read `schema.strategy` at the point they resolve a module's schema; this crate's `strategy` field was set once at construction to `YamlFirst` and, as it turns out, never *read* by any branching logic at all — the new `SchemaLoader::get_schema` (see Added) is the first thing in this crate that consults it. A user setting `schema.strategy: native_first` got native-first loading on Python and TypeScript and yaml-first on Rust, from the same config file, with no error or warning. An absent or unparseable value still falls back to `YamlFirst`, matching the declared default at `config.rs:452` and TypeScript's own fallback (apcore-python's constructor raises on an unparseable value instead — a pre-existing Python/TypeScript divergence this fix does not change).
-
-- **Four contract tests were `#[ignore]`d for symbols that exist, and two live ones asserted a stand-in (skip-asymmetry guard).** None of it could turn red: `check_skip_asymmetry.py` read apcore-rust's `// clause:`-above-`#[ignore]` convention as *live*, so every ignored clause in this crate was invisible to the guard built to find exactly this.
-
-  - `extension_system.get_all.returns.registration_order` and `.property.pure.true` — reason "missing symbol `ExtensionManager::get_all`". It has existed since D-91 and changed signature under D-108. The block header said the same, so the **live** `get`/`get_all` clauses around them were asserted against `count()`: the clause id said `get`, the assertion said `count`, and deleting `get` left them green. Both now drive the real symbol, and the purity clause states the Rust-actual difference — `get_all` returns a borrow, so the copy Python mutates cannot exist and the borrow checker gives the stronger guarantee.
-  - `extension_system.apply.side_effect.4.set_approval_handler` — reason "Executor exposes no approval_handler getter AND no public ApprovalHandler stub is trivially constructible", **both halves false**: `Executor.approval_handler` is a public field and `AutoApproveHandler` is a public unit struct. Its live sibling `apply.side_effect.3.set_acl` carried the same false premise about `Executor.acl` and asserted D-78's store-intactness instead; it passed with the ACL wiring deleted. Both now assert the wiring by `Arc::ptr_eq` against the public field, and both red when `apply()` stops wiring.
-  - `system_modules.check_module_disabled.error.module_disabled` and `is_module_disabled.return.true_when_disabled` — reason "no public mutator for the process-global ToggleState". `global_toggle_state_arc()` is `pub` and returns that exact `Arc`; `ToggleState::disable` is `pub`. Both now exercise the disabled branch with an id unique to the test, restored before returning, so the shared `it` binary is unaffected.
-
-  Also: `config_bus.get.input.key.empty` was `#[ignore]`d in all three SDKs for a rule **D-74 deleted** — a symmetric skip, which is the one shape the guard cannot see, since it needs a live peer as oracle. It now asserts the D-74 behaviour.
-
-- **The executor's ACL step is pinned to the ASYNC path (spec v1.50.0, D-105).** No behaviour change
-  — this SDK already takes it. What was missing is the case: a whole extension point
-  (`register_async_condition`) reachable from every door except the enforcing one is invisible from
-  the door, and a registry that accepts a handler is not evidence anything calls it. `tests/test_executor_async_acl_path.rs`
-  registers a SYNC handler answering false and an ASYNC handler answering true for one key, so the
-  verdict separates the paths — counting invocations would not, since both invoke a handler. Verified
-  red by forcing the synchronous accessor. Each case uses its own condition key, because handlers are
-  registered into a PROCESS-level registry and a shared key let one case decide another.
-
-- **A symlinked module file is discovered, and an aliased directory is not discovered twice (spec
-  v1.56.0, D-127).** `if file_type.is_dir() || (file_type.is_symlink() && follow_symlinks)` routed a
-  symlinked FILE into the directory branch, where `entry_path.is_dir()` is false and it fell out
-  unappended — so `follow_symlinks` governed directories and did nothing for files. An aliased
-  directory, meanwhile, was traversed twice and produced duplicate module IDs. Identity, the module
-  ID and visited-directory tracking are now keyed on the canonical real path, and `file_path` is the
-  target rather than the alias.
-
-- **A malformed annotation value is dropped rather than rejecting the whole value (spec v1.51.0,
-  D-115).** `extra: "oops"` failed deserialization with `ModuleAnnotations.extra must be an object`
-  and `cache_ttl: -5` with `expected u64`, so one bad value removed an entire module — worse than
-  strict, because the declaration is recoverable and the module is not. Both are now dropped with a
-  `tracing::warn!`; a well-formed value is untouched.
-
-- **`MiddlewareManager::remove` / `remove_handle` clear the duplicate-identity entry (spec v1.51.0,
-  D-114).** Neither touched `registered_identities`, so `use` / `remove` / `use` — a legitimate swap
-  — reported a duplicate against a registration that no longer existed. The entry is cleared only
-  when no OTHER registration still holds the same identity, which is reachable because duplicate
-  registration warns but succeeds. The identity is now remembered per registration, parallel to
-  `handles`, since it depends on an optional `identity_key` that is an option of the call rather
-  than a property of the instance.
-
-- **Every `system.*` module declares `open_world: false` (spec v1.51.0, D-119).** The descriptor
-  built by `register_sys_modules` took `..Default::default()`, which gives `open_world: true` — the
-  OPPOSITE of the intended value, since no system module reaches an external system. Written out
-  explicitly now; relying on a default that means the opposite is how the divergence arose, and is
-  the second half of the decision. D-110 needed no change here — this SDK already returned
-  `"apcore"`, and the case is what stops that regressing.
-
-- **A malformed dependency constraint is reported as malformed, not as a version mismatch (spec
-  v1.49.0, D-85).** D-85 was implemented in `try_matches_version_hint`, which reports
-  `VERSION_CONSTRAINT_INVALID` for an operand that does not start with a digit — and
-  `resolve_dependencies` called the NON-fallible `matches_version_hint`, which fails closed to
-  `false` and was then reported as `DEPENDENCY_VERSION_MISMATCH`. An operator who typed `v1.0.0`
-  against an actual `1.0.0` was told the versions did not satisfy each other, about versions that
-  are identical; `latest` produced the same misdirection. Both peers surface
-  `VERSION_CONSTRAINT_INVALID` from this path with the offending constraint and the rule it broke.
-  A malformed constraint is **not** downgraded for an optional dependency either — `optional` means
-  the dependency may be absent, not that the declaration may be nonsense.
-
-  *Found by `conformance/decision_coverage.json`: two cases added to
-  `dependency_version_constraints.json` came back red here. The decision was implemented at the
-  wrong layer, which is invisible from the layer that has it.*
-
-- **`ErrorCode::TaskStoreUnavailable` exists and is framework-reserved (spec v1.50.0,
-  async-tasks.md, D-92).** D-92 required all three SDKs to define, register and export the type; it
-  landed in apcore-python alone, and this SDK never had it — `TASK_STORE_UNAVAILABLE` appeared
-  nowhere in the source. `async-tasks.md` declares it on **eight** surfaces, so callers had eight
-  documented places to catch an error no implementation could raise. The variant is now in the
-  framework set Algorithm A17 reserves against module registration, is retryable (a store outage is
-  transient, matching both peers), and `ModuleError::task_store_unavailable(operation, reason)` is
-  the constructor — this SDK carries error types as `ErrorCode` variants plus constructors rather
-  than per-error structs, which is how every other error here is shaped.
-
-  *Found by `conformance/decision_coverage.json`: the case asserting the collision was added to
-  `error_codes.json` and came back red here and in apcore-typescript.*
-
-- **`version` and `examples` were the unfixed half of D-97 — declared, validated, then discarded at
-  registration.** D-97 gave `FunctionModule` trait accessors for `annotations` / `tags` /
-  `documentation` / `metadata`; `version` and `examples` stayed fields the `Module` trait exposed no
-  accessor for, so `Registry::register_module` had nothing to read and hardcoded
-  `DEFAULT_MODULE_VERSION` / `vec![]` — the same shape as the `documentation: None` / `metadata: {}`
-  that D-97 removed. The version half has teeth because the value is **checked on the way in and
-  dropped on the way out**: `BindingValidator` validates `entry.version` against
-  `validation.binding.version_require_semver`, the loader copies it onto the module, and the registry
-  then registered it as `1.0.0` — so a binding declaring `version: "2.3.0"` passed semver validation
-  and became un-addressable by the version it declares. `Module` now carries defaulted `version()` /
-  `examples()` accessors (existing `impl Module` blocks are unaffected), and **both** registration
-  paths read them. `register_versioned` — the canonical four-argument form registry-system.md names
-  as the cross-language-symmetric one — additionally dropped the module's `documentation` and
-  `examples` outright; it now resolves version as explicit argument > module declaration > default,
-  matching apcore-python's `meta.get("version") or code_version or "1.0.0"`. Measured against both
-  peers rather than assumed: each reports `descriptor.version == "2.3.0"` and one example for the
-  same input, where this SDK reported `1.0.0` and none. Pinned red-first through the real binding
-  loader door. `dependencies` is the fourth field of the same family and was missed on the first
-  pass through this very function: `register_versioned` parsed them out of its `metadata`
-  ARGUMENT only, so a module declaring them on ITSELF — which is how both peers read them
-  (`getattr(module, "dependencies", [])`) — registered with an empty graph, and
-  `ReloadModule::topo_sort_modules` reads that accessor, so a `path_filter` reload of such
-  modules degenerated to alphabetical order.
-
-- **SECURITY: the `system.manifest.*` annotations advertised governance the gate does not enforce
-  (spec v1.54.0, §7.4, D-125).** `annotations_view` projected `requires_approval` / `destructive`
-  off the descriptor alone, so a module whose INSTANCE declares the requirement — gated by the
-  pipeline since the D-96 union — was advertised to agents as ungated. A manifest is what an agent
-  reads to decide whether to call something, so a false `requires_approval: false` is a specific
-  claim it acts on, which makes it worse than publishing nothing. The projection now uses the same
-  `ModuleAnnotations::governance_union` the gate, the preflight and `governance_state()` use.
-  `readonly` / `idempotent` describe behaviour rather than governance and stay descriptor-sourced.
-  The ephemeral-registration advisory (`warn_if_missing_approval`) moves to the union too: it read
-  the descriptor while apcore-python and apcore-typescript read the instance, so the same
-  registration warned on one SDK and stayed silent on another. Pinned red-first, with a control that
-  the manifest does not invent governance either.
-
-- **SECURITY: a `$ref` into an external schema could bind to the caller's definitions, including past
-  an `x-sensitive` marking (spec v1.53.0, A05 step 4a, D-124).** D-104 gave a local `#/…` pointer a
-  second base — the schema node, after the file root — and did not say how far it travels. `node_fallback` lived on the `RefResolver` and was consulted for every local
-  pointer; it is now carried per hop in a `DocumentBase` alongside the root and the file, and cleared
-  the moment resolution crosses into another document.
-  So a `#/$defs/X` written inside an EXTERNAL schema, naming a definition that document does not
-  have, fell back to the CALLING module's `input_schema` `$defs` and bound to whatever shared the
-  name. Three consequences, in increasing order of cost: an invalid reference reports success where
-  it owes `SCHEMA_NOT_FOUND`; the resolved schema then validates against a contract the external
-  author never wrote; and §10.6 reads `x-sensitive` off the **resolved** schema, so a field the
-  external document marks sensitive can be replaced by a same-named local definition that does not,
-  and the value is logged in plaintext — SCH-001's leak by a different route. The fallback is now
-  scoped to the document it was declared for. **This does not narrow D-104**: a local pointer inside
-  an external document still resolves in that document, and Layout B is unaffected. Pinned red-first,
-  with a control case proving the fallback was scoped and not disabled. All three SDKs had it.
-
-- **SECURITY: the approval gate decided from the registry descriptor, not the module — two
-  independent bypasses that compose (D-96, D-97).**
-
-  **Half one (D-96):** `BuiltinApprovalGate::execute` read `requires_approval` / `destructive`
-  from `registry.get_definition(module_id).annotations`, while the `ApprovalRequest` it hands the
-  handler read the live module — its own comment recorded the split. PROTOCOL_SPEC §7.4 Step 5
-  binds `annotations = module.annotations` in step 2 and tests THAT binding in step 3, and both
-  peer SDKs read the live module (`_module_requires_approval(module)` /`needsApproval(mod)`). A
-  module whose `annotations()` declared `requires_approval: true`, registered with a descriptor
-  that omitted it, therefore **executed ungated here and was gated on the peers**.
-
-  The gate now fires on the **UNION** of the two sources, not on the module alone. Swapping which
-  single source is read would have inverted the bypass rather than closing it: the Rust-only
-  three-argument `Registry::register(module_id, module, descriptor)` documents descriptors as
-  "loaded from a config file or discovered from an external source", so an operator's requirement
-  declared there would have stopped gating instead. Both single-source readings are fail-OPEN, and
-  on an approval gate the failure direction is the whole argument — requiring an approval that was
-  not strictly needed costs a prompt, skipping one that was needed is a bypass. The union mirrors
-  §6.9, where the requirement is already the union of the module annotation, the ACL rule and
-  `gate_destructive`, and it costs the peer SDKs nothing because their descriptors are derived from
-  the module. The `ApprovalRequest` reads the same resolved instance, so decision and description
-  can no longer disagree. `Executor::validate`'s preflight verdict moved to the same resolution,
-  which is what keeps its documented promise that the preflight and the gate "cannot report
-  different verdicts"; it still falls back to the descriptor when the pipeline resolved no module at
-  all, the one case the gate never reaches.
-
-  **Half two (D-97):** `FunctionModule` stores `annotations`, `tags`, `documentation`, `metadata`
-  and `examples` as fields but implemented only `input_schema` / `output_schema` / `description` /
-  `execute`, so `annotations()` and `tags()` fell through to the trait defaults and **everything a
-  `*.binding.yaml` declared was discarded at registration** — the approval requirement included.
-  `Registry::register_module` additionally hardcoded `documentation: None` and
-  `metadata: HashMap::new()`, overwriting the `display:` block the binding loader had computed into
-  `metadata["apcore.display"]`. The registry-side half of this had already been fixed under
-  A-D-017, on the reader; the type being read was never updated. `FunctionModule` now implements
-  `annotations()` / `tags()` / `documentation()` / `metadata()`, and `register_module` sources
-  `documentation`, `metadata` and `dependencies` from the module instead of hardcoding them.
-
-  The two compose: before both fixes a binding declaring `requires_approval: true` reached the
-  `ApprovalHandler` by no path at all. Note the behaviour change this implies for existing
-  deployments — a `*.binding.yaml` whose `annotations`, `tags`, `documentation` or `display` were
-  silently inert now takes effect, so a binding that declares `requires_approval: true` will start
-  gating calls that previously ran through. See **BREAKING** above for the descriptor-only case.
-
-- **SECURITY: `$ref` sibling keys were discarded during schema resolution, including `x-sensitive`
-  (D-98).** `RefResolver` read `map["$ref"]` and returned the resolved target; every other key of
-  the node was never read. JSON Schema 2019-09+ makes keys beside a `$ref` independent assertions,
-  and PROTOCOL_SPEC §4.11 step 1b already required them preserved on the self-reference path — so
-  resolution was the one place they vanished. This is a data leak, not a cosmetic gap: §10.6
-  redaction is driven by `x-sensitive` in the RESOLVED input schema, so given
-  `{"owner": {"$ref": "#/$defs/User", "x-sensitive": true}}` apcore-python and apcore-typescript
-  redacted the field at the executor's capture point and this SDK wrote the value to logs and to
-  `context.redacted_inputs` in plaintext. The node's non-`$ref` keys are now overlaid onto the
-  resolved target, siblings winning on a key collision, matching apcore-python's
-  `result.update(sibling_keys)` and apcore-typescript's `Object.assign`. A sibling is resolved in
-  turn (it may carry a `$ref` of its own), against the referring document's base, where it lives.
-
-- **`Executor::call` rejects an over-length module ID at the entry guard (D-75).** `core-executor.md`
-  "Contract: Executor.call" says empty / over-length / malformed IDs MUST be rejected *before the
-  pipeline context is constructed*. `validate_module_id` checked emptiness and the EBNF pattern
-  only; `MAX_MODULE_ID_LENGTH` (192) was enforced one step later, in the registry. A 300-character
-  well-formed ID therefore built a `PipelineContext` and came back as `MODULE_NOT_FOUND` instead of
-  the entry guard's `INVALID_MODULE_ID`. Honouring the stated bound costs one comparison.
-
-- **A stalled topological sort is no longer reported as a cycle (D-79).** When Kahn's algorithm
-  terminates with nodes remaining there are two causes, and `extract_cycle` fell back to the sorted
-  remaining set when it found no back edge — so a batch member whose dependency was simply not in
-  the batch produced a one-element "cycle" reported as `CIRCULAR_DEPENDENCY`. The two causes need
-  opposite fixes (break an edge, versus add a missing module to the batch), and reporting a loop
-  that does not exist sends the author looking for something that is not there. `find_back_edge_cycle`
-  now returns `None` in that case, and the stall is reported as `MODULE_LOAD_ERROR` naming the
-  blocked modules in `details.blocked_modules` — with **no** `cycle_path`. Ported from
-  apcore-python's `_find_back_edge_cycle`.
-
-- **`InMemoryTaskStore` lists tasks in submission order (D-82).** `list` and `list_expired` sorted
-  by `task_id`, which is a UUID v4 and therefore random with respect to submission, so
-  `list_tasks()[0]` returned the lexicographically smallest UUID rather than the first-submitted
-  task. The spec's "insertion order (Python dict / JavaScript Map)" read as an implementation note;
-  it is the requirement, and an implementation whose backing map lacks insertion order must carry
-  its own counter. `DashMap` does, so each record is now stamped with a monotonic sequence on first
-  save and both listings sort on it. An overwrite (a status transition) keeps the record's position.
-
-- **The call-chain limit floors carry `ai_guidance` (D-84).** Both non-positive-limit rejections
-  already raised the typed `GENERAL_INVALID_INPUT` — the reason D-84 made this SDK's behaviour
-  normative for all three — but they were built with `ModuleError::new`, so they were the only two
-  errors in the guard without guidance. `ai_guidance` is `skip_serializing_if = "Option::is_none"`,
-  so leaving it unset drops the field from the wire envelope entirely. They now go through
-  `ModuleError::invalid_input` with wording specific to the misconfigured key. The
-  `call_chain.json` conformance driver was taught the fixture's new `GENERAL_INVALID_INPUT`
-  expectation (it previously pinned only the placeholder name `INVALID_LIMIT`, which existed
-  because Python raised `ValueError` and TypeScript a bare `Error`) and now also asserts the
-  guidance is present.
-
-- **The ACL emits the §6.5 "conditions present but no context" warning, once per rule index
-  (D-88).** This SDK emitted no such warning at all, so a well-formed conditional `deny` rule
-  silently failed to match a context-less caller — the precise situation §6.5 warns about, since
-  such a rule is not a backstop for those callers. The warning is deduped per `(rule index, effect)`
-  as in apcore-python and apcore-typescript, and — the actual subject of D-88 — `add_rule`,
-  `remove_rule` / `remove_rule_with_conditions` and `reload` all clear the dedupe set. `add_rule`
-  inserts at index 0 and shifts every existing rule, so a retained marker would suppress the
-  warning for a different rule than the one it was recorded for, and specifically for the rule the
-  operator just added.
-
-- **The deprecation warning fires at most once per `(module_id, version)` per registry instance
-  (D-89).** Deriving `sunset_date` at registration already keeps the warning off `get_definition`,
-  which is a read hosts call in loops — per-read warning is spam proportional to traffic, which is
-  how operators learn to filter it out. But `watch()` re-runs discovery, which unregisters and
-  re-registers every module, so registration alone was not "once" either: a hot reload re-warned
-  for each deprecated module. The registry now records which pairs it has already reported.
-
-- **`Executor::list_strategies()` never included the executor's own strategy.** `core-executor.md`
-  "Contract: Executor.list_strategies" requires "one entry for the executor's current strategy plus one for
-  every strategy registered", and `design-execution-pipeline.md` publishes the instance-scoped signature
-  `pub fn list_strategies(&self) -> Vec<StrategyInfo>`. Only the module-level function existed, reporting the
-  global `STRATEGY_REGISTRY`, which is not pre-seeded with the built-ins — so a default executor answered
-  with an empty `Vec`. `design-execution-pipeline.md` §8.2 documents this call as the input to AI strategy
-  selection, which means the menu was empty exactly where it mattered. The instance method now yields the
-  current strategy first, then registry entries deduped by name, matching apcore-python.
-
-- **`_approval_token` is removed from the arguments on EVERY exit from the approval gate (PROTOCOL_SPEC §7.4).** §7.4 states it unconditionally, but the only `remove` lived inside the `needs_approval && handler.is_some()` branch, so both earlier returns — the not-gated return and the no-handler skip — left the key in `ctx.inputs`. It then reached Step 7, where an `additionalProperties: false` input schema rejected it as an undeclared key, and reached the module's own `execute()`. The non-string rejection was skipped on those paths too. Extraction now happens as the first statement of the step, and it REBUILDS the inputs rather than mutating them through `as_object_mut()` — parity with apcore-python `_take_approval_token` and apcore-typescript `_takeApprovalToken`, which rebuild for the same reason.
-
-- **`PlatformNotifyMiddleware`'s error rate was permanently 0.0, so `apcore.health.error_threshold_exceeded` could never fire.** `MetricsCollector::increment_calls` is the only writer and always emits the label key `module_id`; `compute_error_rate` built its snapshot keys with `module=`, a key that is never written, so every lookup missed. The middleware is wired by default in `register_sys_modules`, so this was live in any deployment that registered the system modules. Four tests hand-built the same wrong label and passed on it. Snapshot extraction now lives once in `observability::metrics` (`extract_module_call_counts` / `extract_module_latency_stats`, mirroring apcore-typescript's `metrics-utils.ts`) and both readers — the middleware and `system.health.*` — go through it, so reader and writer cannot diverge again. The exported `METRIC_CALLS_TOTAL` / `METRIC_DURATION_SECONDS` constants (plus a new `METRIC_ERRORS_TOTAL`) are now used at every production call site instead of the literal spellings that caused the split.
-
-  Consolidating the two readers surfaced a **second** defect in the other one: `system.health.*` spelled the label correctly but read the counter with `Value::as_u64`, and the collector stores counters as `f64`, which `snapshot()` renders as `3.0` — so `as_u64` answered `None` every time and `system.health.module` / `system.health.summary` reported `total_calls: 0`, `error_count: 0` and status `unknown` for every module regardless of traffic. The shared reader reads them as `f64`.
-
-- **A malformed version constraint no longer silently passes.** `check_single_constraint` validated no operand: `"latest"` matched no operator prefix, fell through to `("=", "latest")`, and `parse_semver` degraded it to `(0, 0, 0)` — whereupon the single-part exact branch compared major against 0 and returned **true** for any module at `0.x.y`, so the constraint enforced nothing. The mirror image was equally wrong: `"v1.0.0"` reported a mismatch against an actual `1.0.0`. The operand must now start with a digit, the same check apcore-python's `_CONSTRAINT_RE` applies (it raises `VersionConstraintError` for `"latest"`, `"v1.0.0"` and `""`). New `try_matches_version_hint`, `try_select_best_version` and `VersionedStore::try_resolve` return the typed `VERSION_CONSTRAINT_INVALID` error; the existing `matches_version_hint` / `select_best_version` / `VersionedStore::resolve` keep their infallible signatures and now fail **closed** — no match, plus a warning naming the constraint.
-
-- **`descriptor.sunset_date` is derived from `metadata["x-deprecation"].sunset_date`, and a deprecated module logs a deprecation warning.** Every Rust descriptor builder hard-coded `None` and `x-deprecation` appeared nowhere in the crate, so a module apcore-python reports a sunset date for reported none here. Derived once in the shared registration core, so `register`, `register_module` and `register_versioned` all pick it up; an explicit descriptor value still wins.
-
-- **`merge_module_metadata` merges annotations FIELD BY FIELD and emits `dependencies`.** Annotations were whole-replaced (YAML wins), so a module whose code declared `{destructive: true, readonly: false}` and whose YAML declared only `{readonly: true}` lost `destructive` — PROTOCOL_SPEC §4.13 requires YAML > code > defaults per field, which both peer SDKs implement. Separately, the returned map carried no `dependencies` key at all, so a declared dependency survived discovery and was then lost before storage; both peers emit it, and both carry comments describing that loss as a fixed defect.
-
-- **The depth and circular arms of `guard_call_chain_with_repeat` carry `ai_guidance`.** The field is `skip_serializing_if = "Option::is_none"`, so leaving it unset dropped it from the wire envelope entirely for the two most common guard trips, while apcore-python and apcore-typescript always carry it. Same wording as both.
-
-- **`CancelToken::check()` no longer fabricates the module id `"@unknown"`.** That string appears nowhere in the protocol specification, and `to_module_error` wrote it into `details` — so an external caller following the spec's own Rust example emitted a payload no other SDK emits (`check()` yields `details == {}` in both peers). `ExecutionCancelledError::module_id` is now `Option<String>`, omitted from `details` and from `Display` when absent; `check_for()` still populates it. **API note:** the field type changed, so a struct-literal construction or a pattern match on it needs `Some(...)`; `ExecutionCancelledError::new` is unchanged and `without_module` is the new no-module constructor.
-
-- **`AsyncTaskManager::shutdown` stops the reaper, and dropping a `ReaperHandle` no longer arms a second one.** `shutdown` never touched `reaper_running` or the stop channel, so a started sweep loop outlived it — apcore-python's `shutdown` awaits `stop_reaper()` first and apcore-typescript clears its sweep timer there. Compounding it, `Drop for ReaperHandle` stored `false` into `running_flag` **without** signalling `stop_tx`: the sweep loop kept running while the guard it held was released, so the next `start_reaper` won its compare-exchange and a second loop ran alongside the first, both deleting from the same store. Dropping a handle now detaches without releasing the guard (a detached reaper is still running), and the manager retains the stop sender so `stop_reaper` / `shutdown` can stop it.
-
-- **A task's `JoinHandle` can no longer be registered after the task has already finished.** `submit_with_retry` spawned first and inserted the handle afterwards, while the spawned body removed itself at the end. A fast failure — `MODULE_NOT_FOUND`, with a free semaphore permit and an immediately-ready `InMemoryTaskStore` — could complete and run its removal before the parent's insert on a multi-threaded runtime: the removal no-opped and a stale handle was then inserted for an already-terminal task, so `cancel()` would later `abort()` a finished task and `handles` grew without bound. A flag the task sets before taking the `handles` lock, read by the parent while holding it, closes the window in both interleavings.
-
-- **SECURITY-adjacent: the executor's ACL step took the SYNCHRONOUS path, so the entire
-  `register_async_condition` extension point was dead in the only code path that enforces
-  (D-105).** `BuiltinACLCheck::execute` is an `async fn` that called `ACL::check_access`;
-  `ACL::async_check_access` had zero non-test callers. §6.1.3's table makes a key registered only
-  on the async registry "async only" for `check()`, which resolves to **UNEVALUABLE** — and §6.1.1
-  then makes an `allow` rule carrying it stop granting (the caller is denied) while a `deny` rule
-  carrying it denies unconditionally rather than when the handler says so. Both directions are
-  wrong, and unit tests that call `async_check` directly pass throughout. apcore-python and
-  apcore-typescript both prefer the async accessor when the ACL exposes one.
-
-- **A local `#/…` `$ref` falls back to the schema node when it does not resolve at the file root
-  (D-104).** Resolution anchored on the whole file — A05 step 4a, and what §4.11's own example
-  requires — so a `$defs` block nested inside `input_schema` raised `SCHEMA_NOT_FOUND` here while
-  apcore-python and apcore-typescript accepted it and rejected the spec's own layout. **No schema
-  file containing a local `$ref` loaded in all three.** Both layouts are now normative, file root
-  first; the retry resolves each schema node against itself, so a pointer inside `output_schema`
-  can never resolve into `input_schema`'s `$defs`.
-
-- **A p99 estimate beyond the largest bucket is that bucket, not zero (D-106).**
-  `estimate_p99_from_histogram` ended its loop with a bare `0.0`, so a module slower than the top
-  finite bucket (60s) reported the *fastest possible* latency — and since
-  `apcore.health.latency_threshold_exceeded` compares the estimate against a threshold, the alert
-  could never fire for exactly the modules that should raise it. The existing unit test
-  `estimate_p99_from_histogram_no_bucket_exceeds_threshold_returns_zero` **pinned the defect**,
-  which is why a green suite never caught it; it is rewritten. The snapshot now also carries the
-  `+Inf` bucket (bound `"+Inf"`, since JSON has no infinity literal), so a consumer can tell "no
-  data" from "all overflow".
-
-- **Prometheus label values are escaped (OBS-002).** `format_prometheus_labels` interpolated
-  caller-supplied values verbatim, so a value containing `"` emitted a malformed exposition line —
-  and Prometheus rejects the ENTIRE scrape on a parse error, dropping every other metric with it.
-  Backslash, double quote and newline are now escaped, as apcore-python (`_escape_label_value`) and
-  apcore-typescript (`escapeLabelValue`) both do.
-
-- **`TASK_LIMIT_EXCEEDED` resolves to `retryable: true` (ERR-003).** It was in neither arm of
-  `retryable_for_code` and fell through to `None`. `RetryMiddleware` in all three SDKs gates on
-  `retryable == Some(true)`, so a full task pool was auto-retried on apcore-python
-  (`_default_retryable = True`) and apcore-typescript (`DEFAULT_RETRYABLE = true`) and surfaced to
-  the caller here.
-
-- **`MODULE_NOT_FOUND`, `MODULE_DISABLED`, `MODULE_TIMEOUT`, `DEPENDENCY_NOT_FOUND` and
-  `DEPENDENCY_VERSION_MISMATCH` carry the peers' default `ai_guidance` (ERR-004).** All five were
-  built with a bare `ModuleError::new` while eight other codes already had guidance here, so the
-  gap was per-code rather than structural. New builders carry the wording verbatim from
-  apcore-python, and the raise sites — the `module_lookup` and `execute` pipeline steps,
-  `Registry::describe` / `acquire`, `resolve_dependencies`, `check_version_constraint`,
-  `system.health.module` and `system.manifest.module` — go through them.
-
-- **The tracing span attribute `error_code` and the obs-logging `error_code` extra carry the
-  canonical wire code (ERR-001).** Both emitted the Rust enum's PascalCase `Debug` name, so an OTLP
-  query or alert rule keyed on the protocol code (`MODULE_NOT_FOUND`) matched apcore-python and
-  apcore-typescript and never this SDK — `tracing.py` and `tracing.ts` both write `error.code`.
-
-- **A streamed call's audit record carries the output projection its non-streamed twin carries
-  (MW-002).** `context.redacted_output` is populated by the `output_validation` step, which stream
-  Phase 3 never ran; it now does, as part of the STR-2 fix above.
-
-- **`system.manifest.module` / `system.manifest.full`: documentation, metadata, null source paths,
-  null omitted keys, and one shared entry builder (SYS-6 – SYS-9, SYS-11).** `documentation` and
-  `metadata` were hardcoded to `null` / `{}` under a comment claiming the `Module` trait does not
-  expose them — true, and irrelevant: the code reads the DESCRIPTOR, which carries both (SYS-6). A
-  relative `source_path` was synthesized when `project.source_root` was unset, stating as fact
-  something the configuration does not say; both peers return null there and
-  `sys-manifest-module.schema.json` types the field `["string","null"]` (SYS-7). `manifest.full`
-  entries omitted `documentation` and `metadata` entirely, though `sys-manifest-full.schema.json`
-  asserts by `$ref` that an entry IS a `manifest.module` output — the two are now built by one
-  function (SYS-8) — and dropped `input_schema` / `output_schema` / `source_path` when excluded
-  rather than emitting them as null (SYS-9). Tag filtering is delegated to `Registry::list(tags)`
-  instead of being re-implemented against `descriptor.tags`, which bypassed that method's union
-  with the live instance's `tags()` (SYS-11).
-
-- **`system.health.summary` reports the most FREQUENT error as `top_error`, not the most recent
-  (SYS-4).** It read the head of a `last_occurred`-descending list, so a single one-off failure
-  displaced the recurring one the field exists to surface. apcore-python resolves it with
-  `max(entries, key=lambda e: e.count)`.
-
-- **Bulk `system.control.reload_module` emits real versions (SYS-15).** The `path_filter` path
-  emitted `apcore.module.reloaded` with the literal `"unknown"` for both `previous_version` and
-  `new_version`, while its own single-module path emitted real ones — so a subscriber could not
-  tell a version bump from a no-op reload. Each module's version is now captured before the
-  unregister (the only moment it is still readable) and read back after re-discovery.
-
-- **The four `system.health.*` / `system.manifest.*` output schemas declare their field contracts
-  (SYS-24).** They returned a bare `{"type": "object"}`, which satisfies PROTOCOL_SPEC §6.7.1.6's
-  "equivalent output schemas" only in the sense that any two such declarations are equivalent to
-  each other. Transcribed from the canonical `schemas/sys-health-*.schema.json` /
-  `schemas/sys-manifest-*.schema.json`, the way `usage.rs` already did.
-
-### Added
-
-- **`BatchSpanProcessor::force_flush(timeout_ms: u64) -> bool`** (observability.md "Contract: BatchSpanProcessor.force_flush", A-C-002). apcore-python has always exposed `force_flush`; this crate had only a private `flush_batch` helper reachable solely by the background loop, so a caller had no way to drain the queue before exit and spans buffered at shutdown could be silently lost. Repeatedly calls the same `flush_batch` the background loop uses, since spans can arrive between successive calls; returns `true` once the queue is empty or `false` if the deadline elapses first. Safe to call on an already-shut-down processor.
-
-- **`SchemaLoader::get_schema(module_id, native_input_schema, native_output_schema) -> Result<SchemaDefinition, ModuleError>`** (schema-system.md "Contract: SchemaLoader.get_schema", A-C-003). Mirrors apcore-python's `SchemaLoader.get_schema` and apcore-typescript's `SchemaLoader.getSchema`, resolving a module's schema per `self.strategy` (`YamlFirst` tries the YAML file first and falls back to the native schema; `NativeFirst` reverses that; `YamlOnly` never falls back). Returns a single `SchemaDefinition` rather than the peers' `(ResolvedSchema, ResolvedSchema)` pair — this crate has no analogous content-addressable cache to key a second type off of, and neither peer's cache has a caller outside its own tests.
-
-- **`Registry::set_discoverer_shared` / `set_validator_shared`, `Executor::set_acl_shared` /
-  `set_approval_handler_shared` / `use_middleware_shared`, `MiddlewareManager::add_shared`,
-  `TracingMiddleware::set_exporter_shared`, `CompositeExporter::from_shared`** — the `Arc`-taking
-  counterparts of the existing `Box`/value-taking setters, for callers that keep their own
-  reference. `ExtensionManager::apply` is the first of them (D-78); the `Box` forms are unchanged
-  and delegate to these.
-
-- **`ExtensionManager::unregister_handle` and `ExtensionHandle`** (D-91) — removal keyed on the
-  token `register` returns, so a host need not keep the extension object to remove exactly one
-  registration. Mirrors `MiddlewareHandle`, which exists for the same reason.
-
-- **`apcore::utils::guard_call_chain_for_context`** (D-83) — the `Context`-taking guard with the
-  documented defaults applied, generic over the context's services type.
-
-- **`registry_events::ALL` / `RegistryEvents::ALL`** (D-80) — the closed set of event names
-  `Registry::on` accepts.
-
-- **`Module::documentation` and `Module::metadata`** (D-97) — two accessors alongside the existing
-  `tags()` / `annotations()`, so `Registry::register_module` can source a module's own declarations
-  instead of hardcoding `None` / an empty map. Both have defaults (`None`, empty), so existing
-  `impl Module` blocks are unaffected.
-
-- **`ExtensionManager::get` / `get_all` / `unregister`** — three Contract blocks from `docs/features/extension-system.md` that had no Rust implementation. The manager could register, count and clear extensions but could not read one back at all, and `clear(point_name)` removes EVERY extension at the point, which is not `unregister`'s identity-scoped removal. Additive; `count` / `has` / `clear` / `clear_all` are unchanged.
-
-- **`ACL::with_audit_config` / `ACL::set_audit_config`** — the `audit_config` field was hard-coded `None` for direct construction and only `load()` / `reload()` ever populated it, so a deployment building its rules in code could not declare an `audit:` block, while apcore-python and apcore-typescript both accept one as an optional fourth constructor parameter. The arity of `new` / `try_new` is unchanged; the audit sink is rebuilt when the block is set, per §6.3.2 requirement 1.
-
-- **`AsyncTaskManager::stop_reaper`** — stops this manager's reaper and releases the single-reaper guard whether or not the `ReaperHandle` is still held. Mirrors apcore-python `AsyncTaskManager.stop_reaper`.
-
-- **`RunOptions::only_steps`** (STR-1, STR-2) — run a SEGMENT of a strategy against a
-  `PipelineContext` the earlier steps already ran against. The Rust counterpart of apcore-python's
-  `post_stream` sub-strategy slice, which is built with `validate_dependencies=False` for the same
-  reason: the segment's `requires` keys were seeded by the steps before it.
-
-- **`RefResolver::with_node_fallback` and `RefResolver::resolve_in_document`** (D-104) — the
-  secondary base for a local `#/…` pointer, and the entry point that resolves a node against a
-  document other than itself.
-
-- **`DiscoveredClass::new` / `DiscoveredClass::with_multi_class` /
-  `MultiClassEntry::with_multi_class`** (D-107) — the per-class multi-class marker and its
-  constructors.
-
-- **`ModuleError::module_not_found` / `module_disabled` / `module_timeout` /
-  `dependency_not_found` / `dependency_version_mismatch`** (ERR-004) — the five guidance-bearing
-  builders, alongside the eight codes that already had one.
-
-### Changed
-
-- **Verified conforming, unchanged: D-77, D-85, D-86, D-87, D-90.** `Registry::describe` already
-  returns `Result<String, _>` and passes a module-supplied `describe()` through only when it is
-  itself a `Value::String`, falling through to the generated envelope otherwise — never
-  stringifying a structured return, which is what D-77 settled on this SDK's behaviour (D-77).
-  `try_matches_version_hint` / `try_select_best_version` / `VersionedStore::try_resolve` exist and
-  the infallible forms fail closed with a warning (D-85). `Registry::register` validates in the
-  order `module_id` → structure/streaming → custom validator → duplicate, which D-86 made
-  normative from this SDK. `ACL::with_audit_config` / `set_audit_config` exist and rebuild the
-  audit sink (D-87). `CancelToken::reset` resets the flag in place rather than substituting the
-  handle (D-90). D-74 (`Config.get("")` returns the default) needed no change here: Rust's `get`
-  has no error channel and has always returned `None`.
-
-- **`FilterSubscriber::matches` calls `utils::helpers::match_glob` directly.** The private one-line `match_glob_pattern` delegation is gone; its #117 regression note now lives on `matches`, where the `include_events` / `exclude_events` filters that need it are.
-
-- **Verified conforming, unchanged: three of ERR-001's five reported sites.** A-D-14 replaced
-  `format!("{:?}", code)` with `wire_str()` for the metrics label, and the audit reported five
-  remaining producers. Two were real and are fixed above. The other three emit a field the peers
-  populate with an error **class name**, not a wire code: `events/emitter.rs`'s DLQ `error.type`
-  (apcore-python `type(error).__name__`, apcore-typescript `error.constructor?.name`),
-  `registry/registry.rs`'s `apcore.registry.module_load_failed` `error_type` (same), and
-  `executor.rs`'s `apcore.stream.post_validation_failed` `error_type` (same — and its code comment
-  already said so). Rust has no per-code error class, so the `ErrorCode` variant's PascalCase
-  `Debug` name is the closest analogue; emitting SCREAMING_SNAKE there would move those three
-  fields AWAY from the peers.
-
----
-
 ## [0.31.0] - 2026-09-14
 
 ### BREAKING
 
-- **`RedactionConfigError::InvalidFieldPattern` is removed (spec v1.37.0 §9.2.3 requirement 2).** A field pattern has no failure mode left: §9.2.3 makes **every string a valid A25 pattern** — there is no parse phase, no escape character and no character class, so nothing can be malformed. The variant existed only because the matcher underneath it was `glob::Pattern`, which *rejects* `a[b` as an invalid range and `a**b` as a misplaced recursive wildcard. `RedactionConfigError` is exported from the crate root, so a downstream `match` that enumerates it stops compiling; delete the arm. `RedactionConfigBuilder::try_build` keeps its `Result` signature — `InvalidValuePattern` remains, because value patterns are regexes and the `regex` crate genuinely does refuse some of them.
+- **The deprecation warning moves from registration to `get_definition`, and its dedupe key carries the notice** (D-89, v1.59.0) — reads never warned at all before; the key is now `(module_id, version, canonical notice)`.
+- **`get`, `get_all` and `unregister` now reject an unknown extension point** (D-108) — signature change: all three now return `Result`.
+- **`ContextFactory::create_context` takes the runtime request, not a pre-extracted `Identity`** (D-76) — matches the spec's canonical signature; add `type Request = YourRequest`.
+- **`ExtensionKind` holds `Arc`, not `Box`; `ExtensionManager::register` returns an `ExtensionHandle`** (D-78, D-91) — `apply` no longer consumes registrations, so applying one manager to two registry/executor pairs now wires both, and removal is expressible from outside the manager.
+- **`Registry::on` returns `Result<u64, ModuleError>` and rejects unknown event names** (D-80) — a typo used to silently subscribe to nothing.
+- **Every `AsyncTaskManager` method that touches the store now propagates the store's error** (D-81) — previously discarded, so a store outage reported "not found" and `cancel()` could report success on a failed write.
+- **`guard_call_chain` takes the chain, not a `Context`** (D-83) — the spec's own Rust example did not compile against the old signature, and a non-`serde_json::Value` services type could not call the guard at all. Use `guard_call_chain_with_repeat`.
+- **The approval gate now fires on the UNION of the live module's and the registry descriptor's governance annotations** (D-96) — previously fail-open when the two disagreed.
+- **Per-class markers are the only multi-class opt-in; the file-level `DiscoveryConfig` gate is inert** (D-107).
+- **A binding's declared `annotations` reach registration in full** — a `streaming: true` binding with no `stream()` is now rejected (DEC-002); seven of twelve annotation keys were previously silently discarded into `extra`.
+- **`DependencyInfo` serializes its constraint as `version`, not `version_constraint`** (SYS-12).
+- **`Executor::stream` now runs the full pipeline tail on the non-streaming fallback path** (STR-1) — output-schema validation and after-middleware previously never ran on it.
+- **Stream Phase 3 now runs the strategy's own post steps instead of a hardcoded pair** (STR-2) — a `minimal`-preset stream previously ran steps the strategy had explicitly removed.
+- **A call with no identity now reaches the module with `context.identity == None`**, instead of a synthesized `@external` principal (D-103).
+- **`RedactionConfigError::InvalidFieldPattern` is removed** (spec v1.37.0 §9.2.3) — every string is now a valid A25 pattern; nothing can be malformed.
 
-### Added
+### Removed
 
-- **A configured `pipeline:` section is applied** (spec v1.43.0 §5.16 reqs 6–7, [apcore#118](https://github.com/aiperceivable/apcore/issues/118) D-72). `build_strategy_from_config` was public and its only callers were its own tests; nothing extracted the section from a loaded `Config`, so `pipeline: remove: [acl_check]` left all eleven steps in place.
-  Two decisions specific to this SDK. A section that fails to build is logged at **error** level and the standard pipeline runs — `Executor::new` returns `Self` and cannot propagate, and panicking in a library constructor is worse than either; this is the idiom `ACL::discover` and `register_sys_modules` already follow. And `build_strategy_from_config_with_toggle` seeds from `build_standard_strategy_with_toggle`, because seeding from the plain factory would rebind `module_lookup` to the process-global toggle store and reintroduce #71 through a different door.
-
-- **The five `observability.tracing.*` keys are wired** (spec v1.44.0 §10.1.1, D-68 C′) via `observability/tracing_config.rs`. `TracingConfig` gains `strategy` and `otlp_endpoint` as typed fields — declared by §9.15.2 all along and by no schema, so `_config.strict` **rejected** them. `jaeger` warns and installs nothing; so does `otlp` **without the `events` feature**, since this crate's OTLP exporter is a silent no-op without it and a middleware whose exporter discards every span is worse than none.
-
-- **`extensions.roots`' namespace half is honoured** (spec v1.46.0, D-70). This SDK was the only one that read the key, and it read half of it: `set_extension_roots_from_config` flattened both element shapes into `Vec<String>` and dropped the namespaces, so one document gave multiple roots here and multiple **namespaced** roots in the other two SDKs. `scan_multi_root` already existed here with the prefixing and the duplicate-namespace check; nothing reached it.
-  `Discoverer::discover(&self, roots: &[String])` is a public trait, so the namespaces travel through `DefaultDiscoverer::from_config` — which reads the same key — and are paired back up in `discover`. A root the map does not know simply has no namespace, so a caller passing roots explicitly is unaffected.
-
-- **`id_map.overrides` is read by `DefaultDiscoverer::from_config`** (spec v1.46.0, D-71) — the same door `extensions.ignore_patterns` uses here, since `Registry::discover` takes the discoverer as an argument. `with_id_map` afterwards still wins.
-
-- **`apcore::utils::match_glob` — Algorithm A25 (spec v1.37.0 §9.2.3), the one matcher for every glob-dialect pattern-valued value in the specification.** Exactly two metacharacters: `*` (zero or more characters, crossing `.` and `/`) and `?` (exactly one character). Every other character is a literal — `[`, `]`, `{`, `}`, `\`, `!`, `^` and `-` included — there is no escape character, the match is anchored to the whole value, and the function cannot fail. It operates on `char`s rather than bytes, so `?` matches one character and not one UTF-8 byte, and it is checked against all 30 cases of the canonical `glob_matching.json` fixture.
-
-  It is deliberately **not** the same function as `match_pattern` (Algorithm A08), and §9.2.3 requirement 5 gives the reason: A08 is the ACL matcher, `?` is a literal there, and §2.7 forbids `?` in a module ID — so promoting `?` in A08 would widen `allow` rules that are inert in every deployed policy today. That is the one direction an authorization matcher must not move without an operator's consent. §6.2.2 closes the gap with a diagnostic instead (below).
-
-- **The six `validation.*` limits are implemented, and every one of them is unconstrained by default (spec v1.38.0 §9.1.2, [apcore#118](https://github.com/aiperceivable/apcore/issues/118)).** `validation.binding.description_max_length`, `validation.binding.documentation_max_length`, `validation.binding.tags_pattern`, `validation.binding.version_require_semver`, `validation.pipeline.step_name_max_length` and `validation.pipeline.timeout_ms_max` were registered in the key surface, documented with defaults, accepted under `_config.strict` — and read by nothing.
-
-  apcore does not impose limits on the content its users author; it offers them, and an operator opts in. That is what makes this purely additive: **every binding file and every pipeline that loaded before this release still loads after it.** The two FORMAT keys default *off* for that reason specifically — shipping `tags_pattern` and `version_require_semver` with the restrictive defaults they previously *declared* would have added a rejection that does not exist today to every project whose tags are capitalised or hyphenated. `validation.binding.version_require_semver` is the only one of the six carrying a canonical value (`false`) in `defaults.schema.json`, because the other five are unconstrained **as null**, and null is the absence of a default rather than a default of its own.
-
-  Lengths are counted in characters, not bytes (§9.1.2 requirement 4). A `tags_pattern` that does not compile is an **error**, not a silent skip (§9.2.3 requirement 6d): a constraint that quietly checks nothing is the exact failure mode §10.6.1 exists to forbid, and it is also the failure mode this whole issue is about. `remove:` step names are deliberately not length-checked — those names identify steps that already exist rather than naming new ones, so a limit there would reject a request to remove a step the operator did not author.
-
-  The new public `ValidationLimits` is resolved once, from the same configuration that supplies `bindings.dir`, and held on the loader, so `load_from_yaml` keeps its signature; `ValidationLimits::default()` checks nothing, which is what a loader built without a `Config` keeps. `build_strategy_from_config` likewise keeps its signature and delegates to a new `_with_limits` variant — the same shape the streaming merge cap uses.
-
-- **`stream::resolve_merge_depth` and `stream::deep_merge_chunks_checked_with_depth`** — the configuration-aware entry points behind the `stream.max_merge_depth` fix below. The existing `deep_merge_chunks_checked` keeps its signature and the canonical default of 32, so every current caller, the conformance driver included, is unaffected.
-
-- **`Config::validate()` reports an `obs.redaction.regex_patterns` entry that does not compile (§9.2.3 requirement 6d).** The `regex` crate is the engine that refuses lookaround and backreferences, so this fires on exactly the configuration that redacts in apcore-python and apcore-typescript and silently redacts nothing here — previously the entry was dropped without a word.
-
-- **A diagnostic for `?` in an ACL pattern (spec v1.37.0 §6.2.2).** `?` is a wildcard in every other pattern surface the specification defines, which is where the expectation comes from; in ACL matching it is a **literal**, and §2.7 forbids `?` in a module ID, so a rule carrying one matches nothing and can never match anything — a `deny` rule that guards nothing, an `allow` rule that never fires. Reported at load time as a warning naming the rule index, the field, the pattern and the effect, and again as a `validate_rules()` finding when every operand of a field carries one. **Reported, never rejected, and no decision changes** — on the §6.1.2 precedent.
+- **The associated function `Executor::list_strategies()`** (deprecated since 0.20.0, no known callers) — superseded by the instance method (see Fixed).
 
 ### Changed
 
-- **A panicking ACL audit callback no longer changes the access decision** (spec v1.45.0 §6.3.2 req 3, D-66). **This is a behaviour change, and it is a fix.** Measured before it: a panicking `audit_logger` propagated out of `ACL::check()` and turned an **allowed** call into a panic.
-  Containment is `catch_unwind` + `AssertUnwindSafe`, and the specification is scoped to **recoverable** failures for exactly this reason: `AuditLoggerFn` is `Fn(&AuditEntry)` with no error channel, so an unwinding panic is all this can contain and a `panic = "abort"` build cannot be. The default panic hook still prints its own message; that is the runtime's output, not the sink's.
-  The ACL file's `audit:` block gained a delivery contract with it: declaring it activates a default sink emitting `apcore.acl.audit` as a `tracing` event with all thirteen §6.3.1 fields as structured data under their `snake_case` wire names.
-
-- **`_config.allow_unknown: false` now drops unregistered namespaces** (spec v1.46.0 §9.6.3 reqs 1–4, D-69). **Read this before upgrading**: it is the only change here that makes a `get()` which returned a value return `None`. It fires only for a configuration that explicitly writes `allow_unknown: false`. The unknown-namespace set is computed from the **raw document**, not from `user_namespaces` — that bag is flattened and in namespace mode also holds the `apcore:` members lifted into `core_data`, so filtering it reported `version` as an unregistered namespace.
+- **`AsyncTaskManager::shutdown()` now attempts every cancellation before it reports** (D-122) — previously stopped at the first failure, leaking active `max_tasks` slots.
+- **A panicking ACL audit callback no longer changes the access decision** (D-66) — auditing must not hold a veto over access.
+- **`_config.allow_unknown: false` now drops unregistered namespaces** (D-69).
+- **Verified conforming, unchanged: D-74, D-77, D-85, D-86, D-87, D-90** — six decisions this crate already satisfied; recorded to close the audit.
+- **`FilterSubscriber::matches` calls `match_glob` directly** — a redundant one-line delegation removed.
+- **Verified conforming, unchanged: three of ERR-001's five reported sites** — they emit an error *class name* by design, matching Python/TypeScript's own class-name fields.
 
 ### Deprecated
 
-- **`acl.default_effect` in `apcore.yaml`** (spec v1.47.0 §9.1.3 req 3, D-73). An ACL's default effect is read from the **ACL file**; this twin reaches nothing. Measured: `allow` here, against an ACL file that omits the key, yields **deny**. Migrate to the ACL file's `default_effect`. Removed at v2.0.
-
-- **`Context::logger`** ([apcore#121](https://github.com/aiperceivable/apcore/issues/121)), carrying `#[deprecated(since = "0.31.0")]`. No configuration door; output fixed at stderr / `info` / JSON and notably **not** going through `tracing`, so a host that configured a subscriber never sees it. Use the host application's own logger. `ObsLoggingMiddleware` is **not** the migration target — it emits apcore's execution events, a different facility. Removed at v2.0.
-
-- **`logging.level` and `logging.format`** are withdrawn with no replacement key (spec v1.48.0, D-67). apcore does not own the host's logging policy.
-
-- **Ten declared configuration keys reach no consumer in any SDK, and now say so (spec v1.39.0 §9.2.4 / §9.2.4.1, [apcore#118](https://github.com/aiperceivable/apcore/issues/118)).** `observability.tracing.enabled` / `.sampling_rate` / `.exporter`, `observability.metrics.enabled` / `.exporter`, `logging.level` / `.format`, and `acl.audit.enabled` / `.include_denied` / `.log_level` — all schema-declared, all environment-overridable, all accepted under `_config.strict: true`, all documented with defaults, and all inert. An `audit:` block in an **ACL file** is the eleventh: no implementation has ever read it, and it is where `acl.audit.*`'s three settings are declared a second time.
-
-  **Nothing changes in this release.** The keys still parse, still validate, still answer `get()` and still pass strict mode; the `audit:` block is still ignored. Withdrawing them cannot be a plain deletion precisely *because* they are accepted today — removing one turns a currently-valid configuration into a rejected one — so this opens the removal window §13.2's two-minor floor requires (§13.4 restates it for `remove_field`), and the keys are removed no earlier than v2.0. Auditing is, and remains, wired programmatically through `ACL::set_audit_logger`.
-
-  **The notice is driven by the as-written document, and in this SDK that is harder than it looks.** §9.2.4 requirement 2 forbids driving it from the merged view, and neither obvious source can supply the as-written one: `observability` is a typed struct field whose leaves always carry a value, so `Config::get_declared("observability.tracing.enabled")` answers `Some(false)` for a document that never mentions it, and `Config::data()` serialises those same typed fields. Measured on the first attempt: a **clean** configuration reported four declared keys — the blanket warning §9.2.2 rejects, which trains operators to ignore the one that matters. It is driven from `user_namespaces` instead, which retains the raw object of every typed section exactly as the file wrote it; a clean configuration now reports none, matching apcore-python and apcore-typescript on the same file.
-
-  That `get_declared` cannot answer *"did this document declare this key"* for a typed section is a real cross-SDK divergence. It is recorded rather than repaired: §9.3's required-field check depends on that method, so changing it is its own change with its own blast radius.
-
-  The ACL half needed new code rather than a schema edit. Deleting the `audit` block from `acl-config.schema.json` would produce **no signal at all** — no implementation validates an ACL file against that schema, and `ACL::load` parses into a `serde_json::Value` and takes the fields it wants, so every unrecognised root key is dropped in silence. The notice therefore lives in the loader, scoped to `audit` **alone**: it is a deprecation notice, not unknown-key closure for ACL files, and every other unrecognised root key keeps being ignored exactly as before.
+- **`acl.default_effect` in `apcore.yaml`** — reaches nothing; the ACL file's own `default_effect` is authoritative. Removed at v2.0 (D-73).
+- **`Context::logger`** — no configuration door, and not routed through `tracing`. Removed at v2.0 (#121).
+- **`logging.level`/`logging.format`**, no replacement (D-67).
+- **Ten declared config keys plus an ACL `audit:` block reach no consumer in any SDK** — now warn once per load; removed no earlier than v2.0 (#118).
 
 ### Fixed
 
-- **`collect_constraint_errors` and `validate_key_constraint` were two hand-written implementations of one table, and they drifted.** Arms added to the latter were invisible to `validate()`, so `observability.tracing.exporter: in_memory` — a value §10.1.1 requirement 2 forbids — loaded without a word. The `observability.tracing.*` constraints now delegate, so a key added to the match is enforced by `validate()` for free.
+- **`schema.strategy` was silently ignored** — `SchemaLoader::with_config` hardcoded `YamlFirst`, and the field was never read by any branching logic at all (A-C-003, see Added: `get_schema`).
+- **The skip-asymmetry guard could not see this crate's `#[ignore]`d tests** — four contract tests were `#[ignore]`d for symbols that exist, and two live ones asserted a stand-in.
+- **The executor's ACL step is pinned to the ASYNC path** (D-105) — no behaviour change, only test coverage; a whole extension point was reachable from every door except the enforcing one.
+- **A symlinked module file is now discovered once, under its real path** (D-127) — `follow_symlinks` previously governed directories only, and an aliased directory was traversed twice.
+- **A malformed annotation value (`extra`/`cache_ttl`) is dropped with a warning** instead of rejecting the whole module (D-115).
+- **`MiddlewareManager::remove`/`remove_handle` now clear the duplicate-identity entry** (D-114).
+- **Every `system.*` module declares `open_world: false`** (D-119) — previously defaulted to the opposite.
+- **A malformed dependency constraint is now reported as malformed**, not as a version mismatch (D-85).
+- **`ErrorCode::TaskStoreUnavailable` now exists and is framework-reserved** (D-92).
+- **`version`, `examples` and `dependencies` were declared, validated, then discarded at registration** — the unfixed half of D-97; a binding declaring `version: "2.3.0"` registered as `1.0.0`.
+- **SECURITY: `system.manifest.*` annotations advertised governance the gate does not enforce** (D-125) — the manifest projected from the descriptor alone while the gate reads the union.
+- **SECURITY: a `$ref` into an external schema could bind to the caller's definitions**, including past an `x-sensitive` marking (D-124) — fallback now scoped to the declaring document.
+- **SECURITY: the approval gate decided from the registry descriptor, not the module — two independent bypasses that compose** (D-96, D-97) — see BREAKING; a module could execute ungated on this SDK and gated on the peers.
+- **SECURITY: `$ref` sibling keys, including `x-sensitive`, were discarded during schema resolution** (D-98) — a data leak, not cosmetic: redaction is driven by `x-sensitive` on the resolved schema.
+- **`Executor::call` now rejects an over-length module ID at the entry guard** (D-75), instead of reaching the registry and reporting `MODULE_NOT_FOUND`.
+- **A stalled topological sort is no longer reported as a cycle** (D-79).
+- **`InMemoryTaskStore` now lists tasks in submission order**, not by random UUID (D-82).
+- **The call-chain limit floors now carry `ai_guidance`** (D-84).
+- **The ACL now emits the §6.5 "conditions present but no context" warning**, deduped per rule index and cleared on rule mutation (D-88).
+- **The deprecation warning now fires at most once per `(module_id, version)` per registry** (D-89).
+- **`Executor::list_strategies()` is now an instance method and includes the executor's own current strategy.**
+- **`_approval_token` is now removed from arguments on EVERY exit from the approval gate**, not only the gated-and-handled path.
+- **`PlatformNotifyMiddleware`'s error rate was permanently 0.0** due to a label-key mismatch between writer and reader — `apcore.health.error_threshold_exceeded` could never fire. A second defect in the same area (`f64` counters read as `u64`) is fixed alongside.
+- **A malformed version constraint (`"latest"`, `"v1.0.0"`) no longer silently passes** as satisfied or mismatched.
+- **`descriptor.sunset_date` is now derived from `metadata["x-deprecation"]`**, and a deprecated module logs a warning.
+- **`merge_module_metadata` now merges annotations field-by-field and emits `dependencies`** — previously whole-replaced, dropping fields YAML did not override.
+- **The depth and circular arms of `guard_call_chain_with_repeat` now carry `ai_guidance`.**
+- **`CancelToken::check()` no longer fabricates the module id `"@unknown"`.**
+- **`AsyncTaskManager::shutdown` now stops the reaper, and dropping a `ReaperHandle` no longer arms a second one** — a sweep loop previously outlived `shutdown` and could double-run.
+- **A task's `JoinHandle` can no longer be registered after the task has already finished** — closed a race that let `cancel()` abort an already-finished task.
+- **SECURITY-adjacent: the executor's ACL step took the synchronous path**, so the entire `register_async_condition` extension point was dead in the only path that enforces (D-105).
+- **A local `#/…` `$ref` now falls back to the schema node when it does not resolve at the file root** (D-104) — previously only one of two normative layouts loaded.
+- **A p99 estimate beyond the largest bucket is now that bucket, not zero** (D-106) — the existing unit test had pinned the defect.
+- **Prometheus label values are now escaped** (OBS-002) — an unescaped `"` previously broke the entire scrape.
+- **`TASK_LIMIT_EXCEEDED` now resolves to `retryable: true`** (ERR-003), matching the peers.
+- **Five error codes now carry the peers' default `ai_guidance`** (ERR-004).
+- **The tracing span `error_code` and obs-logging `error_code` now carry the canonical wire code**, instead of the Rust enum's Debug name (ERR-001).
+- **A streamed call's audit record now carries the same output projection as its non-streamed twin** (MW-002).
+- **`system.manifest.module`/`.full` now share one entry builder** and stop hardcoding `documentation`/`metadata`/`source_path` (SYS-6–SYS-9, SYS-11).
+- **`system.health.summary` now reports the most FREQUENT error as `top_error`**, not the most recent (SYS-4).
+- **Bulk `system.control.reload_module` now emits real versions**, instead of the literal `"unknown"` (SYS-15).
+- **The four `system.health.*`/`system.manifest.*` output schemas now declare their field contracts**, instead of a bare `{"type": "object"}` (SYS-24).
+- **`collect_constraint_errors` and `validate_key_constraint` were two hand-written copies of one table that had drifted** — `validate()` now delegates, so a new constraint is enforced automatically.
+- **Four pattern-valued config surfaces each used a different glob dialect** — unified under `match_glob` (Algorithm A25, #116/#117); the redaction-key case had a real disclosure consequence (a case-sensitivity bug hid uppercase secret-key patterns).
+- **`stream.max_merge_depth` is now read from config** instead of ignored; a misconfigured value still falls back to the safe default of 32 (#118).
+- **The four per-group `sys_modules.*.enabled` flags are now read**, `control.enabled` included (#118).
 
-- **Four pattern-valued surfaces each matched with whichever library was locally at hand, and each inherited that library's dialect (spec v1.37.0 §9.2.3, [apcore#116](https://github.com/aiperceivable/apcore/issues/116), [apcore#117](https://github.com/aiperceivable/apcore/issues/117)).** All four now go through `match_glob`.
+### Added
 
-  - **`bindings.pattern`** stripped a *leading* `*` and compared the remainder with `ends_with`, so `data*.yaml` — an ordinary glob, with the star in the middle — matched nothing here while apcore-python matched one file.
-  - **`obs.redaction.sensitive_keys`**, the one with a disclosure consequence: entries were compiled to `glob::Pattern` and the **key** was lower-cased but the **pattern** never was. `"*Token*"`, or any capitalised spelling, was therefore a perfectly valid pattern that matched nothing — redacted in Python and TypeScript, **plaintext here, with no warning**. Note the exact shape, because it is why this survived: `*key*` *does* match `API_KEY` in all three, since the lowered key is also tried, so only an **uppercase** pattern exposes it. `glob::Pattern` additionally read `[!p]` as a negated character class, which A25 does not have.
-  - **Event `event_pattern` / `include_events` / `exclude_events`** each had a local `*`-only matcher whose own doc comment scoped it to "the subset of `fnmatch` behaviour the spec fixtures and YAML examples actually exercise" — an accurate description of what happens whenever a specification is silent: the corpus becomes the contract, and the corpus under-specifies. Every event pattern in every fixture was `*` or a literal name, so `?` never came up. The direction matters here: **`exclude_events` fails open.** A pattern that does not match means the event is *delivered*, so a matcher understanding fewer metacharacters than the operator wrote does not narrow the filter, it opens it — a subscriber excluding `secret.?vent` received it here and discarded it in the other two SDKs.
-  - **`path_filter`** on the control plane was matched with `glob::Pattern`, which *rejects* `a[b` and `a**b`, so a control-plane request the other two SDKs served was refused here.
-
-- **`stream.max_merge_depth` was declared everywhere and read nowhere — the module constant was the contract ([apcore#118](https://github.com/aiperceivable/apcore/issues/118)).** PROTOCOL_SPEC §5 requires the streaming deep-merge depth to be capped and calls 32 "the canonical default", wording that implies an override; there was none. The key sits in all three SDKs' key surfaces and carries the canonical 32 in `defaults.schema.json`, and no code path read it. Measured before the fix: with the key set to `4`, a depth-10 merge still recursed, and only depth-33 reached the cap.
-
-  A non-positive or non-integer value falls back to 32 rather than disabling the cap. The cap exists to prevent stack exhaustion from adversarial chunk shapes, so a misconfiguration must not remove it — that is the one direction this change must not open. The value is resolved **once per stream**, on the stream setup rather than per chunk, so a configuration mutated mid-stream cannot change the cap of a stream already in flight.
-
-- **The four per-group `sys_modules.*.enabled` flags were read by nothing, so a section that was switched on registered every module in it ([apcore#118](https://github.com/aiperceivable/apcore/issues/118)).** `schemas/sys-modules.schema.json` declares them key by key — "Whether `system.health.summary` and `system.health.module` are registered", and so on — and PROTOCOL_SPEC §9.15.3 (v1.17.0) states the split: `sys_modules.enabled` is the master switch that activates the section, and `health.enabled` / `manifest.enabled` / `usage.enabled` / `control.enabled` select which modules register once activation has happened. All four default to `true`, so a flag narrows and never widens.
-
-  Measured before the fix: all four `false` and all four `true` registered the same six `system.*` modules, while the master switch worked — a **half-alive section**, which is why a smoke test of it passes and why this went unnoticed. Measured after: 9 modules with everything on, 6 with control off and zero `system.control.*`, and exactly the two health modules with manifest, usage and control off.
-
-  **`control.enabled` is the consequential one.** It gates the Level 2 WRITE plane (§6.7) — the three approval-gated `system.control.*` modules. An operator writing `control.enabled: false` to keep that surface off a deployment had expressed exactly the intent the key exists for, and got all three modules anyway.
+- **`BatchSpanProcessor::force_flush(timeout_ms: u64) -> bool`** (A-C-002) — mirrors apcore-python; previously only a private, background-loop-only `flush_batch` existed.
+- **`SchemaLoader::get_schema(module_id, native_input_schema, native_output_schema)`** (A-C-003) — mirrors Python/TypeScript's strategy-driven resolution; `self.strategy` was previously set but never consulted.
+- **`Registry::set_discoverer_shared`/`set_validator_shared`, `Executor::set_acl_shared`/`set_approval_handler_shared`/`use_middleware_shared`, `MiddlewareManager::add_shared`, `TracingMiddleware::set_exporter_shared`, `CompositeExporter::from_shared`** — `Arc`-taking counterparts of the existing `Box`/value-taking setters.
+- **`ExtensionManager::unregister_handle` and `ExtensionHandle`** (D-91).
+- **`apcore::utils::guard_call_chain_for_context`** (D-83).
+- **`registry_events::ALL`/`RegistryEvents::ALL`** (D-80).
+- **`Module::documentation` and `Module::metadata`** (D-97).
+- **`ExtensionManager::get`/`get_all`/`unregister`** — previously the manager could register, count and clear extensions but not read one back.
+- **`ACL::with_audit_config`/`ACL::set_audit_config`** — direct construction previously had no way to declare an `audit:` block.
+- **`AsyncTaskManager::stop_reaper`** — mirrors apcore-python.
+- **`RunOptions::only_steps`** (STR-1, STR-2) — the Rust counterpart of apcore-python's `post_stream` sub-strategy slice.
+- **`RefResolver::with_node_fallback` and `RefResolver::resolve_in_document`** (D-104).
+- **`DiscoveredClass::new`/`with_multi_class`, `MultiClassEntry::with_multi_class`** (D-107).
+- **`ModuleError::module_not_found`/`module_disabled`/`module_timeout`/`dependency_not_found`/`dependency_version_mismatch`** (ERR-004).
+- **A configured `pipeline:` section is applied** (D-72).
+- **The five `observability.tracing.*` keys are wired** (D-68).
+- **`extensions.roots`' namespace half is honoured** (D-70) — this crate read the key but dropped the namespaces.
+- **`id_map.overrides` is read by `DefaultDiscoverer::from_config`** (D-71).
+- **`apcore::utils::match_glob` — Algorithm A25**, the one matcher for every glob-dialect pattern-valued config value (spec §9.2.3).
+- **The six `validation.*` limits are implemented**, unconstrained by default (#118) — purely additive.
+- **`stream::resolve_merge_depth` and `stream::deep_merge_chunks_checked_with_depth`** — the config-aware entry points behind the `stream.max_merge_depth` fix.
+- **`Config::validate()` reports an `obs.redaction.regex_patterns` entry that does not compile** (§9.2.3 requirement 6d).
+- **A diagnostic for `?` in an ACL pattern** (§6.2.2) — `?` is a literal in ACL matching; reported, never rejected.
 
 ---
 
