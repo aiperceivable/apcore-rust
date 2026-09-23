@@ -586,6 +586,32 @@ fn identity_probe_registration(
     reg
 }
 
+/// Replay the fixture's `use` / `remove` sequence and count the duplicate-identity
+/// warnings it would emit. `add_with_opts` warns exactly when the identity is
+/// already recorded (and `allow_duplicate` is off, as it is here), so the count
+/// is read off `identity_registered` immediately before each `use`.
+fn replay_duplicate_warnings(manager: &apcore::middleware::MiddlewareManager, case: &Value) -> u64 {
+    let name = case["input"]["middleware_name"].as_str().unwrap();
+    let mut warnings = 0;
+    for op in case["input"]["sequence"].as_array().expect("sequence") {
+        match op.as_str().expect("sequence entry") {
+            "use" => {
+                if manager.identity_registered(name) {
+                    warnings += 1;
+                }
+                manager
+                    .add_with_opts(identity_probe_registration())
+                    .expect("register");
+            }
+            "remove" => {
+                manager.remove(name);
+            }
+            other => panic!("unknown sequence entry {other}"),
+        }
+    }
+    warnings
+}
+
 #[test]
 fn case_remove_clears_the_duplicate_identity_entry() {
     let fixture = load_fixture();
@@ -610,6 +636,14 @@ fn case_remove_clears_the_duplicate_identity_entry() {
          registration that no longer exists",
         case["id"].as_str().unwrap()
     );
+
+    let replayed = replay_duplicate_warnings(&identity_probe_manager(), case);
+    assert_eq!(
+        replayed,
+        case["expected"]["duplicate_warnings"].as_u64().unwrap(),
+        "[{}] duplicate-identity warnings emitted by the sequence",
+        case["id"].as_str().unwrap()
+    );
 }
 
 #[test]
@@ -619,6 +653,14 @@ fn case_use_twice_still_warns_about_the_duplicate() {
     // duplicate detection.
     let fixture = load_fixture();
     let case = fixture_case(&fixture, "use_twice_still_warns_about_the_duplicate");
+
+    let replayed = replay_duplicate_warnings(&identity_probe_manager(), case);
+    assert_eq!(
+        replayed,
+        case["expected"]["duplicate_warnings"].as_u64().unwrap(),
+        "[{}] duplicate-identity warnings emitted by the sequence",
+        case["id"].as_str().unwrap()
+    );
 
     let manager = identity_probe_manager();
     manager

@@ -57,14 +57,17 @@ fn conformance_id_map_from_config() {
         // Which map the discoverer will consult is what the fixture's
         // `expected.module_ids` is a consequence of: `map.yaml` renames to
         // `executor.renamed.mod`, `explicit.yaml` to `executor.explicit.mod`,
-        // and neither leaves `executor.orig.mod`.
-        let expected_map = match case["expected"]["module_ids"][0]
+        // and neither leaves `executor.orig.mod`. The match is exhaustive on
+        // purpose: a catch-all `None` arm read ANY other ID as "no map", so the
+        // no-override case passed whatever it expected.
+        let expected_id = case["expected"]["module_ids"][0]
             .as_str()
-            .expect("module id")
-        {
+            .expect("module id");
+        let expected_map = match expected_id {
             "executor.renamed.mod" => Some("map.yaml"),
             "executor.explicit.mod" => Some("explicit.yaml"),
-            _ => None,
+            "executor.orig.mod" => None,
+            other => panic!("case {id}: no map in this driver yields {other}"),
         };
         match expected_map {
             Some(name) => assert!(
