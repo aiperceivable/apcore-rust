@@ -411,3 +411,18 @@ mod test_reload_dependents_deprecation;
 
 #[path = "test_reload_restores_previous_module.rs"]
 mod test_reload_restores_previous_module;
+
+#[path = "test_gate_provider_binding.rs"]
+mod test_gate_provider_binding;
+
+#[path = "test_gate_provider_binding_conformance.rs"]
+mod test_gate_provider_binding_conformance;
+
+#[path = "test_gate_step_configure.rs"]
+mod test_gate_step_configure;
+
+#[path = "test_gate_step_configure_conformance.rs"]
+mod test_gate_step_configure_conformance;
+
+#[path = "test_logging_middleware_redaction.rs"]
+mod test_logging_middleware_redaction;

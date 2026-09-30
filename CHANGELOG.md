@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Security
+
+- **Providers reach the gate they configure** (D-129, spec 1.61.0) — the built-in `acl_check` / `approval_gate` steps hold no provider and read the executor's ACL, `ApprovalHandler` and `ExecutionPolicy` on every call, however the strategy was supplied, so `governance_state()` reports what the running gate enforces; pinned by `gate_provider_binding.json`.
+- **Governance gates cannot be weakened by configuration** (D-130) — `ignore_errors: true` and any `match_modules` on `acl_check` / `approval_gate`, and `pure: true` on `approval_gate`, fail with `PIPELINE_CONFIGURATION_ERROR` naming the step and key, from `pipeline.configure` and from `ExecutionStrategy::new` / `configure_step` / `replace` / `replace_with` / `insert_*`; a gate configured with `timeout_ms` keeps its gate identity and capability contract.
+- **Logging middleware logs the captured values** (D-131) — `ObsLoggingMiddleware` and `LoggingMiddleware` log `context.redacted_inputs` / `redacted_output`, never the raw inputs or output, so an `x-sensitive` field is redacted with or without a `RedactionConfig`.
+
 ## [0.31.0] - 2026-09-22
 
 ### BREAKING

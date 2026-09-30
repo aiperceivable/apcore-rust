@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
-use crate::executor::REDACTED_VALUE;
+use crate::executor::{loggable_value, REDACTED_VALUE};
 use crate::middleware::base::Middleware;
 use crate::observability::redaction::RedactionConfig;
 
@@ -266,10 +266,13 @@ impl ContextLogger {
 /// WARNING: The internal start-time stack is not safe for concurrent use on
 /// the same middleware instance. Use separate instances per concurrent pipeline.
 ///
-/// When constructed with [`Self::with_redaction_config`], the supplied
-/// `RedactionConfig` is unioned with schema-level `x-sensitive` annotations
-/// per observability.md §1.5: any field/value matched by EITHER rule set is
-/// replaced before being logged. `trace_id`, `caller_id`, and `module_id`
+/// Inputs and output are logged from `context.redacted_inputs` /
+/// `context.redacted_output` — the values the executor's capture point
+/// already redacted with the schema's `x-sensitive` rule and the configured
+/// rules — never from the raw values the hook receives (PROTOCOL_SPEC §10.6.1
+/// requirement 5). When constructed with [`Self::with_redaction_config`], the
+/// supplied `RedactionConfig` is applied on top: any field/value matched by
+/// EITHER rule set is replaced before being logged. `trace_id`, `caller_id`, and `module_id`
 /// are never redacted (correlation-required fields).
 #[derive(Debug)]
 pub struct ObsLoggingMiddleware {
@@ -357,7 +360,14 @@ impl Middleware for ObsLoggingMiddleware {
             );
         }
         if self.log_inputs {
-            let mut payload = inputs.clone();
+            // D-131: the captured `redacted_inputs`, never the raw inputs —
+            // the schema's `x-sensitive` rule applies whether or not this
+            // middleware was given a `RedactionConfig`.
+            let mut payload = loggable_value(
+                ctx.redacted_inputs.as_ref(),
+                &inputs,
+                self.redaction.as_ref(),
+            );
             self.apply_redaction(&mut payload);
             extra.insert("inputs".to_string(), payload);
         }
@@ -371,7 +381,7 @@ impl Middleware for ObsLoggingMiddleware {
         &self,
         module_id: &str,
         _inputs: serde_json::Value,
-        _output: serde_json::Value,
+        output: serde_json::Value,
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Remove start time by trace_id and compute duration
@@ -393,7 +403,12 @@ impl Middleware for ObsLoggingMiddleware {
         );
         extra.insert("duration_ms".to_string(), serde_json::json!(duration_ms));
         if self.log_outputs {
-            let mut payload = _output.clone();
+            // D-131: the captured `redacted_output`, never the raw output.
+            let mut payload = loggable_value(
+                ctx.redacted_output.as_ref(),
+                &output,
+                self.redaction.as_ref(),
+            );
             self.apply_redaction(&mut payload);
             extra.insert("output".to_string(), payload);
         }

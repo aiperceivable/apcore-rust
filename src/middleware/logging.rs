@@ -9,11 +9,13 @@ use serde_json::Value;
 use super::base::Middleware;
 use crate::context::Context;
 use crate::errors::ModuleError;
+use crate::executor::loggable_value;
 
 /// Structured logging middleware with security-aware redaction.
 ///
-/// Logs module call start, completion (with duration), and errors using
-/// `context.redacted_inputs` to avoid leaking sensitive data. Thread-safe
+/// Logs module call start, completion (with duration), and errors from
+/// `context.redacted_inputs` / `context.redacted_output`, never the raw values
+/// (PROTOCOL_SPEC §10.6.1 requirement 5). Thread-safe
 /// by storing per-call timing via context data markers and interior
 /// atomics — no mutable self required.
 #[derive(Debug)]
@@ -81,11 +83,8 @@ impl Middleware for LoggingMiddleware {
         }
 
         if self.log_inputs {
-            // Use redacted_inputs if available; fall back to raw inputs.
-            let display_inputs = ctx.redacted_inputs.as_ref().map_or_else(
-                || inputs.clone(),
-                |r| Value::Object(r.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-            );
+            // D-131: the captured `redacted_inputs`, never the raw inputs.
+            let display_inputs = loggable_value(ctx.redacted_inputs.as_ref(), &inputs, None);
 
             tracing::info!(
                 trace_id = %ctx.trace_id,
@@ -116,11 +115,13 @@ impl Middleware for LoggingMiddleware {
         };
 
         if self.log_outputs {
+            // D-131: the captured `redacted_output`, never the raw output.
+            let display_output = loggable_value(ctx.redacted_output.as_ref(), &output, None);
             tracing::info!(
                 trace_id = %ctx.trace_id,
                 module_id = module_id,
                 duration_ms = duration_ms,
-                output = %output,
+                output = %display_output,
                 "END {} ({:.2}ms)",
                 module_id,
                 duration_ms,
@@ -133,7 +134,7 @@ impl Middleware for LoggingMiddleware {
     async fn on_error(
         &self,
         module_id: &str,
-        _inputs: Value,
+        inputs: Value,
         error: &ModuleError,
         ctx: &Context<Value>,
     ) -> Result<Option<Value>, ModuleError> {
@@ -145,18 +146,15 @@ impl Middleware for LoggingMiddleware {
         }
 
         if self.log_errors {
-            // Use redacted_inputs for error logging to avoid leaking sensitive data.
-            let display_inputs = ctx
-                .redacted_inputs
-                .as_ref()
-                .map(|r| Value::Object(r.iter().map(|(k, v)| (k.clone(), v.clone())).collect()));
+            // D-131: the captured `redacted_inputs`, never the raw inputs.
+            let display_inputs = loggable_value(ctx.redacted_inputs.as_ref(), &inputs, None);
 
             tracing::error!(
                 trace_id = %ctx.trace_id,
                 module_id = module_id,
                 error_code = ?error.code,
                 error_message = %error.message,
-                inputs = ?display_inputs,
+                inputs = %display_inputs,
                 "ERROR {}: {}",
                 module_id,
                 error.message,

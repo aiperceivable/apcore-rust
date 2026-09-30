@@ -117,6 +117,21 @@ impl Step for ConfiguredStep {
     fn timeout_ms(&self) -> u64 {
         self.timeout_ms
     }
+    // The overlay changes the four configurable fields and nothing else. The
+    // gate identity and the capability contract belong to the implementation
+    // (PROTOCOL_SPEC 6.6.5.2, §5.16.1): dropping `builtin_gate` made a gate
+    // configured with nothing but `timeout_ms` read as unwired in
+    // `governance_state()`, and dropping `requires` / `provides` exempted a
+    // configured step from the `PIPELINE_DEPENDENCY_ERROR` check.
+    fn builtin_gate(&self) -> Option<crate::pipeline::BuiltinGate> {
+        self.inner.builtin_gate()
+    }
+    fn requires(&self) -> &[&str] {
+        self.inner.requires()
+    }
+    fn provides(&self) -> &[&str] {
+        self.inner.provides()
+    }
     async fn execute(
         &self,
         ctx: &mut crate::pipeline::PipelineContext,
@@ -142,6 +157,45 @@ impl Step for ConfiguredStep {
 /// This SDK never applied them, so it was never affected; it dropped them with
 /// a warning instead, which is the defect fixed below.
 const CONFIGURABLE_STEP_FIELDS: &[&str] = &["match_modules", "ignore_errors", "pure", "timeout_ms"];
+
+/// PROTOCOL_SPEC §5.16.1 "Governance gates cannot be weakened by `configure`"
+/// (D-130), applied to the raw `pipeline.configure` entry for `step_name`.
+///
+/// `gate` is the target step's [`Step::builtin_gate`] — gates are located by
+/// type, like `governance_state()` does, not by name. On either gate,
+/// `ignore_errors: true` and any non-null `match_modules` (an empty list
+/// included: it matches nothing, so it exempts everything) are refused; on the
+/// approval gate `pure: true` is refused too. The ACL gate is pure by default
+/// (`validate()` runs it), so both `pure` values are accepted there. Every
+/// offending key is named. Writing a field's default (`false`, `null`) is
+/// accepted, and `timeout_ms` stays configurable.
+fn reject_gate_weakening_keys(
+    step_name: &str,
+    gate: Option<crate::pipeline::BuiltinGate>,
+    fields: &serde_json::Map<String, Value>,
+) -> Result<(), ModuleError> {
+    let Some(gate) = gate else {
+        return Ok(());
+    };
+    let mut offending: Vec<&str> = Vec::new();
+    if fields.get("ignore_errors") == Some(&Value::Bool(true)) {
+        offending.push("ignore_errors: true");
+    }
+    if fields.get("match_modules").is_some_and(|v| !v.is_null()) {
+        offending.push("match_modules");
+    }
+    if gate == crate::pipeline::BuiltinGate::Approval
+        && fields.get("pure") == Some(&Value::Bool(true))
+    {
+        offending.push("pure: true");
+    }
+    if offending.is_empty() {
+        return Ok(());
+    }
+    let mut err = crate::pipeline::gate_weakening_error(step_name, &offending);
+    err.message = format!("pipeline.configure: {}", err.message);
+    Err(err)
+}
 
 /// The ten keys a `pipeline.steps` entry may carry, per `$defs/PipelineStep`
 /// (`additionalProperties: false`) and §4.3.
@@ -491,6 +545,15 @@ fn build_strategy_from_seed(
                     CONFIGURABLE_STEP_FIELDS,
                     &format!("pipeline.configure: cannot configure step '{step_name_str}'"),
                 )?;
+                // D-130: checked here, on the raw keys, before the overlay is
+                // built — `ExecutionStrategy::replace_with` would also refuse
+                // the weakened step, but only after consuming the original.
+                let gate = strategy
+                    .steps()
+                    .iter()
+                    .find(|s| s.name() == step_name_str)
+                    .and_then(|s| s.builtin_gate());
+                reject_gate_weakening_keys(step_name_str, gate, fields)?;
 
                 // Wrap the existing step with a ConfiguredStep overlay.
                 // Issue #33 §1.2: configuring a nonexistent step is a hard

@@ -480,6 +480,29 @@ pub fn redact_sensitive_with(
     redacted
 }
 
+/// The value a built-in logging middleware writes for a call's inputs or output
+/// (PROTOCOL_SPEC §10.6.1 requirement 5, D-131).
+///
+/// `captured` is `context.redacted_inputs` / `context.redacted_output`, filled
+/// by the pipeline's capture point with the `x-sensitive` rule and the
+/// configured rules already applied — that is what gets logged, never `raw`.
+/// When the capture point has not run (the middleware is driven outside an
+/// executor, or the module declares no output schema) there is no schema to
+/// apply, and `raw` is logged only after the `_secret_` prefix rule and
+/// `rules` — or the defaults when `rules` is `None`, per requirement 3 — have
+/// been applied.
+#[must_use]
+pub(crate) fn loggable_value(
+    captured: Option<&HashMap<String, Value>>,
+    raw: &Value,
+    rules: Option<&RedactionConfig>,
+) -> Value {
+    match captured {
+        Some(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        None => redact_sensitive_with(raw, &Value::Null, rules),
+    }
+}
+
 /// In-place redaction based on schema `x-sensitive` markers.
 fn redact_fields(data: &mut serde_json::Map<String, Value>, schema: &Value) {
     let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
@@ -641,11 +664,13 @@ pub struct GovernanceState {
     pub control_modules_registered: bool,
     /// At least one read-only `system.*` module is in the registry.
     pub read_modules_registered: bool,
-    /// An ACL object is attached to the executor.
+    /// An ACL is in force: attached to the executor, which is what the
+    /// built-in ACL gate reads on every call (PROTOCOL_SPEC 6.6.5.5).
     pub acl_configured: bool,
     /// The running strategy contains the built-in ACL gate, matched by capability.
     pub builtin_acl_gate_wired: bool,
-    /// An `ApprovalHandler` is attached.
+    /// An `ApprovalHandler` is in force: attached to the executor, which is
+    /// what the built-in approval gate reads on every call.
     pub approval_handler_configured: bool,
     /// The running strategy contains the built-in approval gate, matched by capability.
     pub builtin_approval_gate_wired: bool,
@@ -2134,6 +2159,13 @@ impl Executor {
                 .is_some_and(|a| a.requires_approval)
             });
 
+        // PROTOCOL_SPEC 6.6.5.5 (D-129) requires these to report what the
+        // running built-in gate holds. In this SDK the gate steps hold no
+        // provider: `inject_resources` hands every call the executor's ACL,
+        // handler and policy, and the gates read them from the
+        // `PipelineContext`. However the strategy was supplied, the executor
+        // fields ARE what the running gate enforces, so reading them here
+        // cannot drift from the gate.
         let acl_configured = self.acl.is_some();
         let approval_handler_configured = self.approval_handler.is_some();
         let policy_strict = self.policy.as_ref().is_some_and(|p| p.strict);

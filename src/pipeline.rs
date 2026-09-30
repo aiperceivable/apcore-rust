@@ -532,6 +532,114 @@ impl std::fmt::Debug for ExecutionStrategy {
     }
 }
 
+/// PROTOCOL_SPEC §5.16.1 "Governance gates cannot be weakened by `configure`"
+/// (D-130), enforced on a step object.
+///
+/// Three fields turn a built-in gate into something that no longer gates:
+/// `ignore_errors` turns a denial into a warning and runs the call,
+/// `match_modules` exempts every module it does not match, and `pure: true` on
+/// the approval gate makes `validate()` run it — and consult the
+/// `ApprovalHandler` — during a dry run. A step that identifies itself as a
+/// built-in gate ([`Step::builtin_gate`]) carrying any of them is refused with
+/// `PIPELINE_CONFIGURATION_ERROR`, naming the step and every offending field.
+///
+/// `pure` is checked on the approval gate only: the built-in ACL gate is
+/// `pure` by default (`validate()` runs it), so either value is accepted there.
+/// The `pipeline.configure` path applies the same rule to the raw keys
+/// (`pipeline_config::reject_gate_weakening_keys`).
+///
+/// # Errors
+///
+/// [`ErrorCode::PipelineConfigurationError`] when the step is a built-in gate
+/// with a weakening field set.
+pub(crate) fn reject_weakened_gate(step: &dyn Step) -> Result<(), ModuleError> {
+    let Some(gate) = step.builtin_gate() else {
+        return Ok(());
+    };
+    let mut offending: Vec<&str> = Vec::new();
+    if step.ignore_errors() {
+        offending.push("ignore_errors: true");
+    }
+    if step.match_modules().is_some() {
+        offending.push("match_modules");
+    }
+    if gate == BuiltinGate::Approval && step.pure() {
+        offending.push("pure: true");
+    }
+    if offending.is_empty() {
+        return Ok(());
+    }
+    Err(gate_weakening_error(step.name(), &offending))
+}
+
+/// The one message both D-130 enforcement points use, so a configuration-file
+/// rejection and a programmatic one read the same.
+pub(crate) fn gate_weakening_error(step_name: &str, offending: &[&str]) -> ModuleError {
+    ModuleError::new(
+        ErrorCode::PipelineConfigurationError,
+        format!(
+            "Step '{step_name}' is a built-in governance gate and cannot be weakened: {} \
+             not allowed (PROTOCOL_SPEC 5.16.1). Only timeout_ms is configurable on a gate \
+             step; remove the step instead to take the gate out, which is reported by \
+             governance_state().",
+            offending.join(", ")
+        ),
+    )
+}
+
+/// A gate a rejected [`ExecutionStrategy::replace_with`] wrapper produced, with
+/// its three weakening fields forced back to the built-in values.
+///
+/// `replace_with` hands the current step to the wrapper by value, so once the
+/// wrapper returns there is no original left to put back. Re-installing the
+/// wrapper's step as-is would leave the weakened gate running behind an error
+/// the caller may ignore; this leaves a gate that behaves as the built-in does.
+struct NeutralisedGate {
+    inner: Box<dyn Step>,
+    gate: BuiltinGate,
+}
+
+#[async_trait]
+impl Step for NeutralisedGate {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn removable(&self) -> bool {
+        self.inner.removable()
+    }
+    fn replaceable(&self) -> bool {
+        self.inner.replaceable()
+    }
+    fn match_modules(&self) -> Option<&[String]> {
+        None
+    }
+    fn ignore_errors(&self) -> bool {
+        false
+    }
+    fn pure(&self) -> bool {
+        // The built-in values: the ACL gate is pure, the approval gate is not.
+        self.gate == BuiltinGate::Acl
+    }
+    fn timeout_ms(&self) -> u64 {
+        self.inner.timeout_ms()
+    }
+    fn requires(&self) -> &[&str] {
+        self.inner.requires()
+    }
+    fn provides(&self) -> &[&str] {
+        self.inner.provides()
+    }
+    fn builtin_gate(&self) -> Option<BuiltinGate> {
+        Some(self.gate)
+    }
+    async fn execute(&self, ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        self.inner.execute(ctx).await
+    }
+}
+
 /// No-op step used as a temporary placeholder by [`ExecutionStrategy::replace_with`].
 struct PlaceholderStep;
 
@@ -563,6 +671,8 @@ impl ExecutionStrategy {
         // Check for duplicate step names.
         let mut seen = std::collections::HashSet::new();
         for step in &steps {
+            // D-130: a strategy cannot be assembled around a weakened gate.
+            reject_weakened_gate(step.as_ref())?;
             if !seen.insert(step.name().to_string()) {
                 // Mirrors apcore-python `pipeline.py:218` and
                 // apcore-typescript `pipeline.ts:235`, which both raise
@@ -673,6 +783,7 @@ impl ExecutionStrategy {
 
     /// Insert a step immediately after the named anchor.
     pub fn insert_after(&mut self, anchor: &str, step: Box<dyn Step>) -> Result<(), ModuleError> {
+        reject_weakened_gate(step.as_ref())?;
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx + 1, step);
@@ -683,6 +794,7 @@ impl ExecutionStrategy {
 
     /// Insert a step immediately before the named anchor.
     pub fn insert_before(&mut self, anchor: &str, step: Box<dyn Step>) -> Result<(), ModuleError> {
+        reject_weakened_gate(step.as_ref())?;
         self.validate_no_duplicate(step.name())?;
         let idx = self.find_step_index(anchor)?;
         self.steps.insert(idx, step);
@@ -727,6 +839,7 @@ impl ExecutionStrategy {
             ));
         }
         self.validate_replacement_name(step_name, new_step.name())?;
+        reject_weakened_gate(new_step.as_ref())?;
         // Step name may differ from original; rebuild the index either way.
         self.steps[idx] = new_step;
         self.rebuild_index();
@@ -786,6 +899,9 @@ impl ExecutionStrategy {
             ));
         }
         self.validate_replacement_name(step_name, new_step.name())?;
+        // D-130: this is the programmatic step-configuration API, so the rule
+        // `pipeline.configure` enforces applies to the step it installs.
+        reject_weakened_gate(new_step.as_ref())?;
         self.steps[idx] = new_step;
         self.rebuild_index();
         Ok(())
@@ -796,15 +912,32 @@ impl ExecutionStrategy {
     /// Used by `build_strategy_from_config` to overlay YAML metadata
     /// (`match_modules`, `ignore_errors`, etc.) on built-in steps without
     /// losing the original step logic.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::StepNotFound`] when the step does not exist, and
+    /// [`ErrorCode::PipelineConfigurationError`] when the wrapper returns a
+    /// weakened built-in gate (D-130). The original step was moved into the
+    /// wrapper, so that rejection cannot be undone; the wrapper's gate stays
+    /// installed with its weakening fields forced back to the built-in values
+    /// rather than running weakened behind an error the caller may ignore.
     pub fn replace_with<F>(&mut self, step_name: &str, wrapper: F) -> Result<(), ModuleError>
     where
         F: FnOnce(Box<dyn Step>) -> Box<dyn Step>,
     {
         let idx = self.find_step_index(step_name)?;
         let old = std::mem::replace(&mut self.steps[idx], Box::new(PlaceholderStep));
-        self.steps[idx] = wrapper(old);
+        let installed = wrapper(old);
+        let rejection = reject_weakened_gate(installed.as_ref()).err();
+        self.steps[idx] = match (&rejection, installed.builtin_gate()) {
+            (Some(_), Some(gate)) => Box::new(NeutralisedGate {
+                inner: installed,
+                gate,
+            }),
+            _ => installed,
+        };
         self.rebuild_index();
-        Ok(())
+        rejection.map_or(Ok(()), Err)
     }
 
     /// Build a [`StrategyInfo`] summary for AI introspection.
