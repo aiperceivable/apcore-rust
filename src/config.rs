@@ -631,7 +631,7 @@ pub struct MetricsConfig {
 ///
 /// **v0.18.0 BREAKING CHANGE.** Prior versions accepted root-level
 /// `max_call_depth`, `default_timeout_ms`, etc. The custom `Deserialize` impl
-/// now rejects these with a hard error pointing at `MIGRATION-v0.18.md`.
+/// now rejects these with a hard error naming each field's canonical location.
 /// **Note (sync finding A-D-016).** Apcore-python and apcore-typescript
 /// register the built-in `observability` and `sys_modules` namespaces at
 /// module-load time, so every code path observes them. Rust has no cheap
@@ -854,7 +854,7 @@ impl<'de> Deserialize<'de> for Config {
             return Err(D::Error::custom(format!(
                 "apcore v0.18.0 changed Config layout: root-level fields {} are no longer accepted. \
                  Move them to their canonical nested namespace. \
-                 See MIGRATION-v0.18.md for the full migration guide.",
+                 See the apcore CHANGELOG entry for 0.18.0.",
                 violations.join(", ")
             )));
         }

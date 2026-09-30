@@ -1,5 +1,5 @@
 //! Cross-language conformance test for OpenAI structured-outputs strict-mode
-//! compatibility detection (DECLARATIVE_CONFIG_SPEC.md §6.2 / §6.6).
+//! compatibility detection (protocol-spec §5.12.5).
 //!
 //! Consumes the canonical `openai_strict_compat.json` fixture shipped by the
 //! `apcore` spec repo (sibling directory or `CONFORMANCE_SPEC_REPO`).

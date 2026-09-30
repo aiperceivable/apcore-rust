@@ -13,7 +13,7 @@
 //!     identical across SDKs so a polyglot consumer reads the same document.
 //!   - T5: PROTOCOL_SPEC §9.1 / §9.3 step 1 — only `version` and
 //!     `project.name` are required, evaluated against the DECLARED document.
-//!   - T6: DECLARATIVE_CONFIG_SPEC §12 — Rust `auto_schema` inference is not
+//!   - T6: protocol-spec §5.12.5 — Rust `auto_schema` inference is not
 //!     implemented (F11); the permissive fallback must be loud, not silent.
 
 #![allow(clippy::pedantic, clippy::all)]

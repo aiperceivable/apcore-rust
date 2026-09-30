@@ -1,5 +1,5 @@
 // APCore Protocol — Binding loader
-// Spec reference: DECLARATIVE_CONFIG_SPEC.md §3 (Bindings YAML)
+// Spec reference: protocol-spec §5.12 (Bindings YAML)
 //
 // Cross-language note: Rust cannot dynamically import compiled modules at
 // runtime, so the canonical `target: "module:callable"` string is used as
@@ -151,7 +151,7 @@ where
 
 /// `auto_schema` field accepts either a boolean or a mode string.
 ///
-/// `true` is a synonym for `"permissive"`. See `DECLARATIVE_CONFIG_SPEC.md` §6.2.
+/// `true` is a synonym for `"permissive"`. See protocol-spec §5.12.5.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum AutoSchemaValue {
@@ -312,7 +312,7 @@ fn semver_re() -> &'static regex::Regex {
 }
 
 /// A single binding entry. Mirrors the canonical YAML structure defined in
-/// `DECLARATIVE_CONFIG_SPEC.md` §3.3.
+/// protocol-spec §5.12.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindingEntry {
     pub module_id: String,
@@ -345,7 +345,7 @@ pub struct BindingEntry {
     /// Threaded into `BINDING_STRICT_SCHEMA_INCOMPATIBLE` and
     /// `BINDING_SCHEMA_INFERENCE_FAILED` diagnostics so the `{file_path}: `
     /// message prefix and the `file_path` details key required by
-    /// `DECLARATIVE_CONFIG_SPEC.md` §7.2 carry a real value. apcore-python and
+    /// protocol-spec §5.12.8 carry a real value. apcore-python and
     /// apcore-typescript both pass the binding file path at the same sites.
     #[serde(skip)]
     pub source_file: Option<String>,
@@ -450,8 +450,7 @@ impl BindingLoader {
                     path = %source_path.display(),
                     default_version = CURRENT_SPEC_VERSION,
                     "spec_version missing in bindings file; defaulting. \
-                     spec_version will be mandatory in spec 1.1. \
-                     See DECLARATIVE_CONFIG_SPEC.md §2.4"
+                     See protocol-spec §5.12.2"
                 );
             }
             Some(v) if !SUPPORTED_SPEC_VERSIONS.contains(&v) => {
@@ -472,8 +471,8 @@ impl BindingLoader {
             // §9.1.2 — unconstrained unless the operator configured a limit.
             self.limits.check(&entry, source_path)?;
             // Record the originating file so downstream diagnostics can emit
-            // the `{file_path}: ` prefix mandated by DECLARATIVE_CONFIG_SPEC
-            // §7.2 (parity with apcore-python / apcore-typescript).
+            // the `{file_path}: ` prefix mandated by protocol-spec §5.12.8
+            // (parity with apcore-python / apcore-typescript).
             entry.source_file = Some(source_path.display().to_string());
             let module_id = entry.module_id.clone();
             let schemas = self.resolve_schemas(&entry, dir, source_path)?;
@@ -483,7 +482,7 @@ impl BindingLoader {
         Ok(())
     }
 
-    /// Resolve input/output schemas per `DECLARATIVE_CONFIG_SPEC.md` §3.4.
+    /// Resolve input/output schemas per protocol-spec §5.12.2.
     ///
     /// Detects mode conflicts (multiple schema fields specified together)
     /// and loads `schema_ref` external files. For Rust, `auto_schema` is
@@ -502,7 +501,7 @@ impl BindingLoader {
             return Err(ModuleError::new(
                 ErrorCode::BindingSchemaModeConflict,
                 format!(
-                    "{}: binding '{}' specifies multiple schema modes ({}). Choose one. See DECLARATIVE_CONFIG_SPEC.md §3.4",
+                    "{}: binding '{}' specifies multiple schema modes ({}). Choose one. See protocol-spec §5.12.2",
                     source_path.display(),
                     entry.module_id,
                     modes.join(", "),
@@ -593,7 +592,7 @@ impl BindingLoader {
             return Err(ModuleError::new(
                 ErrorCode::BindingSchemaInferenceFailed,
                 format!(
-                    "{}: binding '{}': auto_schema is explicitly false; provide input_schema/output_schema or schema_ref instead. See DECLARATIVE_CONFIG_SPEC.md §3.4",
+                    "{}: binding '{}': auto_schema is explicitly false; provide input_schema/output_schema or schema_ref instead. See protocol-spec §5.12.2",
                     source_path.display(),
                     entry.module_id,
                 ),
@@ -612,7 +611,7 @@ impl BindingLoader {
         // deferral `auto_schema: strict` would pass vacuously against the
         // permissive pair below.
         let resolved_mode = auto_mode.unwrap_or("permissive");
-        // DECLARATIVE_CONFIG_SPEC §12 marks Rust's `auto_schema: true` /
+        // protocol-spec §5.12.5 marks Rust's `auto_schema: true` /
         // `permissive` as NOT IMPLEMENTED (F11). Tightening this fallback into
         // an error would break every working binding, so the gap stays
         // permissive — but it MUST NOT be silent. One warning per binding;
@@ -626,7 +625,7 @@ impl BindingLoader {
              falling back to a permissive {{\"type\": \"object\"}} for this binding. \
              Inputs and outputs are effectively unvalidated. Specify input_schema \
              and output_schema (or schema_ref) explicitly, or register the target \
-             with a typed handler. See DECLARATIVE_CONFIG_SPEC.md §6.5 / §12"
+             with a typed handler. See protocol-spec §5.12.5"
         );
         Ok(ResolvedSchemas {
             input: serde_json::json!({"type": "object"}),
@@ -786,7 +785,7 @@ impl BindingLoader {
     /// Register every loaded binding as a [`FunctionModule`] in `registry`,
     /// using `handlers` keyed by the binding's full `target` string.
     ///
-    /// Per `DECLARATIVE_CONFIG_SPEC.md` §3.7, Rust treats the `target` string
+    /// Per protocol-spec §5.12.3, Rust treats the `target` string
     /// as an opaque handler-map key. The user is responsible for providing a
     /// closure for every `target` referenced by the loaded YAML.
     ///
@@ -875,7 +874,7 @@ impl BindingLoader {
     /// corresponding handler carries schemas (`TypedBindingHandler::input_schema` /
     /// `output_schema` are `Some`), the handler's schemas are used instead of the
     /// permissive `{"type":"object"}` fallback. This is the primary mechanism for
-    /// Rust `auto_schema` support per `DECLARATIVE_CONFIG_SPEC.md` §6.5.
+    /// Rust `auto_schema` support per protocol-spec §5.12.5.
     ///
     /// For bindings with explicit `input_schema`/`output_schema` or `schema_ref`,
     /// the YAML-specified schemas take precedence (handler schemas are ignored).
@@ -901,7 +900,7 @@ impl BindingLoader {
             let yaml_schemas = self.schemas.get(module_id);
             let has_explicit_yaml = entry.input_schema.is_some() || entry.schema_ref.is_some();
             // `auto_schema: strict` promises an OpenAI/Anthropic strict-compatible
-            // schema (DECLARATIVE_CONFIG_SPEC.md §6.2 / §6.6).
+            // schema (protocol-spec §5.12.5).
             let strict = !has_explicit_yaml && normalized_auto_mode(entry) == Some("strict");
 
             let (input_schema, output_schema) = if has_explicit_yaml {
@@ -1006,7 +1005,7 @@ fn normalized_auto_mode(entry: &BindingEntry) -> Option<&'static str> {
 ///
 /// Mirrors apcore-python `BindingSchemaInferenceFailedError` and
 /// apcore-typescript `BindingSchemaInferenceFailedError`: message carries the
-/// `{file_path}: ` prefix from DECLARATIVE_CONFIG_SPEC.md §7.2 and the details
+/// `{file_path}: ` prefix from protocol-spec §5.12.8 and the details
 /// map carries `module_id`, `target` and `file_path`.
 fn strict_inference_failed(entry: &BindingEntry, module_id: &str, reason: &str) -> ModuleError {
     let loc = entry
@@ -1033,7 +1032,7 @@ fn strict_inference_failed(entry: &BindingEntry, module_id: &str, reason: &str) 
         format!(
             "{loc}binding '{module_id}' (target '{}') declares auto_schema: strict but no schema could be inferred: {reason}. \
              Register it via BindingLoader::register_into_with_typed_handlers with a `typed_handler`, or declare input_schema/output_schema explicitly. \
-             See DECLARATIVE_CONFIG_SPEC.md §6.6",
+             See protocol-spec §5.12.5",
             entry.target,
         ),
     )
@@ -1043,7 +1042,7 @@ fn strict_inference_failed(entry: &BindingEntry, module_id: &str, reason: &str) 
 /// Reject a bindings document that omits the required top-level `bindings`
 /// key, with the canonical `BindingFileInvalidError` message.
 ///
-/// `DECLARATIVE_CONFIG_SPEC.md` §7.2 fixes the template as
+/// protocol-spec §5.12.8 fixes the template as
 /// `"Invalid binding file '{file_path}': {reason}"` and
 /// `conformance/fixtures/binding_errors.json` pins the exact string for this
 /// condition. apcore-rust used to surface serde's own

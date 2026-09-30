@@ -6,8 +6,8 @@
 //!   - Audit-event single-emit rule for ephemeral.* registrations
 //!   - Soft-warn on missing requires_approval for ephemeral.*
 //!
-//! Cross-references: apcore docs/spec/rfc-preview-method.md +
-//! docs/spec/rfc-ephemeral-modules.md (both Accepted, target v0.21.0).
+//! Cross-references: apcore protocol-spec §5.6 / §12.8.5.1 (preview) and
+//! §2.5.1 (the `ephemeral.*` namespace).
 
 use apcore::context::{Context, Identity};
 use apcore::errors::ModuleError;
@@ -341,7 +341,7 @@ fn test_module_annotations_discoverable_default_is_true() {
     let ann = ModuleAnnotations::default();
     assert!(
         ann.discoverable,
-        "discoverable must default to true per RFC ephemeral-modules"
+        "discoverable must default to true per protocol-spec §2.5.1"
     );
 }
 

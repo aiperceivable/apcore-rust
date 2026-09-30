@@ -82,7 +82,7 @@ pub enum ErrorCode {
     BindingCallableNotFound,
     BindingNotCallable,
     /// Deprecated since 0.19.0; superseded by `BindingSchemaInferenceFailed`.
-    /// Kept for backward-compatibility deserialization. See `DECLARATIVE_CONFIG_SPEC.md` §7.1.
+    /// Kept for backward-compatibility deserialization. See protocol-spec §5.12.8.
     /// The alias below makes the backward-compat contract explicit even if the variant is ever
     /// renamed: old serialized payloads containing `"BINDING_SCHEMA_MISSING"` remain decodable.
     #[serde(alias = "BINDING_SCHEMA_MISSING")]
@@ -153,7 +153,7 @@ pub enum ErrorCode {
     EntryPointAmbiguous,
     /// Reserved for future opt-in runtime entry-point loading APIs (e.g.,
     /// `libloading`-based plugin discovery). No current API path raises this
-    /// error. See `DECLARATIVE_CONFIG_SPEC.md` §5.2.
+    /// error. See protocol-spec §5.2.
     EntryPointRuntimeUnsupported,
     /// `Registry::discover_internal()` was called but no custom discoverer
     /// has been configured via `Registry::set_discoverer()`. Rust-specific:

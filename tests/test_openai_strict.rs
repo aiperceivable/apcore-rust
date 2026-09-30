@@ -1,5 +1,5 @@
 //! Unit + binding-path regression tests for OpenAI strict-mode compatibility
-//! detection (DECLARATIVE_CONFIG_SPEC.md §6.2 / §6.6).
+//! detection (protocol-spec §5.12.5).
 //!
 //! Before this feature existed, `ErrorCode::BindingStrictSchemaIncompatible`
 //! was declared in the error enum but no code path ever produced it —
@@ -166,7 +166,7 @@ fn assert_reports_side_prefixed_features() {
         .message
         .contains("binding 'demo.mod' uses auto_schema: strict"));
     assert!(err.message.contains("input:$.s.minLength"));
-    assert!(err.message.contains("DECLARATIVE_CONFIG_SPEC.md §6.2"));
+    assert!(err.message.contains("See protocol-spec §5.12.5"));
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 // APCore Protocol — Execution pipeline types
-// Spec reference: design-execution-pipeline.md (Sections 2, 3.3, 8.2)
+// Spec reference: docs/features/execution-pipeline.md
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

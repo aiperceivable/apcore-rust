@@ -371,8 +371,7 @@ impl Discoverer for DefaultDiscoverer {
 
         // Reject filesystem-derived IDs in the reserved ephemeral.* namespace.
         //
-        // Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md` (target
-        // v0.21.0), `ephemeral.*` is reserved for programmatically-registered
+        // Per protocol-spec §2.5.1, `ephemeral.*` is reserved for programmatically-registered
         // modules synthesized at runtime. Any filesystem layout that produces
         // such an ID is a configuration error; we surface it as a hard
         // ModuleError to match apcore-python's `_reject_ephemeral_discoveries`

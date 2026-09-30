@@ -4,7 +4,7 @@
 //! `to_strict_schema()` is a general-purpose registry/export transform; baking
 //! an OpenAI-specific dialect check into it would leak one vendor's constraints
 //! into every other consumer. Detection lives here and is invoked only on the
-//! `auto_schema: strict` binding path (DECLARATIVE_CONFIG_SPEC.md §6.2 / §6.6).
+//! `auto_schema: strict` binding path (protocol-spec §5.12.5).
 //!
 //! Detection **never rewrites** the schema. In particular an author-written
 //! `oneOf` is reported, not silently downgraded to `anyOf`: the two differ in
@@ -203,11 +203,11 @@ pub fn detect_openai_strict_incompatibilities(schema: &Value) -> Vec<String> {
 /// feature OpenAI structured outputs rejects under `strict: true`.
 ///
 /// Invoked on the `auto_schema: strict` binding path only
-/// (DECLARATIVE_CONFIG_SPEC.md §6.6). `Ok(())` for compatible schemas.
+/// (protocol-spec §5.12.5). `Ok(())` for compatible schemas.
 ///
 /// `side` prefixes every reported feature (e.g. `input` / `output`); pass
 /// `None` to report bare paths. The message matches the canonical template in
-/// DECLARATIVE_CONFIG_SPEC.md §7.2.
+/// protocol-spec §5.12.8.
 ///
 /// # Errors
 ///
@@ -246,7 +246,7 @@ pub fn assert_openai_strict_compatible(
     Err(ModuleError::new(
         ErrorCode::BindingStrictSchemaIncompatible,
         format!(
-            "{loc}binding '{module_id}' uses auto_schema: strict but inferred schema contains incompatible features: {}. See DECLARATIVE_CONFIG_SPEC.md §6.2",
+            "{loc}binding '{module_id}' uses auto_schema: strict but inferred schema contains incompatible features: {}. See protocol-spec §5.12.5",
             listed.join(", ")
         ),
     )

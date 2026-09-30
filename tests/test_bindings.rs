@@ -1,5 +1,5 @@
 //! Integration tests for BindingLoader with Registry and FunctionModule
-//! using the canonical YAML format defined in DECLARATIVE_CONFIG_SPEC.md §3.
+//! using the canonical YAML format defined in protocol-spec §5.12.
 
 use apcore::bindings::{BindingHandler, BindingLoader};
 use apcore::context::Context;

@@ -1427,7 +1427,7 @@ impl Executor {
                 warnings,
             });
 
-            // Module-level preview() (RFC `rfc-preview-method.md`, target v0.21.0).
+            // Module-level preview() (protocol-spec §5.6 / §12.8.5.1).
             // Invoked after preflight in cross-language alignment with
             // apcore-python and apcore-typescript. Panics are treated as
             // advisory and do NOT fail validation.

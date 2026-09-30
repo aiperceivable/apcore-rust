@@ -243,8 +243,7 @@ pub const RESERVED_WORDS: &[&str] = &[
 /// Namespace reserved for programmatically-registered modules synthesized at
 /// runtime.
 ///
-/// Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md` (Accepted, target
-/// v0.21.0). IDs in this namespace MUST be registered through
+/// Per protocol-spec §2.5.1. IDs in this namespace MUST be registered through
 /// [`Registry::register`] / [`Registry::register_module`] only; the filesystem
 /// discoverer rejects matching IDs because the namespace has no
 /// directory-rooted source of truth, and [`Registry::register_internal`]
@@ -984,7 +983,7 @@ impl Registry {
     /// Same as [`Self::list`] but with explicit visibility control.
     ///
     /// Pass `visibility=Some(&["public", "hidden"])` to enumerate every registered
-    /// module ID including those annotated `discoverable: false` (RFC ephemeral-modules).
+    /// module ID including those annotated `discoverable: false` (protocol-spec §2.5.1).
     /// Aligned with apcore-python `Registry.list(..., visibility=["public", "hidden"])`.
     pub fn list_full(
         &self,
@@ -1078,7 +1077,7 @@ impl Registry {
     /// `apcore::sys_modules`. Aligned with apcore-typescript
     /// `Registry.registerInternal`.
     ///
-    /// Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md`, IDs in the
+    /// Per protocol-spec §2.5.1, IDs in the
     /// reserved `ephemeral.*` namespace are rejected at this entry point.
     /// Agent-synthesized modules MUST go through [`Self::register`] /
     /// [`Self::register_module`] so the audit-emit / soft-warn pilot fires.
@@ -1093,7 +1092,7 @@ impl Registry {
                 crate::errors::ErrorCode::GeneralInvalidInput,
                 format!(
                     "ephemeral.* module IDs must be registered via Registry::register(), \
-                     not register_internal(). See apcore docs/spec/rfc-ephemeral-modules.md \
+                     not register_internal(). See protocol-spec §2.5.1 \
                      for rationale. (offending id: '{name}')"
                 ),
             ));
@@ -1104,7 +1103,7 @@ impl Registry {
     /// Soft-warn when an `ephemeral.*` module is registered without
     /// `requires_approval=true`.
     ///
-    /// Per the apcore ephemeral-modules RFC pilot, agent-synthesized modules
+    /// Per protocol-spec §2.5.1, agent-synthesized modules
     /// SHOULD declare `requires_approval: true` so a human gates execution.
     /// The registry only warns; it does not refuse the registration.
     ///
@@ -1123,7 +1122,7 @@ impl Registry {
             tracing::warn!(
                 module_id = %name,
                 "ephemeral.* module registered without requires_approval=true. \
-                 The apcore RFC docs/spec/rfc-ephemeral-modules.md recommends \
+                 The apcore protocol-spec §2.5.1 recommends \
                  setting ModuleAnnotations {{ requires_approval: true, .. }} so \
                  agent-synthesized code does not run unattended."
             );
@@ -2258,7 +2257,7 @@ impl Registry {
     /// Return all module IDs, sorted alphabetically.
     ///
     /// Modules annotated `discoverable: false` are excluded by default per
-    /// the apcore RFC ephemeral-modules pilot. Use [`Self::module_ids_full`]
+    /// protocol-spec §2.5.1. Use [`Self::module_ids_full`]
     /// to include hidden modules.
     pub fn module_ids(&self) -> Vec<String> {
         self.module_ids_full(false)
@@ -2283,7 +2282,7 @@ impl Registry {
     /// Return a snapshot of all registered (`module_id`, module) pairs.
     ///
     /// Modules annotated `discoverable: false` are excluded by default per
-    /// the apcore RFC ephemeral-modules pilot. Use [`Self::entries_full`] to
+    /// protocol-spec §2.5.1. Use [`Self::entries_full`] to
     /// include hidden modules.
     pub fn entries(&self) -> Vec<(String, Arc<dyn Module>)> {
         self.entries_full(false)

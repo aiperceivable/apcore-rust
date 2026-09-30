@@ -1749,8 +1749,8 @@ fn conformance_annotations_extra_round_trip() {
             // Re-serialize and compare with expected_serialized.
             //
             // Pilot-tolerant comparator for the v0.21.0 `discoverable` rollout:
-            // per RFC `apcore/docs/spec/rfc-ephemeral-modules.md`
-            // "Conformance plan / Transitional fixture handling", the canonical
+            // per the ephemeral-namespace rollout (protocol-spec §2.5.1), the
+            // canonical
             // `annotations_extra_round_trip.json` fixture MUST NOT be updated
             // to require `discoverable` until ALL three SDKs have shipped
             // support. SDKs that have shipped the field strip it from actual
@@ -2062,7 +2062,7 @@ async fn conformance_approval_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. Binding Errors (DECLARATIVE_CONFIG_SPEC §7)
+// 16. Binding Errors (protocol-spec §5.12.8)
 //
 // CORRECTED (apcore#93). Four of this fixture's six cases reached no assertion
 // that any SDK behaviour could fail:
@@ -2243,7 +2243,7 @@ fn conformance_binding_errors() {
                     .load_from_yaml(&path)
                     .expect_err(&format!(
                         "FAIL [{id}]: target {target:?} has no ':' separator and must be \
-                         rejected at parse time (DECLARATIVE_CONFIG_SPEC §2.2)"
+                         rejected at parse time (protocol-spec §5.12.3)"
                     ));
                 assert_binding_code(id, tc, err.code);
                 assert_binding_message(id, tc, &err.message, None);
@@ -2286,7 +2286,7 @@ fn conformance_binding_errors() {
             // BINDING_SCHEMA_INFERENCE_FAILED is raised when a target's schema
             // cannot be inferred from its signature. apcore-rust resolves a
             // binding through an opaque handler-map key with no compile-time
-            // linking (DECLARATIVE_CONFIG_SPEC §3.7 "Rust caveat"), performs no
+            // linking (protocol-spec §5.12.3), performs no
             // inference from a target, and so has no such failure to produce
             // for THIS case's shape. Named explicitly rather than folded into a
             // catch-all, so a case this driver has merely not been taught still
@@ -2304,7 +2304,7 @@ fn conformance_binding_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// 17. Binding YAML Canonical Parse (DECLARATIVE_CONFIG_SPEC §3)
+// 17. Binding YAML Canonical Parse (protocol-spec §5.12)
 // ---------------------------------------------------------------------------
 
 #[test]

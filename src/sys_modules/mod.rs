@@ -786,7 +786,7 @@ pub fn register_sys_modules_with_options(
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         handle.spawn(async move {
                             // Audit-event single-emit rule for ephemeral.* per
-                            // apcore RFC docs/spec/rfc-ephemeral-modules.md.
+                            // protocol-spec §2.5.1.
                             // Ephemeral modules emit ONE canonical event with the
                             // full contextual payload (namespace_class +
                             // caller_id) and do NOT emit the legacy bare-name

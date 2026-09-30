@@ -215,8 +215,7 @@ pub trait Module: Send + Sync {
 
     /// Optional preview hook — return a structured prediction of changes.
     ///
-    /// Per the apcore RFC `docs/spec/rfc-preview-method.md` (Accepted, target
-    /// v0.21.0), called by `Executor::validate()` *after* the standard
+    /// Per protocol-spec §5.6, called by `Executor::validate()` *after* the standard
     /// validation pipeline has been processed. The default implementation
     /// returns `None` (= the module declines to predict).
     ///
@@ -328,8 +327,7 @@ pub struct ModuleAnnotations {
     /// Whether this module is enumerated by `Registry::list()` /
     /// `Registry::iter()` / `Registry::module_ids()` by default.
     ///
-    /// Per the apcore RFC `docs/spec/rfc-ephemeral-modules.md` (Accepted,
-    /// target v0.21.0): defaults to `true`. Setting `discoverable: false`
+    /// Per protocol-spec §2.5.1: defaults to `true`. Setting `discoverable: false`
     /// hides the module from default enumeration without unregistering it;
     /// callers that legitimately need to see every module ID can pass
     /// `include_hidden=true` to the relevant Registry method.
@@ -647,7 +645,7 @@ pub struct PreflightResult {
     #[serde(default)]
     pub requires_approval: bool,
     /// Optional structured prediction of changes from the module's
-    /// `preview()` hook (RFC `docs/spec/rfc-preview-method.md`, target v0.21.0).
+    /// `preview()` hook (protocol-spec §5.6 / §12.8.5.1).
     ///
     /// - Empty when the module does not implement `preview()` or when
     ///   `preview()` returned `None`.
@@ -664,8 +662,7 @@ pub struct PreflightResult {
 /// Structured prediction of a single side-effect produced by executing a
 /// module call.
 ///
-/// Per the apcore RFC `docs/spec/rfc-preview-method.md` (Accepted, target
-/// v0.21.0). `action`, `target`, and `summary` are required; modules define
+/// Per protocol-spec §12.8.5.1. `action`, `target`, and `summary` are required; modules define
 /// their own free-form taxonomy for `action` (e.g. "write", "delete", "send",
 /// "charge", "publish") and `target` (e.g. "users.42", "smtp:user@example.com").
 ///
@@ -710,7 +707,7 @@ impl Change {
     /// `#[non_exhaustive]` removes struct-literal construction for downstream
     /// crates, and `Default::default()` alone would produce a value that is
     /// structurally valid and semantically empty — three empty strings where
-    /// the RFC requires an action, a target and a summary. Set `before`,
+    /// protocol-spec §12.8.5.1 requires an action, a target and a summary. Set `before`,
     /// `after` and `extra` on the returned value as needed.
     ///
     /// ```
@@ -772,8 +769,7 @@ impl<'de> Deserialize<'de> for Change {
                         "before" => before = Some(map.next_value()?),
                         "after" => after = Some(map.next_value()?),
                         other => {
-                            // Per RFC `rfc-preview-method.md` (cross-SDK
-                            // schema-encoding table) any unknown key MUST
+                            // Per protocol-spec §12.8.5.1 any unknown key MUST
                             // start with `x-`. Reject anything else.
                             if !other.starts_with("x-") {
                                 return Err(serde::de::Error::custom(format!(

@@ -1,5 +1,5 @@
 // APCore Protocol — Pipeline YAML configuration: step type registry and strategy builder.
-// Spec reference: design-execution-pipeline.md (Section 8)
+// Spec reference: docs/features/execution-pipeline.md (Configuring the pipeline from apcore.yaml)
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -74,7 +74,7 @@ pub(crate) fn reset_step_registry() {
 }
 
 // ---------------------------------------------------------------------------
-// Step resolution from config dict (DECLARATIVE_CONFIG_SPEC.md §4)
+// Step resolution from config dict (protocol-spec §5.16.1)
 // ---------------------------------------------------------------------------
 
 /// Wrapper that overlays YAML metadata fields onto a factory-created step.
@@ -129,7 +129,7 @@ impl Step for ConfiguredStep {
 ///
 /// The four fields `pipeline.configure` may override, per
 /// `schemas/apcore-config.schema.json` `$defs/ConfigurableStepFields` and
-/// `DECLARATIVE_CONFIG_SPEC.md` §4.2 — the §4.3 step-entry fields that still
+/// protocol-spec §5.16.1 — the step-entry fields that still
 /// mean something applied to a step that already exists.
 ///
 /// `requires` / `provides` are deliberately absent: a step's capability
@@ -212,7 +212,7 @@ fn reject_unknown_keys(
     ))
 }
 
-/// Per `DECLARATIVE_CONFIG_SPEC.md` §4.3:
+/// Per protocol-spec §5.16.1:
 ///   - `type:` → registry lookup (only supported mode in Rust)
 ///   - `handler:` → parse-time error (Rust cannot dynamically load modules)
 ///   - Metadata: `match_modules`, `ignore_errors`, `pure`, `timeout_ms` applied via wrapper.
@@ -240,7 +240,7 @@ fn resolve_step(step_def: &Value) -> Result<Box<dyn Step>, ModuleError> {
             format!(
                 "pipeline step '{step_name}' uses 'handler: {hp}' which is not supported in apcore-rust. \
                  Use 'type:' with register_step_type(). \
-                 See DECLARATIVE_CONFIG_SPEC.md §4.4",
+                 See protocol-spec §5.16.1",
             ),
         ));
     }
@@ -461,7 +461,7 @@ fn build_strategy_from_seed(
         }
     }
 
-    // (2) Configure existing step fields (DECLARATIVE_CONFIG_SPEC.md §4.2)
+    // (2) Configure existing step fields (protocol-spec §5.16.1)
     if let Some(Value::Object(configure)) = pipeline_config.get("configure") {
         for (step_name, overrides) in configure {
             let step_name_str = step_name.as_str();
@@ -817,7 +817,7 @@ mod tests {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::PipelineHandlerNotSupported);
                 assert!(err.message.contains("handler"));
-                assert!(err.message.contains("DECLARATIVE_CONFIG_SPEC.md §4.4"));
+                assert!(err.message.contains("See protocol-spec §5.16.1"));
             }
             Ok(_) => panic!("expected PipelineHandlerNotSupportedError"),
         }

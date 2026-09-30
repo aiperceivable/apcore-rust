@@ -1,5 +1,5 @@
 // APCore Protocol — Built-in execution pipeline steps
-// Spec reference: design-execution-pipeline.md (Section 3)
+// Spec reference: docs/features/execution-pipeline.md (Built-in steps)
 
 use std::time::Duration;
 
@@ -233,8 +233,8 @@ impl Step for BuiltinContextCreation {
         // nested call reported the wrong `caller_id`. apcore-python
         // (`builtin_steps.py` context_creation) and apcore-typescript
         // (`builtin-steps.ts` contextCreation) both derive it here;
-        // docs/spec/design-execution-pipeline.md §4.0 lists `context_creation`
-        // among the mandatory non-removable steps for exactly this reason.
+        // docs/features/execution-pipeline.md lists `context_creation` among
+        // the non-removable steps for exactly this reason.
         ctx.context = ctx.context.child(&ctx.module_id);
 
         Ok(StepResult::continue_step())

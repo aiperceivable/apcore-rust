@@ -2,7 +2,7 @@
 //!
 //! Each test pins a behavior where apcore-rust diverged from apcore-python and
 //! apcore-typescript. The authority is the spec repo (`PROTOCOL_SPEC`,
-//! `DECLARATIVE_CONFIG_SPEC`, `docs/spec/design-execution-pipeline.md`).
+//! `docs/features/execution-pipeline.md`).
 
 #![allow(clippy::pedantic, clippy::all)]
 
@@ -95,7 +95,7 @@ fn c1_auto_schema_strict_with_schemaless_typed_handler_is_rejected() {
     assert_eq!(err.code, ErrorCode::BindingSchemaInferenceFailed);
 }
 
-/// `DECLARATIVE_CONFIG_SPEC` §7.2 requires the `{file_path}: ` message prefix
+/// protocol-spec §5.12.8 requires the `{file_path}: ` message prefix
 /// and a `file_path` details key. Rust hard-coded `file_path = None` at the
 /// only call site, so both were dead code.
 #[test]
