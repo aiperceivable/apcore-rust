@@ -1,6 +1,6 @@
 [package]
 name = "apcore"
-version = "0.31.0"
+version = "0.32.0"
 edition = "2021"
 # Minimum supported Rust version. Verified with `cargo +1.86 check --all-features`.
 # The binding language constraint is `std::task::Waker::noop()` (used by the
@@ -95,6 +95,11 @@ path = "tests/test_deprecated_inert_keys.rs"
 name = "test_get_declared_typed_sections"
 path = "tests/test_get_declared_typed_sections.rs"
 
+# Sets `APCORE_ID__MAP_OVERRIDES` and the working directory per case.
+[[test]]
+name = "test_id_map_from_config_conformance"
+path = "tests/test_id_map_from_config_conformance.rs"
+
 [[test]]
 name = "test_capture_point_redaction"
 path = "tests/test_capture_point_redaction.rs"
@@ -102,6 +107,10 @@ path = "tests/test_capture_point_redaction.rs"
 [[test]]
 name = "test_extensions_ignore_patterns"
 path = "tests/test_extensions_ignore_patterns.rs"
+
+[[test]]
+name = "test_issue_123_conformance"
+path = "tests/test_issue_123_conformance.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }

@@ -88,6 +88,7 @@ impl From<ExecutionCancelledError> for ModuleError {
 #[derive(Debug, Clone)]
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
+    parent: Option<Arc<CancelToken>>,
 }
 
 impl CancelToken {
@@ -96,6 +97,16 @@ impl CancelToken {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            parent: None,
+        }
+    }
+
+    /// Derive an independently cancellable token that observes its parent.
+    #[must_use]
+    pub fn child(&self) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            parent: Some(Arc::new(self.clone())),
         }
     }
 
@@ -107,7 +118,16 @@ impl CancelToken {
     /// Check whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        let mut token = self;
+        loop {
+            if token.cancelled.load(Ordering::SeqCst) {
+                return true;
+            }
+            match token.parent.as_deref() {
+                Some(parent) => token = parent,
+                None => return false,
+            }
+        }
     }
 
     /// Check if cancelled and return [`ExecutionCancelledError`] if so.
@@ -171,5 +191,33 @@ impl CancelToken {
 impl Default for CancelToken {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod child_token_tests {
+    use super::CancelToken;
+
+    #[test]
+    fn test_child_cancellation_does_not_cancel_parent_or_sibling() {
+        let parent = CancelToken::new();
+        let child = parent.child();
+        let sibling = parent.child();
+        child.cancel();
+        assert!(child.is_cancelled());
+        assert!(!parent.is_cancelled());
+        assert!(!sibling.is_cancelled());
+    }
+
+    #[test]
+    fn test_parent_cancellation_reaches_all_descendants_and_clones() {
+        let parent = CancelToken::new();
+        let child = parent.child();
+        let grandchild = child.child();
+        let handle = parent.clone();
+        handle.cancel();
+        assert!(parent.is_cancelled());
+        assert!(child.is_cancelled());
+        assert!(grandchild.is_cancelled());
     }
 }

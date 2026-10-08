@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// Canonical single-binding YAML body with an auto_schema entry.
 fn binding_yaml(module_id: &str, target: &str) -> String {
     format!(
-        "spec_version: \"1.0\"\nbindings:\n  - module_id: {module_id}\n    target: \"{target}\"\n    auto_schema: true\n"
+        "spec_version: \"1.0\"\nbindings:\n  - module_id: {module_id}\n    target: \"{target}\"\n    input_schema: {{type: object}}\n    output_schema: {{type: object}}\n"
     )
 }
 

@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use crate::context::Context;
 use crate::errors::ModuleError;
-use crate::executor::{loggable_value, REDACTED_VALUE};
+use crate::executor::loggable_value;
 use crate::middleware::base::Middleware;
 use crate::observability::redaction::RedactionConfig;
 
@@ -55,6 +55,10 @@ pub struct ContextLogger {
     pub trace_id: Option<String>,
     pub module_id: Option<String>,
     pub caller_id: Option<String>,
+    /// Rules applied to `extra` before it is written. Defaults to
+    /// [`RedactionConfig::defaults`], as apcore-python and apcore-typescript
+    /// do for a logger used directly rather than through the middleware.
+    redaction: RedactionConfig,
     /// Output sink. `None` ⇒ stderr (default). Writes are mutex-guarded so
     /// `ContextLogger` remains `Send + Sync` even with a mutable writer.
     writer: Option<Mutex<LoggerWriter>>,
@@ -69,6 +73,7 @@ impl std::fmt::Debug for ContextLogger {
             .field("trace_id", &self.trace_id)
             .field("module_id", &self.module_id)
             .field("caller_id", &self.caller_id)
+            .field("redaction", &self.redaction)
             .field(
                 "writer",
                 &self.writer.as_ref().map_or("stderr", |_| "<custom>"),
@@ -87,6 +92,7 @@ impl ContextLogger {
             trace_id: None,
             module_id: None,
             caller_id: None,
+            redaction: RedactionConfig::defaults(),
             writer: None,
         }
     }
@@ -102,6 +108,7 @@ impl ContextLogger {
             trace_id: Some(ctx.trace_id.clone()),
             module_id,
             caller_id,
+            redaction: RedactionConfig::defaults(),
             writer: None,
         }
     }
@@ -114,6 +121,13 @@ impl ContextLogger {
     /// Set the output format.
     pub fn set_format(&mut self, format: LogFormat) {
         self.format = format;
+    }
+
+    /// Replace the redaction rules applied to `extra` — e.g.
+    /// `RedactionConfig::from_config(&config)` for the configured
+    /// `obs.redaction.*` rules, or `RedactionConfig::new()` for none.
+    pub fn set_redaction_config(&mut self, config: RedactionConfig) {
+        self.redaction = config;
     }
 
     /// Substitute the output sink (default: stderr). Useful for tests that
@@ -133,8 +147,9 @@ impl ContextLogger {
 
     /// Emit a log record if level meets threshold.
     ///
-    /// `extra` keys go under a nested `extra` object (D-28). Any
-    /// `_secret_*`-prefixed key inside `extra` is redacted in place.
+    /// `extra` keys go under a nested `extra` object (D-28), redacted with
+    /// this logger's rules at every depth; `trace_id`, `caller_id`,
+    /// `module_id` and `span_id` are never redacted.
     pub fn emit(
         &self,
         level_name: &str,
@@ -188,18 +203,14 @@ impl ContextLogger {
                 // D-28: nest user-supplied extras under a single `extra` key
                 // so they cannot collide with the canonical top-level fields.
                 if let Some(extra_map) = extra {
-                    let mut nested = serde_json::Map::new();
-                    for (k, v) in extra_map {
-                        if k.starts_with("_secret_") {
-                            nested.insert(
-                                k.clone(),
-                                serde_json::Value::String(REDACTED_VALUE.to_string()),
-                            );
-                        } else {
-                            nested.insert(k.clone(), v.clone());
-                        }
-                    }
-                    record.insert("extra".to_string(), serde_json::Value::Object(nested));
+                    let mut nested = serde_json::Value::Object(
+                        extra_map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    );
+                    self.redaction.redact(&mut nested);
+                    record.insert("extra".to_string(), nested);
                 }
                 let json_str =
                     serde_json::to_string(&serde_json::Value::Object(record)).unwrap_or_default();
@@ -312,6 +323,9 @@ impl ObsLoggingMiddleware {
     /// with any schema-level `x-sensitive` redaction performed upstream.
     #[must_use]
     pub fn with_redaction_config(mut self, config: RedactionConfig) -> Self {
+        // The logger's own pass applies the same rules, not its broader
+        // defaults — matching apcore-python, which hands the config to both.
+        self.logger.set_redaction_config(config.clone());
         self.redaction = Some(config);
         self
     }

@@ -112,7 +112,13 @@ pub trait TaskStore: Send + Sync {
 
     /// Identifier of the concrete store type, used by tooling to expose the
     /// active backend (matches the type name; e.g. `"InMemoryTaskStore"`).
-    fn store_type_name(&self) -> &'static str;
+    ///
+    /// Defaults to the implementing type's own name, without its module path.
+    fn store_type_name(&self) -> &'static str {
+        let full = std::any::type_name::<Self>();
+        let base = full.split('<').next().unwrap_or(full);
+        base.rsplit("::").next().unwrap_or(base)
+    }
 }
 
 /// Default in-memory [`TaskStore`] backed by [`DashMap`] for lock-free
@@ -256,6 +262,10 @@ impl RetryConfig {
     /// Compute the retry delay for the given attempt index (`0`-based).
     ///
     /// Formula: `min(retry_delay_ms * (backoff_multiplier ^ attempt), max_retry_delay_ms)`.
+    ///
+    /// Returns whole milliseconds: the fractional part is truncated, where
+    /// apcore-python and apcore-typescript return a float (D-61). The two
+    /// differ by under 1 ms, and only for a non-integer product.
     ///
     /// Cross-language: this is the canonical name across `apcore-python` and
     /// `apcore-typescript` (sync alignment D-08). The legacy
@@ -440,6 +450,8 @@ impl AsyncTaskManager {
         max_tasks: usize,
         store: Arc<dyn TaskStore>,
     ) -> Self {
+        // A task's module can make nested calls like any other.
+        executor.enable_nested_calls();
         Self {
             executor,
             max_tasks,
@@ -742,19 +754,43 @@ impl AsyncTaskManager {
     /// Propagates the store's error (D-81) rather than reporting "no tasks"
     /// for a store that is merely unreachable.
     pub fn list_tasks(&self, status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError> {
-        block_on_local(self.store.list(status))
+        block_on_local(self.list_tasks_async(status))
+    }
+
+    /// Async variant of [`Self::list_tasks`] for network-backed stores.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's error (D-81).
+    pub async fn list_tasks_async(
+        &self,
+        status: Option<TaskStatus>,
+    ) -> Result<Vec<TaskInfo>, ModuleError> {
+        self.store.list(status).await
     }
 
     /// Remove terminal-state tasks older than `max_age_seconds`. Returns the
-    /// count of removed tasks.
+    /// count of removed tasks. Synchronous wrapper.
     ///
     /// # Errors
     ///
     /// Propagates the store's error (D-81). A failed `delete` aborts the sweep
     /// rather than being counted as a removal that never happened.
     pub fn cleanup(&self, max_age_seconds: f64) -> Result<usize, ModuleError> {
+        block_on_local(self.cleanup_async(max_age_seconds))
+    }
+
+    /// Async variant of [`Self::cleanup`] for network-backed stores.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::cleanup`].
+    pub async fn cleanup_async(&self, max_age_seconds: f64) -> Result<usize, ModuleError> {
         let now = now_secs();
-        let to_remove: Vec<String> = block_on_local(self.store.list(None))?
+        let to_remove: Vec<String> = self
+            .store
+            .list(None)
+            .await?
             .into_iter()
             .filter(|info| info.status.is_terminal())
             .filter(|info| {
@@ -766,7 +802,7 @@ impl AsyncTaskManager {
 
         let count = to_remove.len();
         for id in &to_remove {
-            block_on_local(self.store.delete(id))?;
+            self.store.delete(id).await?;
             self.handles.lock().remove(id);
         }
         Ok(count)

@@ -220,8 +220,9 @@ pub fn merge_module_metadata<S: std::hash::BuildHasher>(
 
 /// Load an ID Map YAML file for canonical ID overrides.
 ///
-/// The file must contain a top-level `mappings` list. Each entry has `file`,
-/// `id`, and optionally `class`.
+/// The file must contain a top-level `mappings` list. Each entry has `file`
+/// (the module file's path relative to the extension root) and `id`
+/// (PROTOCOL_SPEC §2.2, D-138).
 ///
 /// Aligned with `apcore-python.load_id_map` and
 /// `apcore-typescript.loadIdMap`.
@@ -281,10 +282,10 @@ pub fn load_id_map(
                 .cloned()
                 .unwrap_or_else(|| serde_json::Value::String(file_path.clone())),
         );
-        if let Some(class) = entry.get("class") {
-            info.insert("class".to_string(), class.clone());
-        }
-        result.insert(file_path, info);
+        // Keyed by the path relative to the extension root, spelled with `/`
+        // and without a leading `./`, the form the discoverer matches against.
+        let key = file_path.trim_start_matches("./").replace('\\', "/");
+        result.insert(key, info);
     }
 
     Ok(result)

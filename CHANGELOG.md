@@ -12,13 +12,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.32.0] - 2026-10-08
 
 ### Security
 
 - **Providers reach the gate they configure** (D-129, spec 1.61.0) — the built-in `acl_check` / `approval_gate` steps hold no provider and read the executor's ACL, `ApprovalHandler` and `ExecutionPolicy` on every call, however the strategy was supplied, so `governance_state()` reports what the running gate enforces; pinned by `gate_provider_binding.json`.
 - **Governance gates cannot be weakened by configuration** (D-130) — `ignore_errors: true` and any `match_modules` on `acl_check` / `approval_gate`, and `pure: true` on `approval_gate`, fail with `PIPELINE_CONFIGURATION_ERROR` naming the step and key, from `pipeline.configure` and from `ExecutionStrategy::new` / `configure_step` / `replace` / `replace_with` / `insert_*`; a gate configured with `timeout_ms` keeps its gate identity and capability contract.
 - **Logging middleware logs the captured values** (D-131) — `ObsLoggingMiddleware` and `LoggingMiddleware` log `context.redacted_inputs` / `redacted_output`, never the raw inputs or output, so an `x-sensitive` field is redacted with or without a `RedactionConfig`.
+
+### Fixed
+
+- **Issue #123 conformance hardening** — timeouts signal isolated child cancellation without dropping cooperative module cleanup; preflight collects independent failures and always serializes predictions; binding files reject unknown fields and uninferable targets; schema errors carry JSON Pointer paths and keywords; raw and typed Anthropic/OpenAI exports remove extension keywords without removing property or definition names, and MCP moves true-only approval/streaming hints to `_meta`.
+- **Contextual ephemeral audit and configuration parity** — context-aware registry registration/unregistration emits one credential-safe audit event, environment dispatch reserves the exact `APCORE` prefix and routes unmatched overrides into the framework namespace, and configured subscribers use the standard circuit-breaker wrapper.
+
+- **`OTLPExporter` posts to its endpoint as given** (#123) — it appended `/v1/traces` to a URL that already ended in it, so config-driven OTLP tracing posted to `/v1/traces/v1/traces`; the endpoint is the full traces URL, as in apcore-python and apcore-typescript.
+- **`BatchSpanProcessor` stops only when its last handle is dropped** (#123) — dropping the original after handing a clone to the middleware stopped the worker.
+- **`MetricsCollector::new`, `UsageCollector::new`, `ErrorHistory::new` / `with_limits` / `with_store*` attach the in-memory storage backend** (D-113, #123); `MetricsCollector` and `UsageCollector` gain `storage_backend()`.
+- **A module registered through `APCore` can make nested calls** (#123) — `ctx.executor()` returns the running `Executor`; `APCore` shares its Executor, `Executor::into_shared` / `enable_nested_calls` make any other one reachable, and `APCore::executor_arc` exposes it.
+- **`ContextLogger` redacts `extra` with the default `obs.redaction` rules at every depth**, or with a config set via `set_redaction_config` (#123); it redacted only top-level `_secret_*` keys.
+- **`RedactionConfigBuilder` compiles `value_patterns` case-insensitively**, as `from_config` and the other SDKs do (#123).
+- **`Registry::discover(&discoverer)` passes the registry's extension roots** (#123), and a `DefaultDiscoverer` without a module factory fails with `MODULE_LOAD_ERROR` on a discovered file instead of registering nothing.
+- **`Registry::watch` replaces a changed module and unregisters a removed one** (#123) — it only registered new files.
+- **`register_versioned` accepts another version of a registered module** (#123) — `get` / `get_definition` return the highest; the same version twice is still `DUPLICATE_MODULE_ID`; `unregister` removes every version.
+- **The `sys_modules.control.overrides_path` config key is written back to, and `reload_module`'s `reload_config` works for an `APCore` client** (#123) — only an `overrides_path` option was persisted, and the reload module was registered without a `Config`.
+- **An unknown strategy name raises `STRATEGY_NOT_FOUND`** (#123), not `GENERAL_INVALID_INPUT`.
+- **`Executor::stream`'s non-streaming fallback runs the strategy's own `execute` step** (#123) — a replaced `execute` step was bypassed.
+- **`AsyncTaskManager` gains `list_tasks_async` / `cleanup_async`, and `TaskStore::store_type_name` has a default** (#123).
+- **`APCore::use_middleware` / `Executor::use_middleware` warn on a duplicate middleware `name()`** (#123), and identities stay aligned with registrations after priority-ordered inserts.
+- **`TraceContext::inject` uses the current span as the parent** (#123) — `TracingMiddleware` keeps its stack under `_apcore.mw.tracing.spans`; `InMemoryExporter` defaults to 10 000 spans; `ErrorHistory::new(n)` keeps the 1000 total limit and `get` orders by creation.
+- **`system.control.toggle_feature` is declared `idempotent: true`** (#123).
+- **A custom module-validator rejection raises `GENERAL_INVALID_INPUT`** (#123), not `MODULE_LOAD_ERROR`.
 
 ## [0.31.0] - 2026-09-22
 

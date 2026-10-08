@@ -98,8 +98,10 @@ pub struct DefaultDiscoverer {
     /// (`PROTOCOL_SPEC` §3.5 / §9.2.3), a union with the built-in skip rows.
     ignore_patterns: Vec<String>,
     /// User-provided factory that turns a discovered entry point into a
-    /// live `Arc<dyn Module>`.
-    factory: ModuleFactory,
+    /// live `Arc<dyn Module>`. `None` until [`Self::with_factory`]: Rust
+    /// cannot load a module from its source file, so without one a discovered
+    /// file is an error rather than a module silently not registered.
+    factory: Option<ModuleFactory>,
 }
 
 impl std::fmt::Debug for DefaultDiscoverer {
@@ -117,9 +119,10 @@ impl std::fmt::Debug for DefaultDiscoverer {
 }
 
 impl DefaultDiscoverer {
-    /// Create a new `DefaultDiscoverer` with a no-op factory that always
-    /// returns `Ok(None)`. Use [`Self::with_factory`] to supply a real
-    /// factory before passing this to a `Registry`.
+    /// Create a new `DefaultDiscoverer` with no module factory. Supply one
+    /// with [`Self::with_factory`] before passing this to a `Registry`:
+    /// discovering a module file without one fails with
+    /// [`ErrorCode::ModuleLoadError`].
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -129,7 +132,7 @@ impl DefaultDiscoverer {
             max_depth: 8,
             follow_symlinks: false,
             ignore_patterns: Vec::new(),
-            factory: Arc::new(|_file, _entry| Ok(None)),
+            factory: None,
         }
     }
 
@@ -277,7 +280,7 @@ impl DefaultDiscoverer {
     /// Set the module factory closure.
     #[must_use]
     pub fn with_factory(mut self, factory: ModuleFactory) -> Self {
-        self.factory = factory;
+        self.factory = Some(factory);
         self
     }
 }
@@ -286,6 +289,39 @@ impl Default for DefaultDiscoverer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `file`'s path relative to the extension root it lies under, `/`-separated.
+///
+/// The longest matching root wins, so a root nested inside another resolves to
+/// the inner one. Roots and files are compared as given and, failing that,
+/// canonicalised, since a scanner that follows symlinks reports resolved paths.
+fn path_relative_to_root(file: &Path, roots: &[PathBuf]) -> Option<String> {
+    let canonical_file = std::fs::canonicalize(file).ok();
+    roots
+        .iter()
+        .filter_map(|root| {
+            let rel = file
+                .strip_prefix(root)
+                .ok()
+                .map(Path::to_path_buf)
+                .or_else(|| {
+                    let root = std::fs::canonicalize(root).ok()?;
+                    canonical_file
+                        .as_ref()?
+                        .strip_prefix(root)
+                        .ok()
+                        .map(Path::to_path_buf)
+                })?;
+            Some((root.components().count(), rel))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, rel)| {
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
 }
 
 /// Internal: discovery output for one file before the topo-sort stage.
@@ -349,10 +385,15 @@ impl Discoverer for DefaultDiscoverer {
                 Some(path) => load_id_map(path)?,
                 None => HashMap::new(),
             };
+        // An entry's `file` is relative to the extension root the file is
+        // discovered under (§2.2 rule 4, D-138) — never to the working
+        // directory, and never the file's absolute path.
+        let root_paths: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
         for file in &mut discovered_files {
-            if let Some(override_entry) =
-                id_overrides.get(file.file_path.to_string_lossy().as_ref())
-            {
+            let Some(relative) = path_relative_to_root(&file.file_path, &root_paths) else {
+                continue;
+            };
+            if let Some(override_entry) = id_overrides.get(&relative) {
                 if let Some(new_id) = override_entry.get("id").and_then(|v| v.as_str()) {
                     file.canonical_id = new_id.to_string();
                 }
@@ -386,7 +427,7 @@ impl Discoverer for DefaultDiscoverer {
             sorted.sort();
             sorted.dedup();
             return Err(ModuleError::new(
-                ErrorCode::GeneralInvalidInput,
+                ErrorCode::InvalidModuleId,
                 format!(
                     "Filesystem discovery produced module ID(s) in the reserved \
                      '{EPHEMERAL_NAMESPACE_PREFIX}*' namespace: {sorted:?}. \
@@ -429,7 +470,17 @@ impl Discoverer for DefaultDiscoverer {
                     });
 
             // Stage 4 (continued): instantiate via factory.
-            let Some(module) = (self.factory)(&file, &entry_point_name)? else {
+            let Some(factory) = self.factory.as_ref() else {
+                return Err(ModuleError::new(
+                    ErrorCode::ModuleLoadError,
+                    format!(
+                        "DefaultDiscoverer found '{}' but has no module factory. Rust cannot \
+                         load a module from its source file; supply one with with_factory().",
+                        file.file_path.display()
+                    ),
+                ));
+            };
+            let Some(module) = factory(&file, &entry_point_name)? else {
                 tracing::debug!(
                     canonical_id = %file.canonical_id,
                     entry_point = %entry_point_name,

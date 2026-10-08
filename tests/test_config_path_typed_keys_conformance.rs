@@ -63,17 +63,27 @@ fn collect_path_keys(
     defs: &Value,
     frozen: bool,
     out: &mut BTreeSet<String>,
+    referenced: &mut BTreeSet<String>,
 ) {
     let Some(obj) = node.as_object() else { return };
 
     if let Some(reference) = obj.get("$ref").and_then(Value::as_str) {
-        // Only local `#/$defs/<name>` references are followed. A reference to a
-        // sibling schema file (`sys-modules.schema.json`) names a document that
-        // declares its own keys and is not part of this projection.
         if let Some(name) = reference.strip_prefix("#/$defs/") {
             if let Some(target) = defs.get(name) {
-                collect_path_keys(target, key, defs, frozen, out);
+                collect_path_keys(target, key, defs, frozen, out, referenced);
             }
+        } else if !reference.starts_with('#') {
+            // `driver_contract.cross_file_ref`: a reference to a sibling schema
+            // file (`sys_modules` -> `sys-modules.schema.json`) is followed
+            // exactly like a local one, under the key it is referenced at, with
+            // that file's own `$defs`.
+            referenced.insert(reference.to_string());
+            let document = schema(reference);
+            let file_defs = document
+                .get("$defs")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            collect_path_keys(&document, key, &file_defs, frozen, out, referenced);
         }
         return;
     }
@@ -91,7 +101,7 @@ fn collect_path_keys(
             } else {
                 format!("{key}.{name}")
             };
-            collect_path_keys(child, &child_key, defs, frozen, out);
+            collect_path_keys(child, &child_key, defs, frozen, out, referenced);
         }
     }
 
@@ -101,27 +111,29 @@ fn collect_path_keys(
         } else {
             format!("{key}[]")
         };
-        collect_path_keys(items, &child_key, defs, true, out);
+        collect_path_keys(items, &child_key, defs, true, out, referenced);
     }
 
     for combinator in ["oneOf", "anyOf", "allOf"] {
         if let Some(branches) = obj.get(combinator).and_then(Value::as_array) {
             for branch in branches {
-                collect_path_keys(branch, key, defs, frozen, out);
+                collect_path_keys(branch, key, defs, frozen, out, referenced);
             }
         }
     }
 }
 
-fn schema_path_keys(relative: &str) -> BTreeSet<String> {
+/// The projected keys of one source, and the sibling files it `$ref`s.
+fn schema_path_keys(relative: &str) -> (BTreeSet<String>, BTreeSet<String>) {
     let document = schema(relative);
     let defs = document
         .get("$defs")
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     let mut out = BTreeSet::new();
-    collect_path_keys(&document, "", &defs, false, &mut out);
-    out
+    let mut referenced = BTreeSet::new();
+    collect_path_keys(&document, "", &defs, false, &mut out, &mut referenced);
+    (out, referenced)
 }
 
 fn sdk_keys() -> BTreeSet<String> {
@@ -187,7 +199,7 @@ fn conformance_config_path_typed_keys() {
     let fx = fixture();
     let declared = declared_set(&fx);
     let cases = fx["test_cases"].as_array().expect("test_cases is an array");
-    assert_eq!(cases.len(), 7, "driver is written against all 7 cases");
+    assert_eq!(cases.len(), 8, "driver is written against all 8 cases");
 
     clear_env();
 
@@ -214,12 +226,26 @@ fn conformance_config_path_typed_keys() {
                     "[{id}] the fixture must name at least one canonical schema"
                 );
 
+                // A source another source `$ref`s is projected THROUGH that
+                // reference, at the key it is mounted under; projected on its
+                // own it would report its keys without their namespace.
                 let mut projected: BTreeSet<String> = BTreeSet::new();
                 let mut per_source: Vec<(String, BTreeSet<String>)> = Vec::new();
+                let mut referenced: BTreeSet<String> = BTreeSet::new();
                 for source in &sources {
-                    let keys = schema_path_keys(source);
-                    projected.extend(keys.iter().cloned());
+                    let (keys, refs) = schema_path_keys(source);
+                    referenced.extend(refs);
                     per_source.push((source.clone(), keys));
+                }
+                per_source.retain(|(source, _)| {
+                    let file = std::path::Path::new(source)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or_default();
+                    !referenced.contains(file)
+                });
+                for (_, keys) in &per_source {
+                    projected.extend(keys.iter().cloned());
                 }
 
                 let want = string_set(&expected["path_typed_keys"]);
@@ -287,7 +313,7 @@ fn conformance_config_path_typed_keys() {
                 );
             }
 
-            "non_path_string_keys_are_not_path_typed" => {
+            "non_path_string_keys_are_not_path_typed" | "id_map_overrides_is_path_typed" => {
                 let want = expected["path_typed"].as_bool().expect("path_typed bool");
                 let sdk = sdk_keys();
                 for key in tc["keys"].as_array().expect("case names keys") {

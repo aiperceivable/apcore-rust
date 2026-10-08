@@ -211,12 +211,14 @@ impl SchemaValidator {
             .map(|detail| {
                 let mut m = HashMap::new();
                 m.insert("message".to_string(), detail.message.clone());
-                if !detail.path.is_empty() {
-                    m.insert("path".to_string(), detail.path.clone());
-                }
-                if let Some(constraint) = &detail.constraint {
-                    m.insert("constraint".to_string(), constraint.clone());
-                }
+                m.insert("path".to_string(), detail.path.clone());
+                m.insert(
+                    "keyword".to_string(),
+                    detail
+                        .constraint
+                        .clone()
+                        .unwrap_or_else(|| "schema".to_string()),
+                );
                 m
             })
             .collect();
@@ -501,7 +503,7 @@ fn map_error_code(errors: &[jsonschema::ValidationError<'_>]) -> ErrorCode {
 /// `constraint` is the violated JSON Schema keyword when identifiable.
 fn build_error_detail(error: &jsonschema::ValidationError<'_>) -> ValidationErrorDetail {
     ValidationErrorDetail {
-        path: format_instance_path(error.instance_path.as_str()),
+        path: error.instance_path.to_string(),
         message: format_error_message(error),
         constraint: constraint_name(&error.kind),
         expected: None,
@@ -510,7 +512,7 @@ fn build_error_detail(error: &jsonschema::ValidationError<'_>) -> ValidationErro
 }
 
 /// Map a raw validator error kind to the JSON Schema keyword it violated.
-fn constraint_name(kind: &ValidationErrorKind) -> Option<String> {
+pub(crate) fn constraint_name(kind: &ValidationErrorKind) -> Option<String> {
     let name = match kind {
         ValidationErrorKind::Required { .. } => "required",
         ValidationErrorKind::AdditionalProperties { .. } => "additionalProperties",

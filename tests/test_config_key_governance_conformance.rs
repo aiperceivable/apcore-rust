@@ -527,3 +527,115 @@ fn the_sys_modules_namespace_supplies_every_default_its_schema_declares() {
         wrong.join("\n  ")
     );
 }
+
+/// Load a namespace-mode document that declares nothing beyond the required
+/// `apcore` block, as the `builtin_namespace*` cases prescribe.
+fn load_bare_namespace_document() -> (tempfile::TempDir, apcore::config::Config) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("apcore.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({"apcore": {"version": "1.0.0", "project": {"name": "probe"}}})
+            .to_string(),
+    )
+    .expect("write config file");
+    let config = apcore::config::Config::load(&path).expect("bare namespace document loads");
+    (dir, config)
+}
+
+fn leaf_paths(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                leaf_paths(&format!("{prefix}.{key}"), child, out);
+            }
+        }
+        _ => out.push(prefix.to_string()),
+    }
+}
+
+/// D-144 (§9.15.2): the built-in `observability` registration declares
+/// `tracing` and `metrics` only.
+#[test]
+fn observability_namespace_declares_what_the_schema_declares() {
+    let fx = fixture();
+    let case = fixture_case(
+        &fx,
+        "observability_namespace_declares_what_the_schema_declares",
+    );
+    let name = case["builtin_namespace"]
+        .as_str()
+        .expect("builtin_namespace");
+    let allowed = allowed_keys(&fx);
+    let (_dir, config) = load_bare_namespace_document();
+
+    let tree = serde_json::Value::Object(config.namespace(name).into_iter().collect());
+    let mut leaves = Vec::new();
+    leaf_paths(name, &tree, &mut leaves);
+
+    let mut violations: Vec<&String> = leaves.iter().filter(|k| !allowed.contains(*k)).collect();
+    violations.sort();
+    let expected: Vec<String> =
+        serde_json::from_value(case["expected"]["violations"].clone()).expect("violations");
+    assert_eq!(
+        violations.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "namespace defaults outside the schema-declared key set"
+    );
+    for required in case["expected"]["required_keys"]
+        .as_array()
+        .expect("required")
+    {
+        let required = required.as_str().expect("key");
+        assert!(
+            leaves.iter().any(|l| l == required),
+            "{required} missing from the {name} registration: {leaves:?}"
+        );
+    }
+}
+
+/// D-144 (§9.15): `observability`, `sys_modules` and `obs` are pre-registered
+/// with their env prefixes.
+#[test]
+fn the_three_builtin_namespaces_are_registered() {
+    let fx = fixture();
+    let case = fixture_case(&fx, "the_three_builtin_namespaces_are_registered");
+    let (_dir, _config) = load_bare_namespace_document();
+    let registered = apcore::config::Config::registered_namespaces();
+
+    let mut missing = Vec::new();
+    for (name, prefix) in case["builtin_namespaces_registered"]
+        .as_object()
+        .expect("builtin_namespaces_registered")
+    {
+        let prefix = prefix.as_str().expect("prefix");
+        let found = registered
+            .iter()
+            .any(|ns| ns.name == *name && ns.env_prefix.as_deref() == Some(prefix));
+        if !found {
+            missing.push(format!("{name} ({prefix})"));
+        }
+    }
+    let expected: Vec<String> =
+        serde_json::from_value(case["expected"]["missing"].clone()).expect("missing");
+    assert_eq!(missing, expected, "built-in namespaces not registered");
+}
+
+/// A driver that names cases one by one skips a case the fixture gains; this
+/// guard fails instead.
+#[test]
+fn every_case_in_the_fixture_is_named_by_this_driver() {
+    const NAMED: &[&str] = &[
+        "observability_namespace_declares_what_the_schema_declares",
+        "the_three_builtin_namespaces_are_registered",
+    ];
+    let fx = fixture();
+    let source = include_str!("test_config_key_governance_conformance.rs");
+    for case in fx["test_cases"].as_array().expect("test_cases") {
+        let id = case["id"].as_str().expect("id");
+        assert!(
+            NAMED.contains(&id) || source.contains(&format!("\"{id}\"")),
+            "fixture case '{id}' is not driven by this file"
+        );
+    }
+}

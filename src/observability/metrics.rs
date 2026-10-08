@@ -89,7 +89,9 @@ impl MetricsCollector {
             counters: Arc::new(Mutex::new(HashMap::new())),
             histograms: Arc::new(Mutex::new(HashMap::new())),
             store,
-            storage_backend: None,
+            // D-113: an omitted backend is the in-memory one, on every
+            // constructor that does not take one.
+            storage_backend: Some(crate::observability::storage::default_storage_backend()),
         }
     }
 
@@ -126,6 +128,13 @@ impl MetricsCollector {
     #[must_use]
     pub fn store(&self) -> Arc<dyn ObservabilityStore> {
         self.store.clone()
+    }
+
+    /// The storage backend observations are persisted to (D-113). `Some`
+    /// unless detached with `with_storage(None)`.
+    #[must_use]
+    pub fn storage_backend(&self) -> Option<Arc<dyn StorageBackend>> {
+        self.storage_backend.clone()
     }
 
     /// Format labels into a composite key.

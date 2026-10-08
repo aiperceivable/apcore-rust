@@ -71,7 +71,7 @@ use apcore::config::Config;
 /// on the const rather than a mirror of it. The order is load-bearing: it is
 /// what makes three SDKs name the same keys in the same sequence for the same
 /// file.
-const DEPRECATED_INERT_KEYS: [&str; 8] = [
+const DEPRECATED_INERT_KEYS: [&str; 10] = [
     "acl.default_effect",
     "observability.metrics.enabled",
     "observability.metrics.exporter",
@@ -80,6 +80,8 @@ const DEPRECATED_INERT_KEYS: [&str; 8] = [
     "acl.audit.enabled",
     "acl.audit.include_denied",
     "acl.audit.log_level",
+    "middleware.disabled",
+    "extensions.auto_discover",
 ];
 
 /// The three keys spec v1.44.0 wired, plus the one it added to the schema.
@@ -221,6 +223,7 @@ fn document_declaring(key: &str) -> String {
         "strategy" => "\"off\"",
         "level" | "log_level" => "\"info\"",
         "format" => "\"json\"",
+        "disabled" => "[\"logging\"]",
         _ => "true",
     };
 
@@ -304,7 +307,11 @@ fn all_deprecated_keys_at_once_are_named_in_spec_order() {
            audit:\n    \
              enabled: true\n    \
              include_denied: true\n    \
-             log_level: \"info\"\n",
+             log_level: \"info\"\n\
+         middleware:\n  \
+           disabled: [\"logging\"]\n\
+         extensions:\n  \
+           auto_discover: true\n",
     ));
 
     assert!(
@@ -313,8 +320,8 @@ fn all_deprecated_keys_at_once_are_named_in_spec_order() {
          notice. Captured:\n{logs}"
     );
     assert!(
-        logs.contains("count=8"),
-        "every listed key is declared, so the notice must report eight. \
+        logs.contains("count=10"),
+        "every listed key is declared, so the notice must report ten. \
          Captured:\n{logs}"
     );
     assert!(

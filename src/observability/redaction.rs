@@ -107,7 +107,11 @@ fn read_redaction_key(
     legacy: &'static str,
     legacy_used: &mut Vec<&'static str>,
 ) -> Option<Value> {
-    if let Some(value) = config.get(canonical) {
+    // Registered namespace defaults are effective values, not an operator's
+    // canonical setting. A legacy value must still override those defaults;
+    // otherwise a real legacy-only config is silently ignored once `obs` is
+    // registered at bootstrap.
+    if let Some(value) = config.get_declared(canonical) {
         if !value.is_null() {
             return Some(value);
         }
@@ -508,10 +512,16 @@ impl RedactionConfigBuilder {
             .value_patterns
             .into_iter()
             .map(|p| {
-                Regex::new(&p).map_err(|source| RedactionConfigError::InvalidValuePattern {
-                    pattern: p,
-                    source,
-                })
+                // Case-insensitive, as `from_config` and the other two SDKs
+                // compile `regex_patterns` — the same pattern must not redact
+                // `SECRET-1` through one constructor and leak it through the other.
+                RegexBuilder::new(&p)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|source| RedactionConfigError::InvalidValuePattern {
+                        pattern: p,
+                        source,
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut cfg = RedactionConfig {

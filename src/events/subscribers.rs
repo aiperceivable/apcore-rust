@@ -201,7 +201,7 @@ pub struct WebhookSubscriber {
     pub retry_count: u32,
     pub timeout_ms: u64,
     /// Retry policy applied by [`EventEmitter`](super::EventEmitter) — see
-    /// spec §Event Delivery Semantics (#61).
+    /// event-system.md §Delivery Semantics.
     pub retry: crate::events::retry::EventRetryConfig,
 }
 
@@ -335,7 +335,7 @@ pub struct A2ASubscriber {
     /// Default: `"apevo.event_receiver"` (per apcore A2A spec).
     pub skill_id: String,
     /// Retry policy applied by [`EventEmitter`](super::EventEmitter) — see
-    /// spec §Event Delivery Semantics (#61).
+    /// event-system.md §Delivery Semantics.
     pub retry: crate::events::retry::EventRetryConfig,
 }
 

@@ -45,6 +45,15 @@ static PARENT_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{1
 /// Honors the [`TRACE_FLAGS_KEY`] convention: the value is expected to be a
 /// 2-char lowercase hex string (`"00"` or `"01"`). Returns `None` when the
 /// key is absent or malformed.
+/// The `span_id` of the current span: the last entry of the tracing
+/// middleware's stack under `_apcore.mw.tracing.spans`, when it is a valid
+/// W3C parent ID.
+fn read_current_span_id<T>(context: &Context<T>) -> Option<String> {
+    let spans = crate::context_keys::TRACING_SPANS.get(context)?;
+    let span_id = spans.last()?.get("span_id")?.as_str()?;
+    PARENT_ID_RE.is_match(span_id).then(|| span_id.to_string())
+}
+
 fn read_inbound_flags<T>(context: &Context<T>) -> Option<u8> {
     let data = context.data.read();
     let raw = data.get(TRACE_FLAGS_KEY)?;
@@ -282,8 +291,10 @@ impl TraceContext {
     /// Build a W3C `traceparent` header map from an apcore [`Context`].
     ///
     /// Extracts the `trace_id` from the context (stripping any UUID dashes to
-    /// produce 32 lowercase hex characters) and generates a random 8-byte
-    /// parent span ID. Returns a header map containing the `"traceparent"` key.
+    /// produce 32 lowercase hex characters). The parent span ID is the
+    /// `span_id` of the current span — the top of the tracing middleware's
+    /// stack under `_apcore.mw.tracing.spans` — or a random 8-byte ID when no
+    /// span is active. Returns a header map containing the `"traceparent"` key.
     /// This mirrors `TraceContext.inject(context)` in the Python and TypeScript SDKs.
     ///
     /// **Inbound flag propagation.** When `context.data` contains
@@ -317,8 +328,9 @@ impl TraceContext {
     ///
     /// Arguments:
     /// * `parent_id` — when `Some`, must match `^[0-9a-f]{16}$`. Invalid values
-    ///   are ignored and a fresh random parent_id is used instead. When `None`,
-    ///   a fresh 16-hex random parent_id is generated.
+    ///   are ignored and treated as `None`. When `None`, the current span's
+    ///   `span_id` is used, or a fresh 16-hex random parent_id when no span is
+    ///   active.
     ///
     ///   **Note**: silent fallback is preserved here for backward compatibility.
     ///   New code should use [`inject_checked`] which returns an error on a
@@ -345,7 +357,8 @@ impl TraceContext {
 
         let parent_id_hex = match parent_id {
             Some(p) if PARENT_ID_RE.is_match(p) => p.to_string(),
-            _ => uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
+            _ => read_current_span_id(context)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()[..16].to_string()),
         };
 
         let flags = trace_flags.unwrap_or_else(|| read_inbound_flags(context).unwrap_or(0x01));
@@ -372,11 +385,10 @@ impl TraceContext {
     /// with a fresh random parent_id.
     ///
     /// Cross-language: matches `TraceContext.inject(parent_id=...)` in
-    /// `apcore-python` (raises `ValueError`) and `TraceContext.inject` in
-    /// `apcore-typescript` (throws an `Error` with `code = "INVALID_PARENT_ID"`).
-    /// The wire code `INVALID_PARENT_ID` is required by decision D-51 and the
-    /// `trace_context.json` fixture; this previously returned
-    /// `GENERAL_INVALID_INPUT`, which no other SDK emits here.
+    /// `apcore-python` and `TraceContext.inject` in `apcore-typescript`, both
+    /// of which raise `InvalidParentIdError`. The wire code
+    /// `INVALID_PARENT_ID` is required by decision D-51 and the
+    /// `trace_context.json` fixture.
     ///
     /// [`inject_with_options`]: TraceContext::inject_with_options
     pub fn inject_checked<T: serde::Serialize>(

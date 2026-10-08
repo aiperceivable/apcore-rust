@@ -51,6 +51,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use apcore::config::Config;
+use apcore::executor::redact_sensitive;
 use apcore::observability::redaction::RedactionConfig;
 use serde_json::{json, Value};
 
@@ -405,6 +406,9 @@ fn run_case(tc: &Value) -> Vec<String> {
         payload.is_object(),
         "[{id}] input must be an object to redact"
     );
+    if let Some(schema) = tc.get("schema") {
+        payload = redact_sensitive(&payload, schema);
+    }
     cfg.redact(&mut payload);
 
     let expected = tc["expected"]

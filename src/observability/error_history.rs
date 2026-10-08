@@ -179,6 +179,9 @@ struct ErrorHistoryState {
     seq: u64,
 }
 
+/// Total-entry limit when a constructor does not take one.
+const DEFAULT_MAX_TOTAL_ENTRIES: usize = 1000;
+
 /// Stores a history of errors with O(log N) eviction and SHA-256 deduplication.
 ///
 /// Construction injects a `Arc<dyn ObservabilityStore>`; the default store is
@@ -199,12 +202,14 @@ pub struct ErrorHistory {
 }
 
 impl ErrorHistory {
-    /// Create a new error history with default in-memory store.
+    /// Create a new error history with default in-memory store and the
+    /// default total limit (1000), as apcore-python and apcore-typescript do
+    /// when only the per-module limit is given.
     #[must_use]
     pub fn new(max_entries_per_module: usize) -> Self {
         Self::with_store_and_limits(
             max_entries_per_module,
-            max_entries_per_module * 100,
+            DEFAULT_MAX_TOTAL_ENTRIES,
             Arc::new(InMemoryObservabilityStore::new()),
         )
     }
@@ -222,7 +227,7 @@ impl ErrorHistory {
     /// Create with an explicit observability store and default limits (50 / 1000).
     #[must_use]
     pub fn with_store(store: Arc<dyn ObservabilityStore>) -> Self {
-        Self::with_store_and_limits(50, 1000, store)
+        Self::with_store_and_limits(50, DEFAULT_MAX_TOTAL_ENTRIES, store)
     }
 
     /// Create with explicit limits and an observability store.
@@ -237,7 +242,9 @@ impl ErrorHistory {
             max_entries_per_module,
             max_total_entries,
             store,
-            storage_backend: None,
+            // D-113: an omitted backend is the in-memory one, on every
+            // constructor that does not take one.
+            storage_backend: Some(crate::observability::storage::default_storage_backend()),
         }
     }
 
@@ -382,7 +389,11 @@ impl ErrorHistory {
         }
     }
 
-    /// Get errors for a specific module, newest first.
+    /// Get errors for a specific module, most recently CREATED first.
+    ///
+    /// A repeat of an existing error updates its `count` and `last_occurred`
+    /// but keeps its place, as in apcore-python and apcore-typescript; use
+    /// [`Self::get_all`] for recency of occurrence.
     #[must_use]
     pub fn get(&self, module_id: &str, limit: Option<usize>) -> Vec<ErrorEntry> {
         let state = self.state.lock();
@@ -391,9 +402,9 @@ impl ErrorHistory {
         };
         let mut entries: Vec<ErrorEntry> = fps
             .iter()
+            .rev()
             .filter_map(|fp| state.fp_index.get(fp).cloned())
             .collect();
-        entries.sort_by_key(|e| Reverse(e.last_occurred));
         if let Some(n) = limit {
             entries.truncate(n);
         }

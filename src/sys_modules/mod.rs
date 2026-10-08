@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::errors::{ErrorCode, ModuleError};
+use crate::events::circuit_breaker::{CircuitBreakerWrapper, CircuitEventSink};
 use crate::events::emitter::{ApCoreEvent, EventEmitter};
 use crate::events::subscribers::create_subscriber;
 use crate::executor::Executor;
@@ -36,6 +37,17 @@ pub use control::{ReloadModule, ToggleFeatureModule, UpdateConfigModule};
 pub use health::{HealthModule, HealthSummaryModule};
 pub use manifest::{ManifestFullModule, ManifestModule};
 pub use usage::{UsageModule, UsageSummaryModule};
+
+#[derive(Debug)]
+struct EmitterCircuitSink(std::sync::Weak<EventEmitter>);
+
+impl CircuitEventSink for EmitterCircuitSink {
+    fn emit_circuit_event(&self, event: ApCoreEvent) {
+        if let Some(emitter) = self.0.upgrade() {
+            emitter.emit_delivery_semantics(event);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ToggleState — thread-safe enable/disable tracking
@@ -513,7 +525,7 @@ pub fn register_sys_modules_with_options(
     // Build the EventEmitter up-front as an owned value so we can populate
     // its subscribers from config synchronously, then wrap it in the Arc<Mutex<_>>
     // shared with sys modules.
-    let emitter = EventEmitter::new();
+    let emitter_arc = Arc::new(EventEmitter::new());
 
     let events_enabled = effective_config
         .get("sys_modules.events.enabled")
@@ -540,14 +552,29 @@ pub fn register_sys_modules_with_options(
     }
 
     if events_enabled {
-        // Instantiate subscribers from config while we still own `emitter`
-        // directly — no lock required.
+        // Configured subscribers share the bootstrap emitter through weak circuit sinks.
         if let Some(subs) = effective_config.get("sys_modules.events.subscribers") {
             if let Some(arr) = subs.as_array() {
                 for sub_config in arr {
                     match create_subscriber(sub_config) {
                         Ok(subscriber) => {
-                            emitter.subscribe(subscriber);
+                            let circuit = sub_config.get("circuit_breaker");
+                            let value = |key: &str, default: u64| {
+                                circuit
+                                    .and_then(|c| c.get(key))
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(default)
+                            };
+                            let threshold =
+                                u32::try_from(value("open_threshold", 5)).unwrap_or(u32::MAX);
+                            let wrapped = CircuitBreakerWrapper::new(
+                                subscriber,
+                                Arc::new(EmitterCircuitSink(Arc::downgrade(&emitter_arc))),
+                            )
+                            .with_timeout_ms(value("timeout_ms", 5000))
+                            .with_open_threshold(threshold)
+                            .with_recovery_window_ms(value("recovery_window_ms", 60000));
+                            emitter_arc.subscribe(Box::new(wrapped));
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to create subscriber from config");
@@ -557,8 +584,6 @@ pub fn register_sys_modules_with_options(
             }
         }
     }
-
-    let emitter_arc = Arc::new(emitter);
 
     // --- Step 4: Build the module list the per-group flags select ---
     //
@@ -681,7 +706,10 @@ pub fn register_sys_modules_with_options(
                 "system.control.update_config",
                 Box::new(
                     UpdateConfigModule::new(Arc::clone(&config_arc), Arc::clone(&emitter_arc))
-                        .with_overrides_path(overrides_path.clone())
+                        // The RESOLVED path: an overrides file named only by the
+                        // config key is restored above and must be written back
+                        // here, or a restart loses every runtime change.
+                        .with_overrides_path(resolved_overrides_path.clone())
                         .with_overrides_store(overrides_store.clone())
                         .with_audit_store(audit_store.clone()),
                 ),
@@ -691,6 +719,7 @@ pub fn register_sys_modules_with_options(
                 "system.control.reload_module",
                 Box::new(
                     ReloadModule::new(Arc::clone(&registry), Arc::clone(&emitter_arc))
+                        .with_config(Some(Arc::clone(&config_arc)))
                         .with_audit_store(audit_store.clone()),
                 ),
                 vec!["system".into(), "control".into()],
@@ -703,7 +732,7 @@ pub fn register_sys_modules_with_options(
                         Arc::clone(&emitter_arc),
                         Arc::clone(&toggle_state),
                     )
-                    .with_overrides_path(overrides_path.clone())
+                    .with_overrides_path(resolved_overrides_path.clone())
                     .with_overrides_store(overrides_store.clone())
                     .with_audit_store(audit_store.clone()),
                 ),
@@ -729,7 +758,10 @@ pub fn register_sys_modules_with_options(
             annotations: Some(crate::module::ModuleAnnotations {
                 requires_approval: is_control,
                 readonly: !is_control,
-                idempotent: !is_control,
+                // Setting a module to the state it is already in changes
+                // nothing, so toggle_feature is idempotent where the other two
+                // control modules are not (system-modules.md; SYS-19).
+                idempotent: !is_control || id == "system.control.toggle_feature",
                 // D-119: written out rather than inherited. `Default` gives
                 // `open_world: true`, which means the OPPOSITE of the intended
                 // value — no system module reaches an external system — and
@@ -774,38 +806,21 @@ pub fn register_sys_modules_with_options(
     // dispatch the async emit — fire-and-forget, error-isolated.
     if events_enabled {
         let emitter_for_register = Arc::clone(&emitter_arc);
+        registry.set_event_emitter(Arc::clone(&emitter_arc));
         // `on` is fallible since D-80; both names are in the closed set, so the
         // `?` can only fire if that set ever changes under us.
         registry
             .on(
                 crate::registry::registry_events::REGISTER,
                 Box::new(move |module_id: &str, _module: &dyn Module| {
+                    if is_ephemeral_module_id(module_id) {
+                        return;
+                    }
                     tracing::info!(module_id = %module_id, "module_registered");
                     let emitter = Arc::clone(&emitter_for_register);
                     let module_id_owned = module_id.to_string();
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         handle.spawn(async move {
-                            // Audit-event single-emit rule for ephemeral.* per
-                            // protocol-spec §2.5.1.
-                            // Ephemeral modules emit ONE canonical event with the
-                            // full contextual payload (namespace_class +
-                            // caller_id) and do NOT emit the legacy bare-name
-                            // event so downstream subscribers do not see dual
-                            // events for the same module_id.
-                            if is_ephemeral_module_id(&module_id_owned) {
-                                let payload = json!({
-                                    "namespace_class": "ephemeral",
-                                    "caller_id": crate::acl::EXTERNAL_CALLER,
-                                });
-                                let canonical = ApCoreEvent::with_module(
-                                    "apcore.registry.module_registered",
-                                    payload,
-                                    &module_id_owned,
-                                    "info",
-                                );
-                                emitter.emit(&canonical).await;
-                                return;
-                            }
                             let canonical = ApCoreEvent::with_module(
                                 "apcore.registry.module_registered",
                                 json!({}),
@@ -828,25 +843,14 @@ pub fn register_sys_modules_with_options(
             .on(
                 crate::registry::registry_events::UNREGISTER,
                 Box::new(move |module_id: &str, _module: &dyn Module| {
+                    if is_ephemeral_module_id(module_id) {
+                        return;
+                    }
                     tracing::info!(module_id = %module_id, "module_unregistered");
                     let emitter = Arc::clone(&emitter_for_unregister);
                     let module_id_owned = module_id.to_string();
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         handle.spawn(async move {
-                            if is_ephemeral_module_id(&module_id_owned) {
-                                let payload = json!({
-                                    "namespace_class": "ephemeral",
-                                    "caller_id": crate::acl::EXTERNAL_CALLER,
-                                });
-                                let canonical = ApCoreEvent::with_module(
-                                    "apcore.registry.module_unregistered",
-                                    payload,
-                                    &module_id_owned,
-                                    "info",
-                                );
-                                emitter.emit(&canonical).await;
-                                return;
-                            }
                             let canonical = ApCoreEvent::with_module(
                                 "apcore.registry.module_unregistered",
                                 json!({}),

@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 #[must_use]
 pub fn to_strict_schema(schema: &Value) -> Value {
     let mut result = schema.clone();
-    strip_extensions(&mut result);
+    strip_extensions(&mut result, false, true);
     convert_to_strict(&mut result);
     result
 }
@@ -36,42 +36,56 @@ pub fn to_strict_schema(schema: &Value) -> Value {
 #[must_use]
 pub fn apply_llm_descriptions(schema: &Value) -> Value {
     let mut result = schema.clone();
-    apply_llm_descriptions_in_place(&mut result);
+    apply_llm_descriptions_in_place(&mut result, false);
     result
 }
 
-fn apply_llm_descriptions_in_place(node: &mut Value) {
+fn schema_name_map(key: &str) -> bool {
+    matches!(
+        key,
+        "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+    )
+}
+
+fn apply_llm_descriptions_in_place(node: &mut Value, names: bool) {
     if let Some(obj) = node.as_object_mut() {
         // Both keys present: substitute description with x-llm-description.
         // (Apcore-python parity — Python requires both to be present;
         // apcore-typescript injects description even if absent. We follow
         // Python's stricter rule to avoid silently fabricating descriptions
         // that the spec did not declare.)
-        if obj.contains_key("description") && obj.contains_key("x-llm-description") {
+        if !names && obj.contains_key("description") && obj.contains_key("x-llm-description") {
             if let Some(llm_desc) = obj.get("x-llm-description").cloned() {
                 obj.insert("description".to_string(), llm_desc);
             }
         }
         // Recurse into all nested values.
-        for (_, v) in obj.iter_mut() {
-            apply_llm_descriptions_in_place(v);
+        for (key, v) in obj.iter_mut() {
+            apply_llm_descriptions_in_place(v, !names && schema_name_map(key));
         }
     } else if let Some(arr) = node.as_array_mut() {
         for v in arr.iter_mut() {
-            apply_llm_descriptions_in_place(v);
+            apply_llm_descriptions_in_place(v, false);
         }
     }
 }
 
-/// Remove all `x-*` keys and `default` keys recursively. Mutates in place.
-fn strip_extensions(node: &mut Value) {
+/// Strip extension keywords without deleting property or definition names.
+pub(crate) fn strip_extension_keywords(schema: &Value) -> Value {
+    let mut result = schema.clone();
+    strip_extensions(&mut result, false, false);
+    result
+}
+
+/// Named schema maps contain identifiers, not schema keywords.
+fn strip_extensions(node: &mut Value, names: bool, remove_defaults: bool) {
     let Some(obj) = node.as_object_mut() else {
         return;
     };
 
     let keys_to_remove: Vec<String> = obj
         .keys()
-        .filter(|k| k.starts_with("x-") || *k == "default")
+        .filter(|k| !names && (k.starts_with("x-") || (remove_defaults && *k == "default")))
         .cloned()
         .collect();
 
@@ -84,11 +98,13 @@ fn strip_extensions(node: &mut Value) {
     for key in values {
         if let Some(val) = obj.get_mut(&key) {
             match val {
-                Value::Object(_) => strip_extensions(val),
+                Value::Object(_) => {
+                    strip_extensions(val, !names && schema_name_map(&key), remove_defaults);
+                }
                 Value::Array(arr) => {
                     for item in arr.iter_mut() {
                         if item.is_object() {
-                            strip_extensions(item);
+                            strip_extensions(item, false, remove_defaults);
                         }
                     }
                 }

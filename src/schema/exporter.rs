@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::strict::{apply_llm_descriptions, to_strict_schema};
+use super::strict::{apply_llm_descriptions, strip_extension_keywords, to_strict_schema};
 use super::SchemaDefinition;
 use crate::errors::{ErrorCode, ModuleError};
 use crate::module::{ModuleAnnotations, ModuleExample};
@@ -138,7 +138,7 @@ impl SchemaExporter {
     ) -> serde_json::Value {
         let resolved_name = name.map_or_else(|| schema_def.module_id.clone(), str::to_string);
         let ann = annotations.cloned().unwrap_or_default();
-        serde_json::json!({
+        let mut envelope = serde_json::json!({
             "name": resolved_name,
             "description": schema_def.description,
             "inputSchema": schema_def.input_schema,
@@ -147,7 +147,6 @@ impl SchemaExporter {
                 "destructiveHint": ann.destructive,
                 "idempotentHint": ann.idempotent,
                 "openWorldHint": ann.open_world,
-                "streaming": ann.streaming,
             },
             "_meta": {
                 "cacheable": ann.cacheable,
@@ -156,7 +155,14 @@ impl SchemaExporter {
                 "paginated": ann.paginated,
                 "paginationStyle": ann.pagination_style,
             },
-        })
+        });
+        if ann.requires_approval {
+            envelope["_meta"]["requiresApproval"] = serde_json::json!(true);
+        }
+        if ann.streaming {
+            envelope["_meta"]["streaming"] = serde_json::json!(true);
+        }
+        envelope
     }
 
     fn build_openai_envelope(
@@ -192,7 +198,8 @@ impl SchemaExporter {
             name.map_or_else(|| schema_def.module_id.replace('.', "_"), str::to_string);
         // A-D-030: substitute description with x-llm-description before
         // emitting the input_schema so Anthropic sees the LLM-tuned text.
-        let input_schema_with_llm = apply_llm_descriptions(&schema_def.input_schema);
+        let input_schema_with_llm =
+            strip_extension_keywords(&apply_llm_descriptions(&schema_def.input_schema));
         let mut envelope = serde_json::json!({
             "name": resolved_name,
             "description": schema_def.description,
@@ -253,14 +260,9 @@ impl SchemaExporter {
 
     /// MCP format: { name, description, inputSchema, annotations, _meta }
     ///
-    /// Sync SCHEMA-004: emits the spec-aligned envelope including the
-    /// `annotations` and `_meta` blocks. When the input `Value` carries
-    /// `annotations` / `_meta` keys they are preserved verbatim; otherwise
-    /// default values are used so the envelope shape matches Python and
-    /// TypeScript exports byte-for-byte. For full annotation pass-through
-    /// callers should prefer [`Self::export_def`].
+    /// Normalize native annotations and MCP hints through the same envelope
+    /// builder as typed exports. Approval and streaming are true-only metadata.
     #[allow(clippy::unused_self)] // consistent method signature for dispatch through export()
-    #[allow(clippy::unnecessary_wraps)] // consistent Result return for dispatch through export()
     fn export_mcp(&self, schema: &serde_json::Value) -> Result<serde_json::Value, ModuleError> {
         let name = schema
             .get("name")
@@ -275,32 +277,64 @@ impl SchemaExporter {
             .or_else(|| schema.get("inputSchema"))
             .cloned()
             .unwrap_or(serde_json::json!({}));
-        let annotations = schema.get("annotations").cloned().unwrap_or_else(|| {
-            serde_json::json!({
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": false,
-                "openWorldHint": true,
-                "streaming": false,
-            })
-        });
-        let meta = schema.get("_meta").cloned().unwrap_or_else(|| {
-            serde_json::json!({
-                "cacheable": false,
-                "cacheTtl": 0,
-                "cacheKeyFields": serde_json::Value::Null,
-                "paginated": false,
-                "paginationStyle": "cursor",
-            })
-        });
-
-        Ok(serde_json::json!({
-            "name": name,
-            "description": description,
-            "inputSchema": input_schema,
-            "annotations": annotations,
-            "_meta": meta,
-        }))
+        let mut annotations = schema
+            .get("annotations")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        for (hint, native) in [
+            ("readOnlyHint", "readonly"),
+            ("destructiveHint", "destructive"),
+            ("idempotentHint", "idempotent"),
+            ("openWorldHint", "open_world"),
+            ("requiresApproval", "requires_approval"),
+        ] {
+            if annotations.get(native).is_none() {
+                if let Some(value) = annotations.get(hint).cloned() {
+                    annotations[native] = value;
+                }
+            }
+        }
+        for (meta, native) in [
+            ("requiresApproval", "requires_approval"),
+            ("streaming", "streaming"),
+        ] {
+            if annotations.get(native).is_none() {
+                if let Some(value) = schema
+                    .get("_meta")
+                    .and_then(|value| value.get(meta))
+                    .cloned()
+                {
+                    annotations[native] = value;
+                }
+            }
+        }
+        let annotations: ModuleAnnotations =
+            serde_json::from_value(annotations).map_err(|error| {
+                ModuleError::new(
+                    ErrorCode::SchemaParseError,
+                    format!("Invalid export annotations: {error}"),
+                )
+            })?;
+        let definition = SchemaDefinition {
+            module_id: String::new(),
+            description: String::new(),
+            input_schema,
+            output_schema: serde_json::json!({}),
+            error_schema: None,
+            definitions: None,
+            version: None,
+        };
+        let mut envelope = Self::build_mcp_envelope(&definition, Some(&annotations), None);
+        envelope["name"] = name;
+        envelope["description"] = description;
+        if let Some(meta) = schema.get("_meta").and_then(serde_json::Value::as_object) {
+            for (key, value) in meta {
+                if key != "requiresApproval" && key != "streaming" {
+                    envelope["_meta"][key] = value.clone();
+                }
+            }
+        }
+        Ok(envelope)
     }
 
     /// `OpenAI` format: { type: "function", function: { name, description, parameters, strict } }
@@ -330,7 +364,7 @@ impl SchemaExporter {
 
         // Apply Algorithm A23 strict transform so the envelope satisfies
         // OpenAI's strict-mode contract.
-        let strict_parameters = to_strict_schema(&parameters);
+        let strict_parameters = to_strict_schema(&apply_llm_descriptions(&parameters));
 
         Ok(serde_json::json!({
             "type": "function",
@@ -367,7 +401,7 @@ impl SchemaExporter {
         Ok(serde_json::json!({
             "name": name,
             "description": description,
-            "input_schema": input_schema,
+            "input_schema": strip_extension_keywords(&apply_llm_descriptions(&input_schema)),
         }))
     }
 

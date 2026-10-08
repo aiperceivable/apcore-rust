@@ -195,6 +195,7 @@ pub struct Context<T> {
     #[serde(skip)]
     pub global_deadline: Option<f64>,
     /// Runtime reference to the executor for nested calls (not serialized).
+    /// Opaque; use [`Context::executor`] to call through it.
     #[serde(skip)]
     pub executor: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -759,6 +760,27 @@ impl<T: Default> ContextBuilder<T> {
 }
 
 impl<T> Context<T> {
+    /// The Executor this context is bound to, for a nested call.
+    ///
+    /// A module calls another module with the Executor that is running it and
+    /// the context it was handed (PROTOCOL_SPEC §5.7):
+    ///
+    /// ```ignore
+    /// let executor = ctx.executor().expect("bound to a shared executor");
+    /// let out = executor.call("common.util.parse", inputs, Some(ctx), None).await?;
+    /// ```
+    ///
+    /// `None` when the context is not bound yet, or its Executor is not shared
+    /// (see [`Executor::into_shared`](crate::executor::Executor::into_shared);
+    /// an [`APCore`](crate::APCore) client's Executor always is).
+    #[must_use]
+    pub fn executor(&self) -> Option<Arc<crate::executor::Executor>> {
+        self.executor
+            .as_deref()?
+            .downcast_ref::<crate::executor::ExecutorHandle>()?
+            .executor()
+    }
+
     /// SDK-internal: bind the receiving Executor to this Context per apcore
     /// Issue #66 / `core-executor.md` §"Contract: Executor binding to Context".
     ///

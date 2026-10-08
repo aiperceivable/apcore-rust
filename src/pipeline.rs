@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::acl::ACL;
@@ -21,7 +21,7 @@ use crate::utils::helpers::match_pattern;
 
 /// Predicate evaluated by [`PipelineEngine`] after each step completes.
 /// Returning `true` halts the pipeline; subsequent steps are not executed.
-/// See `core-executor.md` §Pipeline Hardening §1.4.
+/// See `execution-pipeline.md` §run_until.
 pub type RunUntilPredicate = Box<dyn Fn(&PipelineState) -> bool + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -302,6 +302,8 @@ pub struct PipelineContext {
     // -- Pipeline v2 --
     /// `true` during `validate()`. `PipelineEngine` skips steps with `pure=false`.
     pub dry_run: bool,
+    /// Pure-step errors collected by a non-fail-fast preflight run.
+    pub preflight_errors: Vec<(String, ModuleError)>,
     /// Passed through to `module_lookup` for version negotiation.
     pub version_hint: Option<String>,
     /// Tracks which middleware ran, enabling `on_error` recovery chain.
@@ -373,6 +375,7 @@ impl PipelineContext {
             output: None,
             validated_output: None,
             dry_run: false,
+            preflight_errors: vec![],
             version_hint: None,
             executed_middlewares: vec![],
             registry: None,
@@ -445,7 +448,7 @@ impl PipelineTrace {
 // ---------------------------------------------------------------------------
 
 /// Snapshot passed to a [`RunUntilPredicate`] after each pipeline step
-/// completes. See `core-executor.md` §Pipeline Hardening §1.4.
+/// completes. See `execution-pipeline.md` §run_until.
 ///
 /// Mirrors `apcore.pipeline.PipelineState` in Python.
 pub struct PipelineState<'a> {
@@ -511,8 +514,8 @@ impl std::fmt::Display for StrategyInfo {
 ///
 /// Maintains an internal `HashMap<String, usize>` index from step name to
 /// position so step lookups (used by `skip_to`, `configure_step`, and the
-/// streaming `run_until_step` path) are O(1) per `core-executor.md`
-/// §Pipeline Hardening §1.5. The index is rebuilt after every mutation.
+/// streaming `run_until_step` path) are O(1). The index is rebuilt after
+/// every mutation.
 pub struct ExecutionStrategy {
     name: String,
     steps: Vec<Box<dyn Step>>,
@@ -871,8 +874,8 @@ impl ExecutionStrategy {
         Ok(())
     }
 
-    /// Configure a step by replacing it in place — `core-executor.md`
-    /// §Pipeline Hardening §1.2 (Replace Semantic).
+    /// Configure a step by replacing it in place — `execution-pipeline.md`
+    /// §Modifying a strategy.
     ///
     /// Calling this twice with the same `step_name` is idempotent: there is
     /// always exactly one step at the original position. Fails with
@@ -1021,7 +1024,7 @@ pub struct RunOptions {
     pub only_steps: Option<Vec<String>>,
     /// Predicate evaluated **after** every successful step completes. Returning
     /// `true` halts the pipeline; the current step's output is preserved.
-    /// See `core-executor.md` §Pipeline Hardening §1.4.
+    /// See `execution-pipeline.md` §run_until.
     pub until: Option<RunUntilPredicate>,
 }
 
@@ -1101,8 +1104,8 @@ impl PipelineEngine {
         Self::run_with_options(strategy, ctx, RunOptions::default()).await
     }
 
-    /// Run with a predicate-based termination condition — `core-executor.md`
-    /// §Pipeline Hardening §1.4.
+    /// Run with a predicate-based termination condition — `execution-pipeline.md`
+    /// §run_until.
     ///
     /// The predicate is evaluated **after** each step completes successfully.
     /// Returning `true` halts the pipeline and returns the accumulated output;
@@ -1148,6 +1151,7 @@ impl PipelineEngine {
         // Snapshot of ctx.output keyed by step name, accumulated across the
         // run. Passed to run_until predicates as PipelineState::outputs.
         let mut step_outputs: HashMap<String, Option<serde_json::Value>> = HashMap::new();
+        let mut failed_capabilities: HashSet<String> = HashSet::new();
 
         while idx < steps.len() {
             let step = &steps[idx];
@@ -1174,6 +1178,29 @@ impl PipelineEngine {
             let step_ignore_errors = step.ignore_errors();
             let step_pure = step.pure();
             let step_timeout_ms = step.timeout_ms();
+            if ctx.dry_run
+                && ((ctx.module.is_none() && step.requires().contains(&"module"))
+                    || step
+                        .requires()
+                        .iter()
+                        .any(|capability| failed_capabilities.contains(*capability)))
+            {
+                failed_capabilities.extend(
+                    step.provides()
+                        .iter()
+                        .map(|capability| (*capability).to_owned()),
+                );
+                ctx.trace.steps.push(StepTrace {
+                    name: step.name().to_string(),
+                    duration_ms: 0.0,
+                    result: StepResult::continue_step(),
+                    skipped: true,
+                    decision_point: false,
+                    skip_reason: Some("missing_dependency".to_string()),
+                });
+                idx += 1;
+                continue;
+            }
 
             // (1) match_modules filter
             if let Some(patterns) = step_match_modules {
@@ -1324,6 +1351,25 @@ impl PipelineEngine {
             let result = match exec_result {
                 Ok(r) => r,
                 Err(err) => {
+                    if ctx.dry_run {
+                        failed_capabilities.extend(
+                            step.provides()
+                                .iter()
+                                .map(|capability| (*capability).to_owned()),
+                        );
+                        ctx.preflight_errors
+                            .push((step.name().to_string(), err.clone()));
+                        ctx.trace.steps.push(StepTrace {
+                            name: step.name().to_string(),
+                            duration_ms,
+                            result: StepResult::abort(&err.to_string()),
+                            skipped: false,
+                            decision_point: false,
+                            skip_reason: None,
+                        });
+                        idx += 1;
+                        continue;
+                    }
                     // (3b) StepMiddleware: on_step_error hooks run in REVERSE
                     // registration order (onion unwinding) and may recover by
                     // returning Some(value). The FIRST middleware to return a

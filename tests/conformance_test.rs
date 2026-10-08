@@ -153,6 +153,21 @@ fn conformance_normalize_id() {
         let id = tc["id"].as_str().unwrap();
         let local_id = tc["local_id"].as_str().unwrap();
         let language = tc["language"].as_str().unwrap();
+
+        if tc["expected_error"].as_bool().unwrap_or(false) {
+            let expected_normalized = tc["expected_normalized"].as_str().unwrap();
+            let error = normalize_to_canonical_id(local_id, language)
+                .expect_err("invalid local IDs must be rejected");
+            assert!(
+                error
+                    .message
+                    .contains(&format!("Normalized ID '{expected_normalized}'")),
+                "FAIL [{id}]: expected error to contain normalized form {expected_normalized:?}, got {:?}",
+                error.message
+            );
+            continue;
+        }
+
         let expected = tc["expected"].as_str().unwrap();
 
         let result = normalize_to_canonical_id(local_id, language)
@@ -1039,10 +1054,7 @@ fn conformance_schema_validation() {
         // Verify error path when expected
         if !expected_valid {
             if let Some(expected_path) = tc.get("expected_error_path").and_then(|v| v.as_str()) {
-                let has_matching = result
-                    .errors
-                    .iter()
-                    .any(|e| e.path.contains(expected_path) || e.message.contains(expected_path));
+                let has_matching = result.errors.iter().any(|e| e.path == expected_path);
                 assert!(
                     has_matching,
                     "FAIL [{}]: expected error at {:?}, got {:?}",

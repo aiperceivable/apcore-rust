@@ -1044,7 +1044,7 @@ fn register_reports_the_custom_validator_before_the_duplicate_check() {
     let err = reg
         .register_module("order.validator_and_dup", Box::new(SpecModule::new()))
         .expect_err("both checks fail");
-    assert_eq!(err.code, ErrorCode::ModuleLoadError, "{err:?}");
+    assert_eq!(err.code, ErrorCode::GeneralInvalidInput, "{err:?}");
 }
 
 // clause: registry_system.register.order.module_id_first
@@ -1081,7 +1081,7 @@ fn control_each_register_check_still_fires_on_its_own() {
             .register_module("order.validator_only", Box::new(SpecModule::new()))
             .expect_err("validator alone")
             .code,
-        ErrorCode::ModuleLoadError
+        ErrorCode::GeneralInvalidInput
     );
 
     let duplicate_only = Registry::new();

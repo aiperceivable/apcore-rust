@@ -494,24 +494,12 @@ fn c6_observability_namespace_defaults_match_spec_9_15_2() {
     assert_eq!(metrics["enabled"], json!(false));
     assert_eq!(metrics["exporter"], json!("stdout"));
 
-    let logging = ns.get("logging").expect("logging defaults present");
-    assert_eq!(logging["enabled"], json!(true));
-    assert_eq!(logging["level"], json!("info"));
-    assert_eq!(logging["format"], json!("json"));
-    assert_eq!(logging["redact_sensitive"], json!(true));
-
-    let notify = ns
-        .get("platform_notify")
-        .expect("platform_notify defaults present");
-    assert_eq!(notify["enabled"], json!(false));
-    assert_eq!(notify["error_rate_threshold"], json!(0.1));
-    assert_eq!(notify["latency_p99_threshold_ms"], json!(5000.0));
-
-    let history = ns
-        .get("error_history")
-        .expect("error_history defaults present");
-    assert_eq!(history["max_entries_per_module"], json!(50));
-    assert_eq!(history["max_total_entries"], json!(1000));
+    for absent in ["logging", "platform_notify", "error_history", "redaction"] {
+        assert!(
+            ns.get(absent).is_none(),
+            "observability.{absent} belongs to another namespace and MUST NOT be registered here"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

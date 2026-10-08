@@ -210,7 +210,7 @@ impl EventEmitter {
     ///
     /// Canonical delivery path — applies the per-subscriber retry policy and
     /// emits an `apcore.event.delivery_failed` DLQ event on exhaustion, per
-    /// spec docs/features/event-system.md §Event Delivery Semantics (#61).
+    /// docs/features/event-system.md §Delivery Semantics.
     ///
     /// **Non-blocking (sync finding A-D-024):** each matching subscriber's
     /// retry loop (including backoff sleeps) runs on its own spawned task, so

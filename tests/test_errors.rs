@@ -221,17 +221,18 @@ fn test_every_config_error_code_is_non_retryable() {
     );
 }
 
-/// `EXECUTION_CANCELLED` is §8.6 "Yes" and is nevertheless left unset.
-///
-/// Neither peer implements it, and here it is the one §8.6 row that would
-/// change behaviour rather than metadata: `CancelToken::check` raises it from
-/// inside module execution, so it reaches `RetryMiddleware`'s
-/// `retryable == Some(true)` gate and the annotation would auto-retry a call
-/// the caller had just explicitly cancelled. Pinned as a test so the omission
-/// reads as a decision rather than an oversight.
+/// D-135: `EXECUTION_CANCELLED` is retryable from its code — a cancelled call
+/// may be sent again with a fresh `CancelToken`.
 #[test]
-fn test_execution_cancelled_retryable_is_deliberately_unset() {
-    assert_eq!(retryable_for_code(ErrorCode::ExecutionCancelled), None);
+fn test_execution_cancelled_is_retryable_by_code() {
+    assert_eq!(
+        retryable_for_code(ErrorCode::ExecutionCancelled),
+        Some(true)
+    );
+    assert_eq!(
+        ModuleError::new(ErrorCode::ExecutionCancelled, "cancelled").retryable,
+        Some(true)
+    );
 }
 
 #[test]
@@ -498,22 +499,17 @@ fn test_all_codes_retains_framework_after_module_register() {
     assert!(reg.all_codes().contains("SCHEMA_VALIDATION_ERROR"));
 }
 
-/// apcore#36: `CIRCUIT_BREAKER_OPEN` is deliberately absent from
-/// `retryable_for_code` — the fixture does not pin it, and the policy stays
-/// fixture-scoped. Its `retryable: true` therefore rests entirely on the
-/// builder's explicit `.with_retryable(true)`, which is exactly the kind of
-/// value that disappears unnoticed when the builder is refactored.
-///
-/// The peers set it on the class (`CircuitBreakerOpenError._default_retryable
-/// = True`, `static DEFAULT_RETRYABLE = true`), so this is the one code whose
-/// cross-language agreement is carried by a call site rather than by a table.
+/// D-135: `CIRCUIT_BREAKER_OPEN` is retryable from its code, not only through
+/// the middleware's builder — the circuit re-probes after its recovery window.
 #[test]
-fn test_circuit_breaker_open_is_retryable_via_the_builder_not_the_code() {
-    // The code alone resolves to nothing — the builder is load-bearing here.
-    assert_eq!(retryable_for_code(ErrorCode::CircuitBreakerOpen), None);
+fn test_circuit_breaker_open_is_retryable_by_code_and_builder() {
+    assert_eq!(
+        retryable_for_code(ErrorCode::CircuitBreakerOpen),
+        Some(true)
+    );
     assert_eq!(
         ModuleError::new(ErrorCode::CircuitBreakerOpen, "open").retryable,
-        None
+        Some(true)
     );
 
     let err = ModuleError::circuit_breaker_open("billing.charge", "api.gateway");

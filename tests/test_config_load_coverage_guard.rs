@@ -405,7 +405,11 @@ fn the_section_extractors_are_not_vacuous() {
     let builtins = builtin_namespace_names();
     assert_eq!(
         builtins,
-        vec!["observability".to_string(), "sys_modules".to_string()],
+        vec![
+            "observability".to_string(),
+            "sys_modules".to_string(),
+            "obs".to_string(),
+        ],
         "the built-in namespace list changed; if that is intended, this \
          expectation moves with it"
     );

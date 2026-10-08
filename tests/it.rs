@@ -223,8 +223,6 @@ mod test_executor_trace_cancellation_conformance;
 mod test_extensions;
 #[path = "test_id_conflict_reserved_words_conformance.rs"]
 mod test_id_conflict_reserved_words_conformance;
-#[path = "test_id_map_from_config_conformance.rs"]
-mod test_id_map_from_config_conformance;
 #[path = "test_inject_inbound_flags.rs"]
 mod test_inject_inbound_flags;
 #[path = "test_inject_malformed_parent_id.rs"]
@@ -332,6 +330,8 @@ mod test_schema_strict_conversion_conformance;
 mod test_schema_validator;
 #[path = "test_serde_wire_format.rs"]
 mod test_serde_wire_format;
+#[path = "test_single_sdk_defects.rs"]
+mod test_single_sdk_defects;
 #[path = "test_spec_decision_followup.rs"]
 mod test_spec_decision_followup;
 #[path = "test_storage_backend.rs"]

@@ -1,12 +1,12 @@
 // APCore Protocol — Event subscriber retry configuration
-// Spec reference: Event Delivery Semantics (Issue #61)
+// Spec reference: event-system.md §Delivery Semantics
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Retry configuration for event subscribers.
 ///
-/// Defaults align with spec (Event Delivery Semantics, Issue #61):
+/// Defaults align with event-system.md §Per-Subscriber Retry Policy:
 /// `max_attempts=3`, `initial_backoff_ms=100`, `max_backoff_ms=30_000`,
 /// `backoff_multiplier=2.0`. Callers that genuinely want single-attempt
 /// (fire-and-forget) semantics should use [`Self::no_retry`].
@@ -25,8 +25,8 @@ pub struct EventRetryConfig {
 impl Default for EventRetryConfig {
     /// Default: spec-aligned (3 attempts, 100 ms initial backoff, 30 s cap, 2.0x).
     ///
-    /// Spec: docs/features/event-system.md §"Event Delivery Semantics"
-    /// (Issue #61) — `max_attempts=3`, `initial_backoff_ms=100`,
+    /// Spec: docs/features/event-system.md §"Per-Subscriber Retry Policy"
+    /// — `max_attempts=3`, `initial_backoff_ms=100`,
     /// `max_backoff_ms=30000`, `backoff_multiplier=2.0`.
     fn default() -> Self {
         Self {
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_default_matches_spec() {
-        // Spec: docs/features/event-system.md §Event Delivery Semantics (#61)
+        // Spec: docs/features/event-system.md §Per-Subscriber Retry Policy
         let cfg = EventRetryConfig::default();
         assert_eq!(cfg.max_attempts, 3);
         assert_eq!(cfg.initial_backoff_ms, 100);

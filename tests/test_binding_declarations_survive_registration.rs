@@ -42,6 +42,8 @@ spec_version: "1.0"
 bindings:
   - module_id: executor.orders.delete_order
     target: "orders:delete_order"
+    input_schema: {type: object}
+    output_schema: {type: object}
     description: "Delete an order"
     documentation: "Long-form **Markdown** documentation for delete_order."
     tags: ["orders", "dangerous"]
@@ -220,6 +222,8 @@ spec_version: "1.0"
 bindings:
   - module_id: executor.orders.archive_order
     target: "orders:archive_order"
+    input_schema: {type: object}
+    output_schema: {type: object}
     description: "Archive an order"
     version: "2.3.0"
 "#;

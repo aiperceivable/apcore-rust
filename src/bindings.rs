@@ -81,8 +81,8 @@ pub type BindingHandler = BindingHandlerFn;
 /// A binding handler bundled with optional auto-derived schemas.
 ///
 /// When `auto_schema: true` is specified in a binding entry, the loader
-/// reads schemas from this struct instead of falling back to a permissive
-/// `{"type":"object"}`. Use [`typed_handler`] to create instances with
+/// reads schemas from this struct and rejects missing inference sources.
+/// Use [`typed_handler`] to create instances with
 /// auto-generated schemas from `schemars::JsonSchema` types.
 pub struct TypedBindingHandler {
     pub handler: BindingHandlerFn,
@@ -314,6 +314,7 @@ fn semver_re() -> &'static regex::Regex {
 /// A single binding entry. Mirrors the canonical YAML structure defined in
 /// protocol-spec §5.12.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindingEntry {
     pub module_id: String,
     pub target: String,
@@ -357,6 +358,7 @@ fn default_version() -> String {
 
 /// Top-level binding file structure: `spec_version` + `bindings:` list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindingsFile {
     #[serde(default)]
     pub spec_version: Option<String>,
@@ -486,8 +488,7 @@ impl BindingLoader {
     ///
     /// Detects mode conflicts (multiple schema fields specified together)
     /// and loads `schema_ref` external files. For Rust, `auto_schema` is
-    /// recorded but produces an empty/permissive schema until apcore-macros
-    /// (F11) wires up `schemars`-derived lookup.
+    /// deferred until registration supplies the target's typed handler schemas.
     #[allow(clippy::unused_self)]
     #[allow(clippy::too_many_lines)] // one linear mode-resolution ladder (§3.4); each arm returns, so splitting would fragment the decision order
     fn resolve_schemas(
@@ -599,37 +600,11 @@ impl BindingLoader {
             ));
         }
 
-        // Implicit default: auto_schema permissive.
-        //
-        // Rust cannot infer a schema from an opaque `target` string the way
-        // apcore-python (type hints) and apcore-typescript (module exports)
-        // can: the only inference source is a `TypedBindingHandler` supplied at
-        // registration time. So this stage yields the permissive placeholder and
-        // the real decision is deferred to `register_into_with_handlers` /
-        // `register_into_with_typed_handlers`, which reject when the normalized
-        // mode is `strict` and no typed schema is available. Without that
-        // deferral `auto_schema: strict` would pass vacuously against the
-        // permissive pair below.
-        let resolved_mode = auto_mode.unwrap_or("permissive");
-        // protocol-spec §5.12.5 marks Rust's `auto_schema: true` /
-        // `permissive` as NOT IMPLEMENTED (F11). Tightening this fallback into
-        // an error would break every working binding, so the gap stays
-        // permissive — but it MUST NOT be silent. One warning per binding;
-        // bindings that supplied `input_schema`/`output_schema`/`schema_ref`
-        // returned above and never reach here.
-        tracing::warn!(
-            module_id = %entry.module_id,
-            binding_file = %source_path.display(),
-            auto_schema_mode = resolved_mode,
-            "automatic schema inference is not implemented in apcore-rust (F11); \
-             falling back to a permissive {{\"type\": \"object\"}} for this binding. \
-             Inputs and outputs are effectively unvalidated. Specify input_schema \
-             and output_schema (or schema_ref) explicitly, or register the target \
-             with a typed handler. See protocol-spec §5.12.5"
-        );
+        // The target is resolved at registration. Null marks deferred inference,
+        // never a permissive fallback; every mode rejects an uninferable target.
         Ok(ResolvedSchemas {
-            input: serde_json::json!({"type": "object"}),
-            output: serde_json::json!({"type": "object"}),
+            input: serde_json::Value::Null,
+            output: serde_json::Value::Null,
         })
     }
 
@@ -794,10 +769,9 @@ impl BindingLoader {
     ///
     /// # Errors
     ///
-    /// A binding whose normalized `auto_schema` mode is `strict` is rejected
+    /// A binding without an explicit schema pair or schema reference is rejected
     /// with [`ErrorCode::BindingSchemaInferenceFailed`]: this API supplies
-    /// untyped handlers, so no schema can be inferred and the strict promise
-    /// could only be satisfied vacuously against the permissive placeholder.
+    /// untyped handlers, so no schema can be inferred in any automatic mode.
     /// Use [`Self::register_into_with_typed_handlers`] with
     /// [`typed_handler`] for `auto_schema: strict` bindings.
     #[allow(clippy::needless_pass_by_value)]
@@ -808,14 +782,6 @@ impl BindingLoader {
     ) -> Result<usize, ModuleError> {
         let mut count = 0usize;
         for (module_id, entry) in &self.bindings {
-            if normalized_auto_mode(entry) == Some("strict") {
-                return Err(strict_inference_failed(
-                    entry,
-                    module_id,
-                    "this registration path supplies untyped handlers, so no schema can be inferred",
-                ));
-            }
-
             let handler = handlers.get(&entry.target).cloned().ok_or_else(|| {
                 ModuleError::new(
                     ErrorCode::BindingModuleNotFound,
@@ -825,6 +791,13 @@ impl BindingLoader {
                     ),
                 )
             })?;
+
+            if entry.input_schema.is_none() && entry.schema_ref.is_none() {
+                return Err(strict_inference_failed(
+                    entry, module_id,
+                    "this registration path supplies untyped handlers, so no schema can be inferred",
+                ));
+            }
 
             let schemas = self
                 .schemas
@@ -873,7 +846,8 @@ impl BindingLoader {
     /// When a binding entry uses `auto_schema` (explicit or implicit default) AND the
     /// corresponding handler carries schemas (`TypedBindingHandler::input_schema` /
     /// `output_schema` are `Some`), the handler's schemas are used instead of the
-    /// permissive `{"type":"object"}` fallback. This is the primary mechanism for
+    /// deferred inference placeholder. Missing schemas fail loudly in every mode.
+    /// This is the primary mechanism for
     /// Rust `auto_schema` support per protocol-spec §5.12.5.
     ///
     /// For bindings with explicit `input_schema`/`output_schema` or `schema_ref`,
@@ -913,7 +887,7 @@ impl BindingLoader {
             } else if let (Some(is), Some(os)) = (&typed.input_schema, &typed.output_schema) {
                 // Handler provides auto-derived schemas (schemars).
                 (is.clone(), os.clone())
-            } else if strict {
+            } else {
                 // No schema to check means the strict promise cannot be kept.
                 // Falling back to the permissive `{"type":"object"}` pair here
                 // would make `assert_openai_strict_compatible` succeed
@@ -925,12 +899,6 @@ impl BindingLoader {
                     module_id,
                     "the supplied TypedBindingHandler carries no input_schema/output_schema",
                 ));
-            } else {
-                // Fallback: permissive.
-                (
-                    serde_json::json!({"type": "object"}),
-                    serde_json::json!({"type": "object"}),
-                )
             };
 
             if strict {
@@ -1001,13 +969,14 @@ fn normalized_auto_mode(entry: &BindingEntry) -> Option<&'static str> {
 }
 
 /// Build the `BINDING_SCHEMA_INFERENCE_FAILED` error raised when a binding
-/// declares `auto_schema: strict` but no typed schema is available to check.
+/// has no typed schema available in any automatic inference mode.
 ///
 /// Mirrors apcore-python `BindingSchemaInferenceFailedError` and
 /// apcore-typescript `BindingSchemaInferenceFailedError`: message carries the
 /// `{file_path}: ` prefix from protocol-spec §5.12.8 and the details
 /// map carries `module_id`, `target` and `file_path`.
 fn strict_inference_failed(entry: &BindingEntry, module_id: &str, reason: &str) -> ModuleError {
+    let mode = normalized_auto_mode(entry).unwrap_or("implicit");
     let loc = entry
         .source_file
         .as_deref()
@@ -1030,7 +999,7 @@ fn strict_inference_failed(entry: &BindingEntry, module_id: &str, reason: &str) 
     ModuleError::new(
         ErrorCode::BindingSchemaInferenceFailed,
         format!(
-            "{loc}binding '{module_id}' (target '{}') declares auto_schema: strict but no schema could be inferred: {reason}. \
+            "{loc}binding '{module_id}' (target '{}') declares auto_schema: {mode} but no schema could be inferred: {reason}. \
              Register it via BindingLoader::register_into_with_typed_handlers with a `typed_handler`, or declare input_schema/output_schema explicitly. \
              See protocol-spec §5.12.5",
             entry.target,

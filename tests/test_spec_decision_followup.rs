@@ -13,8 +13,8 @@
 //!     identical across SDKs so a polyglot consumer reads the same document.
 //!   - T5: PROTOCOL_SPEC §9.1 / §9.3 step 1 — only `version` and
 //!     `project.name` are required, evaluated against the DECLARED document.
-//!   - T6: protocol-spec §5.12.5 — Rust `auto_schema` inference is not
-//!     implemented (F11); the permissive fallback must be loud, not silent.
+//!   - T6: protocol-spec §5.12.5 (D-139) — every automatic mode rejects
+//!     targets lacking an inferable schema rather than registering a fallback.
 
 #![allow(clippy::pedantic, clippy::all)]
 
@@ -508,7 +508,7 @@ fn t5_config_missing_project_name_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// T6 — the `auto_schema` permissive fallback must warn, not stay silent
+// T6 — uninferable automatic schemas fail instead of registering a fallback
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
@@ -554,8 +554,11 @@ fn load_binding(body: &str) -> String {
 }
 
 #[test]
-fn t6_permissive_auto_schema_fallback_emits_warning() {
-    let logs = load_binding(
+fn t6_implicit_auto_schema_without_typed_handler_fails_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("demo.binding.yaml");
+    std::fs::write(
+        &path,
         r#"
 spec_version: "1.0"
 bindings:
@@ -563,23 +566,20 @@ bindings:
     target: "demo:fn"
     description: "implicit auto_schema"
 "#,
-    );
-    assert!(
-        logs.contains("executor.demo.implicit"),
-        "warning must name the module_id: {logs}"
-    );
-    assert!(
-        logs.contains("WARN"),
-        "the permissive fallback must warn: {logs}"
-    );
-    assert!(
-        logs.contains("demo.binding.yaml"),
-        "warning must name the binding file: {logs}"
-    );
-    assert!(
-        logs.to_lowercase().contains("inference"),
-        "warning must state that schema inference is unimplemented: {logs}"
-    );
+    )
+    .unwrap();
+    let mut loader = apcore::bindings::BindingLoader::new();
+    loader.load_from_yaml(&path).unwrap();
+    let handler: apcore::bindings::BindingHandler =
+        Arc::new(|_, _| Box::pin(async { Ok(json!({})) }));
+    let registry = Registry::new();
+    let error = loader
+        .register_into_with_handlers(&registry, HashMap::from([("demo:fn".to_string(), handler)]))
+        .expect_err("implicit inference requires typed schemas");
+    assert_eq!(error.code, ErrorCode::BindingSchemaInferenceFailed);
+    assert_eq!(error.details["module_id"], "executor.demo.implicit");
+    assert_eq!(error.details["file_path"], path.to_str().unwrap());
+    assert!(!registry.has("executor.demo.implicit"));
 }
 
 #[test]

@@ -342,7 +342,7 @@ async fn test_otlp_exporter_sends_span_to_endpoint() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let endpoint = format!("http://127.0.0.1:{port}");
+    let endpoint = format!("http://127.0.0.1:{port}/v1/traces");
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -393,8 +393,8 @@ async fn test_otlp_exporter_sends_span_to_endpoint() {
         "expected POST request, got: {request}"
     );
     assert!(
-        request.contains("/v1/traces"),
-        "expected /v1/traces path, got: {request}"
+        request.starts_with("POST /v1/traces HTTP/1.1"),
+        "expected the endpoint's own path, got: {request}"
     );
     assert!(
         request

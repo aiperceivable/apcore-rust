@@ -722,7 +722,7 @@ fn test_schema_validator_errors_are_structured_details() {
 
     let detail = &result.errors[0];
     // Structured shape: dedicated `path` and `message` fields (not a flat string).
-    assert_eq!(detail.path, "address.city");
+    assert_eq!(detail.path, "/address/city");
     assert!(detail.message.contains("expected type"));
     assert_eq!(detail.constraint.as_deref(), Some("type"));
 }
@@ -804,7 +804,8 @@ fn test_executor_validate_still_rejects_real_type_errors_under_draft07() {
     let errors = err.details.get("errors").expect("details.errors present");
     let arr = errors.as_array().expect("details.errors is an array");
     assert!(!arr.is_empty());
-    assert!(arr[0].get("field").is_some());
+    assert!(arr[0].get("path").is_some());
+    assert!(arr[0].get("keyword").is_some());
     assert!(arr[0].get("message").is_some());
 }
 

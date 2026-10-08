@@ -54,8 +54,10 @@ pub trait Module: Send + Sync {
     ///
     /// **Validation contract:** `Executor::stream` validates the module's
     /// *merged* output (all chunks deep-merged) against `output_schema` only
-    /// *after* the stream is exhausted (Phase 3). Individual chunks are **not**
-    /// validated as they are yielded. Callers performing incremental chunk
+    /// *after* the stream is exhausted (Phase 3), when the chunks are already
+    /// delivered: a failure is published as
+    /// `apcore.stream.post_validation_failed`, not yielded. Individual chunks
+    /// are **not** validated as they are yielded. Callers performing incremental chunk
     /// processing must tolerate receiving chunks that may not independently
     /// satisfy `output_schema`. If per-chunk schema guarantees are required,
     /// validate each chunk inside this method before yielding it.
@@ -655,7 +657,7 @@ pub struct PreflightResult {
     ///
     /// Cross-language parity: matches `predicted_changes` /
     /// `predictedChanges` in apcore-python and apcore-typescript.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub predicted_changes: Vec<Change>,
 }
 

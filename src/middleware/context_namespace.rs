@@ -1,5 +1,5 @@
 // APCore Protocol — Context-data namespace validation (Issue #42)
-// Spec reference: middleware-system.md §1.1 Context Namespacing
+// Spec reference: middleware-system.md §Context Namespacing
 //
 // Two reserved prefixes partition `context.data`:
 //

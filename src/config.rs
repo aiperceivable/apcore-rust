@@ -385,7 +385,8 @@ pub fn config_default_keys() -> Vec<&'static str> {
 /// filesystem path (PROTOCOL_SPEC §9.2.1).
 ///
 /// Declared canonically by `"x-apcore-path": true` in
-/// `schemas/apcore-config.schema.json`; this slice is that projection.
+/// `schemas/apcore-config.schema.json` and the namespace schema it references,
+/// `schemas/sys-modules.schema.json`; this slice is that projection.
 ///
 /// It exists for consumers outside this SDK. Anything forwarding apcore
 /// configuration across a process boundary — a CLI spawning a worker, a
@@ -394,10 +395,11 @@ pub fn config_default_keys() -> Vec<&'static str> {
 /// the working directory differs. Without a published set, each such consumer
 /// builds its own and drifts from the others.
 ///
-/// Two exclusions are deliberate, being the mistakes an implementer would
-/// otherwise make. `bindings.pattern` is a glob matched against filenames
+/// One exclusion is deliberate, being the mistake an implementer would
+/// otherwise make: `bindings.pattern` is a glob matched against filenames
 /// *within* `bindings.dir`, never resolved as a path itself. `id_map.overrides`
-/// holds module IDs.
+/// is the path of an ID map file, and `sys_modules.control.overrides_path` the
+/// path of the runtime overrides file (D-138).
 ///
 /// `extensions.roots` is list-valued and every element carries a path, in both
 /// the bare-string and the `{ root, namespace }` form — hence the element key
@@ -410,7 +412,9 @@ const PATH_TYPED_CONFIG_KEYS: &[&str] = &[
     "bindings.dir",
     "extensions.root",
     "extensions.roots[]",
+    "id_map.overrides",
     "schema.root",
+    "sys_modules.control.overrides_path",
 ];
 
 /// PROTOCOL_SPEC §9.2.4 — the declared configuration keys that reach no
@@ -434,6 +438,11 @@ const DEPRECATED_INERT_KEYS: &[&str] = &[
     "acl.audit.enabled",
     "acl.audit.include_denied",
     "acl.audit.log_level",
+    // D-137: names built-in middleware that does not exist; use `remove()` or
+    // `pipeline.remove`.
+    "middleware.disabled",
+    // D-150: discovery runs when `discover()` is called.
+    "extensions.auto_discover",
 ];
 
 const CONFIG_DEFAULTS: &[(&str, DefaultValue)] = &[
@@ -633,7 +642,7 @@ pub struct MetricsConfig {
 /// `max_call_depth`, `default_timeout_ms`, etc. The custom `Deserialize` impl
 /// now rejects these with a hard error naming each field's canonical location.
 /// **Note (sync finding A-D-016).** Apcore-python and apcore-typescript
-/// register the built-in `observability` and `sys_modules` namespaces at
+/// register the built-in `observability`, `sys_modules` and `obs` namespaces at
 /// module-load time, so every code path observes them. Rust has no cheap
 /// equivalent (no implicit module-init hook without the `ctor` crate), so
 /// the SDK uses an idempotent `OnceLock`-guarded `init_builtin_namespaces()`
@@ -1774,7 +1783,11 @@ impl Config {
                 let Some((section, rest)) = key.split_once('.') else {
                     return false;
                 };
-                let Some(mut node) = self.user_namespaces.get(section) else {
+                let Some(mut node) = self.user_namespaces.get(section).or_else(|| {
+                    self.user_namespaces
+                        .get("apcore")
+                        .and_then(|framework| framework.get(section))
+                }) else {
                     return false;
                 };
                 for part in rest.split('.') {
@@ -2168,6 +2181,10 @@ impl Config {
     /// which `register_namespace` does not permit). See decision log.
     pub fn set(&mut self, key: &str, value: serde_json::Value) {
         self.generation += 1;
+        if let Some(framework_key) = key.strip_prefix("apcore.") {
+            // Qualified framework writes also update fields read by runtime consumers.
+            self.set_typed_field(framework_key, &value);
+        }
         // Try canonical typed fields.
         if self.set_typed_field(key, &value) {
             // A typed write is still a DECLARATION, so it leaves the same
@@ -2291,6 +2308,9 @@ impl Config {
         // Auto-derive env_prefix from name if not provided.
         if reg.env_prefix.is_none() {
             reg.env_prefix = Some(reg.name.to_uppercase().replace('-', "_"));
+        }
+        if reg.env_prefix.as_deref() == Some("APCORE") && reg.name != "apcore" {
+            return Err(ModuleError::config_namespace_reserved(&reg.name));
         }
         let mut map = global_ns_registry().write();
         if map.contains_key(&reg.name) {
@@ -2656,7 +2676,7 @@ impl Config {
                 // apcore#88: same exemption as the legacy branch — the file
                 // selector is an argument to load(), not configuration.
                 if let Some(suffix) = env_key.strip_prefix("APCORE_") {
-                    let dot_path = Self::env_key_to_dot_path(suffix);
+                    let dot_path = format!("apcore.{}", Self::env_key_to_dot_path(suffix));
                     tracing::debug!(env = %env_key, path = %dot_path, "Applying fallback env override (no namespace match)");
                     self.apply_one_env_override(&env_key, &dot_path, parsed);
                 }
@@ -2706,8 +2726,9 @@ impl Config {
     /// value the operator can mean, and §9.2.1's requirement is scoped to the
     /// closed path-typed set precisely because `""` is meaningless only there.
     fn apply_one_env_override(&mut self, env_key: &str, dot_path: &str, value: serde_json::Value) {
-        let empty_path = Self::is_path_typed_key(dot_path)
-            && matches!(&value, serde_json::Value::String(s) if s.is_empty());
+        let empty_path =
+            Self::is_path_typed_key(dot_path.strip_prefix("apcore.").unwrap_or(dot_path))
+                && matches!(&value, serde_json::Value::String(s) if s.is_empty());
         if empty_path {
             tracing::warn!(
                 env = %env_key,
@@ -3026,22 +3047,11 @@ fn init_builtin_namespaces() {
             NamespaceRegistration {
                 name: "observability".to_string(),
                 env_prefix: Some("APCORE_OBSERVABILITY".to_string()),
-                // Verbatim transcription of PROTOCOL_SPEC §9.15.2. Matches
-                // apcore-python (config.py `register_namespace("observability", …)`)
-                // and apcore-typescript (config.ts `registerNamespace`) key for
-                // key. Rust previously diverged on four points, each of which
-                // changed observable runtime behavior:
-                //   - `metrics.exporter` was "in_memory" (spec/peers: "stdout")
-                //   - `tracing.otlp_endpoint` was a live "http://localhost:4318"
-                //     (spec/peers: null) — a Rust service with tracing enabled
-                //     would attempt OTLP export to localhost where its peers
-                //     would not
-                //   - `logging.enabled`, `logging.redact_sensitive` and
-                //     `platform_notify.enabled` were absent, so consumers read
-                //     None instead of the spec-mandated true/true/false
-                //   - `logging.redact_keys` is not a spec key; the redaction
-                //     key list lives in the observability redaction config,
-                //     not here (see `crate::observability` defaults)
+                // PROTOCOL_SPEC §9.15.2: `tracing` and `metrics`, the two blocks
+                // `$defs/ObservabilityConfig` declares, and nothing else (D-144).
+                // The live equivalents of blocks other SDKs once registered here
+                // are `sys_modules.error_history.*`,
+                // `sys_modules.events.thresholds.*` and `obs.redaction.*`.
                 defaults: Some(serde_json::json!({
                     "tracing": {
                         "enabled": false,
@@ -3053,21 +3063,6 @@ fn init_builtin_namespaces() {
                     "metrics": {
                         "enabled": false,
                         "exporter": "stdout"
-                    },
-                    "logging": {
-                        "enabled": true,
-                        "level": "info",
-                        "format": "json",
-                        "redact_sensitive": true
-                    },
-                    "error_history": {
-                        "max_entries_per_module": 50,
-                        "max_total_entries": 1000
-                    },
-                    "platform_notify": {
-                        "enabled": false,
-                        "error_rate_threshold": 0.1,
-                        "latency_p99_threshold_ms": 5000.0
                     }
                 })),
                 schema: None,
@@ -3102,6 +3097,24 @@ fn init_builtin_namespaces() {
                         "enabled": false,
                         "subscribers": [],
                         "thresholds": { "error_rate": 0.1, "latency_p99_ms": 5000.0 }
+                    }
+                })),
+                schema: None,
+                env_style: EnvStyle::Auto,
+                max_depth: DEFAULT_MAX_DEPTH,
+                env_map: None,
+            },
+            // PROTOCOL_SPEC §9.15.4 (D-144): the namespace carrying the
+            // configured redaction rules of §10.6.1, declared by
+            // `$defs/ObsConfig`.
+            NamespaceRegistration {
+                name: "obs".to_string(),
+                env_prefix: Some("APCORE_OBS".to_string()),
+                defaults: Some(serde_json::json!({
+                    "redaction": {
+                        "regex_patterns": [],
+                        "sensitive_keys": crate::observability::redaction::DEFAULT_SENSITIVE_KEYS,
+                        "replacement": crate::observability::redaction::DEFAULT_REPLACEMENT
                     }
                 })),
                 schema: None,
@@ -3815,7 +3828,9 @@ mod tests {
             "bindings.dir",
             "extensions.root",
             "extensions.roots[]",
+            "id_map.overrides",
             "schema.root",
+            "sys_modules.control.overrides_path",
         ]
         .into_iter()
         .collect();

@@ -1,18 +1,29 @@
-//! Drive `id_map_from_config.json` — §9.1.1 `id_map.overrides` (#118 D-71).
+//! Drive `id_map_from_config.json` — §2.2 / §9.1.1 `id_map.overrides`.
 //!
-//! The ID-map MECHANISM is stage 2 of `DefaultDiscoverer`, and it worked. What
-//! did not exist was the path from a `Config` to it: the map arrived only
-//! through `with_id_map`. `from_config` is that path, exactly as it is for the
-//! three `extensions.*` scan keys since v1.42.0.
+//! Every case runs REAL discovery over a real tree and reads the registered
+//! module IDs (`driver_contract.real_discovery`): which file a map entry
+//! matches is decided inside stage 2 of `DefaultDiscoverer`, so a driver that
+//! only checked which map path the discoverer holds could not see an entry
+//! that matches nothing (D-138).
 //!
-//! The registered-ID half of the fixture is driven through `Debug`, which is
-//! the only public window onto `id_map_path`. That is enough and it is the
-//! honest scope: what was broken is whether the key ARRIVES, and a driver that
-//! called `load_id_map` itself would prove the loader works — which was never
-//! the question.
+//! Its own test binary: each case sets `APCORE_ID__MAP_OVERRIDES` and the
+//! process working directory, neither of which `tests/it.rs` can share across
+//! its threads.
+
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
 
 use apcore::config::Config;
-use serde_json::Value;
+use apcore::context::Context;
+use apcore::errors::ModuleError;
+use apcore::module::Module;
+use apcore::registry::registry::Registry;
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+#[path = "conformance_env.rs"]
+mod conformance_env;
 
 use crate::conformance_env::find_fixtures_root;
 
@@ -23,6 +34,129 @@ fn fixture() -> Value {
     serde_json::from_str(&raw).expect("id_map_from_config.json parses")
 }
 
+struct Probe;
+
+#[async_trait]
+impl Module for Probe {
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn description(&self) -> &'static str {
+        "id-map probe"
+    }
+    async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        Ok(json!({}))
+    }
+}
+
+/// `driver_contract.config_map_entries`: `.py` becomes this SDK's `.rs`.
+fn map_document(entries: &[Value]) -> String {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            let file = entry["file"].as_str().expect("file");
+            let file = file
+                .strip_suffix(".py")
+                .map_or_else(|| file.to_string(), |stem| format!("{stem}.rs"));
+            json!({"file": file, "id": entry["id"]})
+        })
+        .collect();
+    serde_yaml_ng::to_string(&json!({ "mappings": entries })).expect("map serializes")
+}
+
+fn write_tree(root: &Path, case: &Value) {
+    std::fs::create_dir_all(root.join("ext/executor/orig")).expect("tree");
+    std::fs::write(root.join("ext/executor/orig/mod.rs"), "// probe").expect("module file");
+
+    let config_entries = case["input"]["config_map_entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| {
+            vec![json!({"file": "executor/orig/mod.py", "id": "executor.renamed.mod"})]
+        });
+    std::fs::write(root.join("map.yaml"), map_document(&config_entries)).expect("map.yaml");
+    std::fs::write(
+        root.join("explicit.yaml"),
+        map_document(&[json!({"file": "executor/orig/mod.py", "id": "executor.explicit.mod"})]),
+    )
+    .expect("explicit.yaml");
+
+    let mut document = json!({
+        "version": "1.0.0",
+        "project": {"name": "id-map-probe"},
+        "extensions": {"root": "./ext"}
+    });
+    if case["input"]["declare_override"]
+        .as_bool()
+        .expect("declare_override")
+    {
+        document["id_map"] = json!({"overrides": "./map.yaml"});
+    }
+    std::fs::write(
+        root.join("apcore.json"),
+        serde_json::to_string_pretty(&document).expect("document"),
+    )
+    .expect("apcore.json");
+}
+
+fn discovered_ids(case: &Value) -> HashSet<String> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_tree(dir.path(), case);
+
+    let env: Vec<(String, String)> = case["input"]["env"]
+        .as_object()
+        .map(|vars| {
+            vars.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().expect("env value").to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let previous_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(dir.path()).expect("enter the case root");
+    // SAFETY: this binary runs one test; nothing reads the environment
+    // concurrently.
+    unsafe { std::env::remove_var("APCORE_ID__MAP_OVERRIDES") };
+    for (key, value) in &env {
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    let result = {
+        let config = Config::load(Path::new("apcore.json")).expect("config loads");
+        let mut discoverer = apcore::registry::DefaultDiscoverer::from_config(&config)
+            .with_factory(Arc::new(|_file, _entry| {
+                Ok(Some(Arc::new(Probe) as Arc<dyn Module>))
+            }));
+        if case["input"]["explicit_argument"]
+            .as_bool()
+            .expect("explicit_argument")
+        {
+            discoverer = discoverer.with_id_map(Some("./explicit.yaml"));
+        }
+        let registry = Registry::new();
+        registry.set_extension_roots_from_config(&config);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(registry.discover(&discoverer))
+            .expect("discovery succeeds");
+        registry
+            .list(None, None, None)
+            .into_iter()
+            .collect::<HashSet<_>>()
+    };
+
+    for (key, _) in &env {
+        unsafe { std::env::remove_var(key) };
+    }
+    std::env::set_current_dir(previous_cwd).expect("restore cwd");
+    result
+}
+
 #[test]
 fn conformance_id_map_from_config() {
     let fx = fixture();
@@ -31,80 +165,12 @@ fn conformance_id_map_from_config() {
 
     for case in cases {
         let id = case["id"].as_str().expect("case id");
-        let declare = case["input"]["declare_override"]
-            .as_bool()
-            .expect("declare_override");
-        let explicit = case["input"]["explicit_argument"]
-            .as_bool()
-            .expect("explicit_argument");
-
-        let mut raw = serde_json::json!({
-            "version": "1.0",
-            "project": {"name": "id-map-probe"},
-            "extensions": {"root": "./ext"}
-        });
-        if declare {
-            raw["id_map"] = serde_json::json!({"overrides": "./map.yaml"});
-        }
-        let config: Config = serde_json::from_value(raw).expect("probe config parses");
-
-        let mut discoverer = apcore::registry::DefaultDiscoverer::from_config(&config);
-        if explicit {
-            discoverer = discoverer.with_id_map(Some("./explicit.yaml"));
-        }
-        let shown = format!("{discoverer:?}");
-
-        // Which map the discoverer will consult is what the fixture's
-        // `expected.module_ids` is a consequence of: `map.yaml` renames to
-        // `executor.renamed.mod`, `explicit.yaml` to `executor.explicit.mod`,
-        // and neither leaves `executor.orig.mod`. The match is exhaustive on
-        // purpose: a catch-all `None` arm read ANY other ID as "no map", so the
-        // no-override case passed whatever it expected.
-        let expected_id = case["expected"]["module_ids"][0]
-            .as_str()
-            .expect("module id");
-        let expected_map = match expected_id {
-            "executor.renamed.mod" => Some("map.yaml"),
-            "executor.explicit.mod" => Some("explicit.yaml"),
-            "executor.orig.mod" => None,
-            other => panic!("case {id}: no map in this driver yields {other}"),
-        };
-        match expected_map {
-            Some(name) => assert!(
-                shown.contains(name),
-                "case {id}: the discoverer must consult {name}: {shown}"
-            ),
-            None => assert!(
-                shown.contains("id_map_path: None"),
-                "case {id}: no map must be consulted: {shown}"
-            ),
-        }
+        let expected: HashSet<String> = case["expected"]["module_ids"]
+            .as_array()
+            .expect("module_ids")
+            .iter()
+            .map(|v| v.as_str().expect("id").to_string())
+            .collect();
+        assert_eq!(discovered_ids(case), expected, "case {id}");
     }
-}
-
-#[test]
-fn a_relative_override_uses_the_same_base_as_extensions_root() {
-    // §9.2.1 leaves the base for path-typed keys deliberately unspecified
-    // (#113): `acl.root` uses the config file's directory, `schema.root` the
-    // CWD. This key follows its SIBLING rather than settling that, because the
-    // two are halves of one discovery configuration — so the declared value is
-    // carried through unchanged rather than joined to the config's directory.
-    let raw = serde_json::json!({
-        "version": "1.0",
-        "project": {"name": "id-map-probe"},
-        "id_map": {"overrides": "./map.yaml"}
-    });
-    let config: Config = serde_json::from_value(raw).expect("probe config parses");
-    let shown = format!(
-        "{:?}",
-        apcore::registry::DefaultDiscoverer::from_config(&config)
-    );
-    assert!(
-        shown.contains("./map.yaml") || shown.contains("map.yaml"),
-        "the declared value must be carried through as-is: {shown}"
-    );
-    assert!(
-        !shown.contains("id-map-probe"),
-        "the config's own location must not be joined in: {shown}"
-    );
 }

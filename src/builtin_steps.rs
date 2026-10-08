@@ -236,6 +236,10 @@ impl Step for BuiltinContextCreation {
         // docs/features/execution-pipeline.md lists `context_creation` among
         // the non-removable steps for exactly this reason.
         ctx.context = ctx.context.child(&ctx.module_id);
+        ctx.context.cancel_token = Some(ctx.context.cancel_token.as_ref().map_or_else(
+            crate::cancel::CancelToken::new,
+            crate::cancel::CancelToken::child,
+        ));
 
         Ok(StepResult::continue_step())
     }
@@ -1205,12 +1209,22 @@ impl Step for BuiltinExecute {
         // D-11), fall back to `config.executor.default_timeout`. Both are
         // then clamped against the remaining global deadline below.
         // Spec: docs/features/core-executor.md §Step 8 (dual-timeout model).
-        let timeout_ms = resolve_effective_timeout_ms(
+        let timeout_ms = match resolve_effective_timeout_ms(
             ctx.registry.as_ref(),
             &ctx.module_id,
             ctx.context.global_deadline,
             config.executor.default_timeout,
-        )?;
+        ) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                if matches!(error.code, ErrorCode::ModuleTimeout) {
+                    if let Some(token) = &ctx.context.cancel_token {
+                        token.cancel();
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         // Note: Streaming is handled exclusively by `Executor::stream()`, which
         // bypasses this step entirely. `ctx.stream` is intentionally ignored
@@ -1228,14 +1242,31 @@ impl Step for BuiltinExecute {
         }
 
         let execute_result = if timeout_ms > 0 {
-            match tokio::time::timeout(
-                Duration::from_millis(timeout_ms),
-                module.execute(ctx.inputs.clone(), &ctx.context),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => Err(ModuleError::module_timeout(&ctx.module_id, timeout_ms)),
+            // Own the invocation: timeout must not drop module code before cleanup.
+            let inputs = ctx.inputs.clone();
+            let context = ctx.context.clone();
+            let invocation = tokio::spawn(async move {
+                let result = module.execute(inputs, &context).await;
+                if let Err(error) = &result {
+                    tracing::debug!(
+                        code = error.code.wire_str(),
+                        "Module invocation finished with an error"
+                    );
+                }
+                result
+            });
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), invocation).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(ModuleError::new(
+                    ErrorCode::GeneralInternalError,
+                    format!("Module execution task failed: {error}"),
+                )),
+                Err(_elapsed) => {
+                    if let Some(token) = &ctx.context.cancel_token {
+                        token.cancel();
+                    }
+                    Err(ModuleError::module_timeout(&ctx.module_id, timeout_ms))
+                }
             }
         } else {
             module.execute(ctx.inputs.clone(), &ctx.context).await

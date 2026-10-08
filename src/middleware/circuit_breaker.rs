@@ -1,5 +1,5 @@
 // APCore Protocol — CircuitBreakerMiddleware (Issue #42)
-// Spec reference: middleware-system.md §1.2 CircuitBreakerMiddleware
+// Spec reference: middleware-system.md §CircuitBreakerMiddleware
 //
 // Tracks per-(module_id, caller_id) error rates over a rolling window. When
 // the error rate exceeds `open_threshold`, the circuit transitions to OPEN

@@ -142,6 +142,17 @@ struct BatchInner {
 pub struct BatchSpanProcessor {
     tx: mpsc::Sender<Span>,
     inner: Arc<BatchInner>,
+    /// Shared by every clone and never by the worker, so its `Drop` runs when
+    /// the LAST handle goes. The documented wiring hands a clone to the
+    /// middleware and drops the original, and the worker must outlive that
+    /// drop for as long as the middleware can still feed it.
+    _last_handle: Arc<LastHandle>,
+}
+
+/// Signals the worker to flush and exit once no handle remains.
+#[derive(Debug)]
+struct LastHandle {
+    inner: Arc<BatchInner>,
 }
 
 impl BatchSpanProcessor {
@@ -195,7 +206,14 @@ impl BatchSpanProcessor {
             );
         }
 
-        Self { tx, inner }
+        let last_handle = Arc::new(LastHandle {
+            inner: Arc::clone(&inner),
+        });
+        Self {
+            tx,
+            inner,
+            _last_handle: last_handle,
+        }
     }
 
     /// Number of spans currently held in the queue (best-effort, non-locking).
@@ -354,7 +372,7 @@ impl SpanExporter for BatchSpanProcessor {
     }
 }
 
-impl Drop for BatchSpanProcessor {
+impl Drop for LastHandle {
     fn drop(&mut self) {
         // Avoid leaking the background task if the user drops every clone
         // without ever calling shutdown(). We can't await here, so we just

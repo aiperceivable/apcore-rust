@@ -64,14 +64,22 @@ pub struct MiddlewareManager {
     /// and `remove(name)` drops the first in pipeline order rather than the one
     /// the caller holds (sync finding A-C-001).
     handles: Mutex<Vec<MiddlewareHandle>>,
-    /// The identity `add_with_opts` computed for each registration, parallel to
+    /// The duplicate-detection identity of each registration, parallel to
     /// `handles`, so `remove` / `remove_handle` can clear the right entry
     /// (D-114). The identity depends on an optional `identity_key` override
     /// that is an option of the call and is not recoverable from the instance.
-    identities: Mutex<Vec<String>>,
+    /// `None` for a registration made without duplicate detection.
+    identities: Mutex<Vec<Option<String>>>,
     next_handle: AtomicU64,
     /// Tracks identity -> first registration location hint for duplicate detection.
     registered_identities: Mutex<HashMap<String, String>>,
+}
+
+/// The duplicate-detection half of one registration.
+struct Registration {
+    identity: String,
+    allow_duplicate: bool,
+    location: String,
 }
 
 /// Opaque token identifying one middleware registration, returned by
@@ -130,6 +138,41 @@ impl MiddlewareManager {
         &self,
         middleware: Arc<dyn Middleware>,
     ) -> Result<MiddlewareHandle, ModuleError> {
+        self.insert(middleware, None)
+    }
+
+    /// Add a middleware, warning when one with the same `name()` is already
+    /// registered — the duplicate detection apcore-python and
+    /// apcore-typescript apply to every `use()`. Registration always succeeds.
+    ///
+    /// The identity is the middleware's `name()`: a `Box<dyn Middleware>` no
+    /// longer names its concrete type. Use [`Self::add_with_opts`] with an
+    /// `identity_key` to register two instances deliberately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModuleError`] if the middleware's priority exceeds 1000.
+    #[track_caller]
+    pub fn add_detecting_duplicates(
+        &self,
+        middleware: Box<dyn Middleware>,
+    ) -> Result<MiddlewareHandle, ModuleError> {
+        let identity = middleware.name().to_string();
+        let registration = Registration {
+            identity,
+            allow_duplicate: false,
+            location: std::panic::Location::caller().to_string(),
+        };
+        self.insert(Arc::from(middleware), Some(registration))
+    }
+
+    /// Insert in priority order, recording the registration's identity at the
+    /// same position so `remove` / `remove_handle` clear the right entry.
+    fn insert(
+        &self,
+        middleware: Arc<dyn Middleware>,
+        registration: Option<Registration>,
+    ) -> Result<MiddlewareHandle, ModuleError> {
         let priority = middleware.priority();
         if priority > 1000 {
             tracing::warn!(
@@ -147,9 +190,13 @@ impl MiddlewareManager {
                 ),
             ));
         }
+        let identity = registration.map(|r| {
+            self.note_identity(&r);
+            r.identity
+        });
         let mut mws = self.middlewares.lock();
         let mut handles = self.handles.lock();
-        let arc: Arc<dyn Middleware> = middleware;
+        let mut identities = self.identities.lock();
         // Find the first position where existing priority is strictly less than
         // the new priority. Insert before that position to maintain stable
         // ordering (later registrations go after earlier ones at same priority).
@@ -158,9 +205,36 @@ impl MiddlewareManager {
             .position(|m| m.priority() < priority)
             .unwrap_or(mws.len());
         let handle = MiddlewareHandle(self.next_handle.fetch_add(1, Ordering::SeqCst));
-        mws.insert(pos, arc);
+        mws.insert(pos, middleware);
         handles.insert(pos, handle);
+        identities.insert(pos, identity);
         Ok(handle)
+    }
+
+    /// Record an identity on first sight and warn on a later duplicate.
+    ///
+    /// A-D-020: the identity is recorded regardless of `allow_duplicate`; only
+    /// the WARNING is suppressed by it, so a first registration made with
+    /// `allow_duplicate(true)` still makes a later one detectable. Mirrors
+    /// apcore-python (`if first_site is None: record`) and apcore-typescript
+    /// (identity recorded even when allowDuplicate is true).
+    fn note_identity(&self, registration: &Registration) {
+        let mut ids = self.registered_identities.lock();
+        match ids.get(&registration.identity) {
+            Some(first_site) => {
+                if !registration.allow_duplicate {
+                    tracing::warn!(
+                        identity = %registration.identity,
+                        first_registration = %first_site,
+                        duplicate_registration = %registration.location,
+                        "duplicate middleware registration detected"
+                    );
+                }
+            }
+            None => {
+                ids.insert(registration.identity.clone(), registration.location.clone());
+            }
+        }
     }
 
     /// Register a middleware with duplicate-detection options.
@@ -178,41 +252,15 @@ impl MiddlewareManager {
         &self,
         opts: MiddlewareRegistration<M>,
     ) -> Result<MiddlewareHandle, ModuleError> {
-        let location = std::panic::Location::caller().to_string();
-        let identity = opts
-            .identity_key
-            .clone()
-            .unwrap_or_else(|| std::any::type_name::<M>().to_string());
-
-        // A-D-020: always record the identity on first sight, regardless of
-        // `allow_duplicate`. Only the WARNING is suppressed by `allow_duplicate`
-        // — not the recording. Previously the recording lived inside the
-        // `if !allow_duplicate` guard, so a first registration via
-        // `allow_duplicate(true)` was never recorded and a subsequent
-        // non-allow-duplicate registration could not be detected as a duplicate.
-        // Mirrors apcore-python (`if first_site is None: record`) and
-        // apcore-typescript (identity recorded even when allowDuplicate is true).
-        {
-            let mut ids = self.registered_identities.lock();
-            match ids.get(&identity) {
-                Some(first_site) => {
-                    if !opts.allow_duplicate {
-                        tracing::warn!(
-                            identity = %identity,
-                            first_registration = %first_site,
-                            duplicate_registration = %location,
-                            "duplicate middleware registration detected"
-                        );
-                    }
-                }
-                None => {
-                    ids.insert(identity.clone(), location);
-                }
-            }
-        }
-
-        self.identities.lock().push(identity);
-        self.add(Box::new(opts.middleware))
+        let registration = Registration {
+            identity: opts
+                .identity_key
+                .clone()
+                .unwrap_or_else(|| std::any::type_name::<M>().to_string()),
+            allow_duplicate: opts.allow_duplicate,
+            location: std::panic::Location::caller().to_string(),
+        };
+        self.insert(Arc::new(opts.middleware), Some(registration))
     }
 
     /// Returns `true` if `identity` (an explicit `identity_key` or a type name)
@@ -266,8 +314,13 @@ impl MiddlewareManager {
         if index >= identities.len() {
             return;
         }
-        let identity = identities.remove(index);
-        if !identities.contains(&identity) {
+        let Some(identity) = identities.remove(index) else {
+            return;
+        };
+        if !identities
+            .iter()
+            .any(|i| i.as_deref() == Some(identity.as_str()))
+        {
             self.registered_identities.lock().remove(&identity);
         }
     }

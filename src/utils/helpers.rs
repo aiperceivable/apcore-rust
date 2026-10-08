@@ -369,33 +369,40 @@ pub fn guard_call_chain_with_repeat<T>(
 /// Convert a single segment to `snake_case` by detecting case boundaries.
 ///
 /// Matches Algorithm A02 from the apcore protocol spec:
-/// - Inserts `_` before an uppercase letter preceded by a lowercase/digit.
+/// - Leaves segments with no ASCII uppercase byte-for-byte unchanged.
+/// - Inserts `_` before an ASCII uppercase letter preceded by an ASCII lowercase/digit.
 /// - Inserts `_` between consecutive uppercase letters when followed by a lowercase letter
 ///   (e.g., "`HTTPClient`" -> "`http_client`", "`HTMLParser`" -> "`html_parser`").
-/// - Collapses any resulting double underscores.
+/// - Converts ASCII uppercase letters only and never repairs separators.
 fn to_snake_case(segment: &str) -> String {
+    if !segment.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return segment.to_owned();
+    }
+
     let chars: Vec<char> = segment.chars().collect();
     let mut result = String::with_capacity(segment.len() + 4);
 
     for (i, &ch) in chars.iter().enumerate() {
         if i > 0 {
             let prev = chars[i - 1];
-            let boundary = if (prev.is_lowercase() || prev.is_ascii_digit()) && ch.is_uppercase() {
+            let boundary = if (prev.is_ascii_lowercase() || prev.is_ascii_digit())
+                && ch.is_ascii_uppercase()
+            {
                 true
             } else {
-                prev.is_uppercase()
-                    && ch.is_uppercase()
+                prev.is_ascii_uppercase()
+                    && ch.is_ascii_uppercase()
                     && i + 1 < chars.len()
-                    && chars[i + 1].is_lowercase()
+                    && chars[i + 1].is_ascii_lowercase()
             };
             if boundary {
                 result.push('_');
             }
         }
-        result.push(ch.to_lowercase().next().unwrap_or(ch));
+        result.push(ch.to_ascii_lowercase());
     }
 
-    result.replace("__", "_")
+    result
 }
 
 /// Supported source languages for [`normalize_to_canonical_id`], with their

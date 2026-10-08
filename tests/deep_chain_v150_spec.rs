@@ -130,6 +130,8 @@ spec_version: "1.0"
 bindings:
   - module_id: executor.dec002.report
     target: "reports:build"
+    input_schema: {type: object}
+    output_schema: {type: object}
     description: "Build a report"
     annotations:
       readonly: true
@@ -153,6 +155,8 @@ spec_version: "1.0"
 bindings:
   - module_id: executor.dec002.stream_claim
     target: "reports:stream"
+    input_schema: {type: object}
+    output_schema: {type: object}
     description: "Claims to stream"
     annotations:
       streaming: true

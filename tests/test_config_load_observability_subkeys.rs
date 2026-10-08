@@ -460,9 +460,8 @@ fn absent_observability_block_falls_back_to_defaults() {
     );
     assert_eq!(
         config.get("observability.logging.enabled"),
-        Some(json!(true)),
-        "resolved from the §9.15.2 registration defaults, matching what \
-         apcore-python and apcore-typescript answer for the same document"
+        None,
+        "logging is not part of the §9.15.2 observability namespace"
     );
     assert_eq!(
         config.get("observability").is_some(),
@@ -479,10 +478,9 @@ fn absent_observability_block_falls_back_to_defaults() {
     );
 
     let ns = config.namespace("observability");
-    assert_eq!(
-        ns["logging"]["enabled"],
-        json!(true),
-        "with nothing loaded, namespace() is the registered §9.15.2 default"
+    assert!(
+        ns.get("logging").is_none(),
+        "with nothing loaded, namespace() exposes only its registered blocks"
     );
     assert_eq!(ns["tracing"]["strategy"], json!("full"));
     assert_eq!(ns["metrics"]["exporter"], json!("stdout"));
@@ -505,17 +503,14 @@ fn empty_observability_block_is_inert() {
     );
     assert_eq!(
         config.get("observability.logging.enabled"),
-        Some(json!(true)),
-        "an empty block overlays nothing, so the §9.15.2 registration default \
-         stands in `get` as it does in `namespace` — and as it does in \
-         apcore-python and apcore-typescript"
+        None,
+        "an empty block does not invent a logging configuration family"
     );
 
     let ns = config.namespace("observability");
-    assert_eq!(
-        ns["logging"]["enabled"],
-        json!(true),
-        "an empty block overlays nothing, so the registered defaults stand"
+    assert!(
+        ns.get("logging").is_none(),
+        "an empty block exposes only the registered defaults"
     );
     assert_eq!(ns["tracing"]["strategy"], json!("full"));
 }

@@ -34,8 +34,8 @@ impl SpanExporter for StdoutExporter {
     }
 }
 
-/// Default maximum spans for `InMemoryExporter`.
-const DEFAULT_MAX_SPANS: usize = 1000;
+/// Default maximum spans for `InMemoryExporter`, as in apcore-python and apcore-typescript.
+const DEFAULT_MAX_SPANS: usize = 10_000;
 
 /// Exports spans to an in-memory buffer for testing.
 #[derive(Debug, Clone)]
@@ -98,6 +98,10 @@ impl SpanExporter for InMemoryExporter {
 }
 
 /// Exports spans to an OTLP-compatible endpoint.
+///
+/// `endpoint` is the full OTLP/HTTP traces URL — `http://host:4318/v1/traces`,
+/// the shape `observability.tracing.otlp_endpoint` and its default carry, and
+/// the one apcore-python and apcore-typescript post to. It is used as given.
 #[derive(Debug)]
 pub struct OTLPExporter {
     pub endpoint: String,
@@ -160,7 +164,7 @@ impl SpanExporter for OTLPExporter {
             }]
         });
         client
-            .post(format!("{}/v1/traces", self.endpoint))
+            .post(&self.endpoint)
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()

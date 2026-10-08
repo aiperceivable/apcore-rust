@@ -435,6 +435,21 @@ struct RegistryCore {
     lowercase_map: HashMap<String, String>,
     /// Cached JSON schemas for registered modules.
     schema_cache: HashMap<String, serde_json::Value>,
+    /// Every version of a module registered more than once through
+    /// [`Registry::register_versioned`]. `modules` / `descriptors` hold the
+    /// highest of them, which is what `get` returns (it takes no version hint,
+    /// D-126).
+    versions: HashMap<String, Vec<VersionEntry>>,
+    /// `DiscoveredModule::source` of every module registered by discovery, so
+    /// the file watcher can tell which module a changed or removed file is.
+    sources: HashMap<String, String>,
+}
+
+/// One registered version of a multi-version module.
+struct VersionEntry {
+    version: String,
+    module: Arc<dyn Module>,
+    descriptor: ModuleDescriptor,
 }
 
 impl RegistryCore {
@@ -446,6 +461,8 @@ impl RegistryCore {
             draining: HashSet::new(),
             lowercase_map: HashMap::new(),
             schema_cache: HashMap::new(),
+            versions: HashMap::new(),
+            sources: HashMap::new(),
         }
     }
 }
@@ -525,6 +542,23 @@ pub struct Registry {
 struct DiscovererRestoreGuard<'a> {
     slot: &'a RwLock<Option<Arc<dyn Discoverer>>>,
     discoverer: Option<Arc<dyn Discoverer>>,
+}
+
+/// A watched path in the form the platform watcher reports it.
+///
+/// Watchers report resolved paths (`/private/var/...` on macOS for a root under
+/// `/var/...`), so both sides of a comparison are canonicalised. A removed file
+/// can no longer be canonicalised, so its parent is instead.
+fn normalize_watched_path(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            std::fs::canonicalize(parent).map_or_else(|_| path.to_path_buf(), |dir| dir.join(name))
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 impl Drop for DiscovererRestoreGuard<'_> {
@@ -685,7 +719,18 @@ impl Registry {
         module: Box<dyn Module>,
         descriptor: ModuleDescriptor,
     ) -> Result<(), ModuleError> {
-        self.register_core(name, module.into(), descriptor, false, true)
+        self.register_with_context(name, module, descriptor, None)
+    }
+
+    /// Register a module with caller context for ephemeral audit events.
+    pub fn register_with_context(
+        &self,
+        name: &str,
+        module: Box<dyn Module>,
+        descriptor: ModuleDescriptor,
+        context: Option<&crate::Context<serde_json::Value>>,
+    ) -> Result<(), ModuleError> {
+        self.register_core_with_context(name, module.into(), descriptor, false, true, context)
     }
 
     /// Register a module — **spec-compliant two-argument form**.
@@ -700,6 +745,16 @@ impl Registry {
     /// When you need a custom descriptor, use
     /// [`register`](Self::register) (the three-argument extended form).
     pub fn register_module(&self, name: &str, module: Box<dyn Module>) -> Result<(), ModuleError> {
+        self.register_module_with_context(name, module, None)
+    }
+
+    /// Register a module with inferred descriptor and contextual audit metadata.
+    pub fn register_module_with_context(
+        &self,
+        name: &str,
+        module: Box<dyn Module>,
+        context: Option<&crate::Context<serde_json::Value>>,
+    ) -> Result<(), ModuleError> {
         // Read the module's declarations ONCE: `metadata` also feeds
         // `dependencies` below, and `register_core` derives `sunset_date` from
         // `metadata["x-deprecation"]`.
@@ -759,7 +814,7 @@ impl Registry {
             dependencies: dependencies_from_metadata(&metadata),
             enabled: true,
         };
-        self.register(name, module, descriptor)
+        self.register_with_context(name, module, descriptor, context)
     }
 
     /// Register a module with explicit version and metadata — the
@@ -850,7 +905,101 @@ impl Registry {
             dependencies,
             enabled: true,
         };
+        // Multi-version coexistence (§5.4), as apcore-python registers it: an
+        // explicit version of an ID that is already registered is another
+        // version, not a duplicate.
+        if version.is_some_and(|v| !v.is_empty()) && self.has(name) {
+            return self.add_version(name, module.into(), descriptor);
+        }
         self.register(name, module, descriptor)
+    }
+
+    /// Add another version of a registered module. The highest version is the
+    /// one [`get`](Self::get) and [`get_definition`](Self::get_definition)
+    /// return; registering the same version twice is a duplicate.
+    fn add_version(
+        &self,
+        name: &str,
+        module: Arc<dyn Module>,
+        descriptor: ModuleDescriptor,
+    ) -> Result<(), ModuleError> {
+        let mut descriptor = descriptor;
+        self.check_registration(name, &module, &mut descriptor, false, true)?;
+        let version = descriptor.version.clone();
+        let duplicate = || {
+            ModuleError::new(
+                crate::errors::ErrorCode::DuplicateModuleId,
+                format!("Module '{name}' version '{version}' is already registered"),
+            )
+        };
+        if self.version_registered(name, &version) {
+            return Err(duplicate());
+        }
+
+        if let Err(e) = module.on_load() {
+            self.emit_module_load_failed(name, &e);
+            return Err(e);
+        }
+
+        {
+            let mut core = self.core.write();
+            let (Some(current), Some(current_descriptor)) = (
+                core.modules.get(name).cloned(),
+                core.descriptors.get(name).cloned(),
+            ) else {
+                // Unregistered while `on_load` ran: this is a first registration.
+                drop(core);
+                return self.register_core(name, module, descriptor, false, false);
+            };
+            let entries = core.versions.entry(name.to_string()).or_insert_with(|| {
+                vec![VersionEntry {
+                    version: current_descriptor.version.clone(),
+                    module: current,
+                    descriptor: current_descriptor,
+                }]
+            });
+            if entries.iter().any(|e| e.version == version) {
+                return Err(duplicate());
+            }
+            entries.push(VersionEntry {
+                version,
+                module: Arc::clone(&module),
+                descriptor,
+            });
+            let latest = entries
+                .iter()
+                .max_by_key(|e| crate::registry::version::parse_semver(&e.version))
+                .map(|e| (Arc::clone(&e.module), e.descriptor.clone()));
+            if let Some((latest_module, latest_descriptor)) = latest {
+                core.schema_cache.insert(
+                    name.to_string(),
+                    serde_json::json!({
+                        "input": latest_descriptor.input_schema,
+                        "output": latest_descriptor.output_schema,
+                    }),
+                );
+                core.modules.insert(name.to_string(), latest_module);
+                core.descriptors.insert(name.to_string(), latest_descriptor);
+            }
+        }
+
+        for cb in self.snapshot_callbacks("register") {
+            cb(name, module.as_ref());
+        }
+        Ok(())
+    }
+
+    /// Whether `version` of `name` is registered, as the primary entry or as
+    /// one of several versions.
+    fn version_registered(&self, name: &str, version: &str) -> bool {
+        let core = self.core.read();
+        match core.versions.get(name) {
+            Some(entries) => entries.iter().any(|e| e.version == version),
+            None => core
+                .descriptors
+                .get(name)
+                .is_some_and(|d| d.version == version),
+        }
     }
 
     /// Unregister a module by name.
@@ -872,6 +1021,15 @@ impl Registry {
     /// `Result<bool, ModuleError>` in this version. Callers should check the
     /// bool rather than treating `Ok(())` as success.
     pub fn unregister(&self, name: &str) -> Result<bool, ModuleError> {
+        self.unregister_with_context(name, None)
+    }
+
+    /// Unregister with caller context for ephemeral audit events.
+    pub fn unregister_with_context(
+        &self,
+        name: &str,
+        context: Option<&crate::Context<serde_json::Value>>,
+    ) -> Result<bool, ModuleError> {
         let removed: Arc<dyn Module> = {
             let mut core = self.core.write();
             let Some(module) = core.modules.remove(name) else {
@@ -880,6 +1038,8 @@ impl Registry {
             core.descriptors.remove(name);
             core.lowercase_map.remove(&name.to_lowercase());
             core.schema_cache.remove(name);
+            core.versions.remove(name);
+            core.sources.remove(name);
             core.ref_counts.remove(name);
             core.draining.remove(name);
             module
@@ -893,6 +1053,7 @@ impl Registry {
         for cb in self.snapshot_callbacks("unregister") {
             cb(name, removed.as_ref());
         }
+        self.emit_ephemeral_event("apcore.registry.module_unregistered", name, context);
 
         Ok(true)
     }
@@ -965,7 +1126,7 @@ impl Registry {
     /// * `tags` - When supplied, only modules carrying *all* of the given tags are returned.
     /// * `prefix` - When supplied, only IDs starting with the prefix are returned.
     /// * `visibility` - Filter by module visibility. Supported: `["public", "hidden"]`.
-    ///   Defaults to `["public"]`. Aligned with apcore D-24.
+    ///   Defaults to `["public"]` — protocol-spec §4.4 `discoverable`.
     ///
     /// Aligned with apcore-python `Registry.list(...)` (default
     /// `visibility=["public"]`).
@@ -1061,10 +1222,14 @@ impl Registry {
     ///
     /// Aligned with `apcore-python.Registry._discover_custom` and
     /// `apcore-typescript.Registry._discoverCustom` — same skip-and-warn
-    /// semantics for malformed entries.
+    /// semantics for malformed entries, and the same roots: the registry's
+    /// [`extension_roots`](Self::extension_roots), which a filesystem
+    /// discoverer such as [`DefaultDiscoverer`](crate::DefaultDiscoverer)
+    /// scans and nothing else.
     #[allow(clippy::similar_names)] // `discoverer` (param) and `discovered` (result) are semantically distinct
     pub async fn discover(&self, discoverer: &dyn Discoverer) -> Result<usize, ModuleError> {
-        let discovered = discoverer.discover(&[]).await?;
+        let roots = self.extension_roots.read().clone();
+        let discovered = discoverer.discover(&roots).await?;
         Ok(self.register_discovered(discovered))
     }
 
@@ -1089,7 +1254,7 @@ impl Registry {
     ) -> Result<(), ModuleError> {
         if is_ephemeral_module_id(name) {
             return Err(ModuleError::new(
-                crate::errors::ErrorCode::GeneralInvalidInput,
+                crate::errors::ErrorCode::InvalidModuleId,
                 format!(
                     "ephemeral.* module IDs must be registered via Registry::register(), \
                      not register_internal(). See protocol-spec §2.5.1 \
@@ -1296,25 +1461,25 @@ impl Registry {
         self.register_core(name, module, descriptor, true, false)
     }
 
-    #[allow(clippy::too_many_lines)] // one atomic register path: conflict detection, in_flight reservation, lock-free on_load, and the re-checked publish/rollback must stay together to preserve the lock-ordering and single-winner invariants
-    fn register_core(
+    /// The checks every registration path runs before `on_load`: the ID,
+    /// deprecation metadata, the streaming marker and the custom validator.
+    fn check_registration(
         &self,
         name: &str,
-        module: Arc<dyn Module>,
-        descriptor: ModuleDescriptor,
+        module: &Arc<dyn Module>,
+        descriptor: &mut ModuleDescriptor,
         allow_reserved: bool,
         run_validator: bool,
     ) -> Result<(), ModuleError> {
         validate_module_id(name, allow_reserved)?;
 
-        let mut descriptor = descriptor;
-        Self::apply_deprecation_metadata(&mut descriptor);
+        Self::apply_deprecation_metadata(descriptor);
 
         // Ephemeral RFC pilot: emit a soft tracing::warn when an ephemeral.*
         // module lacks requires_approval=true. Does NOT fail the registration —
         // the audit-emit single-emit rule fires later via the sys_modules bridge.
         if is_ephemeral_module_id(name) {
-            Self::warn_if_missing_approval(name, module.as_ref(), &descriptor);
+            Self::warn_if_missing_approval(name, module.as_ref(), descriptor);
         }
 
         // Issue #62: if annotations declare streaming=true, the module MUST implement
@@ -1333,10 +1498,13 @@ impl Registry {
             // `validate()` call happens without any Registry lock held.
             let validator_snapshot = self.validator.read().as_ref().map(Arc::clone);
             if let Some(validator) = validator_snapshot {
-                let result = validator.validate(module.as_ref(), Some(&descriptor));
+                let result = validator.validate(module.as_ref(), Some(descriptor));
                 if !result.valid {
+                    // A rejected module is invalid input to `register`, the
+                    // code apcore-python and apcore-typescript raise; nothing
+                    // failed to load.
                     return Err(ModuleError::new(
-                        crate::errors::ErrorCode::ModuleLoadError,
+                        crate::errors::ErrorCode::GeneralInvalidInput,
                         format!(
                             "Module '{}' failed validation: {}",
                             name,
@@ -1346,6 +1514,46 @@ impl Registry {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // one atomic register path: conflict detection, in_flight reservation, lock-free on_load, and the re-checked publish/rollback must stay together to preserve the lock-ordering and single-winner invariants
+    fn register_core(
+        &self,
+        name: &str,
+        module: Arc<dyn Module>,
+        descriptor: ModuleDescriptor,
+        allow_reserved: bool,
+        run_validator: bool,
+    ) -> Result<(), ModuleError> {
+        self.register_core_with_context(
+            name,
+            module,
+            descriptor,
+            allow_reserved,
+            run_validator,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // publication and lifecycle cleanup preserve one atomic registration operation
+    fn register_core_with_context(
+        &self,
+        name: &str,
+        module: Arc<dyn Module>,
+        descriptor: ModuleDescriptor,
+        allow_reserved: bool,
+        run_validator: bool,
+        context: Option<&crate::Context<serde_json::Value>>,
+    ) -> Result<(), ModuleError> {
+        let mut descriptor = descriptor;
+        self.check_registration(
+            name,
+            &module,
+            &mut descriptor,
+            allow_reserved,
+            run_validator,
+        )?;
 
         // Issue #65: deferred-publish — run conflict detection first (under
         // core.read() to avoid holding write for long), then atomically reserve
@@ -1438,6 +1646,7 @@ impl Registry {
                 for cb in self.snapshot_callbacks("register") {
                     cb(name, module_clone.as_ref());
                 }
+                self.emit_ephemeral_event("apcore.registry.module_registered", name, context);
                 Ok(())
             }
             Err(e) => {
@@ -1457,6 +1666,45 @@ impl Registry {
                 self.emit_module_load_failed(name, &e);
                 // Re-raise the original error unchanged.
                 Err(e)
+            }
+        }
+    }
+
+    fn emit_ephemeral_event(
+        &self,
+        event_type: &str,
+        name: &str,
+        context: Option<&crate::Context<serde_json::Value>>,
+    ) {
+        if !is_ephemeral_module_id(name) {
+            return;
+        }
+        let Some(emitter) = self.event_emitter.read().clone() else {
+            return;
+        };
+        // Attribute bags may contain arbitrary credentials; omit them from the snapshot.
+        let identity = context
+            .and_then(|context| context.identity.as_ref())
+            .map_or(serde_json::Value::Null, |identity| {
+                serde_json::json!({
+                    "id":identity.id(), "type":identity.identity_type(), "roles":identity.roles(),
+                })
+            });
+        let payload = serde_json::json!({"namespace_class":"ephemeral", "identity":identity,
+            "caller_id":context.and_then(|context| context.caller_id.as_deref())
+                .unwrap_or(crate::acl::EXTERNAL_CALLER)});
+        let event = ApCoreEvent::with_module(event_type, payload, name, "info");
+        if tokio::runtime::Handle::try_current().is_ok() {
+            emitter.emit_delivery_semantics(event);
+        } else {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(emitter.emit(&event)),
+                Err(error) => {
+                    tracing::error!(error = %error, "Failed to initialize registry audit runtime");
+                }
             }
         }
     }
@@ -1789,11 +2037,13 @@ impl Registry {
         self.discover_internal().await
     }
 
-    /// Filesystem watching (stub — filesystem watching is not implemented on apcore-rust).
+    /// Watch the extension roots and apply file changes to the registry.
     ///
-    /// Watches every path in `extension_roots` recursively. File create / modify
-    /// / remove events trigger a debounced (300ms) call to
-    /// [`Self::discover_internal`]. Cross-language parity with apcore-python's
+    /// Watches every path in `extension_roots` recursively. File events are
+    /// debounced (300ms) and then applied through the configured discoverer:
+    /// a new module file is registered, a changed one REPLACES its registered
+    /// module (`on_suspend` → unregister → register → `on_resume`), and a
+    /// removed one is unregistered. Cross-language parity with apcore-python's
     /// `watchdog`-based watcher and apcore-typescript's `fs.watch` watcher
     /// (sync finding A-D-010).
     ///
@@ -1875,49 +2125,141 @@ impl Registry {
         Ok(())
     }
 
-    /// Background task body that consumes notify events and triggers a
-    /// debounced re-discovery. Exits when the receiver channel closes or the
-    /// `Weak<Registry>` can no longer be upgraded.
+    /// Background task body that consumes notify events and applies each
+    /// debounced batch of changed paths. Exits when the receiver channel
+    /// closes or the `Weak<Registry>` can no longer be upgraded.
     async fn watch_loop(
         mut rx: tokio::sync::mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
         weak: std::sync::Weak<Self>,
     ) {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         const DEBOUNCE: Duration = Duration::from_millis(300);
-        let mut last_trigger = Instant::now()
-            .checked_sub(DEBOUNCE)
-            .unwrap_or_else(Instant::now);
+
+        fn relevant(event: &notify::Event) -> bool {
+            matches!(
+                event.kind,
+                notify::EventKind::Create(_)
+                    | notify::EventKind::Modify(_)
+                    | notify::EventKind::Remove(_)
+            )
+        }
 
         while let Some(res) = rx.recv().await {
             let Ok(event) = res else {
                 continue;
             };
-            // Only react to lifecycle-relevant events
-            match event.kind {
-                notify::EventKind::Create(_)
-                | notify::EventKind::Modify(_)
-                | notify::EventKind::Remove(_) => {}
-                _ => continue,
-            }
-
-            // Per-event debounce — collapse rapid bursts (editors writing
-            // through temp file + rename) into a single re-discovery.
-            if last_trigger.elapsed() < DEBOUNCE {
+            if !relevant(&event) {
                 continue;
             }
-            last_trigger = Instant::now();
+            // Collapse a burst (editors writing through temp file + rename)
+            // into one pass, keeping every path the burst touched.
+            let mut paths: Vec<std::path::PathBuf> = event.paths;
+            while let Ok(Some(res)) = tokio::time::timeout(DEBOUNCE, rx.recv()).await {
+                if let Ok(event) = res {
+                    if relevant(&event) {
+                        paths.extend(event.paths);
+                    }
+                }
+            }
 
             let Some(reg) = weak.upgrade() else {
                 break;
             };
-            if let Err(e) = reg.discover_internal().await {
+            if let Err(e) = reg.apply_file_changes(&paths).await {
                 tracing::warn!(
                     error = %e.message,
-                    "Registry watch: discover_internal failed during hot-reload"
+                    "Registry watch: applying file changes failed during hot-reload"
                 );
             }
         }
+    }
+
+    /// Apply a batch of changed file paths: register new modules, replace the
+    /// modules whose source (or `_meta.yaml` sidecar) changed, and unregister
+    /// those whose source file is gone.
+    async fn apply_file_changes(&self, paths: &[std::path::PathBuf]) -> Result<(), ModuleError> {
+        let changed: HashSet<std::path::PathBuf> =
+            paths.iter().map(|p| normalize_watched_path(p)).collect();
+        let touches = |source: &str| {
+            let source = normalize_watched_path(std::path::Path::new(source));
+            if changed.contains(&source) {
+                return true;
+            }
+            let (Some(dir), Some(stem)) = (source.parent(), source.file_stem()) else {
+                return false;
+            };
+            changed.contains(&dir.join(format!("{}_meta.yaml", stem.to_string_lossy())))
+        };
+
+        let discovered = self.run_discoverer().await?;
+
+        let removed: Vec<String> = {
+            let core = self.core.read();
+            core.sources
+                .iter()
+                .filter(|(id, source)| {
+                    !std::path::Path::new(source).exists()
+                        && touches(source)
+                        && !discovered.iter().any(|dm| &dm.name == *id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in removed {
+            self.safe_unregister(&id, 5000).await?;
+        }
+
+        let mut new_modules = Vec::new();
+        for dm in discovered {
+            if !self.has(&dm.name) {
+                new_modules.push(dm);
+            } else if touches(&dm.source) {
+                self.replace_discovered(dm).await?;
+            }
+        }
+        self.register_discovered(new_modules);
+        Ok(())
+    }
+
+    /// Replace a registered module with a freshly discovered instance,
+    /// handing its `on_suspend` state to the new instance's `on_resume`. The
+    /// previous instance is put back if the new one fails to register.
+    async fn replace_discovered(&self, dm: DiscoveredModule) -> Result<(), ModuleError> {
+        let name = dm.name.clone();
+        let previous = self.get(&name)?;
+        let previous_descriptor = self.get_definition(&name)?;
+        let state = previous.as_ref().and_then(|module| {
+            let module = Arc::clone(module);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || module.on_suspend()))
+                .unwrap_or_else(|_| {
+                    tracing::warn!(module_id = %name, "Module on_suspend panicked; continuing reload");
+                    None
+                })
+        });
+
+        self.safe_unregister(&name, 5000).await?;
+        if self.register_discovered(vec![dm]) == 0 {
+            tracing::warn!(
+                module_id = %name,
+                "Registry watch: the changed module failed to register; keeping the previous instance"
+            );
+            if let (Some(module), Some(descriptor)) = (previous, previous_descriptor) {
+                self.reinstate_internal(&name, module, descriptor)?;
+            }
+            return Ok(());
+        }
+
+        if let (Some(state), Ok(Some(module))) = (state, self.get(&name)) {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                module.on_resume(state);
+            }))
+            .is_err()
+            {
+                tracing::warn!(module_id = %name, "Module on_resume panicked; reload still applied");
+            }
+        }
+        Ok(())
     }
 
     /// Stop filesystem watching. The background task is aborted and the
@@ -1937,6 +2279,13 @@ impl Registry {
     ///
     /// Returns the number of newly registered modules.
     pub async fn discover_internal(&self) -> Result<usize, ModuleError> {
+        let discovered = self.run_discoverer().await?;
+        Ok(self.register_discovered(discovered))
+    }
+
+    /// Run the internally-set discoverer over the extension roots, without
+    /// registering what it returns.
+    async fn run_discoverer(&self) -> Result<Vec<DiscoveredModule>, ModuleError> {
         // Run discovery outside of any lock, but we need to briefly check
         // that a discoverer is set. We can't hold the discoverer lock across
         // `.await`, so we invoke it through a short-lived critical section
@@ -1977,8 +2326,7 @@ impl Registry {
         // ends here, so the drop is reachable.
         drop(guard);
 
-        let discovered = discover_result?;
-        Ok(self.register_discovered(discovered))
+        discover_result
     }
 
     /// Return true if a descriptor's schema fields have an acceptable shape (object or null).
@@ -2115,6 +2463,7 @@ impl Registry {
                         core.modules.insert(dm.name.clone(), Arc::clone(&dm.module));
                         core.descriptors
                             .insert(dm.name.clone(), dm.descriptor.clone());
+                        core.sources.insert(dm.name.clone(), dm.source.clone());
                     }
                     self.in_flight.lock().remove(&dm.name);
 

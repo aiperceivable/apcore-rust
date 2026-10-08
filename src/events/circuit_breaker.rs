@@ -1,5 +1,5 @@
 // APCore Protocol — Per-subscriber circuit breaker (Issue #36)
-// Spec reference: docs/features/event-system.md (Event Management Hardening)
+// Spec reference: docs/features/event-system.md §Subscriber Circuit Breaker
 //
 // Wraps any `EventSubscriber` with an independent circuit breaker that
 // tolerates a degraded downstream by tripping into OPEN after
@@ -219,6 +219,9 @@ impl CircuitBreakerWrapper {
                 "apcore.subscriber.circuit_closed",
                 "info",
                 json!({
+                    // D-145: WHICH subscriber — two of one type are otherwise
+                    // indistinguishable.
+                    "subscriber_id": self.subscriber.subscriber_id(),
                     "subscriber_type": self.subscriber_type_name,
                     "recovery_attempt": true,
                 }),
@@ -252,6 +255,7 @@ impl CircuitBreakerWrapper {
                 "apcore.subscriber.circuit_opened",
                 "warn",
                 json!({
+                    "subscriber_id": self.subscriber.subscriber_id(),
                     "subscriber_type": self.subscriber_type_name,
                     "consecutive_failures": new_count,
                 }),

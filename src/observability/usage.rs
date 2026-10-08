@@ -88,10 +88,13 @@ impl UsageCollector {
     /// Create a new usage collector.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            data: Arc::new(Mutex::new(HashMap::new())),
-            storage_backend: None,
-        }
+        Self::with_storage_backend(None)
+    }
+
+    /// The storage backend records are persisted to (D-113).
+    #[must_use]
+    pub fn storage_backend(&self) -> Option<Arc<dyn StorageBackend>> {
+        self.storage_backend.clone()
     }
 
     /// Create with an optional `StorageBackend` (Issue #43 §1).

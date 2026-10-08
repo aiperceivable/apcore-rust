@@ -238,7 +238,7 @@ fn expected_subtrees() -> Vec<(&'static str, Value)> {
         ),
         (
             "obs",
-            json!({"redaction": {"sensitive_keys": ["vendor_token"], "replacement": "[GONE]"}}),
+            json!({"redaction": {"regex_patterns": [], "sensitive_keys": ["vendor_token"], "replacement": "[GONE]"}}),
         ),
     ]
 }
@@ -299,7 +299,11 @@ fn absent_sections_are_not_invented() {
     let (_dir, config) = load_file("apcore.yaml", "apcore:\n  version: \"1.0\"\n");
 
     for (key, declared) in declared_pairs() {
-        match Config::default_for(key) {
+        let registered_default = key.strip_prefix("obs.").and_then(|rest| {
+            let namespace = Value::Object(config.namespace("obs").into_iter().collect());
+            walk(&namespace, rest).cloned()
+        });
+        match registered_default.or_else(|| Config::default_for(key)) {
             None => assert_eq!(
                 config.get(key),
                 None,
@@ -325,6 +329,17 @@ fn absent_sections_are_not_invented() {
         }
     }
     for section in SECTIONS {
+        if *section == "obs" {
+            assert!(
+                config.get(section).is_some(),
+                "the built-in `{section}` namespace must resolve its defaults"
+            );
+            assert!(
+                !config.namespace(section).is_empty(),
+                "the built-in `{section}` namespace must expose its defaults"
+            );
+            continue;
+        }
         assert_eq!(
             config.get(section),
             None,
@@ -382,6 +397,11 @@ fn get_reflects_every_declared_section_in_legacy_mode() {
 fn container_fetches_agree_with_their_leaves() {
     let (_dir, config) = loaded_ns();
     for (section, subtree) in expected_subtrees() {
+        let declared_subtree = if section == "obs" {
+            json!({"redaction": {"sensitive_keys": ["vendor_token"], "replacement": "[GONE]"}})
+        } else {
+            subtree.clone()
+        };
         let container = config.get(section).unwrap_or_else(|| {
             panic!(
                 "`get({section})` returned None though the file declares the \
@@ -389,7 +409,7 @@ fn container_fetches_agree_with_their_leaves() {
             )
         });
         assert_eq!(
-            container, subtree,
+            container, declared_subtree,
             "`get({section})` disagrees with the file's subtree"
         );
         for (key, expected) in declared_pairs() {

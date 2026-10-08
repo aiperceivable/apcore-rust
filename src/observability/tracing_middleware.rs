@@ -146,6 +146,23 @@ impl TracingMiddleware {
     }
 }
 
+/// Mirror the span stack into `context.data` under `_apcore.mw.tracing.spans`,
+/// the key apcore-python and apcore-typescript keep their stack under, so
+/// [`TraceContext::inject`](crate::trace_context::TraceContext::inject) takes
+/// the current span as the outbound parent. The context's data map is shared
+/// by the whole call tree, as the stack is.
+fn publish_span_stack(ctx: &Context<serde_json::Value>, stack: &[Span]) {
+    if stack.is_empty() {
+        crate::context_keys::TRACING_SPANS.delete(ctx);
+        return;
+    }
+    let spans = stack
+        .iter()
+        .filter_map(|span| serde_json::to_value(span).ok())
+        .collect();
+    crate::context_keys::TRACING_SPANS.set(ctx, spans);
+}
+
 #[async_trait]
 impl Middleware for TracingMiddleware {
     fn name(&self) -> &'static str {
@@ -173,14 +190,16 @@ impl Middleware for TracingMiddleware {
         }
 
         // Single lock scope: read parent span_id and push the new span
-        {
+        let snapshot = {
             let mut state = self.state.lock();
             let stack = state.spans.entry(ctx.trace_id.clone()).or_default();
             if let Some(parent) = stack.last() {
                 span.parent_span_id = Some(parent.span_id.clone());
             }
             stack.push(span);
-        }
+            stack.clone()
+        };
+        publish_span_stack(ctx, &snapshot);
 
         Ok(None)
     }
@@ -193,7 +212,7 @@ impl Middleware for TracingMiddleware {
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Single lock scope: pop span and clean up empty stacks
-        let (span, should_clean_sampling) = {
+        let (span, should_clean_sampling, remaining) = {
             let mut state = self.state.lock();
             let popped = state
                 .spans
@@ -210,9 +229,11 @@ impl Middleware for TracingMiddleware {
             } else {
                 false
             };
+            let remaining = state.spans.get(&ctx.trace_id).cloned().unwrap_or_default();
 
-            (popped, should_clean)
+            (popped, should_clean, remaining)
         };
+        publish_span_stack(ctx, &remaining);
 
         if let Some(mut span) = span {
             span.status = SpanStatus::Ok;
@@ -247,7 +268,7 @@ impl Middleware for TracingMiddleware {
         ctx: &Context<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>, ModuleError> {
         // Single lock scope: pop span and clean up empty stacks
-        let (span, should_clean_sampling) = {
+        let (span, should_clean_sampling, remaining) = {
             let mut state = self.state.lock();
             let popped = state
                 .spans
@@ -264,9 +285,11 @@ impl Middleware for TracingMiddleware {
             } else {
                 false
             };
+            let remaining = state.spans.get(&ctx.trace_id).cloned().unwrap_or_default();
 
-            (popped, should_clean)
+            (popped, should_clean, remaining)
         };
+        publish_span_stack(ctx, &remaining);
 
         if let Some(mut span) = span {
             span.status = SpanStatus::Error;

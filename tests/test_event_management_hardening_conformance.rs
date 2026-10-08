@@ -419,6 +419,8 @@ fn every_case_in_the_fixture_is_named_by_this_driver() {
         "event_naming_canonical",
         "circuit_event_reports_the_declared_subscriber_type",
         "circuit_event_uses_the_dlq_default_for_an_undeclared_subscriber",
+        "circuit_opened_event_carries_the_subscriber_id",
+        "circuit_closed_event_carries_the_subscriber_id",
     ];
     let fixture = load_fixture();
     let ids: Vec<&str> = fixture["test_cases"]
@@ -746,6 +748,67 @@ async fn conformance_circuit_event_uses_the_dlq_default_for_an_undeclared_subscr
     assert_eq!(
         event.data["subscriber_type"].as_str(),
         Some(subscriber.subscriber_type())
+    );
+}
+
+// D-145: the opening event names WHICH subscriber's breaker opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_circuit_opened_event_carries_the_subscriber_id() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "circuit_opened_event_carries_the_subscriber_id");
+    let event = trip_open_and_capture(&case, Some("webhook")).await;
+    assert_eq!(
+        event.data["subscriber_id"].as_str(),
+        case["expected"]["event_subscriber_id"].as_str()
+    );
+    assert_eq!(
+        event.data["subscriber_type"].as_str(),
+        case["expected"]["event_subscriber_type"].as_str()
+    );
+}
+
+// D-145: the same for the closing transition.
+#[tokio::test]
+async fn conformance_circuit_closed_event_carries_the_subscriber_id() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "circuit_closed_event_carries_the_subscriber_id");
+    assert_eq!(case["input"]["circuit_state"], json!("HALF_OPEN"));
+
+    let sink = Arc::new(CapturingSink::default());
+    let wrapper = CircuitBreakerWrapper::new(
+        Box::new(AlwaysOk {
+            id: case["input"]["subscriber"]["subscriber_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            calls: Arc::new(AtomicU32::new(0)),
+        }),
+        sink.clone(),
+    )
+    .with_subscriber_type_name("webhook");
+    wrapper.force_state(CircuitState::HalfOpen);
+    wrapper
+        .on_event(&ApCoreEvent::new("test.event", json!({})))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        wrapper.state().as_str(),
+        case["expected"]["circuit_state"].as_str().unwrap()
+    );
+    assert_eq!(
+        u64::from(wrapper.consecutive_failures()),
+        case["expected"]["consecutive_failures"].as_u64().unwrap()
+    );
+    let expected_event = case["expected"]["event_emitted"].as_str().unwrap();
+    let captured = sink.captured();
+    let event = captured
+        .iter()
+        .find(|e| e.event_type == expected_event)
+        .unwrap_or_else(|| panic!("no {expected_event} emitted; got {captured:?}"));
+    assert_eq!(
+        event.data["subscriber_id"].as_str(),
+        case["expected"]["event_subscriber_id"].as_str()
     );
 }
 

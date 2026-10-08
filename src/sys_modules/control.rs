@@ -1,11 +1,11 @@
 // APCore Protocol — System control modules
 // Spec reference: system.control.update_config (F11), system.control.reload_module (F10),
 //                 system.control.toggle_feature (F19)
-// Hardening (Issue #45 / system-modules.md §1.1–§1.4):
-//   §1.1 — overrides_path persistence for update_config + toggle_feature
-//   §1.2 — contextual AuditEntry recorded for every state-changing call
-//   §1.4 — path_filter glob (mutually exclusive with module_id) and
-//          dependency-topological reload order
+// Behaviour (system-modules.md §system.control.*):
+//   - overrides_path persistence for update_config + toggle_feature
+//   - contextual AuditEntry recorded for every state-changing call
+//   - path_filter glob (mutually exclusive with module_id) and
+//     dependency-topological reload order
 
 use async_trait::async_trait;
 use serde_json::json;

@@ -44,7 +44,8 @@ spec_version: "1.0"
 bindings:
   - module_id: test.echo
     target: "test.echo:handler"
-    auto_schema: true
+    input_schema: {type: object}
+    output_schema: {type: object}
 "#,
     )
     .unwrap();
@@ -75,10 +76,16 @@ spec_version: "1.0"
 bindings:
   - module_id: test.b1
     target: "test.b1:handler"
+    input_schema: {type: object}
+    output_schema: {type: object}
   - module_id: test.b2
     target: "test.b2:handler"
+    input_schema: {type: object}
+    output_schema: {type: object}
   - module_id: test.b3
     target: "test.b3:handler"
+    input_schema: {type: object}
+    output_schema: {type: object}
 "#,
     )
     .unwrap();
@@ -112,6 +119,8 @@ spec_version: "1.0"
 bindings:
   - module_id: test.described
     target: "test.described:handler"
+    input_schema: {type: object}
+    output_schema: {type: object}
     description: "A well-described module"
     documentation: "Long-form details about this module."
 "#,
@@ -175,7 +184,8 @@ fn json_load_canonical_format() {
     let body = json!({
         "spec_version": "1.0",
         "bindings": [
-            {"module_id": "test.j", "target": "test.j:handler"}
+            {"module_id": "test.j", "target": "test.j:handler",
+             "input_schema":{"type":"object"}, "output_schema":{"type":"object"}}
         ]
     });
     std::fs::write(&file_path, serde_json::to_string(&body).unwrap()).unwrap();
@@ -206,7 +216,8 @@ bindings:
   - module_id: test.yaml_echo
     target: "test.yaml_echo:echo_fn"
     description: Echo inputs back as output
-    auto_schema: true
+    input_schema: {type: object}
+    output_schema: {type: object}
 "#;
     std::fs::write(dir.path().join("echo.binding.yaml"), yaml).unwrap();
 
@@ -247,7 +258,8 @@ spec_version: "1.0"
 bindings:
   - module_id: test.failing
     target: "test.failing:fail_fn"
-    auto_schema: true
+    input_schema: {type: object}
+    output_schema: {type: object}
 "#;
     std::fs::write(dir.path().join("fail.binding.yaml"), yaml).unwrap();
 

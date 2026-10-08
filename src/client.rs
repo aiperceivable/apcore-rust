@@ -23,7 +23,9 @@ use crate::sys_modules::{SysModulesContext, ToggleState};
 /// Main entry point for interacting with the `APCore` system.
 pub struct APCore {
     pub config: Config,
-    executor: Executor,
+    /// Shared so a module this client runs can reach it for a nested call
+    /// through `ctx.executor()`.
+    executor: Arc<Executor>,
     /// Single shared `Arc<Registry>` used by the executor, the pipeline, and
     /// all sys modules. Interior mutability on `Registry` removes the need
     /// for `Arc::get_mut` or an external `Mutex`.
@@ -221,7 +223,7 @@ impl APCore {
 
         Self {
             config,
-            executor,
+            executor: executor.into_shared(),
             registry,
             event_emitter,
             metrics_collector,
@@ -465,6 +467,7 @@ impl APCore {
     /// **Cross-language note:** The Python and TypeScript SDKs expose this
     /// method as `use()`. Rust names it `use_middleware` because `use` is a
     /// reserved keyword.
+    #[track_caller]
     pub fn use_middleware(
         &self,
         middleware: Box<dyn Middleware>,
@@ -488,6 +491,7 @@ impl APCore {
     /// so two instances answering the same `name()` is a reachable state, and
     /// [`remove`](Self::remove) drops whichever comes first in pipeline order
     /// rather than the one the caller meant (sync finding A-C-001).
+    #[track_caller]
     pub fn use_middleware_handle(
         &self,
         middleware: Box<dyn Middleware>,
@@ -552,6 +556,13 @@ impl APCore {
     /// Get a reference to the executor.
     pub fn executor(&self) -> &Executor {
         &self.executor
+    }
+
+    /// Get a shared handle to the executor, e.g. for an
+    /// [`AsyncTaskManager`](crate::AsyncTaskManager).
+    #[must_use]
+    pub fn executor_arc(&self) -> Arc<Executor> {
+        Arc::clone(&self.executor)
     }
 
     /// Disable a module by routing through the executor pipeline.
@@ -801,8 +812,9 @@ impl APCore {
     /// Returns an async `Stream` of chunks. Each chunk is delivered to the
     /// caller as soon as it is produced by the underlying module -- true
     /// incremental streaming, no buffering. Phase 3 validation runs after
-    /// the inner stream is exhausted; if it fails, the error is yielded as
-    /// the final item.
+    /// the inner stream is exhausted; the chunks are already delivered, so a
+    /// failure is not yielded but published as
+    /// `apcore.stream.post_validation_failed`. See [`Executor::stream`].
     pub fn stream<'a>(
         &'a self,
         module_id: &str,

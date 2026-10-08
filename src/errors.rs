@@ -129,12 +129,12 @@ pub enum ErrorCode {
     PipelineConfigurationError,
     PipelineHandlerNotSupported,
     PipelineStepInsertionAmbiguous,
-    /// Issue #33 (core-executor.md §Pipeline Hardening §1.1): a pipeline step's
+    /// `execution-pipeline.md` §The engine loop: a pipeline step's
     /// handler raised an error and `ignore_errors` is `false`. The step name and
     /// the original error are stored in `details["step_name"]` / `details["cause"]`.
     /// Cross-language: Python/TS `PIPELINE_STEP_ERROR`.
     PipelineStepError,
-    /// Issue #33 (core-executor.md §Pipeline Hardening §1.2): `configure_step`
+    /// `execution-pipeline.md` §Modifying a strategy: `configure_step`
     /// targeted a step name that does not exist in the strategy.
     /// Cross-language: Python/TS `PIPELINE_STEP_NOT_FOUND`.
     PipelineStepNotFound,
@@ -203,9 +203,9 @@ pub enum ErrorCode {
     /// `parent_id` Override on `inject()`"): the `parent_id` passed to
     /// `TraceContext::inject_checked` does not match `^[0-9a-f]{16}$`.
     /// Serializes to `INVALID_PARENT_ID`, the exact code required by the
-    /// `trace_context.json` fixture. Cross-language: Python raises `ValueError`
-    /// and TypeScript throws an `Error` carrying `code = "INVALID_PARENT_ID"`
-    /// (`src/trace-context.ts`).
+    /// `trace_context.json` fixture. Cross-language: Python raises
+    /// `InvalidParentIdError` (a `ValueError`) and TypeScript throws
+    /// `InvalidParentIdError`, both carrying this code.
     InvalidParentId,
     /// Issue #32 (PROTOCOL_SPEC §2.1.1, multi-module-discovery.md): two or more
     /// classes in the same file produce the same `class_segment` after
@@ -428,14 +428,15 @@ pub static FRAMEWORK_CODES: std::sync::LazyLock<HashSet<String>> = std::sync::La
 /// prevent, and §8.6 is the authority that makes the rest transcription rather
 /// than invention.
 ///
-/// Two §8.6 rows are deliberately **not** carried:
-/// - `EXECUTION_CANCELLED` (§8.6 "Yes"). Neither peer implements it, and here
-///   it is the one row that would change behaviour rather than metadata:
-///   [`crate::CancelToken::check`] raises it from inside module execution, so
-///   it reaches [`crate::middleware::RetryMiddleware`]'s gate and `Some(true)`
-///   would auto-retry a call the caller had just explicitly cancelled.
-/// - `MODULE_EXECUTE_ERROR` (§8.6 "Depends" — on the module's
-///   `annotations.idempotent`), which is exactly what `None` means here.
+/// `EXECUTION_CANCELLED` is retryable (D-135) in the sense §8.6 gives it: the
+/// same call sent again WITH A FRESH `CancelToken` may succeed. A retry inside
+/// the pipeline reuses the call's own token, which stays cancelled, so
+/// [`crate::middleware::RetryMiddleware`] re-raising it cannot resurrect a call
+/// the caller cancelled.
+///
+/// `MODULE_EXECUTE_ERROR` (§8.6 "Depends" — on the module's
+/// `annotations.idempotent`) is deliberately not carried, which is exactly
+/// what `None` means here.
 ///
 /// Not part of the public crate API: `pub` only so integration tests in `tests/`
 /// can assert fixture↔source parity; hidden from rustdoc.
@@ -463,7 +464,12 @@ pub fn retryable_for_code(code: ErrorCode) -> Option<bool> {
         // auto-retried a submission this SDK surfaced to the caller (ERR-003).
         | ErrorCode::TaskLimitExceeded
         | ErrorCode::TaskStoreUnavailable
-        | ErrorCode::ReloadFailed => Some(true),
+        | ErrorCode::ReloadFailed
+        // D-135: retried with a fresh token, and the circuit closes again after
+        // its recovery window — the code alone carries the default, not only
+        // the middleware's builder.
+        | ErrorCode::ExecutionCancelled
+        | ErrorCode::CircuitBreakerOpen => Some(true),
 
         // §8.6 "No", grouped by why retrying cannot help.
         //
@@ -531,10 +537,13 @@ pub fn retryable_for_code(code: ErrorCode) -> Option<bool> {
         | ErrorCode::ConfigMountError
         | ErrorCode::ConfigBindError
         | ErrorCode::ConfigEnvMapConflict
-        | ErrorCode::ConfigKeyRestricted => Some(false),
+        | ErrorCode::ConfigKeyRestricted
+        // D-135: a configuration error does not go away on retry; set
+        // explicitly rather than left unset.
+        | ErrorCode::PipelineConfigurationError => Some(false),
 
-        // Unlisted codes (e.g. MODULE_EXECUTE_ERROR, EXECUTION_CANCELLED) stay
-        // unset — see the scope note above.
+        // Unlisted codes (e.g. MODULE_EXECUTE_ERROR) stay unset — see the
+        // scope note above.
         _ => None,
     }
 }
@@ -1229,7 +1238,17 @@ impl SchemaValidationError {
         let errors_json: Vec<serde_json::Value> = self
             .errors
             .iter()
-            .map(|e| serde_json::to_value(e).unwrap_or_default())
+            .map(|error| {
+                let location = error.get("path").or_else(|| error.get("field")).map_or("", String::as_str);
+                let path = if location.is_empty() || location.starts_with('/') { location.to_string() }
+                    else { format!("/{}", location.replace('[', ".").replace(']', "").split('.')
+                        .filter(|segment| !segment.is_empty()).map(|segment| segment.replace('~', "~0").replace('/', "~1"))
+                        .collect::<Vec<_>>().join("/")) };
+                serde_json::json!({"path":path,
+                    "keyword":error.get("keyword").or_else(|| error.get("constraint")).map_or("schema", String::as_str),
+                    "message":error.get("message").filter(|message| !message.is_empty()).map_or("Schema validation failed", String::as_str),
+                })
+            })
             .collect();
         details.insert("errors".to_string(), serde_json::Value::Array(errors_json));
         ModuleError::new(ErrorCode::SchemaValidationError, &self.message)
