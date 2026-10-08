@@ -12,20 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.32.0] - 2026-10-08
 
 ### Added
 
 - **Public bare-name canonicalization** (#40) — `canonicalize_name`, `CanonicalNameResult`, and `CanonicalNameError` are exported from the crate root and `utils`. One arbitrary ASCII name becomes a canonical segment or a structured snake_case diagnostic, preserving the original input without transliteration, invented prefixes, truncation, or changes to Algorithm A02 module ID normalization.
-
-### Fixed
-
-- **Test emptiness assertions use value comparisons for Clippy compatibility.** Failed assertions now display unexpected values; runtime behavior and warning-as-error lint enforcement remain unchanged.
-- **Require async-trait 0.1.92 or newer** to avoid redundant generated `must_use` attributes under Rust 1.99 Clippy, without suppressing lint checks or changing async trait behavior.
-- **Track Cargo.lock** so local checks and CI resolve the same dependency versions.
-- **Reload test failure counters use a compare-exchange loop** instead of the deprecated `fetch_update`, preserving atomic conditional decrement behavior and the minimum supported Rust version.
-
-## [0.32.0] - 2026-10-08
 
 ### Security
 
@@ -35,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Test emptiness assertions use value comparisons for Clippy compatibility.** Failed assertions now display unexpected values; runtime behavior and warning-as-error lint enforcement remain unchanged.
+- **Require async-trait 0.1.92 or newer** to avoid redundant generated `must_use` attributes under Rust 1.99 Clippy, without suppressing lint checks or changing async trait behavior.
+- **Track Cargo.lock** so local checks and CI resolve the same dependency versions.
+- **Reload test failure counters use a compare-exchange loop** instead of the deprecated `fetch_update`, preserving atomic conditional decrement behavior and the minimum supported Rust version.
 - **Issue #123 conformance hardening** — timeouts signal isolated child cancellation without dropping cooperative module cleanup; preflight collects independent failures and always serializes predictions; binding files reject unknown fields and uninferable targets; schema errors carry JSON Pointer paths and keywords; raw and typed Anthropic/OpenAI exports remove extension keywords without removing property or definition names, and MCP moves true-only approval/streaming hints to `_meta`.
 - **Contextual ephemeral audit and configuration parity** — context-aware registry registration/unregistration emits one credential-safe audit event, environment dispatch reserves the exact `APCORE` prefix and routes unmatched overrides into the framework namespace, and configured subscribers use the standard circuit-breaker wrapper.
 
