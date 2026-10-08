@@ -670,7 +670,7 @@ mod tests {
         assert_eq!(event.event_type, "test.event");
         assert_eq!(event.severity, "info");
         assert!(event.module_id.is_none());
-        assert!(!event.timestamp.is_empty());
+        assert_ne!(event.timestamp, "");
     }
 
     #[test]

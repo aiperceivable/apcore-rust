@@ -769,7 +769,7 @@ mod tests {
     fn test_registered_step_types_after_reset() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_step_registry();
-        assert!(registered_step_types().is_empty());
+        assert_eq!(registered_step_types(), Vec::<String>::new());
     }
 
     #[test]

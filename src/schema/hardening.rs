@@ -558,7 +558,7 @@ mod tests {
             "properties": { "occurred_at": { "type": "string", "format": "date-time" } }
         });
         let data = json!({ "occurred_at": "2026-04-28T12:00:00Z" });
-        assert!(format_warnings(&data, &schema).is_empty());
+        assert_eq!(format_warnings(&data, &schema), Vec::<FormatWarning>::new());
     }
 
     #[test]
@@ -568,7 +568,7 @@ mod tests {
             "properties": { "exotic": { "type": "string", "format": "made-up-format" } }
         });
         let data = json!({ "exotic": "anything" });
-        assert!(format_warnings(&data, &schema).is_empty());
+        assert_eq!(format_warnings(&data, &schema), Vec::<FormatWarning>::new());
     }
 
     #[test]

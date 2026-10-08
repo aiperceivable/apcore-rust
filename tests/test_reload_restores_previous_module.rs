@@ -59,15 +59,23 @@ impl Module for HookRecordingModule {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(format!("{}:on_load", self.tag));
-        if self
-            .load_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(ModuleError::new(
-                apcore::errors::ErrorCode::ModuleLoadError,
-                format!("{} refuses to load", self.tag),
-            ));
+        // Preserve conditional decrement behavior on the minimum supported Rust version.
+        let mut remaining = self.load_failures_remaining.load(Ordering::SeqCst);
+        while let Some(next) = remaining.checked_sub(1) {
+            match self.load_failures_remaining.compare_exchange(
+                remaining,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Err(ModuleError::new(
+                        apcore::errors::ErrorCode::ModuleLoadError,
+                        format!("{} refuses to load", self.tag),
+                    ));
+                }
+                Err(actual) => remaining = actual,
+            }
         }
         Ok(())
     }

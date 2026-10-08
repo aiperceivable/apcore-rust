@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn test_empty_modules() {
         let result = resolve_dependencies(&[], None, None).unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result, Vec::<String>::new());
     }
 
     #[test]

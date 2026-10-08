@@ -2749,7 +2749,7 @@ mod extension_roots_from_config_tests {
         // The #39 case. Before `set_extension_roots_from_config` existed this
         // registry kept an empty root list and `discover()` returned Ok(0).
         let registry = Registry::new();
-        assert!(registry.extension_roots().is_empty());
+        assert_eq!(registry.extension_roots(), Vec::<String>::new());
 
         let config = config_from(serde_json::json!({
             "version": "1.0.0",

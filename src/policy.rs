@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn empty_document() {
         let policy = ExecutionPolicy::from_value(json!({})).unwrap();
-        assert!(policy.rules().is_empty());
+        assert_eq!(policy.rules(), []);
         assert!(!policy.gate_destructive);
         assert!(!policy.strict);
     }

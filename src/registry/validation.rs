@@ -72,7 +72,7 @@ mod tests {
             "output_schema": {"type": "object"},
             "description": "A test module"
         });
-        assert!(validate_descriptor(&desc).is_empty());
+        assert_eq!(validate_descriptor(&desc), Vec::<String>::new());
     }
 
     #[test]

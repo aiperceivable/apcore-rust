@@ -587,7 +587,7 @@ mod tests {
         let classes = vec![DiscoveredClass::new("InternalHelper", false)];
         let config = DiscoveryConfig::with_multi_class();
         let ids = derive_module_ids(&p, "extensions", &classes, &config).unwrap();
-        assert!(ids.is_empty());
+        assert_eq!(ids, Vec::<String>::new());
     }
 
     #[test]

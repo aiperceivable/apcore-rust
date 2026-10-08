@@ -3426,8 +3426,8 @@ mod pattern_arity_backstop_tests {
         let (acl, captured) = planted(rule, "allow");
 
         assert!(!acl.check(Some("api.gateway"), "cli.rm", None));
-        assert!(handler_error_paths(&captured).is_empty());
-        assert!(finding_paths(&acl).is_empty());
+        assert_eq!(handler_error_paths(&captured), Vec::<String>::new());
+        assert_eq!(finding_paths(&acl), Vec::<String>::new());
     }
 }
 

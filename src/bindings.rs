@@ -1189,13 +1189,13 @@ mod tests {
     #[test]
     fn test_binding_loader_new_is_empty() {
         let loader = BindingLoader::new();
-        assert!(loader.list_bindings().is_empty());
+        assert_eq!(loader.list_bindings(), Vec::<&str>::new());
     }
 
     #[test]
     fn test_binding_loader_default() {
         let loader = BindingLoader::default();
-        assert!(loader.list_bindings().is_empty());
+        assert_eq!(loader.list_bindings(), Vec::<&str>::new());
     }
 
     #[test]

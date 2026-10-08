@@ -659,7 +659,7 @@ mod tests {
             err.message,
         );
         // Pipeline should be empty — the middleware was not added.
-        assert!(mgr.snapshot().is_empty());
+        assert_eq!(mgr.snapshot(), Vec::<String>::new());
     }
 
     #[test]

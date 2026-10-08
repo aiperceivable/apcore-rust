@@ -410,7 +410,7 @@ async fn conformance_error_details_shape() {
                         .map(String::as_str)
                         .collect();
                     assert_eq!(names, BTreeSet::from(["path", "keyword", "message"]));
-                    assert!(!item["message"].as_str().unwrap().is_empty());
+                    assert_ne!(item["message"].as_str().unwrap(), "");
                 }
                 for error in errors.as_array().unwrap() {
                     assert!(actual
@@ -525,7 +525,10 @@ async fn conformance_preflight_check_reporting() {
                             "optional_passed_checks" => {
                                 if let Some(check) = find(&name) {
                                     assert_eq!(check["passed"], true);
-                                    assert!(check["warnings"].as_array().unwrap().is_empty());
+                                    assert_eq!(
+                                        check["warnings"].as_array().unwrap(),
+                                        &Vec::<Value>::new()
+                                    );
                                 }
                             }
                             _ => unreachable!(),

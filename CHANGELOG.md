@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Public bare-name canonicalization** (#40) — `canonicalize_name`, `CanonicalNameResult`, and `CanonicalNameError` are exported from the crate root and `utils`. One arbitrary ASCII name becomes a canonical segment or a structured snake_case diagnostic, preserving the original input without transliteration, invented prefixes, truncation, or changes to Algorithm A02 module ID normalization.
 
+### Fixed
+
+- **Test emptiness assertions use value comparisons for Clippy compatibility.** Failed assertions now display unexpected values; runtime behavior and warning-as-error lint enforcement remain unchanged.
+- **Require async-trait 0.1.92 or newer** to avoid redundant generated `must_use` attributes under Rust 1.99 Clippy, without suppressing lint checks or changing async trait behavior.
+- **Track Cargo.lock** so local checks and CI resolve the same dependency versions.
+- **Reload test failure counters use a compare-exchange loop** instead of the deprecated `fetch_update`, preserving atomic conditional decrement behavior and the minimum supported Rust version.
+
 ## [0.32.0] - 2026-10-08
 
 ### Security
