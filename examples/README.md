@@ -37,7 +37,7 @@ The [`bindings/`](bindings/) directory shows the YAML-binding pattern:
 | [`bindings/format_date.binding.yaml`](bindings/format_date.binding.yaml) | Canonical binding definition. |
 | [`bindings/format_date.rs`](bindings/format_date.rs) | Target function loaded by the binding. |
 
-Because this file lives in a sub-directory, Cargo does not auto-register it as an example. To run it, add `[[example]] name = "format_date" path = "examples/bindings/format_date.rs"` to `Cargo.toml`, or copy the loader pattern from the file into your own program.
+Because this file lives in a sub-directory, Cargo does not auto-register it as an example. This repository already declares the required `[[example]]` target in `Cargo.toml`, so run it with `cargo run --example format_date`; copy the loader pattern into your own program when adapting it.
 
 ## Pipeline demo — what to look for
 

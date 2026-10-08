@@ -149,6 +149,7 @@ Add to your `Cargo.toml`:
 apcore = "0.32"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
+async-trait = "0.1"
 ```
 
 ## Bare-name canonicalization
