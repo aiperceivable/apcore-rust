@@ -374,7 +374,7 @@ pub fn guard_call_chain_with_repeat<T>(
 /// - Inserts `_` between consecutive uppercase letters when followed by a lowercase letter
 ///   (e.g., "`HTTPClient`" -> "`http_client`", "`HTMLParser`" -> "`html_parser`").
 /// - Converts ASCII uppercase letters only and never repairs separators.
-fn to_snake_case(segment: &str) -> String {
+pub(super) fn to_snake_case(segment: &str) -> String {
     if !segment.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return segment.to_owned();
     }

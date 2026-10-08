@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Public bare-name canonicalization** (#40) — `canonicalize_name`, `CanonicalNameResult`, and `CanonicalNameError` are exported from the crate root and `utils`. One arbitrary ASCII name becomes a canonical segment or a structured snake_case diagnostic, preserving the original input without transliteration, invented prefixes, truncation, or changes to Algorithm A02 module ID normalization.
+
 ## [0.32.0] - 2026-10-08
 
 ### Security

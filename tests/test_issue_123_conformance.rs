@@ -60,14 +60,29 @@ fn test_conformance_declaration_matches_current_version_and_fixture_scope() {
         declaration["implementation"]["version"],
         env!("CARGO_PKG_VERSION")
     );
+    assert_eq!(declaration["implementation"]["spec_version"], "1.65.0");
     let results = &declaration["conformance"]["fixture_results"];
     let names = strings(&results["fixture_names"]);
+    assert_eq!(names.len(), 9);
+    assert!(names.iter().any(|name| name == "canonicalize_name"));
     assert_eq!(json!(names.len()), results["fixtures"]);
     let count: usize = names.iter().map(|name| cases(&fixture(name)).len()).sum();
+    assert_eq!(count, 79);
     assert_eq!(json!(count), results["cases"]);
     assert_eq!(results["passed"], results["cases"]);
     assert_eq!(results["failed"], 0);
     assert_eq!(results["skipped"], 0);
+    assert_eq!(
+        strings(&results["report"]),
+        [
+            "tests/test_issue_123_conformance.rs",
+            "tests/test_canonicalize_name.rs"
+        ]
+    );
+    assert_eq!(
+        results["command"],
+        "cargo test --all-features --test it --test test_issue_123_conformance"
+    );
     assert_eq!(
         declaration["conformance"]["level"], 0,
         "scoped verification cannot certify a higher level"

@@ -146,10 +146,46 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-apcore = "0.26"
+apcore = "0.32"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
+
+## Bare-name canonicalization
+
+Use `canonicalize_name` for one external name, such as a CLI command or
+operation name. It returns a canonical segment or a structured diagnostic,
+always retaining the exact original input:
+
+```rust
+use apcore::{canonicalize_name, CanonicalNameError};
+
+fn main() {
+    let command = canonicalize_name("cat-file");
+    assert_eq!(command.original_name, "cat-file");
+    assert_eq!(command.canonical_name.as_deref(), Some("cat_file"));
+    assert_eq!(command.error, None);
+
+    let invalid = canonicalize_name("7z");
+    assert_eq!(invalid.original_name, "7z");
+    assert_eq!(invalid.canonical_name, None);
+    assert_eq!(invalid.error, Some(CanonicalNameError::InvalidStart));
+}
+```
+
+The function rejects non-ASCII input before trimming ASCII edge punctuation
+and whitespace, applies ASCII case boundaries, and replaces each internal
+separator run with one underscore. Existing underscores are preserved.
+Diagnostics are `non_ascii`, `empty_name`, `invalid_start`, and `name_too_long`,
+checked in that order. The candidate must start with an ASCII lowercase letter
+and must not exceed 192 characters; names are never prefixed or truncated.
+`CanonicalNameResult` and `CanonicalNameError` support serde and JSON Schema.
+
+This API does not process a module ID hierarchy: `api.GetUser` becomes the
+single segment `api_get_user`. Existing `normalize_to_canonical_id` remains
+the strict, language-aware module ID API and still rejects hyphens.
+`system` is a valid bare segment; reserved namespaces and collisions must be
+checked when registering or scanning modules.
 
 ## Quick Start
 

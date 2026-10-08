@@ -128,6 +128,8 @@ mod test_approval_callback_handler;
 mod test_approval_decision_event;
 #[path = "test_approval_gate_decides_from_live_module.rs"]
 mod test_approval_gate_decides_from_live_module;
+#[path = "test_canonicalize_name.rs"]
+mod test_canonicalize_name;
 
 #[path = "test_approval_request_caller_id_action.rs"]
 mod test_approval_request_caller_id_action;
