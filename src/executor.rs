@@ -1,6 +1,8 @@
 // APCore Protocol — Executor
 // Spec reference: Module execution engine
 
+mod schema_redaction;
+
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -440,6 +442,9 @@ fn stream_deadline_exceeded(deadline: Option<f64>, module_id: &str) -> Option<Mo
 ///
 /// Returns a deep copy of `data` with sensitive values replaced by `"***REDACTED***"`.
 /// Also redacts any keys starting with `_secret_` regardless of schema.
+/// Local `$ref` definitions, JSON Pointers, anchors and root `$id` references
+/// participate in redaction. Recursive schemas are traversed without reference
+/// loops; external references are never fetched.
 ///
 /// Applies §10.6's schema rule ONLY. The executor's capture point must apply
 /// the configured `obs.redaction.*` rules as well — use
@@ -448,9 +453,11 @@ fn stream_deadline_exceeded(deadline: Option<f64>, module_id: &str) -> Option<Mo
 #[must_use]
 pub fn redact_sensitive(data: &Value, schema: &Value) -> Value {
     let mut redacted = data.clone();
-    if let Some(obj) = redacted.as_object_mut() {
-        redact_fields(obj, schema);
-        redact_secret_prefix(obj);
+    schema_redaction::redact(&mut redacted, schema);
+    match &mut redacted {
+        Value::Object(object) => redact_secret_prefix(object),
+        Value::Array(items) => redact_secret_prefix_in_list(items),
+        _ => {}
     }
     redacted
 }
@@ -476,9 +483,11 @@ pub fn redact_sensitive_with(
     rules: Option<&RedactionConfig>,
 ) -> Value {
     let mut redacted = data.clone();
-    if let Some(obj) = redacted.as_object_mut() {
-        redact_fields(obj, schema);
-        redact_secret_prefix(obj);
+    schema_redaction::redact(&mut redacted, schema);
+    match &mut redacted {
+        Value::Object(object) => redact_secret_prefix(object),
+        Value::Array(items) => redact_secret_prefix_in_list(items),
+        _ => {}
     }
     match rules {
         Some(cfg) => cfg.redact(&mut redacted),
@@ -507,87 +516,6 @@ pub(crate) fn loggable_value(
     match captured {
         Some(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         None => redact_sensitive_with(raw, &Value::Null, rules),
-    }
-}
-
-/// Whether a schema or any composition branch marks its value sensitive.
-fn schema_is_sensitive(schema: &Value) -> bool {
-    schema.get("x-sensitive") == Some(&Value::Bool(true))
-        || ["anyOf", "oneOf", "allOf"].iter().any(|keyword| {
-            schema
-                .get(*keyword)
-                .and_then(Value::as_array)
-                .is_some_and(|branches| branches.iter().any(schema_is_sensitive))
-        })
-}
-
-/// Apply every schema branch's `items` rule to an array value.
-fn redact_array_items(items: &mut [Value], schema: &Value) {
-    if let Some(item_schema) = schema.get("items") {
-        for item in items.iter_mut() {
-            redact_value(item, item_schema);
-        }
-    }
-    for keyword in ["anyOf", "oneOf", "allOf"] {
-        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
-            for branch in branches {
-                redact_array_items(items, branch);
-            }
-        }
-    }
-}
-
-/// In-place redaction of one value, descending through object and array shapes.
-fn redact_value(value: &mut Value, schema: &Value) {
-    if schema_is_sensitive(schema) {
-        if !value.is_null() {
-            *value = Value::String(REDACTED_VALUE.to_string());
-        }
-        return;
-    }
-
-    match value {
-        Value::Object(object) => redact_fields(object, schema),
-        Value::Array(items) => redact_array_items(items, schema),
-        _ => {}
-    }
-}
-
-/// In-place redaction based on schema `x-sensitive` markers.
-fn redact_fields(data: &mut serde_json::Map<String, Value>, schema: &Value) {
-    // A composition branch contributes every property it declares. Applying all
-    // branches is intentional: redaction is a safe union, not schema validation.
-    for keyword in ["anyOf", "oneOf", "allOf"] {
-        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
-            for branch in branches {
-                redact_fields(data, branch);
-            }
-        }
-    }
-
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        return;
-    };
-
-    for (field_name, field_schema) in properties {
-        let value = match data.get(field_name) {
-            Some(v) => v.clone(),
-            None => continue,
-        };
-
-        if schema_is_sensitive(field_schema) {
-            if !value.is_null() {
-                data.insert(
-                    field_name.clone(),
-                    Value::String(REDACTED_VALUE.to_string()),
-                );
-            }
-            continue;
-        }
-
-        if let Some(value) = data.get_mut(field_name) {
-            redact_value(value, field_schema);
-        }
     }
 }
 
@@ -2858,6 +2786,191 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
     // redact_sensitive
     // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_redact_sensitive_preserves_object_root_with_sensitive_ref_and_composition() {
+        let data = json!({"public":"visible","nested":{"private":"canary"}});
+        let schema = json!({"x-sensitive":true,"$ref":"#/$defs/root", "$defs":{"root":{
+            "x-sensitive":true,"allOf":[{"properties":{"nested":{"x-sensitive":true}}}]}}});
+        let expected = json!({"public":"visible","nested":REDACTED_VALUE});
+        assert_eq!(redact_sensitive(&data, &schema), expected);
+        assert_eq!(redact_sensitive_with(&data, &schema, None), expected);
+        assert_eq!(data["nested"]["private"], "canary");
+    }
+
+    #[test]
+    fn test_redact_sensitive_ignores_prefix_items_in_legacy_dialects() {
+        for dialect in [
+            "http://json-schema.org/draft-07/schema#",
+            "https://json-schema.org/draft/2019-09/schema",
+        ] {
+            let schema = json!({"$schema":dialect,"properties":{"rows":{"items":{
+                "prefixItems":[{"type":"string"}], "items":{"x-sensitive":true}}}}});
+            assert_eq!(
+                redact_sensitive(&json!({"rows":[["canary","canary"]]}), &schema),
+                json!({"rows":[[REDACTED_VALUE,REDACTED_VALUE]]})
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_sensitive_ignores_unknown_schema_keyword_anchor_shadows() {
+        for keyword in ["definitions", "dependencies"] {
+            let mut schema = json!({"properties":{"schemaField":{"$anchor":"private","x-sensitive":true},
+                "value":{"$ref":"#private"}}});
+            schema[keyword] = json!({"opaque":{"$anchor":"private","x-sensitive":false}});
+            assert_eq!(
+                redact_sensitive(&json!({"value":"canary"}), &schema),
+                json!({"value":REDACTED_VALUE})
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_sensitive_resolves_refs_and_escaped_pointers() {
+        let schema = json!({"$defs":{
+            "Secret/Value~":{"x-sensitive":true}, "Space Name":{"x-sensitive":true}},
+            "properties":{"token":{"$ref":"#/$defs/Secret~1Value~0"},
+                "encoded":{"$ref":"#/$defs/Space%20Name"}, "public":{"type":"string"}}});
+        let data = json!({"token":"private","encoded":"private","public":"visible"});
+        let original_schema = schema.clone();
+        let result = redact_sensitive(&data, &schema);
+        assert_eq!(result["token"], REDACTED_VALUE);
+        assert_eq!(result["encoded"], REDACTED_VALUE);
+        assert_eq!(result["public"], "visible");
+        assert_eq!(data["token"], "private");
+        assert_eq!(schema, original_schema);
+    }
+
+    #[test]
+    fn test_redact_sensitive_resolves_anchors_root_ids_and_siblings() {
+        let schema = json!({"$id":"https://local.example/schema", "$defs":{
+            "Secret":{"$anchor":"secret","x-sensitive":true}}, "properties":{
+            "anchor":{"$ref":"#secret"}, "absolute":{"$ref":"https://local.example/schema#secret"},
+            "sibling":{"$ref":"#/$defs/Missing","x-sensitive":true},
+            "external":{"$ref":"file:///unavailable/schema"}}});
+        let data = json!({"anchor":"private","absolute":"private","sibling":"private","external":"visible"});
+        let result = redact_sensitive(&data, &schema);
+        for name in ["anchor", "absolute", "sibling"] {
+            assert_eq!(result[name], REDACTED_VALUE);
+        }
+        assert_eq!(result["external"], "visible");
+    }
+
+    #[test]
+    fn test_redact_sensitive_handles_recursive_refs_and_compositions() {
+        let schema = json!({"$ref":"#/$defs/Node", "$defs":{
+            "Secret":{"x-sensitive":true},
+            "LoopA":{"$ref":"#/$defs/LoopB"},
+            "LoopB":{"anyOf":[{"$ref":"#/$defs/LoopA"},{"x-sensitive":true}]},
+            "Node":{"allOf":[{"properties":{"token":{"$ref":"#/$defs/Secret"}}},
+                {"properties":{"child":{"$ref":"#/$defs/Node"},"loop":{"$ref":"#/$defs/LoopA"}}}]}}});
+        let data = json!({"token":"private","child":{"token":"nested","child":null},"loop":"private","public":"visible"});
+        let result = redact_sensitive(&data, &schema);
+        assert_eq!(result["token"], REDACTED_VALUE);
+        assert_eq!(result["child"]["token"], REDACTED_VALUE);
+        assert!(result["child"]["child"].is_null());
+        assert_eq!(result["loop"], REDACTED_VALUE);
+        assert_eq!(result["public"], "visible");
+    }
+
+    #[test]
+    fn test_redact_sensitive_handles_referenced_root_arrays_and_scalars() {
+        let schema =
+            json!({"$defs":{"Secret":{"x-sensitive":true}},"items":{"$ref":"#/$defs/Secret"}});
+        assert_eq!(
+            redact_sensitive(&json!(["private", null]), &schema),
+            json!([REDACTED_VALUE, null])
+        );
+        let schema = json!({"$defs":{"Secret":{"x-sensitive":true}},"$ref":"#/$defs/Secret"});
+        assert_eq!(
+            redact_sensitive(&json!("private"), &schema),
+            json!(REDACTED_VALUE)
+        );
+        assert!(redact_sensitive(&Value::Null, &schema).is_null());
+        assert_eq!(
+            redact_sensitive(
+                &json!([{"_secret_token":"private","public":"visible"}]),
+                &json!({})
+            ),
+            json!([{"_secret_token":REDACTED_VALUE,"public":"visible"}])
+        );
+    }
+
+    #[test]
+    fn test_redact_sensitive_with_refs_preserves_configured_rules() {
+        let schema = json!({"$defs":{"Credentials":{"properties":{"token":{"x-sensitive":true}}}},
+            "properties":{"profile":{"$ref":"#/$defs/Credentials"}}});
+        let data = json!({"profile":{"token":"private"},"password":"configured","_secret_other":"prefix","public":"visible"});
+        let result = redact_sensitive_with(&data, &schema, None);
+        assert_eq!(result["profile"]["token"], REDACTED_VALUE);
+        assert_eq!(result["password"], REDACTED_VALUE);
+        assert_eq!(result["_secret_other"], REDACTED_VALUE);
+        assert_eq!(result["public"], "visible");
+        assert_eq!(data["profile"]["token"], "private");
+    }
+
+    #[test]
+    fn test_redact_sensitive_resolves_embedded_resource_ids() {
+        let schema = json!({"$id":"https://example.test/root", "$defs":{
+            "child":{"$id":"child","$anchor":"secret","type":"object",
+                "$defs":{"Sensitive":{"type":"string","x-sensitive":true}},
+                "properties":{"value":{"$ref":"#/$defs/Sensitive"}}}},
+            "properties":{"payload":{"$ref":"child#secret"}}});
+        let data = json!({"payload":{"value":"scope-canary"},"public":"visible"});
+        let result = redact_sensitive(&data, &schema);
+        assert_eq!(result["payload"]["value"], REDACTED_VALUE);
+        assert_eq!(result["public"], "visible");
+        assert_eq!(data["payload"]["value"], "scope-canary");
+    }
+
+    #[test]
+    fn test_redact_sensitive_keeps_embedded_anchor_scopes_distinct() {
+        let schema = json!({"$id":"https://example.test/root", "$defs":{
+            "first":{"$id":"one", "$anchor":"same", "$defs":{"Secret":{"x-sensitive":true}},
+                "properties":{"value":{"$ref":"#/$defs/Secret"}}},
+            "second":{"$id":"nested/two", "$anchor":"same", "properties":{"value":{"type":"string"}}}},
+            "properties":{"first":{"$ref":"one#same"},"second":{"$ref":"nested/two#same"}},
+            "default":{"$id":"one","$anchor":"same","$ref":"https://unavailable.invalid/data"}});
+        let result = redact_sensitive(
+            &json!({"first":{"value":"private"},"second":{"value":"visible"}}),
+            &schema,
+        );
+        assert_eq!(result["first"]["value"], REDACTED_VALUE);
+        assert_eq!(result["second"]["value"], "visible");
+    }
+
+    #[test]
+    fn test_redact_sensitive_resolves_modern_positional_and_tail_refs() {
+        let schema = json!({"$schema":"https://json-schema.org/draft/2020-12/schema",
+            "$defs":{"Sensitive":{"type":"string","x-sensitive":true}},
+            "properties":{"values":{"type":"array","prefixItems":[{"$ref":"#/$defs/Sensitive"},{"type":"string"}],
+                "items":{"$ref":"#/$defs/Sensitive"}}}});
+        let data = json!({"values":["position-canary","visible","tail-canary"]});
+        let original_schema = schema.clone();
+        assert_eq!(
+            redact_sensitive(&data, &schema),
+            json!({"values":[REDACTED_VALUE,"visible",REDACTED_VALUE]})
+        );
+        assert_eq!(data["values"][0], "position-canary");
+        assert_eq!(schema, original_schema);
+    }
+
+    #[test]
+    fn test_redact_sensitive_resolves_legacy_tuple_and_additional_refs() {
+        let schema = json!({"$schema":"http://json-schema.org/draft-07/schema#",
+            "definitions":{"Sensitive":{"type":"string","x-sensitive":true}},
+            "properties":{"values":{"type":"array","items":[{"$ref":"#/definitions/Sensitive"},{"type":"string"}],
+                "additionalItems":{"$ref":"#/definitions/Sensitive"}}}});
+        let data = json!({"values":["position-canary","visible","tail-canary"]});
+        let original_schema = schema.clone();
+        assert_eq!(
+            redact_sensitive(&data, &schema),
+            json!({"values":[REDACTED_VALUE,"visible",REDACTED_VALUE]})
+        );
+        assert_eq!(data["values"][0], "position-canary");
+        assert_eq!(schema, original_schema);
+    }
 
     #[test]
     fn test_redact_sensitive_basic_field() {

@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+## [0.32.1] - 2026-10-14
+
+### Fixed
+
+- Resolve local schema references during sensitive-value redaction, including
+  escaped JSON Pointers, scoped embedded resource identifiers/anchors and recursive/composed schemas.
+  Preserve object-root shape and apply dialect-specific schema indexing/array rules.
+  Preserve deep-copy behavior, configured redaction and protected prefix rules;
+  external schema resources are never retrieved. (aiperceivable/apcore-rust#41)
+
 ## [0.32.0] - 2026-10-08
 
 ### Added

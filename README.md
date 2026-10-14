@@ -707,6 +707,14 @@ user-999: {"email":"unknown@example.com","id":"user-999","name":"Unknown"}
 
 ### `send_email` — Destructive module with sensitive fields
 
+Schema-driven redaction follows local `$ref` definitions, escaped JSON Pointers,
+anchors and references within scoped embedded `$id` resources, including recursive object and
+array fields and composition branches. It uses a deep copy, retains configured
+redaction and `_secret_` protection, and never retrieves external HTTP/file schemas.
+Object roots retain their object shape; whole-value sensitivity applies to nested
+fields. Schema indexing and positional array rules follow the declared dialect
+(default 2020-12), so unknown keywords cannot shadow local sensitivity anchors.
+
 Shows `x-sensitive: true` on schema fields (for log redaction), `ModuleAnnotations` with metadata, and behavioral annotation for destructive operations.
 
 ```rust
