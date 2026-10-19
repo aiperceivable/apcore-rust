@@ -10,7 +10,7 @@
 //! callback propagated out of `check()` and turned an **allowed** call into a
 //! panic. That is the one behaviour change here, and it is a fix.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use apcore::acl::{AuditEntry, ACL};
 use apcore::errors::ErrorCode;
@@ -49,7 +49,16 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
     }
 }
 
-fn capture<T>(f: impl FnOnce() -> T) -> (T, String) {
+pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, String) {
+    // Tracing caches callsite interest process-wide. With only one registered
+    // dispatcher it consults the current thread, which may have no subscriber
+    // while another test is entering a capture scope. Keep two dispatchers alive
+    // to retain the multi-dispatcher path even between captures. Neither becomes
+    // a default subscriber; output still goes only to each scope's own buffer.
+    static DISPATCHERS: OnceLock<[tracing::Dispatch; 2]> = OnceLock::new();
+    DISPATCHERS.get_or_init(|| {
+        std::array::from_fn(|_| tracing::Dispatch::new(tracing_subscriber::registry()))
+    });
     let buf = CaptureWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buf.clone())
@@ -232,16 +241,10 @@ fn with_panicking_sink() -> ACL {
 fn a_panicking_callback_does_not_change_the_decision() {
     // Measured before spec v1.45.0: this propagated, and an ALLOWED call became
     // a panic. Both decisions are driven — deny is a different branch.
-    //
-    // The default panic hook is silenced for the duration: it prints its own
-    // message, which is the runtime's business and would otherwise bury the one
-    // diagnostic requirement 5 governs.
+
     let acl = with_panicking_sink();
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let (allowed, _) = capture(|| acl.check(Some("api.x"), "executor.y", None));
     let (denied, _) = capture(|| acl.check(Some("worker.x"), "executor.y", None));
-    std::panic::set_hook(previous);
     assert!(allowed, "an allowed call must stay allowed");
     assert!(!denied, "a denied call must stay denied");
 }
@@ -249,11 +252,8 @@ fn a_panicking_callback_does_not_change_the_decision() {
 #[tokio::test]
 async fn a_panicking_callback_does_not_change_the_async_decision() {
     let acl = with_panicking_sink();
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let allowed = acl.async_check(Some("api.x"), "executor.y", None).await;
     let denied = acl.async_check(Some("worker.x"), "executor.y", None).await;
-    std::panic::set_hook(previous);
     assert!(allowed);
     assert!(!denied);
 }
@@ -263,19 +263,39 @@ fn a_failing_sink_is_reported_once() {
     // §6.3.2 requirement 5. A sink that is down otherwise produces one
     // diagnostic per check — the flood §9.2.2 rejects.
     let acl = with_panicking_sink();
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let (_, logs) = capture(|| {
         for _ in 0..5 {
             acl.check(Some("api.x"), "executor.y", None);
         }
     });
-    std::panic::set_hook(previous);
     assert_eq!(
         logs.matches("audit delivery failed").count(),
         1,
         "logs:\n{logs}"
     );
+}
+
+#[test]
+fn concurrent_captures_preserve_each_sinks_first_failure_report() {
+    const THREADS: usize = 8;
+    let barrier = std::sync::Barrier::new(THREADS);
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..100 {
+                    let mut acl = ACL::new(vec![], "deny", None);
+                    acl.set_audit_logger(|_: &AuditEntry| panic!("the audit sink is down"));
+                    let (_, logs) = capture(|| {
+                        for _ in 0..5 {
+                            assert!(!acl.check(Some("api.x"), "executor.y", None));
+                        }
+                    });
+                    assert_eq!(logs.matches("audit delivery failed").count(), 1, "{logs}");
+                }
+            });
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -354,8 +374,6 @@ fn reload_starts_a_new_failure_report_scope() {
     let mut acl = ACL::load(path.to_str().expect("utf-8")).expect("loads");
     acl.set_audit_logger(|_e: &AuditEntry| panic!("down"));
 
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let (_, logs) = capture(|| {
         acl.check(Some("api.x"), "executor.y", None);
         acl.check(Some("api.x"), "executor.y", None);
@@ -364,7 +382,6 @@ fn reload_starts_a_new_failure_report_scope() {
 
     acl.reload().expect("reloads");
     let (_, logs) = capture(|| acl.check(Some("api.x"), "executor.y", None));
-    std::panic::set_hook(previous);
     assert_eq!(
         logs.matches("audit delivery failed").count(),
         1,

@@ -10,47 +10,13 @@ use apcore::acl::{AuditEntry, ACL, AUDIT_EVENT_NAME};
 use serde_json::Value;
 
 use crate::conformance_env::find_fixtures_root;
+use crate::test_acl_audit_delivery::capture;
 
 fn fixture() -> Value {
     let path = find_fixtures_root().join("acl_audit_delivery.json");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     serde_json::from_str(&raw).expect("acl_audit_delivery.json parses")
-}
-
-#[derive(Clone, Default)]
-struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
-    type Writer = Self;
-    fn make_writer(&self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-fn capture<T>(f: impl FnOnce() -> T) -> (T, String) {
-    let buf = CaptureWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
-    let out = tracing::subscriber::with_default(subscriber, f);
-    let bytes = buf.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    (out, String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn audit_lines(logs: &str) -> Vec<&str> {
@@ -71,11 +37,6 @@ fn conformance_acl_audit_delivery() {
     let fx = fixture();
     let cases = fx["test_cases"].as_array().expect("test_cases is an array");
     assert!(!cases.is_empty(), "the fixture drove nothing");
-
-    // The default panic hook prints for every contained panic; that is the
-    // runtime's output, not the sink's, and it would bury what we assert on.
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
 
     for case in cases {
         let id = case["id"].as_str().expect("case id");
@@ -228,6 +189,4 @@ fn conformance_acl_audit_delivery() {
             );
         }
     }
-
-    std::panic::set_hook(previous_hook);
 }
