@@ -151,11 +151,40 @@ fn span_to_otlp(span: &Span) -> serde_json::Value {
     otlp_span
 }
 
+/// Returns whether the endpoint uses a loopback host.
+#[cfg(feature = "events")]
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.strip_suffix('.')
+        .unwrap_or(host)
+        .eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.to_canonical().is_loopback())
+}
+
 #[cfg(feature = "events")]
 #[async_trait]
 impl SpanExporter for OTLPExporter {
     async fn export(&self, span: &Span) -> Result<(), ModuleError> {
-        let client = reqwest::Client::new();
+        let mut builder = reqwest::Client::builder();
+        if is_loopback_endpoint(&self.endpoint) {
+            // Avoid macOS system proxy discovery and keep local collectors local.
+            // Remote endpoints retain reqwest's normal proxy configuration.
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(|e| {
+            ModuleError::new(
+                crate::errors::ErrorCode::GeneralInternalError,
+                format!("OTLP HTTP client error: {e}"),
+            )
+        })?;
         let payload = serde_json::json!({
             "resourceSpans": [{
                 "scopeSpans": [{
@@ -276,5 +305,60 @@ impl SpanExporter for CompositeExporter {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "events"))]
+mod tests {
+    use super::is_loopback_endpoint;
+
+    #[test]
+    fn test_proxy_bypass_rejects_multiple_trailing_dots() {
+        for endpoint in [
+            "http://localhost..:4318/v1/traces",
+            "http://localhost...:4318/v1/traces",
+        ] {
+            assert!(!is_loopback_endpoint(endpoint), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn test_proxy_bypass_handles_ipv4_mapped_ipv6_addresses() {
+        for (endpoint, expected) in [
+            ("http://[::ffff:127.0.0.1]:4318/v1/traces", true),
+            ("http://[::ffff:127.42.0.1]:4318/v1/traces", true),
+            ("http://[::ffff:7f00:1]:4318/v1/traces", true),
+            ("http://[::ffff:192.168.1.1]:4318/v1/traces", false),
+            ("http://[::ffff:128.0.0.1]:4318/v1/traces", false),
+            ("http://[::127.0.0.1]:4318/v1/traces", false),
+        ] {
+            assert_eq!(is_loopback_endpoint(endpoint), expected, "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn test_proxy_bypass_is_limited_to_loopback_hosts() {
+        for endpoint in [
+            "http://127.0.0.1:4318/v1/traces",
+            "http://127.42.0.1:4318/v1/traces",
+            "http://[::1]:4318/v1/traces",
+            "https://LOCALHOST:4318/v1/traces",
+            "http://localhost.:4318/v1/traces",
+        ] {
+            assert!(is_loopback_endpoint(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "https://collector.example/v1/traces",
+            "http://192.168.1.1:4318/v1/traces",
+            "http://[2001:db8::1]:4318/v1/traces",
+            "http://localhost.example/v1/traces",
+            "http://127.0.0.1.example/v1/traces",
+            "http://localhost@collector.example/v1/traces",
+            "http://collector.example/v1/traces?host=127.0.0.1",
+            "file:///v1/traces",
+            "not a URL",
+        ] {
+            assert!(!is_loopback_endpoint(endpoint), "{endpoint}");
+        }
     }
 }

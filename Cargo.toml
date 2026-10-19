@@ -112,6 +112,12 @@ path = "tests/test_extensions_ignore_patterns.rs"
 name = "test_issue_123_conformance"
 path = "tests/test_issue_123_conformance.rs"
 
+# Changes proxy environment variables, so it must run outside the shared test binary.
+[[test]]
+name = "test_otlp_proxy_routing"
+path = "tests/test_otlp_proxy_routing.rs"
+required-features = ["events"]
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
