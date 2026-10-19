@@ -182,39 +182,31 @@ fn declares_object_type(type_value: Option<&Value>) -> bool {
     }
 }
 
-/// Make a property nullable by adding "null" to its type, or wrapping in oneOf.
+/// Make a property nullable without weakening its non-null constraints.
 fn make_nullable(prop: &mut Value) {
     let Some(prop_obj) = prop.as_object_mut() else {
         return;
     };
-
-    if let Some(type_val) = prop_obj.get_mut("type") {
+    let constrained = [
+        "enum", "const", "$ref", "allOf", "anyOf", "oneOf", "not", "if",
+    ]
+    .iter()
+    .any(|key| prop_obj.contains_key(*key));
+    if !prop_obj.contains_key("type") || constrained {
+        // Constraints can reject null independently of the type keyword.
+        // Preserve the complete original schema in the non-null branch.
+        let original = Value::Object(std::mem::take(prop_obj));
+        *prop = serde_json::json!({"anyOf": [original, {"type": "null"}]});
+    } else if let Some(type_val) = prop_obj.get_mut("type") {
         match type_val {
-            Value::String(s) => {
-                *type_val = Value::Array(vec![
-                    Value::String(s.clone()),
-                    Value::String("null".to_string()),
-                ]);
+            Value::String(s) if s != "null" => {
+                *type_val = serde_json::json!([s, "null"]);
             }
-            Value::Array(arr) => {
-                let has_null = arr.iter().any(|v| v.as_str() == Some("null"));
-                if !has_null {
-                    arr.push(Value::String("null".to_string()));
-                }
+            Value::Array(arr) if !arr.iter().any(|v| v.as_str() == Some("null")) => {
+                arr.push(Value::String("null".to_string()));
             }
             _ => {}
         }
-    } else {
-        // Pure $ref or composition — wrap in anyOf with null. `anyOf`, not
-        // `oneOf`: OpenAI structured outputs accepts only `anyOf` as the
-        // nullable-union spelling, and strict mode exists to feed that adapter.
-        let original = Value::Object(prop_obj.clone());
-        let mut new_map = Map::new();
-        new_map.insert(
-            "anyOf".to_string(),
-            Value::Array(vec![original, serde_json::json!({"type": "null"})]),
-        );
-        *prop = Value::Object(new_map);
     }
 }
 

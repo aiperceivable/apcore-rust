@@ -45,6 +45,17 @@ fn schema_strict_conversion_fixture_parity() {
             "[{id}] strict-schema mismatch.\n  description: {}\n  input: {schema}",
             case["description"].as_str().unwrap_or("(none)")
         );
+        if let Some(examples) = case["validation_cases"].as_array() {
+            let validator = jsonschema::validator_for(&got).expect("valid strict schema");
+            for example in examples {
+                assert_eq!(
+                    validator.is_valid(&example["data"]),
+                    example["valid"].as_bool().expect("boolean validity"),
+                    "[{id}] unexpected validation result for {}",
+                    example["data"]
+                );
+            }
+        }
         // A23 MUST deep-copy — the caller's schema is never mutated.
         assert_eq!(&before, schema, "[{id}] to_strict_schema mutated its input");
     }
