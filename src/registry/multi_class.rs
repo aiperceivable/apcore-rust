@@ -234,7 +234,7 @@ fn canonical_id_pattern() -> &'static Regex {
 ///   returns `Ok(vec![base_id])` (only the first class is loaded; the file is
 ///   treated as single-class per backward-compat policy).
 /// - **Multiple qualifying classes, at least one carrying the marker** →
-///   derives one ID per class as `base_id.class_segment`.  Conflicts (two
+///   derives one ID per marked class as `base_id.class_segment`.  Conflicts (two
 ///   classes mapping to the same segment) raise
 ///   [`ErrorCode::ModuleIdConflict`].  Invalid segments raise
 ///   [`ErrorCode::InvalidSegment`]; over-length IDs raise
@@ -285,7 +285,7 @@ pub fn derive_module_ids(
     let mut seen: Vec<(String, String)> = Vec::with_capacity(qualifying.len());
     let mut results: Vec<String> = Vec::with_capacity(qualifying.len());
 
-    for class in qualifying {
+    for class in qualifying.into_iter().filter(|class| class.multi_class) {
         let segment = class_name_to_segment(&class.name);
 
         if !segment_pattern().is_match(&segment) {
@@ -336,9 +336,10 @@ pub fn derive_module_ids(
 /// registering a multi-class file with [`Registry::register_multi_class`].
 ///
 /// `multi_class` is the same per-class marker [`DiscoveredClass`] carries
-/// (D-107): a file registers one module per entry only when at least one entry
-/// carries it. [`Self::new`] leaves it unset, so a batch that means to register
-/// several classes from one file must say so — with
+/// (D-107): in a file with multiple entries, only marked entries register when
+/// any entry carries the marker; otherwise only the first entry registers.
+/// A single entry keeps the bare file ID. [`Self::new`] leaves the marker unset,
+/// so participating entries in a multi-class file must opt in — with
 /// [`Self::with_multi_class`] — exactly as a Python `@multi_class` decorator or
 /// a TypeScript `@multiClass()` does.
 pub struct MultiClassEntry {
@@ -365,7 +366,7 @@ impl MultiClassEntry {
 }
 
 impl Registry {
-    /// Register all classes discovered in a multi-class source file.
+    /// Register the participating classes discovered in a multi-class source file.
     ///
     /// Computes the IDs via [`derive_module_ids`] and registers each module
     /// under its derived ID.  The whole batch is registered atomically — if
@@ -397,13 +398,15 @@ impl Registry {
 
         let module_ids = derive_module_ids(file_path, extensions_root, &classes, config)?;
 
-        // `module_ids.len()` is `qualifying.len()` in the multi-class path, or
-        // 1 in the single-class / disabled-by-default path.  Only the first
-        // `module_ids.len()` entries are registered; the rest are dropped.
-        let to_register = module_ids.len();
-        let mut registered: Vec<String> = Vec::with_capacity(to_register);
+        // Match derivation's participant selection so an unmarked helper
+        // cannot be paired with a marked class's ID, regardless of ordering.
+        let multi_class = entries.len() > 1 && entries.iter().any(|entry| entry.multi_class);
+        let participants = entries
+            .into_iter()
+            .filter(|entry| !multi_class || entry.multi_class);
+        let mut registered: Vec<String> = Vec::with_capacity(module_ids.len());
 
-        for (module_id, entry) in module_ids.iter().zip(entries.into_iter().take(to_register)) {
+        for (module_id, entry) in module_ids.iter().zip(participants) {
             let descriptor = ModuleDescriptor {
                 module_id: module_id.clone(),
                 name: None,

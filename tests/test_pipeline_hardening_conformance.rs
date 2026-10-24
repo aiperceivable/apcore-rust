@@ -3,7 +3,7 @@
 // Fixture source: apcore/conformance/fixtures/pipeline_hardening.json
 // Spec reference: apcore/docs/features/core-executor.md (§Pipeline Hardening)
 //
-// The five fixture cases exercise:
+// The fixture cases exercise:
 //   §1.1 fail_fast_on_step_error        — step error wraps in PipelineStepError
 //   §1.1 continue_on_ignored_error      — ignore_errors: true keeps the pipeline alive
 //   §1.2 replace_semantic_no_duplicate  — configure_step is idempotent
@@ -507,4 +507,105 @@ async fn pipeline_hardening_step_lookup_is_not_linear() {
         "skipped middle steps must NOT execute",
     );
     assert_eq!(tail_count.load(Ordering::SeqCst), 1);
+}
+
+struct SlowStep {
+    name: String,
+    sleep_ms: u64,
+    timeout_ms: u64,
+    completed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Step for SlowStep {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "Fixture-driven timed step"
+    }
+    fn removable(&self) -> bool {
+        true
+    }
+    fn replaceable(&self) -> bool {
+        true
+    }
+    fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+    async fn execute(&self, _ctx: &mut PipelineContext) -> Result<StepResult, ModuleError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(StepResult::continue_step())
+    }
+}
+
+struct EchoModule;
+
+#[async_trait]
+impl apcore::module::Module for EchoModule {
+    fn input_schema(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn output_schema(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn description(&self) -> &str {
+        "Step timeout fixture module"
+    }
+    async fn execute(&self, inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        Ok(inputs)
+    }
+}
+
+async fn assert_timeout_case(id: &str) {
+    let fixture = load_fixture("pipeline_hardening");
+    let case = fixture_case(&fixture, id);
+    let input = &case["input"];
+    let custom = &input["custom_step"];
+    let completed = Arc::new(AtomicUsize::new(0));
+    let step = SlowStep {
+        name: custom["name"].as_str().unwrap().to_string(),
+        sleep_ms: custom["sleep_ms"].as_u64().unwrap(),
+        timeout_ms: input["timeout_ms"].as_u64().unwrap(),
+        completed: completed.clone(),
+    };
+    let registry = apcore::Registry::new();
+    registry
+        .register_module("fixture.module", Box::new(EchoModule))
+        .unwrap();
+    let mut strategy = apcore::builtin_steps::build_standard_strategy();
+    strategy
+        .insert_after(custom["after"].as_str().unwrap(), Box::new(step))
+        .unwrap();
+    let executor = apcore::Executor::with_strategy(registry, apcore::Config::default(), strategy);
+    let result = executor
+        .call("fixture.module", serde_json::json!({}), None, None)
+        .await;
+    let expected = &case["expected"];
+    if let Some(code) = expected.get("call_error_code") {
+        let error = result.expect_err("step exceeding its deadline must fail the call");
+        assert_eq!(serde_json::json!(error.code.wire_str()), *code, "case {id}");
+        assert_eq!(completed.load(Ordering::SeqCst), 0, "case {id}");
+    } else if let Some(succeeds) = expected.get("call_succeeds") {
+        assert_eq!(
+            serde_json::json!(result.is_ok()),
+            *succeeds,
+            "case {id}: {result:?}"
+        );
+        assert_eq!(result.unwrap(), serde_json::json!({}), "case {id}");
+        assert_eq!(completed.load(Ordering::SeqCst), 1, "case {id}");
+    } else {
+        panic!("case {id}: unhandled timeout expectation");
+    }
+}
+
+#[tokio::test]
+async fn pipeline_hardening_step_timeout_raises_module_timeout() {
+    assert_timeout_case("step_timeout_raises_module_timeout").await;
+}
+
+#[tokio::test]
+async fn pipeline_hardening_step_within_its_timeout_runs() {
+    assert_timeout_case("step_within_its_timeout_runs").await;
 }

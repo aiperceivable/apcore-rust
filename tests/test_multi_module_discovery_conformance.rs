@@ -94,7 +94,7 @@ fn run_derive(case: &Value) -> Result<Vec<String>, apcore::errors::ModuleError> 
 }
 
 // ---------------------------------------------------------------------------
-// Conformance tests — one per fixture case (8 total)
+// Conformance tests — one per fixture case (10 total)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -259,4 +259,190 @@ fn conformance_disabled_by_default() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, expected, "disabled-by-default returns base_id only");
+}
+
+fn assert_marked_class_case(id: &str) {
+    let fixture = load_fixture("multi_module_discovery");
+    let case = fixture_case(&fixture, id);
+    let outcome = run_derive(case);
+    let observed_error = match &outcome {
+        Ok(_) => Value::Null,
+        Err(error) => serde_json::json!({"code": error.code.wire_str()}),
+    };
+    assert_eq!(observed_error, case["expected"]["error"], "case {id}");
+    assert_eq!(
+        serde_json::json!(outcome.unwrap()),
+        case["expected"]["module_ids"],
+        "case {id}"
+    );
+}
+
+#[test]
+fn conformance_unmarked_class_beside_marked_ones_is_not_registered() {
+    assert_marked_class_case("unmarked_class_beside_marked_ones_is_not_registered");
+}
+
+#[test]
+fn conformance_one_marked_class_beside_an_unmarked_one_keeps_its_segment() {
+    assert_marked_class_case("one_marked_class_beside_an_unmarked_one_keeps_its_segment");
+}
+
+struct NamedModule(&'static str);
+
+#[async_trait::async_trait]
+impl apcore::module::Module for NamedModule {
+    fn input_schema(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn output_schema(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn description(&self) -> &str {
+        self.0
+    }
+    async fn execute(
+        &self,
+        inputs: Value,
+        _ctx: &apcore::Context<Value>,
+    ) -> Result<Value, apcore::errors::ModuleError> {
+        Ok(inputs)
+    }
+}
+
+#[test]
+fn registration_preserves_marked_module_identity_with_interleaved_helpers() {
+    use apcore::registry::MultiClassEntry;
+    for names in [
+        vec![("Helper", false), ("Addition", true), ("Subtraction", true)],
+        vec![("Addition", true), ("Helper", false), ("Subtraction", true)],
+        vec![("Helper", false), ("Addition", true)],
+    ] {
+        let registry = apcore::Registry::new();
+        let entries = names
+            .iter()
+            .map(|&(name, marked)| {
+                MultiClassEntry::new(name, Box::new(NamedModule(name))).with_multi_class(marked)
+            })
+            .collect();
+        let ids = registry
+            .register_multi_class(
+                &PathBuf::from("extensions/math/math_ops.py"),
+                "extensions",
+                entries,
+                &DiscoveryConfig::default(),
+            )
+            .unwrap();
+        let expected: Vec<_> = names
+            .iter()
+            .filter(|(_, marked)| *marked)
+            .map(|(name, _)| format!("math.math_ops.{}", class_name_to_segment(name)))
+            .collect();
+        assert_eq!(ids, expected);
+        for (name, marked) in names {
+            let id = format!("math.math_ops.{}", class_name_to_segment(name));
+            let module = registry.get(&id).unwrap();
+            if marked {
+                assert_eq!(
+                    module.unwrap().description(),
+                    name,
+                    "module paired with {id}"
+                );
+            } else {
+                assert!(module.is_none(), "unmarked {name} must not be registered");
+            }
+        }
+    }
+}
+
+#[test]
+fn registration_preserves_empty_single_class_and_unmarked_defaults() {
+    use apcore::registry::MultiClassEntry;
+    for (names, expected_name) in [
+        (vec![], None),
+        (vec![("Only", true)], Some("Only")),
+        (vec![("Only", false)], Some("Only")),
+        (vec![("First", false), ("Second", false)], Some("First")),
+    ] {
+        let registry = apcore::Registry::new();
+        let entries = names
+            .into_iter()
+            .map(|(name, marked)| {
+                MultiClassEntry::new(name, Box::new(NamedModule(name))).with_multi_class(marked)
+            })
+            .collect();
+        let ids = registry
+            .register_multi_class(
+                &PathBuf::from("extensions/math/math_ops.py"),
+                "extensions",
+                entries,
+                &DiscoveryConfig::default(),
+            )
+            .unwrap();
+        let expected_ids = if expected_name.is_some() {
+            vec!["math.math_ops"]
+        } else {
+            vec![]
+        };
+        assert_eq!(ids, expected_ids);
+        assert_eq!(registry.module_ids(), expected_ids);
+        let module = registry.get("math.math_ops").unwrap();
+        assert_eq!(
+            module.as_ref().map(|module| module.description()),
+            expected_name
+        );
+    }
+}
+
+#[test]
+fn registration_ignores_an_unmarked_class_with_the_same_segment() {
+    use apcore::registry::MultiClassEntry;
+    let registry = apcore::Registry::new();
+    let ids = registry
+        .register_multi_class(
+            &PathBuf::from("extensions/math/math_ops.py"),
+            "extensions",
+            vec![
+                MultiClassEntry::new("My_Module", Box::new(NamedModule("helper"))),
+                MultiClassEntry::new("MyModule", Box::new(NamedModule("participant")))
+                    .with_multi_class(true),
+            ],
+            &DiscoveryConfig::default(),
+        )
+        .unwrap();
+    assert_eq!(ids, vec!["math.math_ops.my_module"]);
+    assert_eq!(registry.module_ids(), ids);
+    assert_eq!(
+        registry.get(&ids[0]).unwrap().unwrap().description(),
+        "participant"
+    );
+}
+
+#[test]
+fn registration_rolls_back_marked_modules_and_preserves_an_existing_duplicate() {
+    use apcore::registry::MultiClassEntry;
+    let registry = apcore::Registry::new();
+    let existing_id = "math.math_ops.subtraction";
+    registry
+        .register_module(existing_id, Box::new(NamedModule("existing")))
+        .unwrap();
+    let existing = registry.get(existing_id).unwrap().unwrap();
+    let error = registry
+        .register_multi_class(
+            &PathBuf::from("extensions/math/math_ops.py"),
+            "extensions",
+            vec![
+                MultiClassEntry::new("Helper", Box::new(NamedModule("helper"))),
+                MultiClassEntry::new("Addition", Box::new(NamedModule("new")))
+                    .with_multi_class(true),
+                MultiClassEntry::new("Subtraction", Box::new(NamedModule("duplicate")))
+                    .with_multi_class(true),
+            ],
+            &DiscoveryConfig::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::DuplicateModuleId);
+    assert_eq!(registry.module_ids(), vec![existing_id]);
+    let retained = registry.get(existing_id).unwrap().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&existing, &retained));
+    assert_eq!(retained.description(), "existing");
 }
