@@ -94,6 +94,78 @@ impl Module for DelayedModule {
     }
 }
 
+#[derive(Default)]
+struct OverlapState {
+    active: usize,
+    peak: usize,
+    released: bool,
+}
+
+#[derive(Default)]
+struct LoadOverlap {
+    state: Mutex<OverlapState>,
+    changed: parking_lot::Condvar,
+}
+
+impl LoadOverlap {
+    fn enter(&self, watchdog: Duration) {
+        let mut state = self.state.lock();
+        state.active += 1;
+        state.peak = state.peak.max(state.active);
+        if state.active == 2 {
+            state.released = true;
+            self.changed.notify_all();
+        }
+        // A watchdog lets a serialized implementation fail instead of hanging.
+        // Elapsed time is not the observation: peak active callbacks is.
+        let deadline = Instant::now() + watchdog;
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.released = true;
+                self.changed.notify_all();
+                break;
+            }
+            self.changed.wait_for(&mut state, remaining);
+        }
+    }
+
+    fn leave(&self) {
+        self.state.lock().active -= 1;
+    }
+
+    fn callbacks_overlap(&self) -> bool {
+        self.state.lock().peak > 1
+    }
+}
+
+struct OverlappingModule {
+    inner: DelayedModule,
+    overlap: Arc<LoadOverlap>,
+}
+
+#[async_trait]
+impl Module for OverlappingModule {
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+    fn output_schema(&self) -> Value {
+        self.inner.output_schema()
+    }
+    fn on_load(&self) -> Result<(), ModuleError> {
+        self.overlap.enter(Duration::from_secs(5));
+        let result = self.inner.on_load();
+        self.overlap.leave();
+        result
+    }
+    async fn execute(&self, inputs: Value, context: &Context<Value>) -> Result<Value, ModuleError> {
+        self.inner.execute(inputs, context).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Case: visibility_after_successful_on_load
 // ---------------------------------------------------------------------------
@@ -466,67 +538,75 @@ fn conformance_concurrent_same_id_rejects_duplicate() {
 // Case: concurrent_distinct_ids_run_in_parallel
 // ---------------------------------------------------------------------------
 
+fn assert_parallel_registrations(case: &Value, startup_delay: Duration) {
+    let registry = Arc::new(Registry::new());
+    let overlap = Arc::new(LoadOverlap::default());
+    let handles = ["module_x", "module_y"].map(|key| {
+        let module = &case["setup"][key];
+        let id = module["id"].as_str().unwrap().to_string();
+        let delay_ms = module["on_load_delay_ms"].as_u64().unwrap();
+        let registry = Arc::clone(&registry);
+        let overlap = Arc::clone(&overlap);
+        std::thread::spawn(move || {
+            std::thread::sleep(startup_delay);
+            registry.register(
+                &id,
+                Box::new(OverlappingModule {
+                    inner: DelayedModule {
+                        delay_ms,
+                        fail: false,
+                    },
+                    overlap,
+                }),
+                make_descriptor(&id),
+            )
+        })
+    });
+    let results = handles.map(|handle| handle.join().unwrap());
+    assert_eq!(
+        results.iter().all(Result::is_ok),
+        case["expected"]["both_succeed"].as_bool().unwrap(),
+        "registration results: {results:?}"
+    );
+    assert_eq!(
+        registry.count(),
+        case["expected"]["post_register_count"].as_u64().unwrap() as usize
+    );
+    for key in ["module_x", "module_y"] {
+        assert!(registry
+            .get(case["setup"][key]["id"].as_str().unwrap())
+            .unwrap()
+            .is_some());
+    }
+    assert_eq!(
+        overlap.callbacks_overlap(),
+        case["expected"]["callbacks_overlap"].as_bool().unwrap(),
+        "distinct-ID on_load callbacks must overlap"
+    );
+}
+
 #[test]
 fn conformance_concurrent_distinct_ids_run_in_parallel() {
     let fixture = load_fixture();
     let case = fixture_case(&fixture, "concurrent_distinct_ids_run_in_parallel");
+    assert_parallel_registrations(case, Duration::ZERO);
+}
 
-    let id_x = case["setup"]["module_x"]["id"].as_str().unwrap();
-    let id_y = case["setup"]["module_y"]["id"].as_str().unwrap();
-    let delay_ms = case["setup"]["module_x"]["on_load_delay_ms"]
-        .as_u64()
-        .unwrap_or(50);
+#[test]
+fn concurrent_distinct_ids_tolerate_slow_thread_startup() {
+    let fixture = load_fixture();
+    let case = fixture_case(&fixture, "concurrent_distinct_ids_run_in_parallel");
+    assert_parallel_registrations(case, Duration::from_millis(150));
+}
 
-    let registry = Arc::new(Registry::new());
-    let r1 = Arc::clone(&registry);
-    let r2 = Arc::clone(&registry);
-    let mx = id_x.to_string();
-    let my = id_y.to_string();
-
-    let wall_clock_limit_ms = case["expected"]["wall_clock_ms_less_than"]
-        .as_u64()
-        .unwrap_or(90);
-
-    let start = Instant::now();
-    let h1 = std::thread::spawn(move || {
-        r1.register(
-            &mx,
-            Box::new(DelayedModule {
-                delay_ms,
-                fail: false,
-            }),
-            make_descriptor(&mx),
-        )
-    });
-    let h2 = std::thread::spawn(move || {
-        r2.register(
-            &my,
-            Box::new(DelayedModule {
-                delay_ms,
-                fail: false,
-            }),
-            make_descriptor(&my),
-        )
-    });
-    h1.join().unwrap().unwrap();
-    h2.join().unwrap().unwrap();
-    let elapsed = start.elapsed().as_millis();
-
-    // both_succeed: true
-    assert!(
-        case["expected"]["both_succeed"].as_bool().unwrap(),
-        "fixture expects both_succeed=true"
-    );
-    assert_eq!(
-        registry.count(),
-        case["expected"]["post_register_count"].as_u64().unwrap() as usize,
-        "both modules must be registered"
-    );
-
-    // wall_clock_ms_less_than (proves per-module parallelism)
-    assert!(
-        elapsed < wall_clock_limit_ms as u128,
-        "wall clock was {elapsed}ms; fixture requires < {wall_clock_limit_ms}ms \
-         (distinct-ID on_load callbacks must run concurrently)"
-    );
+#[test]
+fn overlap_probe_does_not_count_sequential_callbacks() {
+    let overlap = LoadOverlap::default();
+    // Expire the watchdog without sleeping, then enter a second callback only
+    // after the first has left. Total entries must not masquerade as overlap.
+    for _ in 0..2 {
+        overlap.enter(Duration::ZERO);
+        overlap.leave();
+    }
+    assert!(!overlap.callbacks_overlap());
 }
