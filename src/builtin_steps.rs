@@ -1245,7 +1245,8 @@ impl Step for BuiltinExecute {
             // Own the invocation: timeout must not drop module code before cleanup.
             let inputs = ctx.inputs.clone();
             let context = ctx.context.clone();
-            let invocation = tokio::spawn(async move {
+            let token = context.cancel_token.clone();
+            let execution = async move {
                 let result = module.execute(inputs, &context).await;
                 if let Err(error) = &result {
                     tracing::debug!(
@@ -1254,7 +1255,12 @@ impl Step for BuiltinExecute {
                     );
                 }
                 result
-            });
+            };
+            let invocation = if let Some(token) = token {
+                token.spawn_tracked(execution)
+            } else {
+                tokio::spawn(execution)
+            };
             match tokio::time::timeout(Duration::from_millis(timeout_ms), invocation).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => Err(ModuleError::new(
@@ -1499,6 +1505,103 @@ mod tests {
     use crate::context::Context;
     use crate::context::Identity;
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct PendingModule {
+        started: Arc<tokio::sync::Notify>,
+        cleaned: Arc<std::sync::atomic::AtomicBool>,
+        finish: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::module::Module for PendingModule {
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn output_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn description(&self) -> &'static str {
+            "Wait until cancelled"
+        }
+        async fn execute(
+            &self,
+            _inputs: serde_json::Value,
+            _context: &Context<serde_json::Value>,
+        ) -> Result<serde_json::Value, ModuleError> {
+            struct Cleanup(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _cleanup = Cleanup(self.cleaned.clone());
+            self.started.notify_one();
+            self.finish.notified().await;
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_executor_timeout_tracks_cleanup_and_manager_cancel_drains() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for timeout in [false, true] {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let registry = Arc::new(crate::registry::registry::Registry::new());
+            registry
+                .register_module(
+                    "pending",
+                    Box::new(PendingModule {
+                        started: started.clone(),
+                        cleaned: cleaned.clone(),
+                        finish: finish.clone(),
+                    }),
+                )
+                .unwrap();
+            let mut config = crate::config::Config::default();
+            config.set(
+                "executor.default_timeout",
+                serde_json::json!(if timeout { 20 } else { 60_000 }),
+            );
+            let executor = Arc::new(crate::executor::Executor::new(registry, Arc::new(config)));
+            if timeout {
+                let token = crate::cancel::CancelToken::new();
+                let mut context = Context::anonymous();
+                context.cancel_token = Some(token.clone());
+                let invocation = tokio::spawn(async move {
+                    executor
+                        .call("pending", serde_json::json!({}), Some(&context), None)
+                        .await
+                });
+                started.notified().await;
+                assert_eq!(
+                    invocation.await.unwrap().unwrap_err().code,
+                    ErrorCode::ModuleTimeout
+                );
+                assert!(
+                    !cleaned.load(Ordering::Acquire),
+                    "deadline must return before cooperative cleanup"
+                );
+                assert!(token.has_active_executions());
+                finish.notify_one();
+                token.drain().await;
+            } else {
+                let manager = crate::async_task::AsyncTaskManager::new(executor, 1, 100);
+                let task_id = manager
+                    .submit("pending", serde_json::json!({}), None)
+                    .await
+                    .unwrap();
+                started.notified().await;
+                assert!(manager.cancel(&task_id).await.unwrap());
+            }
+            assert!(
+                cleaned.load(Ordering::Acquire),
+                "timeout={timeout}: module future outlived its owner"
+            );
+        }
+    }
 
     fn empty_context() -> PipelineContext {
         let identity = Identity::new(

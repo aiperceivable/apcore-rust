@@ -755,6 +755,18 @@ fn send_email_examples() -> Vec<ModuleExample> {
 
 ### `cancel_token` — Cooperative cancellation during long-running execution
 
+`CancelToken::drain().await` waits for actual execution in that token's scope
+and its descendants, including cleanup continuing after a timeout response.
+It does not request cancellation or force termination. Call `cancel()` to
+signal cooperative cancellation separately. `has_active_executions()` reports
+whether the scope still owns execution; completed scopes retain no invocation
+handles. A deadline continues to return `MODULE_TIMEOUT` immediately, while
+successful active-task cancellation joins its owned background work, and
+`AsyncTaskManager::shutdown` drains remaining local work. Cancelling an already
+terminal task still returns `false` without interrupting its late cleanup.
+These execution-draining APIs are unreleased additions
+after version 0.32.2.
+
 `CancelToken` is a cloneable, shared cancellation signal. Modules poll `token.is_cancelled()` between steps to stop early.
 
 ```rust

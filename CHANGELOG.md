@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Drain the actual module execution tree when cancelling owned background tasks or shutting down their manager. Serialize cancellation, preserve winning terminal states, and finish local teardown even when the task store fails during shutdown. Executor deadlines still report immediately and allow cooperative cleanup; they do not forcibly terminate module code.
+- Track execution lifetime through linked `CancelToken` scopes. The additive `drain()` method waits for module futures and their resources to finish, and `has_active_executions()` lets integrations retain only live cleanup work. Reclaim manager bookkeeping after late cleanup even if the terminal task record was already deleted.
+
 ## [0.32.2] - 2026-10-19
 
 ### Fixed

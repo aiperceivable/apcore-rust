@@ -1,8 +1,59 @@
 // APCore Protocol — Cancellation tokens
 // Spec reference: Cooperative cancellation for module execution
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
+
+static NEXT_EXECUTION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default)]
+struct ExecutionState {
+    active: Mutex<HashMap<u64, ExecutionRecord>>,
+    changed: tokio::sync::Notify,
+    abort_requested: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionRecord {
+    abort: Option<tokio::task::AbortHandle>,
+    abort_requested: bool,
+}
+
+struct ExecutionRegistration {
+    id: u64,
+    scopes: Vec<Arc<ExecutionState>>,
+}
+
+impl Drop for ExecutionRegistration {
+    fn drop(&mut self) {
+        for scope in &self.scopes {
+            scope
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.id);
+            scope.changed.notify_waiters();
+        }
+    }
+}
+
+// Struct fields drop in declaration order: all module-owned resources must
+// finish dropping before drain() can observe the registration as complete.
+struct TrackedExecution<F> {
+    future: Pin<Box<F>>,
+    _registration: ExecutionRegistration,
+}
+
+impl<F: Future> Future for TrackedExecution<F> {
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(context)
+    }
+}
 
 use crate::errors::{ErrorCode, ModuleError};
 
@@ -89,6 +140,7 @@ impl From<ExecutionCancelledError> for ModuleError {
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
     parent: Option<Arc<CancelToken>>,
+    executions: Arc<ExecutionState>,
 }
 
 impl CancelToken {
@@ -98,6 +150,7 @@ impl CancelToken {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             parent: None,
+            executions: Arc::new(ExecutionState::default()),
         }
     }
 
@@ -107,12 +160,110 @@ impl CancelToken {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             parent: Some(Arc::new(self.clone())),
+            executions: Arc::new(ExecutionState::default()),
         }
     }
 
     /// Signal cancellation.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait for this invocation and its descendants to finish actual module
+    /// execution, including cooperative cleanup after a reported timeout.
+    /// This does not cancel or forcibly terminate any execution.
+    pub async fn drain(&self) {
+        loop {
+            let changed = self.executions.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.has_active_executions() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Whether this invocation still owns running module execution.
+    #[must_use]
+    pub fn has_active_executions(&self) -> bool {
+        !self
+            .executions
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    pub(crate) fn spawn_tracked<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let id = NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed);
+        let mut scopes = Vec::new();
+        let mut current = Some(self);
+        while let Some(token) = current {
+            let mut active = token
+                .executions
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.insert(
+                id,
+                ExecutionRecord {
+                    abort_requested: token.executions.abort_requested.load(Ordering::Acquire),
+                    ..ExecutionRecord::default()
+                },
+            );
+            drop(active);
+            scopes.push(token.executions.clone());
+            current = token.parent.as_deref();
+        }
+        let invocation = tokio::spawn(TrackedExecution {
+            future: Box::pin(future),
+            _registration: ExecutionRegistration {
+                id,
+                scopes: scopes.clone(),
+            },
+        });
+        let abort = invocation.abort_handle();
+        for scope in scopes {
+            let mut active = scope
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(record) = active.get_mut(&id) {
+                record.abort = Some(abort.clone());
+                if record.abort_requested {
+                    abort.abort();
+                }
+            }
+        }
+        invocation
+    }
+
+    /// Background task cancellation may interrupt only its own invocation tree.
+    /// The public cancel() and executor deadlines remain cooperative.
+    pub(crate) async fn abort_owned_executions(&self) {
+        self.executions
+            .abort_requested
+            .store(true, Ordering::Release);
+        let aborts: Vec<_> = self
+            .executions
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+            .filter_map(|record| {
+                record.abort_requested = true;
+                record.abort.clone()
+            })
+            .collect();
+        for abort in aborts {
+            abort.abort();
+        }
+        self.drain().await;
     }
 
     /// Check whether cancellation has been requested.
@@ -197,6 +348,62 @@ impl Default for CancelToken {
 #[cfg(test)]
 mod child_token_tests {
     use super::CancelToken;
+
+    #[tokio::test]
+    async fn test_drain_reaches_descendants_and_all_waiters_after_resource_drop() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct Cleanup(Arc<AtomicBool>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let parent = CancelToken::new();
+        let child = parent.child();
+        let sibling = parent.child();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup = Cleanup(cleaned.clone());
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let invocation = child.spawn_tracked(async move {
+            let _cleanup = cleanup;
+            let _ = finish_rx.await;
+        });
+        assert!(parent.has_active_executions());
+        assert!(!sibling.has_active_executions());
+        let first = parent.clone();
+        let second = parent.clone();
+        let first_waiter = tokio::spawn(async move { first.drain().await });
+        let second_waiter = tokio::spawn(async move { second.drain().await });
+        finish_tx.send(()).unwrap();
+        invocation.await.unwrap();
+        first_waiter.await.unwrap();
+        second_waiter.await.unwrap();
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(!parent.has_active_executions());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tracked_execution_handles_early_finish_abort_and_panic() {
+        let parent = CancelToken::new();
+        for _ in 0..100 {
+            let child = parent.child();
+            child.spawn_tracked(async {}).await.unwrap();
+            child.drain().await;
+            assert!(!parent.has_active_executions());
+        }
+        let child = parent.child();
+        let aborted = child.spawn_tracked(std::future::pending::<()>());
+        child.abort_owned_executions().await;
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        let child = parent.child();
+        let panicked = child.spawn_tracked(async { panic!("tracked invocation panic") });
+        assert!(panicked.await.unwrap_err().is_panic());
+        parent.drain().await;
+        assert!(!parent.is_cancelled());
+    }
 
     #[test]
     fn test_child_cancellation_does_not_cancel_parent_or_sibling() {

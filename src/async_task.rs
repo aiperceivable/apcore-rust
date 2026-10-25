@@ -399,6 +399,8 @@ pub struct AsyncTaskManager {
     max_tasks: usize,
     store: Arc<dyn TaskStore>,
     handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    execution_tokens: Arc<Mutex<HashMap<String, crate::cancel::CancelToken>>>,
+    cancellation_lock: tokio::sync::Mutex<()>,
     semaphore: Arc<Semaphore>,
     // Serialises the capacity-check + save sequence in `submit_with_retry`.
     // Without this guard, two concurrent submits can both observe
@@ -457,6 +459,8 @@ impl AsyncTaskManager {
             max_tasks,
             store,
             handles: Arc::new(Mutex::new(HashMap::new())),
+            execution_tokens: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_lock: tokio::sync::Mutex::new(()),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -533,6 +537,16 @@ impl AsyncTaskManager {
         }
 
         let handles = Arc::clone(&self.handles);
+        let execution_tokens = Arc::clone(&self.execution_tokens);
+        let mut context = context.unwrap_or_else(Context::anonymous);
+        let execution_token = context.cancel_token.as_ref().map_or_else(
+            crate::cancel::CancelToken::new,
+            crate::cancel::CancelToken::child,
+        );
+        context.cancel_token = Some(execution_token.clone());
+        execution_tokens
+            .lock()
+            .insert(task_id.clone(), execution_token.clone());
         let semaphore = Arc::clone(&self.semaphore);
         let executor = Arc::clone(&self.executor);
         let store_for_run = Arc::clone(&self.store);
@@ -561,15 +575,20 @@ impl AsyncTaskManager {
                 tid.clone(),
                 mid,
                 inputs,
-                context,
+                Some(context),
                 retry,
                 executor,
                 semaphore,
                 store_for_run,
             )
             .await;
+            // The store may already expose a timeout while the invocation is
+            // still cleaning up cooperatively. Keep bookkeeping until actual
+            // completion, including after cleanup() has deleted its record.
+            execution_token.drain().await;
             finished_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
             handles.lock().remove(&tid);
+            execution_tokens.lock().remove(&tid);
         });
 
         {
@@ -656,25 +675,43 @@ impl AsyncTaskManager {
     /// it kept running. The cancellation OUTCOME is still the boolean —
     /// `Ok(false)` for an unknown or already-terminal task.
     pub async fn cancel(&self, task_id: &str) -> Result<bool, ModuleError> {
+        let _cancellation = self.cancellation_lock.lock().await;
         let Some(info) = self.store.get(task_id).await? else {
             return Ok(false);
         };
         if !info.status.is_active() {
             return Ok(false);
         }
+        self.stop_local_task(task_id).await;
 
-        if let Some(handle) = self.handles.lock().remove(task_id) {
-            handle.abort();
+        // State may have changed while the physical execution was draining.
+        let Some(mut updated) = self.store.get(task_id).await? else {
+            return Ok(false);
+        };
+        if !updated.status.is_active() {
+            return Ok(false);
         }
-
-        // Transition to Cancelled if still active.
-        let mut updated = info;
-        if updated.status.is_active() {
-            updated.status = TaskStatus::Cancelled;
-            updated.completed_at = Some(now_secs());
-            self.store.save(&updated).await?;
-        }
+        updated.status = TaskStatus::Cancelled;
+        updated.completed_at = Some(now_secs());
+        self.store.save(&updated).await?;
         Ok(true)
+    }
+
+    async fn stop_local_task(&self, task_id: &str) {
+        // Extract the handle before awaiting: holding the synchronous mutex
+        // would deadlock a completing task's own handle removal and make this
+        // future non-Send. abort() only schedules cancellation; joining ensures
+        // module futures and their resource guards have actually been dropped.
+        let handle = self.handles.lock().remove(task_id);
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        let execution_token = self.execution_tokens.lock().remove(task_id);
+        if let Some(token) = execution_token {
+            token.cancel();
+            token.abort_owned_executions().await;
+        }
     }
 
     /// Signal this manager's reaper to stop and release the single-reaper
@@ -725,21 +762,29 @@ impl AsyncTaskManager {
     pub async fn shutdown(&self) -> Result<(), ModuleError> {
         self.stop_reaper();
 
-        let task_ids: Vec<String> = self
-            .store
-            .list(None)
-            .await?
-            .into_iter()
-            .filter_map(|info| info.status.is_active().then_some(info.task_id))
-            .collect();
-
         let mut first_error: Option<ModuleError> = None;
+        let mut task_ids: Vec<String> = self.handles.lock().keys().cloned().collect();
+        task_ids.extend(self.execution_tokens.lock().keys().cloned());
+        match self.store.list(None).await {
+            Ok(tasks) => task_ids.extend(
+                tasks
+                    .into_iter()
+                    .filter_map(|info| info.status.is_active().then_some(info.task_id)),
+            ),
+            Err(error) => first_error = Some(error),
+        }
+        task_ids.sort();
+        task_ids.dedup();
         for task_id in task_ids {
             if let Err(err) = self.cancel(&task_id).await {
                 if first_error.is_none() {
                     first_error = Some(err);
                 }
             }
+            // Explicit shutdown owns physical teardown even for terminal
+            // records with late cleanup, or when the store is unavailable.
+            let _cancellation = self.cancellation_lock.lock().await;
+            self.stop_local_task(&task_id).await;
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -804,6 +849,11 @@ impl AsyncTaskManager {
         for id in &to_remove {
             self.store.delete(id).await?;
             self.handles.lock().remove(id);
+            // A reported timeout may still be cleaning up cooperatively.
+            // Keep its scope until shutdown/cancel has actually drained it.
+            self.execution_tokens
+                .lock()
+                .retain(|task_id, token| task_id != id || token.has_active_executions());
         }
         Ok(count)
     }
@@ -1116,10 +1166,285 @@ mod tests {
     use crate::executor::Executor;
     use crate::registry::registry::Registry;
 
+    struct UnavailableStore;
+    #[async_trait]
+    impl TaskStore for UnavailableStore {
+        async fn save(&self, _task: &TaskInfo) -> Result<(), ModuleError> {
+            Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                "store save unavailable",
+            ))
+        }
+        async fn get(&self, _id: &str) -> Result<Option<TaskInfo>, ModuleError> {
+            Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                "store get unavailable",
+            ))
+        }
+        async fn list(&self, _status: Option<TaskStatus>) -> Result<Vec<TaskInfo>, ModuleError> {
+            Err(ModuleError::new(
+                ErrorCode::GeneralInternalError,
+                "store list unavailable",
+            ))
+        }
+        async fn delete(&self, _id: &str) -> Result<(), ModuleError> {
+            Ok(())
+        }
+        async fn list_expired(&self, _before: f64) -> Result<Vec<TaskInfo>, ModuleError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drains_local_work_when_store_is_unavailable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Cleanup(Arc<AtomicBool>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let manager =
+            AsyncTaskManager::with_store(make_executor(), 1, 100, Arc::new(UnavailableStore));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup = Cleanup(cleaned.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        manager.handles.lock().insert("local".into(), handle);
+        started_rx.await.unwrap();
+        let error = manager.shutdown().await.unwrap_err();
+        assert_eq!(error.message, "store list unavailable");
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(manager.handles.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_preserves_terminal_state_written_during_join() {
+        struct CompleteOnDrop(Arc<InMemoryTaskStore>);
+        impl Drop for CompleteOnDrop {
+            fn drop(&mut self) {
+                let mut stored = self.0.tasks.get_mut("race").unwrap();
+                stored.1.status = TaskStatus::Completed;
+                stored.1.result = Some(serde_json::json!({"winner": "completion"}));
+            }
+        }
+        let store = Arc::new(InMemoryTaskStore::new());
+        let manager = AsyncTaskManager::with_store(make_executor(), 1, 100, store.clone());
+        store
+            .save(&TaskInfo {
+                task_id: "race".into(),
+                module_id: "module".into(),
+                status: TaskStatus::Running,
+                submitted_at: 0.0,
+                started_at: Some(0.0),
+                completed_at: None,
+                result: None,
+                error: None,
+                retry_count: 0,
+                max_retries: 0,
+            })
+            .await
+            .unwrap();
+        let cleanup = CompleteOnDrop(store);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        manager.handles.lock().insert("race".into(), handle);
+        started_rx.await.unwrap();
+        assert!(!manager.cancel("race").await.unwrap());
+        let result = manager.get_status("race").unwrap().unwrap();
+        assert_eq!(result.status, TaskStatus::Completed);
+        assert_eq!(result.result.unwrap()["winner"], "completion");
+    }
+
     fn make_executor() -> Arc<Executor> {
         let registry = Arc::new(Registry::default());
         let config = Arc::new(crate::config::Config::default());
         Arc::new(Executor::new(registry, config))
+    }
+
+    struct LateCleanupModule(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl crate::module::Module for LateCleanupModule {
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn output_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn description(&self) -> &'static str {
+            "Wait for late cooperative cleanup"
+        }
+        async fn execute(
+            &self,
+            _inputs: serde_json::Value,
+            _context: &Context<serde_json::Value>,
+        ) -> Result<serde_json::Value, ModuleError> {
+            self.0.notified().await;
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reclaimed_timed_out_record_releases_scope_after_late_cleanup() {
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_module("late", Box::new(LateCleanupModule(finish.clone())))
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.set("executor.default_timeout", serde_json::json!(10));
+        let manager =
+            AsyncTaskManager::new(Arc::new(Executor::new(registry, Arc::new(config))), 1, 100);
+        let task_id = manager
+            .submit("late", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.get_status(&task_id).unwrap().unwrap().status != TaskStatus::Failed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(manager.cleanup(0.0).unwrap(), 1);
+        assert!(!manager.execution_tokens.lock().is_empty());
+        finish.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !manager.execution_tokens.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scope remained after deleted record's late execution finished");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_and_shutdown_wait_for_running_future_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Cleanup(Arc<AtomicBool>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        for shutdown in [false, true] {
+            let manager = Arc::new(AsyncTaskManager::new(make_executor(), 1, 100));
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let cleanup = Cleanup(cleaned.clone());
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _cleanup = cleanup;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            });
+            manager
+                .store
+                .save(&TaskInfo {
+                    task_id: "cleanup".into(),
+                    module_id: "waiting".into(),
+                    status: if shutdown {
+                        TaskStatus::Completed
+                    } else {
+                        TaskStatus::Running
+                    },
+                    submitted_at: 0.0,
+                    started_at: Some(0.0),
+                    completed_at: None,
+                    result: None,
+                    error: None,
+                    retry_count: 0,
+                    max_retries: 0,
+                })
+                .await
+                .unwrap();
+            manager.handles.lock().insert("cleanup".into(), handle);
+            started_rx.await.unwrap();
+            if shutdown {
+                assert!(!manager.cancel("cleanup").await.unwrap());
+                assert!(
+                    !cleaned.load(Ordering::Acquire),
+                    "terminal cancel must not interrupt late cleanup"
+                );
+                manager.shutdown().await.unwrap();
+            } else {
+                assert!(manager.cancel("cleanup").await.unwrap());
+            }
+            assert!(
+                cleaned.load(Ordering::Acquire),
+                "shutdown={shutdown}: cancellation returned before future Drop"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_concurrent_cancel_waits_for_the_first_callers_cleanup() {
+        struct HeldCleanup {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: Arc<std::sync::Barrier>,
+        }
+        impl Drop for HeldCleanup {
+            fn drop(&mut self) {
+                let _ = self.started.take().unwrap().send(());
+                // Deliberately hold synchronous Drop on one worker so a second
+                // caller can deterministically probe cancellation completion.
+                self.release.wait();
+            }
+        }
+        let manager = Arc::new(AsyncTaskManager::new(make_executor(), 1, 100));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropping_tx, dropping_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let cleanup = HeldCleanup {
+            started: Some(dropping_tx),
+            release: release.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        manager
+            .store
+            .save(&TaskInfo {
+                task_id: "concurrent".into(),
+                module_id: "waiting".into(),
+                status: TaskStatus::Running,
+                submitted_at: 0.0,
+                started_at: Some(0.0),
+                completed_at: None,
+                result: None,
+                error: None,
+                retry_count: 0,
+                max_retries: 0,
+            })
+            .await
+            .unwrap();
+        manager.handles.lock().insert("concurrent".into(), handle);
+        started_rx.await.unwrap();
+        let first_manager = manager.clone();
+        let first = tokio::spawn(async move { first_manager.cancel("concurrent").await });
+        dropping_rx.await.unwrap();
+        let mut second = Box::pin(manager.cancel("concurrent"));
+        let second_poll = futures_util::poll!(second.as_mut());
+        let returned_early = second_poll.is_ready();
+        // Always release the worker, even when the regression is present.
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        assert!(first.await.unwrap().unwrap());
+        assert!(
+            !returned_early,
+            "second cancel returned before future cleanup completed"
+        );
+        assert!(!second.await.unwrap());
     }
 
     #[test]
