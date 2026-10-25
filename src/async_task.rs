@@ -2,6 +2,7 @@
 // Spec reference: docs/features/async-tasks.md
 // Issue #34: Pluggable TaskStore, retry with exponential backoff, Reaper TTL cleanup.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -389,6 +390,23 @@ impl ReaperHandle {
 // AsyncTaskManager
 // ---------------------------------------------------------------------------
 
+struct TaskHandle {
+    join: JoinHandle<()>,
+    // Shared with the worker's normal deregistration path, so cancellation
+    // cannot reinsert a handle after that worker has already removed itself.
+    finished: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl From<JoinHandle<()>> for TaskHandle {
+    fn from(join: JoinHandle<()>) -> Self {
+        Self {
+            join,
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 /// Manages background execution of modules via tokio tasks.
 ///
 /// Bounds concurrency with a semaphore, persists task state through a
@@ -398,7 +416,7 @@ pub struct AsyncTaskManager {
     executor: Arc<Executor>,
     max_tasks: usize,
     store: Arc<dyn TaskStore>,
-    handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    handles: Arc<Mutex<HashMap<String, TaskHandle>>>,
     execution_tokens: Arc<Mutex<HashMap<String, crate::cancel::CancelToken>>>,
     cancellation_lock: tokio::sync::Mutex<()>,
     semaphore: Arc<Semaphore>,
@@ -597,7 +615,13 @@ impl AsyncTaskManager {
                 // Already terminal: registering now would strand the entry.
                 drop(handle);
             } else {
-                registered.insert(task_id.clone(), handle);
+                registered.insert(
+                    task_id.clone(),
+                    TaskHandle {
+                        join: handle,
+                        finished,
+                    },
+                );
             }
         }
 
@@ -698,19 +722,40 @@ impl AsyncTaskManager {
     }
 
     async fn stop_local_task(&self, task_id: &str) {
-        // Extract the handle before awaiting: holding the synchronous mutex
-        // would deadlock a completing task's own handle removal and make this
-        // future non-Send. abort() only schedules cancellation; joining ensures
-        // module futures and their resource guards have actually been dropped.
-        let handle = self.handles.lock().remove(task_id);
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
+        // A caller can drop cancel()/shutdown() at either await. Return any
+        // unfinished join to the manager rather than detaching its teardown.
+        struct PendingJoin<'a> {
+            task_id: &'a str,
+            handles: &'a Mutex<HashMap<String, TaskHandle>>,
+            handle: Option<TaskHandle>,
         }
-        let execution_token = self.execution_tokens.lock().remove(task_id);
+        impl Drop for PendingJoin<'_> {
+            fn drop(&mut self) {
+                if let Some(handle) = self.handle.take() {
+                    let mut handles = self.handles.lock();
+                    if !handle.finished.load(Ordering::SeqCst) && !handle.join.is_finished() {
+                        handles.insert(self.task_id.to_owned(), handle);
+                    }
+                }
+            }
+        }
+        let mut pending = PendingJoin {
+            task_id,
+            handles: &self.handles,
+            handle: self.handles.lock().remove(task_id),
+        };
+        if let Some(handle) = pending.handle.as_mut() {
+            handle.join.abort();
+            let _ = (&mut handle.join).await;
+        }
+        pending.handle.take();
+        // Keep the token registered until the physical invocation tree has
+        // drained, even when this particular cancellation waiter is dropped.
+        let execution_token = self.execution_tokens.lock().get(task_id).cloned();
         if let Some(token) = execution_token {
             token.cancel();
             token.abort_owned_executions().await;
+            self.execution_tokens.lock().remove(task_id);
         }
     }
 
@@ -1214,7 +1259,7 @@ mod tests {
             let _ = started_tx.send(());
             std::future::pending::<()>().await;
         });
-        manager.handles.lock().insert("local".into(), handle);
+        manager.handles.lock().insert("local".into(), handle.into());
         started_rx.await.unwrap();
         let error = manager.shutdown().await.unwrap_err();
         assert_eq!(error.message, "store list unavailable");
@@ -1256,7 +1301,7 @@ mod tests {
             let _ = started_tx.send(());
             std::future::pending::<()>().await;
         });
-        manager.handles.lock().insert("race".into(), handle);
+        manager.handles.lock().insert("race".into(), handle.into());
         started_rx.await.unwrap();
         assert!(!manager.cancel("race").await.unwrap());
         let result = manager.get_status("race").unwrap().unwrap();
@@ -1326,6 +1371,137 @@ mod tests {
         .expect("scope remained after deleted record's late execution finished");
     }
 
+    struct PendingCleanupModule {
+        started: Arc<tokio::sync::Notify>,
+        cleaned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::module::Module for PendingCleanupModule {
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn output_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn description(&self) -> &'static str {
+            "Keep execution alive until cancelled"
+        }
+        async fn execute(
+            &self,
+            _inputs: serde_json::Value,
+            _context: &Context<serde_json::Value>,
+        ) -> Result<serde_json::Value, ModuleError> {
+            struct Cleanup(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _cleanup = Cleanup(self.cleaned.clone());
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dropped_cancel_keeps_execution_tracked_for_shutdown() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context as TaskContext, Waker};
+
+        for drain_started in [false, true] {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let registry = Arc::new(Registry::new());
+            registry
+                .register_module(
+                    "pending",
+                    Box::new(PendingCleanupModule {
+                        started: started.clone(),
+                        cleaned: cleaned.clone(),
+                    }),
+                )
+                .unwrap();
+            let manager = AsyncTaskManager::new(
+                Arc::new(Executor::new(
+                    registry,
+                    Arc::new(crate::config::Config::default()),
+                )),
+                1,
+                100,
+            );
+            let id = manager
+                .submit("pending", serde_json::json!({}), None)
+                .await
+                .unwrap();
+            started.notified().await;
+            let mut cancel = Box::pin(manager.cancel(&id));
+            let mut context = TaskContext::from_waker(Waker::noop());
+            assert!(cancel.as_mut().poll(&mut context).is_pending());
+            if drain_started {
+                tokio::task::yield_now().await;
+                // Reach the execution-drain await after the manager worker is aborted.
+                assert!(cancel.as_mut().poll(&mut context).is_pending());
+            }
+            drop(cancel);
+            assert!(!cleaned.load(Ordering::Acquire));
+            manager.shutdown().await.unwrap();
+            assert!(
+                cleaned.load(Ordering::Acquire),
+                "shutdown lost the cancelled caller's execution"
+            );
+            assert!(manager.execution_tokens.lock().is_empty());
+            assert!(manager.handles.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drains_execution_after_timeout_record_is_reclaimed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_module(
+                "pending",
+                Box::new(PendingCleanupModule {
+                    started: started.clone(),
+                    cleaned: cleaned.clone(),
+                }),
+            )
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.set("executor.default_timeout", serde_json::json!(10));
+        let manager =
+            AsyncTaskManager::new(Arc::new(Executor::new(registry, Arc::new(config))), 1, 100);
+        let id = manager
+            .submit("pending", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.get_status(&id).unwrap().unwrap().status != TaskStatus::Failed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(manager
+            .get_status(&id)
+            .unwrap()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("timed out"));
+        assert_eq!(manager.cleanup(0.0).unwrap(), 1);
+        assert!(manager.get_status(&id).unwrap().is_none());
+        assert!(!cleaned.load(Ordering::Acquire));
+        manager.shutdown().await.unwrap();
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(manager.execution_tokens.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn test_cancel_and_shutdown_wait_for_running_future_cleanup() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1365,7 +1541,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            manager.handles.lock().insert("cleanup".into(), handle);
+            manager
+                .handles
+                .lock()
+                .insert("cleanup".into(), handle.into());
             started_rx.await.unwrap();
             if shutdown {
                 assert!(!manager.cancel("cleanup").await.unwrap());
@@ -1427,7 +1606,10 @@ mod tests {
             })
             .await
             .unwrap();
-        manager.handles.lock().insert("concurrent".into(), handle);
+        manager
+            .handles
+            .lock()
+            .insert("concurrent".into(), handle.into());
         started_rx.await.unwrap();
         let first_manager = manager.clone();
         let first = tokio::spawn(async move { first_manager.cancel("concurrent").await });
